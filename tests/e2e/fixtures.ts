@@ -11,6 +11,8 @@ import type {
   BatchPlan,
   BranchExecutor,
   EightSurfacePatch,
+  FailureCategory,
+  FailureDiagnosis,
   IActivePolicy,
   ICordisSeamManager,
   IHarnessProposer,
@@ -30,7 +32,7 @@ import type {
 } from '../../src/types/contracts';
 import { parseLessonDocument } from '../../src/memory-bridge';
 import { parseEvoHarnessConfig } from '../../src/config';
-import { createActivePolicyFromDefaults, createFailureTaxonomy } from '../../src/dream-rsi';
+import { createActivePolicyFromDefaults, createFailureTaxonomy, diagnoseFailure } from '../../src/dream-rsi';
 import type { FailureDiagnosisRequest, IFailureTaxonomy } from '../../src/dream-rsi';
 import type { McpClient, McpToolCallResult, McpToolDescriptor } from '../../src/memory-bridge';
 import { createCordisHostFromContext, createEvoHarnessPlugin } from '../../src/index';
@@ -88,20 +90,69 @@ export function proposalPayload(): Record<string, unknown> {
   };
 }
 
+/** Proposer payload that edits the system prompt surface. */
+export function systemPromptProposalPayload(): Record<string, unknown> {
+  return {
+    rationale: 'State the failing tool up front in the system prompt.',
+    focusSurfaces: ['system_prompt'],
+    confidence: 0.7,
+    expectedStepsDelta: -1,
+    edits: {
+      system_prompt: {
+        kind: 'system_prompt',
+        mode: 'append',
+        content: 'round 1: declare the failing tool before retrying'
+      }
+    }
+  };
+}
+
+/** Proposer payload that edits the skills surface instead of guardrails. */
+export function skillsProposalPayload(): Record<string, unknown> {
+  return {
+    rationale: 'Mount a domain SOP so the retry follows a written procedure.',
+    focusSurfaces: ['skills'],
+    confidence: 0.68,
+    expectedStepsDelta: -2,
+    edits: {
+      skills: {
+        kind: 'skills',
+        skills: [{ name: 'build-sop', markdown: '# Build SOP', description: 'retry procedure' }]
+      }
+    }
+  };
+}
+
+export interface ScriptedModelOptions {
+  /**
+   * Proposal payloads cycled per 'propose' request (the last one repeats). The
+   * default is the single guardrails payload, so existing callers are unaffected.
+   */
+  readonly proposals?: readonly Record<string, unknown>[];
+}
+
 /**
  * Routes on ModelPurpose so one adapter serves propose/compose/reflect:
- *  - propose -> proposalPayload
+ *  - propose -> the next cycled proposal payload
  *  - compose -> ranking of every candidate alias found in the prompt
  *  - reflect -> no headers, so the reflector keeps its deterministic titles
  */
-export function createScriptedModel(): ScriptedModel {
+export function createScriptedModel(options: ScriptedModelOptions = {}): ScriptedModel {
   const requests: ModelRequest[] = [];
+  const proposals = options.proposals ?? [proposalPayload()];
+  let proposalIndex = 0;
   return {
     requests,
     async complete(request: ModelRequest): Promise<ModelResponse> {
       requests.push(request);
       if (request.purpose === 'propose') {
-        return { text: JSON.stringify(proposalPayload()), finishReason: 'stop', model: 'scripted' };
+        const index = Math.min(proposalIndex, proposals.length - 1);
+        proposalIndex += 1;
+        return {
+          text: JSON.stringify(proposals[index] ?? proposalPayload()),
+          finishReason: 'stop',
+          model: 'scripted'
+        };
       }
       if (request.purpose === 'compose') {
         const text = request.messages.map((message) => message.content).join(String.fromCharCode(10));
@@ -134,6 +185,10 @@ export function createScriptedModel(): ScriptedModel {
 export interface ScriptedRunner {
   (context: IsolatedBranchContext): Promise<ProbeExecutionResult>;
   readonly calls: string[];
+  /** Mounted surface keys of every executed branch, sorted, in call order. */
+  readonly executedSurfaces: readonly (readonly string[])[];
+  /** Id of the patch object each executed branch received, in call order. */
+  readonly executedPatchIds: readonly string[];
 }
 
 export interface ScriptedRunnerOptions {
@@ -156,6 +211,8 @@ export function createScriptedRunner(
   options: ScriptedRunnerOptions = {}
 ): ScriptedRunner {
   const calls: string[] = [];
+  const executedSurfaces: string[][] = [];
+  const executedPatchIds: string[] = [];
   let candidateIndex = 0;
   const run = async (context: IsolatedBranchContext): Promise<ProbeExecutionResult> => {
       // The baseline run is the only purpose 'initial', edit-free patch; exploit
@@ -164,6 +221,8 @@ export function createScriptedRunner(
       const isReference =
         context.patch.purpose === 'initial' && Object.keys(context.patch.edits).length === 0;
       calls.push(isReference ? 'reference' : 'candidate');
+      executedSurfaces.push(Object.keys(context.patch.edits).sort());
+      executedPatchIds.push(context.patch.id);
       const candidateOutcome = isReference
         ? undefined
         : (options.candidateOutcomes?.[candidateIndex] ?? 'succeed');
@@ -260,7 +319,7 @@ export function createScriptedRunner(
         usage: { inputTokens: 120, outputTokens: 48, totalTokens: 168 }
     };
   };
-  return Object.assign(run, { calls });
+  return Object.assign(run, { calls, executedSurfaces, executedPatchIds });
 }
 
 // ---------------------------------------------------------------------------
@@ -717,6 +776,32 @@ export interface RecordingPolicy extends IActivePolicy {
 export interface RecordingPolicyOverrides {
   /** Force the grid stop condition while keeping the real policy behaviour. */
   readonly stopCondition?: StopCondition;
+  /**
+   * Rewrite exploit slots so they deepen the most recently created succeeded
+   * candidate. Real policies resolve the best node heuristically; pinning the
+   * chain here keeps deep-lineage regressions deterministic without touching any
+   * production code path.
+   */
+  readonly pinExploitToLatestNode?: boolean;
+}
+
+/** See RecordingPolicyOverrides.pinExploitToLatestNode. */
+function pinExploitParents(batch: BatchPlan, request: SelectBatchRequest): BatchPlan {
+  const succeeded = Object.values(request.tree.nodes)
+    .filter((node) => node.status === 'succeeded' && node.parentId !== null)
+    .sort((left, right) => left.createdAt - right.createdAt);
+  const latest = succeeded[succeeded.length - 1];
+  if (latest === undefined) {
+    return batch;
+  }
+  return {
+    ...batch,
+    slots: batch.slots.map((slot) =>
+      slot.slot === 'exploit'
+        ? { ...slot, parentNodeId: latest.id, seedPatchIds: [latest.patchId] }
+        : slot
+    )
+  };
 }
 
 /** Wrap a real ActivePolicy, recording every scheduler interaction. */
@@ -745,8 +830,10 @@ export function createRecordingPolicyFrom(
     selectBatch(request: SelectBatchRequest): BatchPlan {
       selectBatchRequests.push(request);
       const batch = base.selectBatch(request);
-      batchPlans.push(batch);
-      return batch;
+      const adjusted =
+        overrides.pinExploitToLatestNode === true ? pinExploitParents(batch, request) : batch;
+      batchPlans.push(adjusted);
+      return adjusted;
     },
     update(policy: MetaSearchPolicy): void {
       current = policy;
@@ -799,6 +886,82 @@ export function createRecordingTaxonomy(base: IFailureTaxonomy): RecordingTaxono
 /** Recording taxonomy over the production default taxonomy. */
 export function createDefaultRecordingTaxonomy(): RecordingTaxonomy {
   return createRecordingTaxonomy(createFailureTaxonomy({}));
+}
+
+export interface ForcedTaxonomyOptions {
+  /** Repairability reported with the forced category (default false). */
+  readonly repairable?: boolean;
+  /** How many diagnoses to override before delegating (default: all). */
+  readonly maxForced?: number;
+}
+
+/**
+ * Taxonomy that reports a fixed category for the first N diagnoses and then
+ * delegates to the production classifier. Used to exercise stop-condition scope
+ * (hard_unrecoverable vs repeatedly_unpromising) deterministically.
+ */
+export function createForcedTaxonomy(
+  category: FailureCategory,
+  options: ForcedTaxonomyOptions = {}
+): IFailureTaxonomy {
+  let forced = 0;
+  const maxForced = options.maxForced ?? Number.MAX_SAFE_INTEGER;
+  return {
+    diagnose(request: FailureDiagnosisRequest): FailureDiagnosis {
+      if (forced >= maxForced) {
+        return diagnoseFailure(request);
+      }
+      forced += 1;
+      return {
+        category,
+        confidence: 0.9,
+        repairable: options.repairable ?? false,
+        recommendedAction: category === 'hard_unrecoverable' ? 'stop' : 'explore_elsewhere',
+        evidence: ['forced category ' + category + ' by the e2e taxonomy'],
+        signals: []
+      };
+    }
+  };
+}
+
+/** One step of a sequenced taxonomy run. */
+export interface ForcedDiagnosisStep {
+  readonly category: FailureCategory;
+  /** Repairability reported with this step (default true only for repairable_implementation). */
+  readonly repairable?: boolean;
+}
+
+/**
+ * Taxonomy that walks a fixed step sequence - one diagnosis per probe, repeating
+ * the last step afterwards - so sibling arrival order can be controlled
+ * deterministically in failure-precedence regressions.
+ */
+export function createSequencedTaxonomy(
+  steps: readonly ForcedDiagnosisStep[]
+): IFailureTaxonomy {
+  const sequence: readonly ForcedDiagnosisStep[] =
+    steps.length > 0 ? steps : [{ category: 'none' }];
+  let index = 0;
+  return {
+    diagnose(): FailureDiagnosis {
+      const step = sequence[Math.min(index, sequence.length - 1)] ?? sequence[0];
+      index += 1;
+      const category: FailureCategory = step === undefined ? 'none' : step.category;
+      return {
+        category,
+        confidence: 0.9,
+        repairable: step?.repairable ?? category === 'repairable_implementation',
+        recommendedAction:
+          category === 'hard_unrecoverable'
+            ? 'stop'
+            : category === 'repairable_implementation'
+              ? 'repair'
+              : 'explore_elsewhere',
+        evidence: ['sequenced category ' + category + ' by the e2e taxonomy'],
+        signals: []
+      };
+    }
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -232,6 +232,16 @@ function firstRepairableFailedNode(
 /**
  * Replay one historical tree under one policy at one budget preference rho.
  * Pure in-memory: only recorded node scores/statuses are consulted.
+ *
+ * Level semantics: the root is the already-probed reference that every policy
+ * inherits, so it is visited first, for free, and is not charged to the
+ * candidate budget. `depth` then counts candidate layers below the root -
+ * layer 1 is the root's children, layer 2 their children, and so on. Each layer
+ * scores and expands at most `width` ordered nodes, children are expanded from
+ * the selected nodes only, and the whole replay spends at most width * depth
+ * candidate probes. depth=1 therefore reaches the first candidate layer, and a
+ * width=1 policy follows a single branch downwards instead of exhausting a
+ * sibling layer.
  */
 export function replayTree(
   tree: DiscoveryTreeSnapshot,
@@ -267,12 +277,26 @@ export function replayTree(
   const seen = new Set<string>();
   let quality = 0;
   let earlyStopped = false;
-  let frontier: readonly DiscoveryNode[] = [root];
+  let probes = 0;
 
-  for (let level = 0; level < depth && frontier.length > 0; level += 1) {
-    const ordered = orderFrontier(frontier, context);
-    for (const node of ordered) {
-      if (visited.length >= budget) {
+  // The root is the reference run every policy inherits: visit it first and leave
+  // it out of the candidate budget.
+  seen.add(root.id);
+  visited.push(root.id);
+  quality = replayNodeScore(root);
+  earlyStopped = quality >= stopThreshold;
+  let frontier: readonly DiscoveryNode[] = earlyStopped
+    ? []
+    : childrenOfSnapshot(tree, root.id).filter((child) => !seen.has(child.id));
+
+  for (let layer = 1; layer <= depth && !earlyStopped && probes < budget; layer += 1) {
+    if (frontier.length === 0) {
+      break;
+    }
+    const selected = orderFrontier(frontier, context).slice(0, width);
+    const expanded: DiscoveryNode[] = [];
+    for (const node of selected) {
+      if (probes >= budget) {
         break;
       }
       if (seen.has(node.id)) {
@@ -280,6 +304,7 @@ export function replayTree(
       }
       seen.add(node.id);
       visited.push(node.id);
+      probes += 1;
       const score = replayNodeScore(node);
       if (score > quality) {
         quality = score;
@@ -288,15 +313,14 @@ export function replayTree(
         earlyStopped = true;
         break;
       }
+      expanded.push(node);
     }
-    if (earlyStopped || visited.length >= budget) {
+    if (earlyStopped || probes >= budget) {
       break;
     }
+    // Children are expanded only from the nodes this layer actually selected.
     const next: DiscoveryNode[] = [];
-    for (const node of ordered) {
-      if (visited.length >= budget) {
-        break;
-      }
+    for (const node of expanded) {
       for (const child of childrenOfSnapshot(tree, node.id)) {
         if (!seen.has(child.id)) {
           next.push(child);
@@ -307,11 +331,12 @@ export function replayTree(
   }
 
   const recoveryWeight = slotWeights.recover;
-  if (recoveryWeight > 0 && visited.length < budget) {
+  if (recoveryWeight > 0 && probes < budget) {
     const failed = firstRepairableFailedNode(tree);
     if (failed !== undefined && !seen.has(failed.id)) {
       seen.add(failed.id);
       visited.push(failed.id);
+      probes += 1;
       const score = replayNodeScore(failed);
       if (score > quality) {
         quality = score;
@@ -326,7 +351,7 @@ export function replayTree(
     }
   }
 
-  const cost = visited.length;
+  const cost = probes;
   evidence.push(
     'rho=' +
       preference.toFixed(2) +
@@ -336,8 +361,10 @@ export function replayTree(
       String(depth) +
       ' budget=' +
       String(budget) +
-      ' probes=' +
+      ' candidateProbes=' +
       String(cost) +
+      ' visited=' +
+      String(visited.length) +
       ' quality=' +
       quality.toFixed(4) +
       (earlyStopped ? ' early_stopped=true' : '')

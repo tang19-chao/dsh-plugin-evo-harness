@@ -735,6 +735,13 @@ class ActivePolicyImpl implements ActivePolicy {
     return stringArrayFromMetadata(request.tree.metadata, 'memoryHintIds');
   }
 
+  /**
+   * Resolve the exploitation base for this batch. Only a node that actually
+   * succeeded qualifies: a failed node is dead evidence and belongs to the
+   * recovery track, so the explicit previousBestNodeId hint is honoured only
+   * while it still qualifies and the scan falls back to the root when no
+   * succeeded candidate exists.
+   */
   private resolveBestNode(
     request: SelectBatchRequest,
     rootId: string
@@ -742,13 +749,13 @@ class ActivePolicyImpl implements ActivePolicy {
     const explicitId = request.previousBestNodeId;
     if (explicitId !== undefined) {
       const explicit = request.tree.nodes[explicitId];
-      if (explicit !== undefined) {
+      if (explicit !== undefined && explicit.status === 'succeeded') {
         return explicit;
       }
     }
     let best: DiscoveryNode | undefined;
     for (const node of Object.values(request.tree.nodes)) {
-      if (node.status !== 'succeeded' && node.score === undefined) {
+      if (node.status !== 'succeeded') {
         continue;
       }
       if (best === undefined) {

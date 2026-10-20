@@ -363,6 +363,23 @@ function tagsFor(
   return tags;
 }
 
+/**
+ * True when this trajectory is the candidate the composer selected. The composed H* is a
+ * fresh patch id that no trajectory carries, so a winner must be identified by the
+ * composition's selected trajectory/node, never by patch id lookup.
+ */
+function isSelectedWinner(request: ReflectionRequest, trajectory: ProbeTrajectory): boolean {
+  const composition = request.composition;
+  if (composition.selectedTrajectoryId !== null && composition.selectedTrajectoryId === trajectory.id) {
+    return true;
+  }
+  return (
+    composition.selectedNodeId !== null &&
+    trajectory.nodeId !== undefined &&
+    composition.selectedNodeId === trajectory.nodeId
+  );
+}
+
 function buildDossier(
   request: ReflectionRequest,
   trajectory: ProbeTrajectory,
@@ -370,7 +387,15 @@ function buildDossier(
   patches: ReadonlyMap<string, EightSurfacePatch>,
   maxClauses: number
 ): CandidateDossier | undefined {
-  const patch = patches.get(trajectory.patchId);
+  // The selected winner's evidence is the composed H* (ancestry merged), not its own
+  // incremental patch, so its lesson records the edits that were actually mounted. Every
+  // other candidate keeps its own patch, and a null composedPatch falls back to the
+  // trajectory patch exactly as before.
+  const composedPatch = request.composition.composedPatch;
+  const patch =
+    isSelectedWinner(request, trajectory) && composedPatch !== null
+      ? composedPatch
+      : patches.get(trajectory.patchId);
   const fromTrajectory = surfaceKeysInOrder(trajectory.surfaceKeys);
   const surfaces = fromTrajectory.length > 0 ? fromTrajectory : patch !== undefined ? surfaceKeysInOrder(Object.keys(patch.edits)) : [];
   if (surfaces.length === 0) {

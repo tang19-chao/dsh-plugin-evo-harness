@@ -1,11 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { EVO_HARNESS_STAGES, autoFallbackRequested } from '../../src/orchestrator';
+import {
+  EVO_HARNESS_STAGES,
+  autoFallbackRequested,
+  resolvePreviousFailure
+} from '../../src/orchestrator';
+import type { FailureCategory, FailureDiagnosis } from '../../src/types/contracts';
 import { createCordisSeamManager, createInMemoryCordisHost } from '../../src/cordis-seams';
 import {
   buildE2E,
   createDefaultRecordingTaxonomy,
   createRecordingPolicy,
   createScriptedRunner,
+  createSequencedTaxonomy,
   createThrowingRollbackSeams,
   makeClock,
   makeIdFactory,
@@ -388,5 +394,121 @@ describe('end-to-end lifecycle', () => {
     expect(throwing.rollbackFailures).toEqual([first.composedPatchId]);
     expect(second.diagnostics.join(' ')).toContain('failed to roll back permanent patch');
     expect(plugin.orchestrator.activePatchIds()).toEqual([second.composedPatchId]);
+  });
+
+  it('resolves sibling failures by category rank regardless of arrival order', () => {
+    const ranked: readonly FailureCategory[] = [
+      'hard_unrecoverable',
+      'repeatedly_unpromising',
+      'repairable_implementation',
+      'weak_underexplored',
+      'none'
+    ];
+    const diagnosisOf = (category: FailureCategory): FailureDiagnosis => ({
+      category,
+      confidence: 0.5,
+      repairable: category === 'repairable_implementation',
+      recommendedAction: category === 'hard_unrecoverable' ? 'stop' : 'explore_elsewhere',
+      evidence: ['rank probe for ' + category],
+      signals: []
+    });
+
+    for (const first of ranked) {
+      for (const second of ranked) {
+        const expected =
+          ranked.indexOf(first) <= ranked.indexOf(second) ? first : second;
+        // symmetric: the higher-ranked category wins whichever side it arrives on
+        expect(resolvePreviousFailure(diagnosisOf(first), diagnosisOf(second)).category).toBe(
+          expected
+        );
+        expect(resolvePreviousFailure(diagnosisOf(second), diagnosisOf(first)).category).toBe(
+          expected
+        );
+      }
+    }
+  });
+
+  it('stops on an earlier hard failure even when a later sibling reports repeatedly_unpromising', async () => {
+    const options = { maxWidth: 2, maxDepth: 3, rolloutBudget: 12, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const { plugin } = buildE2E({
+      ...options,
+      candidateOutcomes: ['fail', 'fail', 'fail', 'fail'],
+      extra: {
+        deps: {
+          policy,
+          // slot 0 -> hard_unrecoverable, slot 1 -> repeatedly_unpromising
+          taxonomy: createSequencedTaxonomy([
+            { category: 'hard_unrecoverable' },
+            { category: 'repeatedly_unpromising' }
+          ])
+        }
+      }
+    });
+
+    const result = await plugin.run({
+      sessionId: 'sess-hard-first',
+      task: plugin.makeTask({ id: 'task-hard-first', prompt: 'Repair the broken pipeline.' }),
+      trigger: 'always'
+    });
+
+    expect(result.metadata?.stopReason).toBe('failure_taxonomy:hard_unrecoverable');
+    expect(policy.batchPlans).toHaveLength(1);
+  });
+
+  it('stops on a later hard failure after an earlier repeatedly_unpromising sibling', async () => {
+    const options = { maxWidth: 2, maxDepth: 3, rolloutBudget: 12, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const { plugin } = buildE2E({
+      ...options,
+      candidateOutcomes: ['fail', 'fail', 'fail', 'fail'],
+      extra: {
+        deps: {
+          policy,
+          // slot 0 -> repeatedly_unpromising, slot 1 -> hard_unrecoverable
+          taxonomy: createSequencedTaxonomy([
+            { category: 'repeatedly_unpromising' },
+            { category: 'hard_unrecoverable' }
+          ])
+        }
+      }
+    });
+
+    const result = await plugin.run({
+      sessionId: 'sess-hard-last',
+      task: plugin.makeTask({ id: 'task-hard-last', prompt: 'Repair the broken pipeline.' }),
+      trigger: 'always'
+    });
+
+    expect(result.metadata?.stopReason).toBe('failure_taxonomy:hard_unrecoverable');
+    expect(policy.batchPlans).toHaveLength(1);
+  });
+
+  it('does not let a repairable sibling mask an earlier hard failure', async () => {
+    const options = { maxWidth: 2, maxDepth: 3, rolloutBudget: 12, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const { plugin } = buildE2E({
+      ...options,
+      candidateOutcomes: ['fail', 'fail', 'fail', 'fail'],
+      extra: {
+        deps: {
+          policy,
+          // slot 0 -> hard_unrecoverable, slot 1 -> repairable_implementation
+          taxonomy: createSequencedTaxonomy([
+            { category: 'hard_unrecoverable' },
+            { category: 'repairable_implementation', repairable: true }
+          ])
+        }
+      }
+    });
+
+    const result = await plugin.run({
+      sessionId: 'sess-hard-then-repairable',
+      task: plugin.makeTask({ id: 'task-hard-then-repairable', prompt: 'Repair the broken pipeline.' }),
+      trigger: 'always'
+    });
+
+    expect(result.metadata?.stopReason).toBe('failure_taxonomy:hard_unrecoverable');
+    expect(policy.batchPlans).toHaveLength(1);
   });
 });

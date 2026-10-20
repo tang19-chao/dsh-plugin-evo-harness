@@ -36,6 +36,7 @@ import { createEvoHarnessPlugin } from '../../src/index';
 import { createMemoryBridge } from '../../src/memory-bridge';
 import {
   buildE2E,
+  createForcedTaxonomy,
   createRecordingPolicy,
   createRecordingProposer,
   createScriptedModel,
@@ -43,7 +44,10 @@ import {
   e2eConfig,
   makeClock,
   makeIdFactory,
-  mem0LikeServer
+  mem0LikeServer,
+  proposalPayload,
+  skillsProposalPayload,
+  systemPromptProposalPayload
 } from './fixtures';
 
 interface RecordingComposer extends IHarnessComposer {
@@ -583,5 +587,213 @@ describe('fix-wave composition', () => {
     expect(composed?.metadata?.lineageDepth).toBe(2);
     expect(composed?.metadata?.baseResolution).toBe('lineage');
     expect(composed?.rationale).toContain('over lineage depth 2');
+  });
+
+  it('stops with diminishing_returns when two rounds after an early success stop improving', async () => {
+    // depth 5 -> plan_grid depth 4 / capacity 8, so six candidate probes still fit
+    // inside the budget and the stagnation guard, not the budget, ends the run.
+    const options = { maxWidth: 2, maxDepth: 5, rolloutBudget: 12, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const { plugin } = buildE2E({
+      ...options,
+      // round 1: exploit succeeds, explore_domain fails; every later probe fails
+      candidateOutcomes: ['succeed', 'fail', 'fail', 'fail', 'fail', 'fail', 'fail', 'fail'],
+      extra: { deps: { policy } }
+    });
+
+    const result = await plugin.run({
+      sessionId: 'sess-diminishing',
+      task: plugin.makeTask({ id: 'task-diminishing', prompt: 'Improve the failing build.' }),
+      trigger: 'always'
+    });
+
+    expect(result.outcome).toBe('composed');
+    // three rounds: the winning round plus two that no longer improve
+    expect(policy.batchPlans).toHaveLength(3);
+    expect(result.metadata?.stopReason).toBe('diminishing_returns');
+  });
+
+  it('executes round-2 exploit probes with the parent edits merged beneath the child edits', async () => {
+    const options = { maxWidth: 2, maxDepth: 2, rolloutBudget: 8, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const now = makeClock();
+    const model = createScriptedModel({
+      proposals: [proposalPayload(), skillsProposalPayload()]
+    });
+    const runner = createScriptedRunner(now, {
+      candidateOutcomes: ['succeed', 'fail', 'succeed', 'succeed']
+    });
+    const { plugin } = buildE2E({
+      ...options,
+      extra: { model, runBranch: runner, deps: { policy } }
+    });
+
+    const result = await plugin.run({
+      sessionId: 'sess-merge',
+      task: plugin.makeTask({ id: 'task-merge', prompt: 'Improve the failing build.' }),
+      trigger: 'always'
+    });
+
+    expect(result.outcome).toBe('composed');
+    // the reference branch mounts nothing and the round-1 exploit mounts only guardrails
+    expect(runner.executedSurfaces[0]).toEqual([]);
+    expect(runner.executedSurfaces[1]).toEqual(['guardrails']);
+
+    // a later exploit against the guardrails parent executes guardrails + skills
+    const merged = runner.executedSurfaces.filter(
+      (surfaces) => surfaces.includes('guardrails') && surfaces.includes('skills')
+    );
+    expect(merged.length).toBeGreaterThanOrEqual(1);
+
+    // and the recorded trajectory surfaces of that node expose both
+    const tree = plugin.orchestrator.treePool.list()[0];
+    const mergedNodes = Object.values(tree?.nodes ?? {}).filter((node) => {
+      const surfaces = node.metadata?.surfaceKeys;
+      return (
+        Array.isArray(surfaces) &&
+        surfaces.includes('guardrails') &&
+        surfaces.includes('skills')
+      );
+    });
+    expect(mergedNodes.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('never makes a failed candidate the exploitation parent', async () => {
+    const options = { maxWidth: 2, maxDepth: 2, rolloutBudget: 8, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const { plugin } = buildE2E({
+      ...options,
+      candidateOutcomes: ['fail', 'fail', 'fail', 'fail'],
+      extra: { deps: { policy } }
+    });
+
+    const result = await plugin.run({
+      sessionId: 'sess-no-best',
+      task: plugin.makeTask({ id: 'task-no-best', prompt: 'Improve the failing build.' }),
+      trigger: 'always'
+    });
+
+    expect(result.probesRun).toBeGreaterThanOrEqual(3);
+    expect(policy.selectBatchRequests.length).toBeGreaterThanOrEqual(2);
+    const second = policy.selectBatchRequests[1];
+    // a fully failed first round records no best node
+    expect(second?.previousBestNodeId).toBeUndefined();
+
+    // The orchestrator is the owner of previousBestNodeId: it must stay unset, so
+    // no failed probe is handed to the scheduler as the exploitation parent.
+    // NOTE (scope boundary): ActivePolicy.resolveBestNode performs its own scan of
+    // scored tree nodes, so whether a scored-but-failed node is rejected there is
+    // owned by src/dream-rsi/active-policy.ts (a separate task), not by t34.
+    expect(second?.previousBestNodeId).toBeUndefined();
+    expect(second?.previousFailure?.category).toBe('repairable_implementation');
+  });
+
+  it('keeps exploring after a repeatedly_unpromising lineage', async () => {
+    const options = { maxWidth: 2, maxDepth: 3, rolloutBudget: 12, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const { plugin } = buildE2E({
+      ...options,
+      // the first candidate is forced to repeatedly_unpromising, its sibling succeeds
+      candidateOutcomes: ['fail', 'succeed', 'fail', 'fail', 'fail', 'fail'],
+      extra: {
+        deps: {
+          policy,
+          taxonomy: createForcedTaxonomy('repeatedly_unpromising', { maxForced: 1 })
+        }
+      }
+    });
+
+    const result = await plugin.run({
+      sessionId: 'sess-elsewhere',
+      task: plugin.makeTask({ id: 'task-elsewhere', prompt: 'Improve the failing build.' }),
+      trigger: 'always'
+    });
+
+    expect(result.metadata?.stopReason).not.toBe('failure_taxonomy:repeatedly_unpromising');
+    expect(policy.batchPlans.length).toBeGreaterThanOrEqual(2);
+    expect(result.probesRun).toBeGreaterThanOrEqual(3);
+  });
+
+  it('still stops the whole run on a hard_unrecoverable diagnosis', async () => {
+    const options = { maxWidth: 2, maxDepth: 3, rolloutBudget: 12, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const { plugin } = buildE2E({
+      ...options,
+      candidateOutcomes: ['fail', 'fail', 'fail'],
+      extra: {
+        deps: {
+          policy,
+          taxonomy: createForcedTaxonomy('hard_unrecoverable', { maxForced: 1 })
+        }
+      }
+    });
+
+    const result = await plugin.run({
+      sessionId: 'sess-hard',
+      task: plugin.makeTask({ id: 'task-hard', prompt: 'Improve the failing build.' }),
+      trigger: 'always'
+    });
+
+    expect(result.metadata?.stopReason).toBe('failure_taxonomy:hard_unrecoverable');
+    expect(policy.batchPlans).toHaveLength(1);
+  });
+
+  it('executes a three-round exploit chain with every ancestor edit merged', async () => {
+    const options = { maxWidth: 1, maxDepth: 4, rolloutBudget: 12, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, {
+      stopCondition: 'max_depth',
+      pinExploitToLatestNode: true
+    });
+    const now = makeClock();
+    const model = createScriptedModel({
+      proposals: [systemPromptProposalPayload(), proposalPayload(), skillsProposalPayload()]
+    });
+    const runner = createScriptedRunner(now);
+    const { plugin } = buildE2E({
+      ...options,
+      extra: { model, runBranch: runner, deps: { policy } }
+    });
+
+    const result = await plugin.run({
+      sessionId: 'sess-lineage-exec',
+      task: plugin.makeTask({
+        id: 'task-lineage-exec',
+        prompt: 'Evolve the scaffold across three exploit rounds.'
+      }),
+      trigger: 'always'
+    });
+
+    expect(result.outcome).toBe('composed');
+    expect(runner.calls).toEqual(['reference', 'candidate', 'candidate', 'candidate']);
+
+    // single-round behaviour: the reference mounts nothing, round 1 mounts only its own edit
+    expect(runner.executedSurfaces[0]).toEqual([]);
+    expect(runner.executedSurfaces[1]).toEqual(['system_prompt']);
+    // each later exploit round executes the whole ancestor lineage root-to-parent
+    expect(runner.executedSurfaces[2]).toEqual(['guardrails', 'system_prompt']);
+    expect(runner.executedSurfaces[3]).toEqual(['guardrails', 'skills', 'system_prompt']);
+
+    // identity: the executed patch id is the id recorded for that node's trajectory
+    const tree = plugin.orchestrator.treePool.list()[0];
+    const nodes = Object.values(tree?.nodes ?? {});
+    const roundThree = nodes.find((node) => node.round === 3);
+    expect(roundThree).toBeDefined();
+    expect(runner.executedPatchIds[3]).toBe(roundThree?.patchId);
+    expect(new Set(runner.executedPatchIds).size).toBe(runner.executedPatchIds.length);
+
+    // the recorded trajectory surfaces cover all three merged surfaces
+    const surfaces = roundThree?.metadata?.surfaceKeys as unknown[] | undefined;
+    expect(Array.isArray(surfaces)).toBe(true);
+    expect(surfaces).toContain('system_prompt');
+    expect(surfaces).toContain('guardrails');
+    expect(surfaces).toContain('skills');
+
+    // candidate/composition semantics unchanged: the composer still produces H* for
+    // the chain (the full-lineage merge itself is asserted by the dedicated
+    // 'keeps the round-1 surface edit when a three-round exploit chain composes'
+    // case above, which still uses the incremental candidate patches).
+    const composition = plugin.orchestrator.lastComposition();
+    expect(composition?.composedPatch).not.toBeNull();
+    expect(composition?.assessments.length).toBeGreaterThanOrEqual(3);
   });
 });

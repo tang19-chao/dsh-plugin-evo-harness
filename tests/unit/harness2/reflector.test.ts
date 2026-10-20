@@ -143,7 +143,7 @@ function tree(): DiscoveryTreeSnapshot {
   ]);
 }
 
-function composition(): CompositionResult {
+function composition(overrides: Partial<CompositionResult> = {}): CompositionResult {
   return makeComposition({
     selectedBranchId: 'branch_b',
     selectedNodeId: 'node_b',
@@ -160,7 +160,8 @@ function composition(): CompositionResult {
         rejectedReason: 'tool error'
       })
     ],
-    adoptionRatios: { candidate_A: 0.82, candidate_B: 0.2 }
+    adoptionRatios: { candidate_A: 0.82, candidate_B: 0.2 },
+    ...overrides
   });
 }
 
@@ -257,6 +258,89 @@ describe('Harness² reflector / canonical lesson extraction', () => {
     expect(negative?.verificationEvidence.metricsDelta).toEqual({ stepsDiff: 3, toolErrorsDiff: 2 });
     expect(negative?.executionPatch.componentDiffs?.guardrails).toContain('quote identifiers');
     expect(negative?.confidence).toBeLessThan(positiveConfidence(result));
+  });
+
+  it('records the composed H* component diffs on the selected winner dossier', async () => {
+    const composedPatch = makePatch({
+      id: 'patch_composed_h',
+      branchId: 'branch_b',
+      origin: 'composed',
+      purpose: 'compose',
+      guidance: 'memory',
+      label: 'composed:exploit:scripts',
+      sourceLessonIds: ['lesson_round1', 'lesson_round2'],
+      edits: {
+        system_prompt: { kind: 'system_prompt', mode: 'append', content: 'composed round one prompt' },
+        guardrails: { kind: 'guardrails', formatContract: 'composed round two contract' },
+        scripts: {
+          kind: 'scripts',
+          scripts: [{ path: 'tools/migrate.py', language: 'python', code: 'print(1)' }]
+        }
+      }
+    });
+    const { reflector } = makeReflector([HEADERS]);
+    const result = await reflector.reflect(baseRequest({ composition: composition({ composedPatch }) }));
+
+    // The composed id is freshly generated: no trajectory carries it, so the old patch-id
+    // lookup could never find it and the winner lesson lost the merged ancestor diffs.
+    expect(composedPatch.id).not.toBe('patch_node_b');
+    expect(composedPatch.id).not.toBe('patch_node_c');
+    expect(composedPatch.id).not.toBe('patch_ref');
+
+    const winner = result.lessons.find((lesson) => lesson.metadata?.nodeId === 'node_b');
+    expect(winner).toBeDefined();
+    expect(lessonViolations(winner as CanonicalLesson)).toEqual([]);
+    expect(Object.keys(winner?.executionPatch.componentDiffs ?? {}).sort()).toEqual([
+      'guardrails',
+      'scripts',
+      'system_prompt'
+    ]);
+    expect(winner?.executionPatch.componentDiffs?.system_prompt).toContain('composed round one prompt');
+    expect(winner?.executionPatch.componentDiffs?.guardrails).toContain('composed round two contract');
+    // the winning trajectory's own patch id is still recorded for the evidence chain
+    expect(winner?.executionPatch.patchId).toBe('patch_node_b');
+  });
+
+  it('keeps each non-winner dossier on its own incremental patch', async () => {
+    const composedPatch = makePatch({
+      id: 'patch_composed_h',
+      branchId: 'branch_b',
+      origin: 'composed',
+      purpose: 'compose',
+      guidance: 'memory',
+      label: 'composed:exploit:scripts',
+      edits: {
+        system_prompt: { kind: 'system_prompt', mode: 'append', content: 'composed round one prompt' },
+        guardrails: { kind: 'guardrails', formatContract: 'composed round two contract' },
+        scripts: {
+          kind: 'scripts',
+          scripts: [{ path: 'tools/migrate.py', language: 'python', code: 'print(1)' }]
+        }
+      }
+    });
+    const { reflector } = makeReflector([HEADERS]);
+    const result = await reflector.reflect(baseRequest({ composition: composition({ composedPatch }) }));
+
+    // node_c is not selected, so it keeps its own failure patch (guardrails only).
+    const loser = result.lessons.find((lesson) => lesson.metadata?.nodeId === 'node_c');
+    expect(loser).toBeDefined();
+    expect(Object.keys(loser?.executionPatch.componentDiffs ?? {})).toEqual(['guardrails']);
+    expect(loser?.executionPatch.componentDiffs?.guardrails).toContain('quote identifiers');
+    expect(loser?.executionPatch.componentDiffs?.system_prompt).toBeUndefined();
+    expect(loser?.executionPatch.componentDiffs?.scripts).toBeUndefined();
+  });
+
+  it('falls back to the trajectory patch when composedPatch is null', async () => {
+    const { reflector } = makeReflector([HEADERS]);
+    const result = await reflector.reflect(
+      baseRequest({ composition: composition({ composedPatch: null }) })
+    );
+
+    const winner = result.lessons.find((lesson) => lesson.metadata?.nodeId === 'node_b');
+    expect(winner).toBeDefined();
+    // exactly the pre-fix behaviour: the winner's own incremental patch, no composed merge
+    expect(Object.keys(winner?.executionPatch.componentDiffs ?? {})).toEqual(['scripts']);
+    expect(winner?.executionPatch.componentDiffs?.system_prompt).toBeUndefined();
   });
 
   it('keeps every CCG element when the model returns unusable prose', async () => {

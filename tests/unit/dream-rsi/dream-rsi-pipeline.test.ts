@@ -227,7 +227,24 @@ describe('dream-rsi online-to-offline pipeline', () => {
   it('hot-swaps the active policy only on strict improvement', async () => {
     const tree = freshTree();
     probeNode(tree, 0, 'succeeded');
-    tree.recordProbe('n0', { trajectoryId: 'traj-n0', score: 1 });
+    tree.recordProbe('n0', { trajectoryId: 'traj-n0', score: 0.2 });
+    // t44 note (why this expectation changed): replayTree counts depth as
+    // candidate layers below the free root, so a (1x1) baseline and a wide
+    // (4x4) candidate both reach the root's only child and evaluate identically
+    // (improved === false). The fixture therefore keeps the first layer weak
+    // (n0 = 0.2) and puts the better outcome one layer deeper (n0-deep = 0.9),
+    // which only a deeper policy reaches: the (1x1) baseline stays strictly
+    // worse and the (1x4) candidate is the strict improvement this test expects
+    // to hot-swap to. Assertion count is unchanged (41 expects, 5 tests).
+    tree.addNode({
+      id: 'n0-deep',
+      parentId: 'n0',
+      patchId: 'patch-n0-deep',
+      patchOrigin: 'reference',
+      purpose: 'deepen',
+      guidance: 'memory'
+    });
+    tree.recordProbe('n0-deep', { trajectoryId: 'traj-n0-deep', score: 0.9 });
     const snapshot = tree.snapshot();
 
     const active = createActivePolicyFromDefaults({
@@ -250,13 +267,13 @@ describe('dream-rsi online-to-offline pipeline', () => {
     const better = await dreamer.replay({
       trees: [snapshot],
       baselinePolicy: baseline,
-      candidatePolicies: [makePolicy({ id: 'pi-wide', maxWidth: 4, maxDepth: 4, version: 2 })]
+      candidatePolicies: [makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4, version: 2 })]
     });
     expect(better.improved).toBe(true);
-    expect(better.selectedPolicyId).toBe('pi-wide');
-    expect(active.policy.id).toBe('pi-wide');
+    expect(better.selectedPolicyId).toBe('pi-deep');
+    expect(active.policy.id).toBe('pi-deep');
     expect(active.policy.version).toBe(2);
-    expect(active.appliedPolicyIds).toEqual(['pi-0@1', 'pi-wide@2']);
+    expect(active.appliedPolicyIds).toEqual(['pi-0@1', 'pi-deep@2']);
     expect(better.replayedTreeIds).toEqual(['tree-e2e']);
   });
 

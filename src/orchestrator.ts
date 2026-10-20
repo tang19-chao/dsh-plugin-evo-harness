@@ -38,7 +38,9 @@ import type {
   DreamReplayReport,
   EvoHarnessRunOutcome,
   EvoHarnessRunRequest,
+  EightSurfacePatch,
   EvoHarnessRunResult,
+  FailureCategory,
   FailureDiagnosis,
   IActivePolicy,
   ICordisSeamManager,
@@ -63,10 +65,7 @@ import type {
   SurfacePatchDisposer,
   SurrogateScore
 } from './types/contracts';
-import {
-  createDiscoveryTree,
-  isTerminalFailure
-} from './dream-rsi';
+import { createDiscoveryTree } from './dream-rsi';
 import type {
   DiscoveryTree,
   DiscoveryTreeOptions,
@@ -202,13 +201,29 @@ function nodeStatusFor(status: ProbeTrajectory['status']): 'succeeded' | 'failed
 }
 
 /**
- * Precedence for the failure handed to the next selectBatch round:
- *  1. a terminal diagnosis (hard_unrecoverable / repeatedly_unpromising) always
- *     wins, so the existing terminal stop conditions are unaffected;
- *  2. otherwise a repairable diagnosis is preferred over a non-repairable one, so
- *     a later weak/underexplored sibling cannot hide the repairable failure that
- *     ActivePolicy.findRecoveryTarget needs to schedule a recover slot;
- *  3. when both sides have the same repairability the most recent one wins.
+ * Severity ranking for failure resolution. Lower wins.
+ */
+const FAILURE_CATEGORY_RANK: Readonly<Record<FailureCategory, number>> = {
+  hard_unrecoverable: 0,
+  repeatedly_unpromising: 1,
+  repairable_implementation: 2,
+  weak_underexplored: 3,
+  none: 4
+};
+
+/**
+ * Rank-based, order-independent precedence for the failure handed to the next
+ * selectBatch round:
+ *  1. hard_unrecoverable always wins over every other category, so a hard failure
+ *     from any earlier slot or round still stops the run;
+ *  2. repeatedly_unpromising then beats repairable_implementation and the weaker
+ *     remaining categories (it must not abort the run itself - the stop gate only
+ *     fires on hard_unrecoverable);
+ *  3. repairable_implementation beats weak_underexplored/none, so a later weak
+ *     sibling cannot hide the repairable failure ActivePolicy.findRecoveryTarget
+ *     needs to schedule a recover slot;
+ *  4. equal ranks keep the most recent diagnosis.
+ * A lower-ranked incoming diagnosis never replaces a higher-ranked accumulated one.
  */
 export function resolvePreviousFailure(
   current: FailureDiagnosis | undefined,
@@ -217,11 +232,13 @@ export function resolvePreviousFailure(
   if (current === undefined) {
     return incoming;
   }
-  if (isTerminalFailure(incoming) || isTerminalFailure(current)) {
-    return isTerminalFailure(incoming) ? incoming : current;
+  const currentRank = FAILURE_CATEGORY_RANK[current.category];
+  const incomingRank = FAILURE_CATEGORY_RANK[incoming.category];
+  if (incomingRank < currentRank) {
+    return incoming;
   }
-  if (incoming.repairable !== current.repairable) {
-    return incoming.repairable ? incoming : current;
+  if (incomingRank > currentRank) {
+    return current;
   }
   return incoming;
 }
@@ -474,6 +491,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       });
       const trajectories: ProbeTrajectory[] = [reference];
       const candidates: ProbeCandidate[] = [];
+      // nodeId -> the patch that node actually executed, so a child can reuse its
+      // parent's cumulative edits (root-to-parent) with a single map read instead of
+      // re-walking or re-reading the tree.
+      const cumulativePatches = new Map<string, EightSurfacePatch>();
       let previousFailure: FailureDiagnosis | undefined;
       let previousBestNodeId: string | undefined;
       let bestScore = -1;
@@ -485,6 +506,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
 
       while (!stop && rounds < maxRounds) {
         rounds += 1;
+        // Progress is measured per round: the composer re-evaluates every earlier
+        // candidate, so a stale winner would otherwise look like progress forever.
+        const scoreBeforeRound = bestScore;
+        const winnerBeforeRound = composition === null ? null : composition.selectedNodeId;
         stage('select_batch', { round: rounds });
         const batch: BatchPlan = this.deps.policy.selectBatch({
           task,
@@ -554,13 +579,35 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
             round: rounds
           });
 
+          // The proposer only returns the child delta, but a probe must run against
+          // the whole scaffold: every ancestor edit merged root-to-parent (later
+          // patches overriding earlier ones) and then overlaid by this round's edits.
+          // The cumulative entry is reused by children, a missing entry falls back to
+          // the parent's incremental patch, and the lookup is a single map read, so
+          // repeated ids or a cyclic parent chain cannot loop. A candidate without a
+          // parent (the reference root) still executes exactly its own patch object.
+          const inheritedEdits =
+            parentCandidate === undefined
+              ? undefined
+              : (cumulativePatches.get(parentCandidate.nodeId) ?? parentCandidate.patch).edits;
+          const executionPatch: EightSurfacePatch =
+            inheritedEdits === undefined
+              ? proposed.patch
+              : {
+                  ...proposed.patch,
+                  edits: { ...inheritedEdits, ...proposed.patch.edits }
+                };
+          if (!cumulativePatches.has(node.id)) {
+            cumulativePatches.set(node.id, executionPatch);
+          }
+
           stage('probe', { round: rounds, detail: { nodeId: node.id } });
           const trajectory = await this.probeCandidate({
             sessionId,
             task,
             slot,
-            patchId: proposed.patch.id,
-            patch: proposed.patch,
+            patchId: executionPatch.id,
+            patch: executionPatch,
             nodeId: node.id,
             treeId: tree.id,
             referenceTrajectoryId: reference.id,
@@ -620,7 +667,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
             patch: proposed.patch,
             trajectory
           });
-          if (score.score > bestScore) {
+          // Only a succeeded candidate may become the exploitation parent: a failed
+          // run still scores above 0 through the efficiency term and must never be
+          // deepened by ActivePolicy.resolveBestNode.
+          if (probeStatus === 'succeeded' && score.score > bestScore) {
             bestScore = score.score;
             previousBestNodeId = node.id;
           }
@@ -672,15 +722,19 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
             score: finalScore.score,
             ...(assessment === undefined ? {} : { adoptionRatio: assessment.adoptionRatio })
           });
-          if (finalScore.score > bestFinalScore) {
+          if (candidate.trajectory.status === 'succeeded' && finalScore.score > bestFinalScore) {
             bestFinalScore = finalScore.score;
             previousBestNodeId = candidate.nodeId;
           }
         }
         bestScore = bestFinalScore;
 
-        const selected = composition.assessments.some((assessment) => assessment.selected);
-        if (selected) {
+        // A round improves only when the best final score rose or the overall winner
+        // changed; re-selecting an earlier winner is not progress.
+        const improvedThisRound =
+          bestScore > scoreBeforeRound + 1e-9 ||
+          (composition.selectedNodeId !== null && composition.selectedNodeId !== winnerBeforeRound);
+        if (improvedThisRound) {
           stagnantRounds = 0;
         } else {
           stagnantRounds += 1;
@@ -696,7 +750,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           stop = true;
           break;
         }
-        if (previousFailure !== undefined && isTerminalFailure(previousFailure)) {
+        // Only a hard-unrecoverable diagnosis ends the whole task. A repeatedly
+        // unpromising lineage means 'explore elsewhere' for that lineage, so the run
+        // keeps probing other directions (the policy keeps it out of exploit/recover).
+        if (previousFailure !== undefined && previousFailure.category === 'hard_unrecoverable') {
           stopReason = 'failure_taxonomy:' + previousFailure.category;
           stop = true;
           break;

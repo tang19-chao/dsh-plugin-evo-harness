@@ -261,6 +261,46 @@ describe('three-way batch portfolio', () => {
     expect(exploit?.seedPatchIds).toEqual(['patch-a']);
   });
 
+  it('never exploits a failed node, even when it carries a score', () => {
+    const { tree, request } = withTree({ previousBestNodeId: 'b', previousFailure: REPAIRABLE });
+    const batch = policyApi.selectBatch(request);
+    const exploit = batch.slots.find((slot) => slot.slot === 'exploit');
+    expect(exploit?.parentNodeId).toBe('a');
+    expect(exploit?.parentNodeId).not.toBe('b');
+    expect(exploit?.seedPatchIds).toEqual(['patch-a']);
+    // the failed node is still handled by the recovery track
+    expect(batch.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('b');
+
+    const withoutHint = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), round: 2 })
+    );
+    expect(withoutHint.slots.find((slot) => slot.slot === 'exploit')?.parentNodeId).toBe('a');
+  });
+
+  it('falls back to the root when no node succeeded', () => {
+    const tree = createDiscoveryTree({
+      id: 'tree-dead-end',
+      sessionId: 'session-1',
+      taskId: 'task-1',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    tree.addNode(childInput(tree.rootId, { id: 'dead', origin: 'domain', purpose: 'explore' }));
+    tree.recordProbe('dead', {
+      trajectoryId: 'traj-dead',
+      status: 'failed',
+      score: 0.95,
+      failure: makeDiagnosis('repairable_implementation')
+    });
+    const batch = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), previousBestNodeId: 'dead', round: 3 })
+    );
+    const exploit = batch.slots.find((slot) => slot.slot === 'exploit');
+    expect(exploit?.parentNodeId).toBe(tree.rootId);
+    expect(exploit?.seedPatchIds).toEqual(['patch-root']);
+    expect(batch.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('dead');
+  });
+
   it('still scans the tree when the supplied failure is not repairable', () => {
     const { request } = withTree({
       previousFailure: makeDiagnosis('weak_underexplored', { repairable: false })

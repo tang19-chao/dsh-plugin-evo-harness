@@ -44,6 +44,46 @@ function narrowPolicy(overrides: Partial<MetaSearchPolicy> = {}): MetaSearchPoli
   return makePolicy({ id: 'pi-narrow', maxWidth: 1, maxDepth: 1, ...overrides });
 }
 
+/**
+ * Four shallow siblings plus a deeper branch that holds the best recorded
+ * outcome (every score stays below the default early-stop threshold): this
+ * distinguishes a wide-shallow policy from a narrow-deep one.
+ */
+function deepTree(): DiscoveryTreeSnapshot {
+  const tree = createDiscoveryTree({
+    id: 'tree-deep',
+    sessionId: 'session-1',
+    taskId: 'task-1',
+    rootPatchId: 'patch-root',
+    clock: fixedClock()
+  });
+  tree.addNode(childInput(tree.rootId, { id: 's1', origin: 'domain', purpose: 'explore' }));
+  tree.recordProbe('s1', { trajectoryId: 'traj-s1', score: 0.1 });
+  tree.addNode(childInput(tree.rootId, { id: 's2', origin: 'domain', purpose: 'explore' }));
+  tree.recordProbe('s2', { trajectoryId: 'traj-s2', score: 0.3 });
+  tree.addNode(childInput(tree.rootId, { id: 's3', origin: 'domain', purpose: 'explore' }));
+  tree.recordProbe('s3', { trajectoryId: 'traj-s3', score: 0.2 });
+  tree.addNode(childInput(tree.rootId, { id: 's4', origin: 'domain', purpose: 'explore' }));
+  tree.recordProbe('s4', { trajectoryId: 'traj-s4', score: 0.15 });
+  tree.addNode(childInput('s2', { id: 'd1', purpose: 'deepen' }));
+  tree.recordProbe('d1', { trajectoryId: 'traj-d1', score: 0.35 });
+  tree.addNode(childInput('d1', { id: 'd2', purpose: 'deepen' }));
+  tree.recordProbe('d2', { trajectoryId: 'traj-d2', score: 0.4 });
+  tree.addNode(childInput('d2', { id: 'd3', purpose: 'deepen' }));
+  tree.recordProbe('d3', { trajectoryId: 'traj-d3', score: 0.55 });
+  return tree.snapshot();
+}
+
+/** Wide-but-shallow (4x1) policy over deepTree. */
+function shallowPolicy(): MetaSearchPolicy {
+  return makePolicy({ id: 'pi-shallow', maxWidth: 4, maxDepth: 1 });
+}
+
+/** Narrow-but-deep (1x4) policy over deepTree. */
+function deepPolicy(): MetaSearchPolicy {
+  return makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4 });
+}
+
 function dreamRequest(overrides: Partial<OfflineDreamRequest> = {}): OfflineDreamRequest {
   return {
     trees: overrides.trees ?? [richTree()],
@@ -101,15 +141,19 @@ describe('replay primitives', () => {
       rootPatchId: 'patch-root',
       clock: fixedClock()
     });
-    tree.recordProbe(tree.rootId, { trajectoryId: 'traj-root', score: 0.2 });
-    tree.addNode(childInput(tree.rootId, { id: 'c1' }));
-    tree.recordProbe('c1', { trajectoryId: 'traj-c1', score: 0.3 });
-    tree.addNode(childInput(tree.rootId, { id: 'c2' }));
-    tree.recordProbe('c2', { trajectoryId: 'traj-c2', score: 0.4 });
-    tree.addNode(childInput('c1', { id: 'c1a' }));
-    tree.recordProbe('c1a', { trajectoryId: 'traj-c1a', score: 0.5 });
-    tree.addNode(childInput('c2', { id: 'c2a' }));
-    tree.recordProbe('c2a', { trajectoryId: 'traj-c2a', score: 0.6 });
+    tree.recordProbe(tree.rootId, { trajectoryId: 'traj-root', score: 0.05 });
+    tree.addNode(childInput(tree.rootId, { id: 'b1' }));
+    tree.recordProbe('b1', { trajectoryId: 'traj-b1', score: 0.1 });
+    tree.addNode(childInput(tree.rootId, { id: 'b2' }));
+    tree.recordProbe('b2', { trajectoryId: 'traj-b2', score: 0.4 });
+    tree.addNode(childInput('b1', { id: 'b1a' }));
+    tree.recordProbe('b1a', { trajectoryId: 'traj-b1a', score: 0.3 });
+    tree.addNode(childInput('b2', { id: 'b2a' }));
+    tree.recordProbe('b2a', { trajectoryId: 'traj-b2a', score: 0.65 });
+    tree.addNode(childInput('b2', { id: 'b2b' }));
+    tree.recordProbe('b2b', { trajectoryId: 'traj-b2b', score: 0.7 });
+    tree.addNode(childInput('b2a', { id: 'b2a1' }));
+    tree.recordProbe('b2a1', { trajectoryId: 'traj-b2a1', score: 0.85 });
     const snapshot = tree.snapshot();
     const exhaustive = makePolicy({
       id: 'pi-exhaustive',
@@ -119,14 +163,16 @@ describe('replay primitives', () => {
     });
     const atZero = replayTree(snapshot, exhaustive, 0);
     const atOne = replayTree(snapshot, exhaustive, 1);
-    expect(atZero.probes).toBe(3);
-    expect(atOne.probes).toBe(5);
+    // rho=0 => width 2, depth 2, budget 4; rho=1 => width 4, depth 4, budget 16.
+    expect(atZero.probes).toBe(4);
+    expect(atOne.probes).toBe(6);
     expect(atZero.probes).toBeLessThan(atOne.probes);
-    expect(atOne.probes).toBeLessThanOrEqual(16);
-    expect(atZero.quality).toBe(0.4);
-    expect(atOne.quality).toBe(0.6);
+    expect(atZero.probes).toBeLessThanOrEqual(2 * 2);
+    expect(atOne.probes).toBeLessThanOrEqual(4 * 4);
+    expect(atZero.quality).toBe(0.7);
+    expect(atOne.quality).toBe(0.85);
     expect(atOne.visitedNodeIds[0]).toBe(snapshot.rootId);
-    expect(atOne.evidence.join(' ')).toContain('probes=');
+    expect(atOne.evidence.join(' ')).toContain('candidateProbes=');
   });
 
   it('stops early once the quality threshold is reached', () => {
@@ -134,7 +180,7 @@ describe('replay primitives', () => {
     const stopping = replayTree(tree, makePolicy({ id: 'pi-stop', maxWidth: 4, maxDepth: 4 }), 1);
     expect(stopping.earlyStopped).toBe(true);
     expect(stopping.quality).toBe(1);
-    expect(stopping.probes).toBe(2);
+    expect(stopping.probes).toBe(1);
     expect(stopping.visitedNodeIds).toEqual([tree.rootId, 'good']);
   });
 
@@ -153,7 +199,7 @@ describe('replay primitives', () => {
 
     const snapshot = richTree();
     const outcome = replayTree(snapshot, narrowPolicy(), 1);
-    expect(outcome.visitedNodeIds).toEqual([snapshot.rootId]);
+    expect(outcome.visitedNodeIds).toEqual([snapshot.rootId, 'good']);
     expect(outcome.probes).toBe(1);
   });
 
@@ -166,9 +212,11 @@ describe('replay primitives', () => {
       clock: fixedClock()
     });
     tree.recordProbe(tree.rootId, { trajectoryId: 'traj-root', score: 0.2 });
-    tree.addNode(childInput(tree.rootId, { id: 'child', purpose: 'deepen' }));
-    tree.recordProbe('child', { trajectoryId: 'traj-child', score: 0.3 });
-    tree.addNode(childInput('child', { id: 'broken', purpose: 'repair' }));
+    tree.addNode(childInput(tree.rootId, { id: 'good', purpose: 'deepen' }));
+    tree.recordProbe('good', { trajectoryId: 'traj-good', score: 0.5 });
+    tree.addNode(childInput('good', { id: 'deeper', purpose: 'deepen' }));
+    tree.recordProbe('deeper', { trajectoryId: 'traj-deeper', score: 0.9 });
+    tree.addNode(childInput(tree.rootId, { id: 'broken', purpose: 'repair' }));
     tree.recordProbe('broken', {
       trajectoryId: 'traj-broken',
       status: 'failed',
@@ -176,18 +224,22 @@ describe('replay primitives', () => {
       failure: makeDiagnosis('repairable_implementation')
     });
     const snapshot = tree.snapshot();
+    // width 1 / depth 3 => budget 3, but the best branch dies out after 2 probes,
+    // so the recovery injection is what spends the remaining budget.
     const withoutRecovery = replayTree(
       snapshot,
-      makePolicy({ id: 'pi-no-recover', maxWidth: 2, maxDepth: 2, earlyStopThreshold: 1, slotWeights: { exploit: 0.6, explore_domain: 0.2, explore_invariant: 0.2, recover: 0 } }),
+      makePolicy({ id: 'pi-no-recover', maxWidth: 1, maxDepth: 3, earlyStopThreshold: 1, slotWeights: { exploit: 0.6, explore_domain: 0.2, explore_invariant: 0.2, recover: 0 } }),
       1
     );
     const withRecovery = replayTree(
       snapshot,
-      makePolicy({ id: 'pi-recover', maxWidth: 2, maxDepth: 2, earlyStopThreshold: 1 }),
+      makePolicy({ id: 'pi-recover', maxWidth: 1, maxDepth: 3, earlyStopThreshold: 1 }),
       1
     );
+    expect(withoutRecovery.visitedNodeIds).toEqual([snapshot.rootId, 'good', 'deeper']);
     expect(withoutRecovery.probes).toBe(2);
     expect(withRecovery.probes).toBe(3);
+    expect(withRecovery.probes).toBeLessThanOrEqual(1 * 3);
     expect(withRecovery.quality).toBe(withoutRecovery.quality);
     expect(withRecovery.visitedNodeIds).toContain('broken');
     expect(withoutRecovery.visitedNodeIds).not.toContain('broken');
@@ -214,10 +266,78 @@ describe('replay primitives', () => {
   });
 
   it('evaluates a policy with its own ceiling for ad-hoc comparisons', () => {
-    const tree = richTree();
-    const wide = evaluatePolicy([tree], makePolicy({ id: 'pi-wide', maxWidth: 4, maxDepth: 4 }), [0, 1]);
-    const narrow = evaluatePolicy([tree], narrowPolicy(), [0, 1]);
-    expect(wide.hypervolume).toBeGreaterThan(narrow.hypervolume);
+    const trees = [deepTree()];
+    const deep = evaluatePolicy(trees, deepPolicy(), [0, 1]);
+    const shallow = evaluatePolicy(trees, shallowPolicy(), [0, 1]);
+    expect(deep.hypervolume).toBeGreaterThan(shallow.hypervolume);
+  });
+
+  it('visits the root and then exactly depth candidate layers', () => {
+    const snapshot = deepTree();
+    const depthOne = replayTree(
+      snapshot,
+      makePolicy({ id: 'pi-1x1', maxWidth: 1, maxDepth: 1 }),
+      1
+    );
+    expect(depthOne.visitedNodeIds).toEqual([snapshot.rootId, 's2']);
+    expect(depthOne.probes).toBe(1);
+    expect(depthOne.quality).toBe(0.3);
+    expect(depthOne.evidence.join(' ')).toContain('depth=1');
+
+    const depthTwo = replayTree(
+      snapshot,
+      makePolicy({ id: 'pi-1x2', maxWidth: 1, maxDepth: 2 }),
+      1
+    );
+    expect(depthTwo.visitedNodeIds).toEqual([snapshot.rootId, 's2', 'd1']);
+    expect(depthTwo.probes).toBe(2);
+    expect(depthTwo.quality).toBe(0.35);
+  });
+
+  it('caps each candidate layer at width so a narrow-deep policy follows one branch', () => {
+    const snapshot = deepTree();
+    const outcome = replayTree(snapshot, deepPolicy(), 1);
+    expect(outcome.visitedNodeIds).toEqual([snapshot.rootId, 's2', 'd1', 'd2', 'd3']);
+    expect(outcome.probes).toBe(4);
+    expect(outcome.quality).toBe(0.55);
+    for (const sibling of ['s1', 's3', 's4']) {
+      expect(outcome.visitedNodeIds).not.toContain(sibling);
+    }
+    expect(outcome.probes).toBeLessThanOrEqual(1 * 4);
+  });
+
+  it('distinguishes a narrow-deep policy from a wide-shallow one', () => {
+    const snapshot = deepTree();
+    const narrowDeep = replayTree(snapshot, deepPolicy(), 1);
+    const wideShallow = replayTree(snapshot, shallowPolicy(), 1);
+    expect(narrowDeep.probes).toBe(4);
+    expect(wideShallow.probes).toBe(4);
+    expect(narrowDeep.quality).toBe(0.55);
+    expect(wideShallow.quality).toBe(0.3);
+    expect(narrowDeep.visitedNodeIds).not.toEqual(wideShallow.visitedNodeIds);
+    expect(wideShallow.visitedNodeIds).toEqual([snapshot.rootId, 's2', 's1', 's3', 's4']);
+  });
+
+  it('replays deterministically for identical inputs', () => {
+    const snapshot = deepTree();
+    const first = replayTree(snapshot, deepPolicy(), 1);
+    const second = replayTree(snapshot, deepPolicy(), 1);
+    expect(second.visitedNodeIds).toEqual(first.visitedNodeIds);
+    expect(second.probes).toBe(first.probes);
+    expect(second.quality).toBe(first.quality);
+    expect(second.evidence).toEqual(first.evidence);
+  });
+
+  it('never spends more than width * depth candidate probes', () => {
+    const snapshot = deepTree();
+    for (const rho of [0, 0.25, 0.5, 0.75, 1]) {
+      for (const policy of [deepPolicy(), shallowPolicy(), narrowPolicy({ maxWidth: 2, maxDepth: 3 })]) {
+        const outcome = replayTree(snapshot, policy, rho);
+        const width = Math.max(1, Math.round(policy.maxWidth * (0.5 + 0.5 * rho)));
+        const depth = Math.max(1, Math.round(policy.maxDepth * (0.5 + 0.5 * rho)));
+        expect(outcome.probes).toBeLessThanOrEqual(width * depth);
+      }
+    }
   });
 });
 
@@ -329,18 +449,18 @@ describe('offline dreamer monotonic replay', () => {
     });
     const report = await dreamer.replay(
       dreamRequest({
-        candidatePolicies: [
-          makePolicy({ id: 'pi-wide', maxWidth: 4, maxDepth: 4, version: 2 })
-        ]
+        trees: [deepTree()],
+        baselinePolicy: shallowPolicy(),
+        candidatePolicies: [makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4, version: 2 })]
       })
     );
     expect(report.improved).toBe(true);
-    expect(report.selectedPolicyId).toBe('pi-wide');
-    expect(report.best.policyId).toBe('pi-wide');
+    expect(report.selectedPolicyId).toBe('pi-deep');
+    expect(report.best.policyId).toBe('pi-deep');
     expect(report.best.hypervolume).toBeGreaterThan(report.baseline.hypervolume);
-    expect(report.baseline.hypervolume).toBeCloseTo(0.25, 10);
-    expect(report.best.hypervolume).toBeCloseTo(0.5, 10);
-    expect(applied.map((policy) => policy.id)).toEqual(['pi-wide']);
+    expect(report.baseline.hypervolume).toBeCloseTo(0.1875, 6);
+    expect(report.best.hypervolume).toBeCloseTo(0.235, 6);
+    expect(applied.map((policy) => policy.id)).toEqual(['pi-deep']);
   });
 
   it('applies the winner through an injected active policy', async () => {
@@ -355,28 +475,31 @@ describe('offline dreamer monotonic replay', () => {
     });
     const report = await dreamer.replay(
       dreamRequest({
-        candidatePolicies: [
-          makePolicy({ id: 'pi-wide', maxWidth: 4, maxDepth: 4, version: 2 })
-        ]
+        trees: [deepTree()],
+        baselinePolicy: shallowPolicy(),
+        candidatePolicies: [makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4, version: 2 })]
       })
     );
     expect(report.improved).toBe(true);
-    expect(updates.map((policy) => policy.id)).toEqual(['pi-wide']);
+    expect(updates.map((policy) => policy.id)).toEqual(['pi-deep']);
   });
 
   it('picks the best of several candidates deterministically', async () => {
     const dreamer = createOfflineDreamer({ now: () => 100 });
     const report = await dreamer.replay(
       dreamRequest({
+        trees: [deepTree()],
+        baselinePolicy: shallowPolicy(),
         candidatePolicies: [
-          makePolicy({ id: 'pi-b', maxWidth: 2, maxDepth: 2, version: 2 }),
-          makePolicy({ id: 'pi-a', maxWidth: 2, maxDepth: 2, version: 2 }),
-          makePolicy({ id: 'pi-wide', maxWidth: 4, maxDepth: 4, version: 2 })
+          makePolicy({ id: 'pi-wide', maxWidth: 4, maxDepth: 1, version: 2 }),
+          makePolicy({ id: 'pi-deep-b', maxWidth: 1, maxDepth: 4, version: 2 }),
+          makePolicy({ id: 'pi-deep-a', maxWidth: 1, maxDepth: 4, version: 2 })
         ]
       })
     );
     expect(report.candidateEvaluations).toHaveLength(3);
-    expect(report.selectedPolicyId).toBe('pi-wide');
+    expect(report.improved).toBe(true);
+    expect(report.selectedPolicyId).toBe('pi-deep-a');
   });
 
   it('generates candidates when the request carries none', async () => {
@@ -454,15 +577,10 @@ describe('offline dreamer monotonic replay', () => {
   });
 
   it('ranks a cheap policy above an expensive one at high rho', () => {
-    const trees = [richTree()];
-    const shared = { costCeiling: 2 };
+    const trees = [deepTree()];
+    const shared = { costCeiling: 4 };
     const cheap = evaluatePolicy(trees, narrowPolicy(), [0, 1], shared);
-    const expensive = evaluatePolicy(
-      trees,
-      makePolicy({ id: 'pi-wide', maxWidth: 4, maxDepth: 4 }),
-      [0, 1],
-      shared
-    );
+    const expensive = evaluatePolicy(trees, deepPolicy(), [0, 1], shared);
     expect(cheap.perRho['1']).toBeGreaterThan(expensive.perRho['1'] as number);
     expect(expensive.perRho['0']).toBeGreaterThan(cheap.perRho['0'] as number);
   });
@@ -501,13 +619,19 @@ describe('offline dreamer monotonic replay', () => {
     const adapter: IModelAdapter = {
       complete: async () => ({
         text:
-          '[{"maxWidth": 4, "maxDepth": 4, "earlyStopThreshold": 0.8, "slotWeights": {"exploit": 0.4, "explore_domain": 0.3, "explore_invariant": 0.2, "recover": 0.1}}]'
+          '[{"maxWidth": 1, "maxDepth": 4, "earlyStopThreshold": 0.8, "slotWeights": {"exploit": 0.4, "explore_domain": 0.3, "explore_invariant": 0.2, "recover": 0.1}}]'
       })
     };
     const dreamer = createOfflineDreamer({ now: () => 100, modelAdapter: adapter });
-    const report = await dreamer.replay(dreamRequest({ candidatePolicies: [] }));
+    const report = await dreamer.replay(
+      dreamRequest({
+        trees: [deepTree()],
+        baselinePolicy: shallowPolicy(),
+        candidatePolicies: []
+      })
+    );
     expect(report.candidateEvaluations).toHaveLength(1);
-    expect(report.selectedPolicyId).toBe('pi-narrow::dream-m1');
+    expect(report.selectedPolicyId).toBe('pi-shallow::dream-m1');
     expect(report.improved).toBe(true);
   });
 });
