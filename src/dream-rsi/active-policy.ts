@@ -21,6 +21,7 @@ import type {
   BatchSlotPlan,
   ContractMetadata,
   DiscoveryNode,
+  DiscoveryTreeSnapshot,
   FailureDiagnosis,
   HarnessComponentKey,
   IActivePolicy,
@@ -361,6 +362,25 @@ export interface ActivePolicyOptions {
 /** Active policy handle with an audit trail of applied policy ids. */
 export interface ActivePolicy extends IActivePolicy {
   readonly appliedPolicyIds: readonly string[];
+}
+
+/**
+ * True when a repair was already derived from this failed node: it has a child
+ * probed from a recover slot or a child whose purpose is 'repair'. A failed node
+ * keeps its 'failed' status afterwards, so without this check round 3 would
+ * dispatch a second recovery for the same node.
+ */
+function hasRepairChild(tree: DiscoveryTreeSnapshot, node: DiscoveryNode): boolean {
+  for (const childId of node.childIds) {
+    const child = tree.nodes[childId];
+    if (child === undefined) {
+      continue;
+    }
+    if (child.slot === 'recover' || child.purpose === 'repair') {
+      return true;
+    }
+  }
+  return false;
 }
 
 class ActivePolicyImpl implements ActivePolicy {
@@ -750,20 +770,19 @@ class ActivePolicyImpl implements ActivePolicy {
    * Resolve the single node a recovery slot should repair.
    *
    * Targeting order:
-   * 1. an explicit metadata.repairNodeId / previousFailureNodeId wins;
-   * 2. otherwise the most recently updated failed node in the tree whose
-   *    diagnosis is repairable.
+   * 1. an explicit metadata.repairNodeId / previousFailureNodeId wins; it is an
+   *    escape hatch and is honoured even for a node that was already repaired;
+   * 2. otherwise the most recently updated failed node whose diagnosis is
+   *    repairable and that has not been repaired yet (no child with slot
+   *    'recover' and no child with purpose 'repair').
    *
-   * The tree scan also runs when previousFailure is undefined: the orchestrator
-   * clears previousFailure as soon as a later sibling slot succeeds, but the
-   * discovery tree still holds the repairable failure that deserves a targeted
-   * repair. A supplied but non-repairable diagnosis still disables recovery.
+   * request.previousFailure deliberately no longer gates the scan: the
+   * orchestrator replaces it with whatever the latest sibling slot reported, and
+   * a sibling's non-repairable diagnosis must not hide an older repairable
+   * failure. When no node is eligible the method returns null anyway, so a tree
+   * with only non-repairable failures still produces no recovery slot.
    */
   private findRecoveryTarget(request: SelectBatchRequest): DiscoveryNode | null {
-    const failure = request.previousFailure;
-    if (failure !== undefined && !failure.repairable) {
-      return null;
-    }
     const explicitId =
       typeof request.metadata?.repairNodeId === 'string'
         ? request.metadata.repairNodeId
@@ -783,6 +802,9 @@ class ActivePolicyImpl implements ActivePolicy {
       }
       const diagnosis: FailureDiagnosis | undefined = node.failure;
       if (diagnosis === undefined || !diagnosis.repairable) {
+        continue;
+      }
+      if (hasRepairChild(request.tree, node)) {
         continue;
       }
       if (candidate === undefined || node.updatedAt > candidate.updatedAt) {

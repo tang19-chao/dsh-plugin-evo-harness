@@ -201,6 +201,31 @@ function nodeStatusFor(status: ProbeTrajectory['status']): 'succeeded' | 'failed
   return status === 'succeeded' ? 'succeeded' : 'failed';
 }
 
+/**
+ * Precedence for the failure handed to the next selectBatch round:
+ *  1. a terminal diagnosis (hard_unrecoverable / repeatedly_unpromising) always
+ *     wins, so the existing terminal stop conditions are unaffected;
+ *  2. otherwise a repairable diagnosis is preferred over a non-repairable one, so
+ *     a later weak/underexplored sibling cannot hide the repairable failure that
+ *     ActivePolicy.findRecoveryTarget needs to schedule a recover slot;
+ *  3. when both sides have the same repairability the most recent one wins.
+ */
+export function resolvePreviousFailure(
+  current: FailureDiagnosis | undefined,
+  incoming: FailureDiagnosis
+): FailureDiagnosis {
+  if (current === undefined) {
+    return incoming;
+  }
+  if (isTerminalFailure(incoming) || isTerminalFailure(current)) {
+    return isTerminalFailure(incoming) ? incoming : current;
+  }
+  if (incoming.repairable !== current.repairable) {
+    return incoming.repairable ? incoming : current;
+  }
+  return incoming;
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return undefined;
@@ -488,6 +513,12 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           }
           const parentNode = tree.getNode(slot.parentNodeId) ?? rootNode;
           const guidance = this.guidanceForSlot(slot, recall, config);
+          // Round >= 2 exploit/recover slots deepen or repair an already probed
+          // candidate, so the proposer must see what that parent actually changed.
+          // The reference root is never a candidate, so nothing is passed for it.
+          const parentCandidate = candidates.find(
+            (candidate) => candidate.nodeId === parentNode.id
+          );
 
           stage('propose', { round: rounds, detail: { slot: slot.slot } });
           let proposed;
@@ -498,6 +529,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
               slot,
               guidance,
               parentNode,
+              ...(parentCandidate === undefined ? {} : { parentPatch: parentCandidate.patch }),
               referenceTrajectory: reference,
               enabledSurfaces: config.enabledSurfaces,
               attemptIndex: slot.slotIndex + 1,
@@ -595,7 +627,8 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           if (diagnosis.category !== 'none') {
             // Retain the failure: ActivePolicy.findRecoveryTarget needs it to
             // schedule a recover slot even when a sibling slot just succeeded.
-            previousFailure = diagnosis;
+            // Precedence keeps a repairable failure visible to the next round.
+            previousFailure = resolvePreviousFailure(previousFailure, diagnosis);
           }
         }
 
@@ -711,6 +744,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         stage('apply_patch');
         const winningPatch = composition.composedPatch ?? composition.selectedPatch;
         if (winningPatch !== null && this.applyWinningPatch) {
+          // Roll back the scaffold mounted by an earlier run() before mounting the
+          // new winner, so a long-lived host never stacks prompt segments,
+          // middleware or skills across successive runs.
+          await this.disposeMountedPatches(diagnostics);
           const disposer = await this.deps.seams.applyPermanentPatch(winningPatch);
           this.patchDisposers.push(disposer);
           composedPatchId = winningPatch.id;
@@ -756,6 +793,27 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       return result('failed', {
         failure: { category: 'hard_unrecoverable', message: errorMessage(error) }
       });
+    }
+  }
+
+  /**
+   * Dispose every permanent patch mounted by an earlier run and clear the list.
+   * Inactive disposers are skipped and a throwing disposer is recorded as a
+   * diagnostic instead of aborting the run.
+   */
+  private async disposeMountedPatches(diagnostics: string[]): Promise<void> {
+    const mounted = this.patchDisposers.splice(0, this.patchDisposers.length);
+    for (const disposer of mounted) {
+      if (!disposer.active) {
+        continue;
+      }
+      try {
+        await disposer.dispose();
+      } catch (error) {
+        diagnostics.push(
+          'failed to roll back permanent patch ' + disposer.patchId + ': ' + errorMessage(error)
+        );
+      }
     }
   }
 

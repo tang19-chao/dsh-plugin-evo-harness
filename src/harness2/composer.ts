@@ -711,23 +711,85 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
 
       let composedPatch: EightSurfacePatch | null = null;
       if (selected !== undefined) {
-        const baseCandidate = ordered.find(
-          (candidate) => reference !== undefined && candidate.patch.id === reference.patchId
-        );
-        const parentPatchIds: string[] = [];
-        if (baseCandidate !== undefined && baseCandidate.patch.id !== selected.candidate.patch.id) {
-          parentPatchIds.push(baseCandidate.patch.id);
-        }
-        parentPatchIds.push(selected.candidate.patch.id);
-        const sourceLessonIds: string[] = [];
-        for (const lessonId of [
-          ...(baseCandidate?.patch.sourceLessonIds ?? []),
-          ...(selected.candidate.patch.sourceLessonIds ?? [])
-        ]) {
-          if (!sourceLessonIds.includes(lessonId)) {
-            sourceLessonIds.push(lessonId);
+        // The composed H* is the winning candidate applied on top of its real base patch.
+        // Multi-round chains are incremental (a winner only carries its own delta), so the
+        // parent round's edits must be merged back in or they are silently dropped. The base
+        // is resolved from the winner's own lineage first; the reference scaffold match is only
+        // a fallback for single-round compositions.
+        const selectedPatch = selected.candidate.patch;
+        const patchCandidateById = new Map<string, ProbeCandidate>();
+        for (const candidate of ordered) {
+          if (!patchCandidateById.has(candidate.patch.id)) {
+            patchCandidateById.set(candidate.patch.id, candidate);
           }
         }
+        // Walk the winner's complete ancestor lineage root-ward. The walk is a post-order
+        // DFS with the selected patch pre-marked as visited, so cycles (P1 -> P2 -> P1), repeated
+        // parent ids and parents that are not candidates all terminate deterministically, and
+        // `ancestors` ends up in stable root-to-parent order with no duplicates.
+        const ancestors: ProbeCandidate[] = [];
+        const visited = new Set<string>([selectedPatch.id]);
+        const visitAncestor = (patchId: string): void => {
+          if (visited.has(patchId)) {
+            return;
+          }
+          const candidate = patchCandidateById.get(patchId);
+          if (candidate === undefined) {
+            return;
+          }
+          visited.add(patchId);
+          for (const parentId of candidate.patch.parentPatchIds ?? []) {
+            visitAncestor(parentId);
+          }
+          ancestors.push(candidate);
+        };
+        for (const parentId of selectedPatch.parentPatchIds ?? []) {
+          visitAncestor(parentId);
+        }
+        // The reference scaffold is only a fallback for single-round compositions.
+        const referenceBase =
+          ancestors.length === 0 && reference !== undefined
+            ? patchCandidateById.get(reference.patchId)
+            : undefined;
+        const immediateParent = ancestors[ancestors.length - 1];
+        const baseResolution: 'parent' | 'lineage' | 'reference' | undefined =
+          ancestors.length > 1
+            ? 'lineage'
+            : ancestors.length === 1
+              ? 'parent'
+              : referenceBase !== undefined
+                ? 'reference'
+                : undefined;
+        // Ancestry order (reference fallback, then root -> ... -> parent, then the winner), each
+        // descendant overriding the surfaces its ancestors already edited.
+        const mergeOrder: readonly EightSurfacePatch[] = [
+          ...(referenceBase === undefined ? [] : [referenceBase.patch]),
+          ...ancestors.map((candidate) => candidate.patch),
+          selectedPatch
+        ];
+        let mergedEdits: EightSurfaceEdits = {};
+        for (const patch of mergeOrder) {
+          mergedEdits = mergeEdits(mergedEdits, patch.edits);
+        }
+        const parentPatchIds: string[] = [];
+        for (const patchId of [
+          ...ancestors.map((candidate) => candidate.patch.id),
+          ...(referenceBase === undefined ? [] : [referenceBase.patch.id]),
+          selectedPatch.id
+        ]) {
+          if (!parentPatchIds.includes(patchId)) {
+            parentPatchIds.push(patchId);
+          }
+        }
+        const sourceLessonIds: string[] = [];
+        for (const patch of mergeOrder) {
+          for (const lessonId of patch.sourceLessonIds ?? []) {
+            if (!sourceLessonIds.includes(lessonId)) {
+              sourceLessonIds.push(lessonId);
+            }
+          }
+        }
+        const lineageIds = ancestors.map((candidate) => candidate.patch.id);
         const rationale =
           'composed H* from ' +
           selected.alias +
@@ -736,7 +798,17 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
           ', adoption ' +
           selected.adoptionRatio.toFixed(4) +
           ')' +
-          (baseCandidate !== undefined ? ' over reference scaffold ' + baseCandidate.patch.label : '') +
+          (ancestors.length > 1
+            ? ' over lineage depth ' +
+              String(ancestors.length) +
+              ' [' +
+              lineageIds.join(' -> ') +
+              ']'
+            : immediateParent !== undefined
+              ? ' over parent patch ' + immediateParent.patch.id + ' (' + immediateParent.patch.label + ')'
+              : referenceBase !== undefined
+                ? ' over reference patch ' + referenceBase.patch.id + ' (' + referenceBase.patch.label + ')'
+                : '') +
           '; dimension wins: ' +
           selected.contrasts
             .filter((contrast) => (contrast.delta ?? 0) > 0)
@@ -751,7 +823,7 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
           guidance: selected.candidate.patch.guidance,
           label: 'composed:' + selected.candidate.patch.label,
           rationale,
-          edits: mergeEdits(baseCandidate?.patch.edits, selected.candidate.patch.edits),
+          edits: mergedEdits,
           parentPatchIds,
           sourceLessonIds,
           createdAt: evaluatedAt,
@@ -762,6 +834,10 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
             evidenceScore: selected.evidenceScore,
             adoptionRatio: selected.adoptionRatio,
             contrastDimensions: selected.contrasts.map((contrast) => contrast.dimension),
+            basePatchId: immediateParent?.patch.id ?? referenceBase?.patch.id,
+            baseResolution,
+            lineageIds,
+            lineageDepth: ancestors.length,
             policyId: request.policyId
           }
         };

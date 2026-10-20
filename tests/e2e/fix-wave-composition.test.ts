@@ -10,25 +10,34 @@
 import { describe, expect, it, vi } from 'vitest';
 import type {
   BatchPlan,
+  BatchSlotPlan,
+  BranchExecutor,
   CompositionResult,
   ComposeRequest,
   DiscoveryNode,
   IActivePolicy,
   IHarnessComposer,
+  IModelAdapter,
+  IsolatedBranchContext,
   MetaSearchPolicy,
+  ModelRequest,
+  ModelResponse,
   PlanGridRequest,
+  ProbeExecutionResult,
   ProbeTrajectory,
   SearchGridPlan,
-  SelectBatchRequest
+  SelectBatchRequest,
+  TrajectoryStep
 } from '../../src/types/contracts';
 import { parseEvoHarnessConfig } from '../../src/config';
-import { createSurrogateScorer } from '../../src/dream-rsi';
-import { createAnonymousComposer } from '../../src/harness2';
+import { createActivePolicyFromDefaults, createSurrogateScorer } from '../../src/dream-rsi';
+import { createAnonymousComposer, createDualTrackProposer } from '../../src/harness2';
 import { createEvoHarnessPlugin } from '../../src/index';
 import { createMemoryBridge } from '../../src/memory-bridge';
 import {
   buildE2E,
   createRecordingPolicy,
+  createRecordingProposer,
   createScriptedModel,
   createScriptedRunner,
   e2eConfig,
@@ -69,6 +78,176 @@ function createClearingPolicy(base: IActivePolicy): IActivePolicy {
       base.update(policy);
     }
   };
+}
+
+/**
+ * Local policy for the three-round chain regression: exactly one exploit slot per round,
+ * deepening the best node so every round's patch is incremental on the previous one.
+ */
+function createExploitChainPolicy(base: IActivePolicy, now: () => number): IActivePolicy {
+  return {
+    get policy(): MetaSearchPolicy {
+      return base.policy;
+    },
+    planGrid(request: PlanGridRequest): SearchGridPlan {
+      return { ...base.planGrid(request), stopCondition: 'max_depth', maxWidth: 1 };
+    },
+    selectBatch(request: SelectBatchRequest): BatchPlan {
+      // Deepen the deepest node in the snapshot (the previous round's candidate), which
+      // makes the round-over-round chain independent of the scorer's best-node bookkeeping.
+      let parent = request.tree.nodes[request.tree.rootId];
+      for (const node of Object.values(request.tree.nodes)) {
+        if (node.id === request.tree.rootId) {
+          continue;
+        }
+        if (parent === undefined || node.depth > parent.depth || (node.depth === parent.depth && node.id > parent.id)) {
+          parent = node;
+        }
+      }
+      const slot: BatchSlotPlan = {
+        slot: 'exploit',
+        slotIndex: 0,
+        branchId: 'chain-' + String(request.round),
+        parentNodeId: parent?.id ?? request.tree.rootId,
+        origin: 'reference',
+        guidance: 'memory',
+        focusSurfaces: ['system_prompt', 'guardrails', 'skills'],
+        rationale: 'one exploit slot per round for the three-round chain regression',
+        seedPatchIds: parent === undefined ? [] : [parent.patchId]
+      };
+      return {
+        round: request.round,
+        grid: request.grid,
+        policyId: request.grid.policyId,
+        width: 1,
+        slots: [slot],
+        createdAt: now()
+      };
+    },
+    update(policy: MetaSearchPolicy): void {
+      base.update(policy);
+    }
+  };
+}
+
+/** Local model: a different surface each round, plus a scripted compose verdict. */
+function createChainModel(): IModelAdapter {
+  let proposals = 0;
+  return {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      if (request.purpose === 'propose') {
+        proposals += 1;
+        const payload =
+          proposals === 1
+            ? {
+                rationale: 'round 1: declare the failing tool before retrying',
+                focusSurfaces: ['system_prompt'],
+                confidence: 0.6,
+                edits: {
+                  system_prompt: {
+                    kind: 'system_prompt',
+                    mode: 'append',
+                    content: 'round 1: declare the failing tool before retrying'
+                  }
+                }
+              }
+            : proposals === 2
+              ? {
+                  rationale: 'round 2: add an output contract',
+                  focusSurfaces: ['guardrails'],
+                  confidence: 0.6,
+                  edits: { guardrails: { kind: 'guardrails', formatContract: 'round 2 contract' } }
+                }
+              : {
+                  rationale: 'round 3: mount a recovery SOP',
+                  focusSurfaces: ['skills'],
+                  confidence: 0.6,
+                  edits: {
+                    skills: {
+                      kind: 'skills',
+                      skills: [{ name: 'round-3-sop', markdown: '# round 3 SOP', activate: true }]
+                    }
+                  }
+                };
+        return { text: JSON.stringify(payload), finishReason: 'stop', model: 'chain-scripted' };
+      }
+      if (request.purpose === 'compose') {
+        const text = request.messages.map((message) => message.content).join(String.fromCharCode(10));
+        const aliases = [...new Set(text.match(/candidate_[A-Z]/g) ?? [])];
+        return {
+          text: JSON.stringify({
+            ranking: aliases,
+            assessments: aliases.map((alias, index) => ({
+              alias,
+              rationale: 'ranked ' + String(index + 1) + ' by the chain judge'
+            }))
+          }),
+          finishReason: 'stop',
+          model: 'chain-scripted'
+        };
+      }
+      if (request.purpose === 'reflect') {
+        return { text: JSON.stringify({ lessons: [] }), finishReason: 'stop', model: 'chain-scripted' };
+      }
+      return { text: JSON.stringify({ policies: [] }), finishReason: 'stop', model: 'chain-scripted' };
+    }
+  };
+}
+
+/** Local runner: the reference fails, then three candidate rounds get steadily better. */
+function createChainRunner(now: () => number): BranchExecutor & { readonly calls: string[] } {
+  const calls: string[] = [];
+  let candidates = 0;
+  const run = async (context: IsolatedBranchContext): Promise<ProbeExecutionResult> => {
+    const isReference =
+      context.patch.purpose === 'initial' && Object.keys(context.patch.edits).length === 0;
+    calls.push(isReference ? 'reference' : 'candidate');
+    if (isReference) {
+      return {
+        status: 'failed',
+        steps: [
+          { index: 0, at: now(), kind: 'model', text: 'plan the migration' },
+          {
+            index: 1,
+            at: now(),
+            kind: 'tool',
+            toolName: 'shell',
+            error: { name: 'ToolError', message: 'exit 1' }
+          },
+          { index: 2, at: now(), kind: 'error', text: 'the build failed' }
+        ],
+        toolErrors: [{ toolName: 'shell', message: 'exit 1', code: 'E1', stepIndex: 1, retryable: true }],
+        failureSignals: [{ kind: 'tool_error', message: 'exit 1', toolName: 'shell', repairable: true }]
+      };
+    }
+    candidates += 1;
+    const round = candidates;
+    const stepCount = round === 1 ? 30 : round === 2 ? 12 : 3;
+    const errorCount = round === 1 ? 8 : round === 2 ? 3 : 0;
+    const padding = round === 1 ? 20 : round === 2 ? 400 : 2000;
+    const plan: TrajectoryStep[] = Array.from({ length: stepCount }, (_, index) => ({
+      index,
+      at: now(),
+      kind: index === stepCount - 1 ? 'result' : 'tool',
+      toolName: 'shell',
+      text: 'round ' + String(round) + ' step ' + String(index)
+    }));
+    return {
+      status: 'succeeded',
+      steps: plan,
+      toolErrors: Array.from({ length: errorCount }, (_, index) => ({
+        toolName: 'shell',
+        message: 'round ' + String(round) + ' error ' + String(index),
+        retryable: true
+      })),
+      deliverable: {
+        content: 'round ' + String(round) + ' deliverable ' + 'x'.repeat(padding),
+        format: 'markdown'
+      },
+      usage: { inputTokens: 100, outputTokens: 40, totalTokens: round === 1 ? 5000 : round === 2 ? 2000 : 200 }
+    };
+  };
+  return Object.assign(run, { calls });
 }
 
 describe('fix-wave composition', () => {
@@ -291,5 +470,118 @@ describe('fix-wave composition', () => {
 
     await plugin.dispose();
     expect(plugin.orchestrator.isDisposed()).toBe(true);
+  });
+
+  it('hands the parent candidate patch to round-2 proposals and nothing to the reference root', async () => {
+    const options = { maxWidth: 2, maxDepth: 2, rolloutBudget: 6, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const now = makeClock();
+    const model = createScriptedModel();
+    const proposer = createRecordingProposer(
+      createDualTrackProposer({ model, now, newId: makeIdFactory('parent-proposer') })
+    );
+    const { plugin } = buildE2E({
+      ...options,
+      candidateOutcomes: ['fail', 'succeed'],
+      extra: { deps: { policy, proposer } }
+    });
+
+    const result = await plugin.run({
+      sessionId: 'sess-parent-patch',
+      task: plugin.makeTask({ id: 'task-parent-patch', prompt: 'Repair the broken pipeline.' }),
+      trigger: 'always'
+    });
+
+    expect(result.outcome).toBe('composed');
+    const rootId = policy.selectBatchRequests[0]?.tree.rootId;
+    expect(rootId).toBeDefined();
+
+    // round 1 proposals hang off the reference root: no parent patch is handed over
+    const roundOne = proposer.requests.filter((request) => request.parentNode?.id === rootId);
+    expect(roundOne.length).toBeGreaterThanOrEqual(1);
+    for (const request of roundOne) {
+      expect(request.parentPatch).toBeUndefined();
+    }
+
+    const secondBatchRequest = policy.selectBatchRequests[1];
+    expect(secondBatchRequest).toBeDefined();
+    const roundTwo = proposer.requests.filter(
+      (request) => request.parentNode !== undefined && request.parentNode.id !== rootId
+    );
+    expect(roundTwo.length).toBeGreaterThanOrEqual(1);
+    const exploitOrRecover = roundTwo.filter(
+      (request) => request.slot.slot === 'exploit' || request.slot.slot === 'recover'
+    );
+    expect(exploitOrRecover.length).toBeGreaterThanOrEqual(1);
+
+    // every proposal whose parent is a probed candidate carries that parent's patch
+    for (const request of proposer.requests) {
+      const parentId = request.parentNode?.id;
+      if (parentId === undefined || parentId === rootId) {
+        expect(request.parentPatch).toBeUndefined();
+        continue;
+      }
+      expect(request.parentPatch).toBeDefined();
+      const parentNode = secondBatchRequest?.tree.nodes[parentId];
+      expect(parentNode).toBeDefined();
+      expect(request.parentPatch?.id).toBe(parentNode?.patchId);
+      expect(request.parentPatch?.edits.guardrails).toBeDefined();
+    }
+  });
+
+  it('keeps the round-1 surface edit when a three-round exploit chain composes', async () => {
+    const now = makeClock();
+    const config = parseEvoHarnessConfig(
+      e2eConfig({ maxWidth: 1, maxDepth: 3, rolloutBudget: 6, dreamEveryNTasks: 100 })
+    );
+    const model = createChainModel();
+    const runner = createChainRunner(now);
+    const policy = createExploitChainPolicy(
+      createActivePolicyFromDefaults({ maxWidth: 1, maxDepth: 3 }, { now, maxRecoverySlots: 0 }),
+      now
+    );
+    const plugin = createEvoHarnessPlugin(
+      {
+        config,
+        model,
+        clients: [mem0LikeServer().client],
+        runBranch: runner,
+        now,
+        newId: makeIdFactory('chain'),
+        deps: { policy }
+      },
+      {}
+    );
+
+    const result = await plugin.run({
+      sessionId: 'sess-chain',
+      task: plugin.makeTask({
+        id: 'task-chain',
+        prompt: 'Evolve the scaffold across three exploit rounds.'
+      }),
+      trigger: 'always'
+    });
+
+    // The reference anchor plus three incremental exploit rounds actually ran.
+    expect(result.outcome).toBe('composed');
+    expect(runner.calls.filter((call) => call === 'candidate')).toHaveLength(3);
+
+    const composition = plugin.orchestrator.lastComposition();
+    const composed = composition?.composedPatch;
+    expect(composed).not.toBeNull();
+    // The deepest round wins on evidence even though the judge ranks the round-1 alias first.
+    expect(composition?.selectedNodeId).toBeDefined();
+
+    // Every round contributes: without the full lineage walk the round-1 system_prompt edit
+    // would be silently dropped here (the reported t30 defect).
+    expect(Object.keys(composed?.edits ?? {}).sort()).toEqual(['guardrails', 'skills', 'system_prompt']);
+    expect(composed?.edits.system_prompt?.content).toBe('round 1: declare the failing tool before retrying');
+    expect(composed?.edits.guardrails?.formatContract).toBe('round 2 contract');
+    expect(composed?.edits.skills?.skills[0]?.name).toBe('round-3-sop');
+    expect(composed?.parentPatchIds).toHaveLength(3);
+    expect(new Set(composed?.parentPatchIds ?? []).size).toBe(3);
+    expect(composed?.metadata?.lineageDepth).toBe(2);
+    expect(composed?.metadata?.baseResolution).toBe('lineage');
+    expect(composed?.rationale).toContain('over lineage depth 2');
   });
 });

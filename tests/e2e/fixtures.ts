@@ -10,7 +10,10 @@ import { vi } from 'vitest';
 import type {
   BatchPlan,
   BranchExecutor,
+  EightSurfacePatch,
   IActivePolicy,
+  ICordisSeamManager,
+  IHarnessProposer,
   IModelAdapter,
   IsolatedBranchContext,
   MetaSearchPolicy,
@@ -18,9 +21,12 @@ import type {
   ModelResponse,
   PlanGridRequest,
   ProbeExecutionResult,
+  ProposeRequest,
+  ProposedPatch,
   SearchGridPlan,
   SelectBatchRequest,
-  StopCondition
+  StopCondition,
+  SurfacePatchDisposer
 } from '../../src/types/contracts';
 import { parseLessonDocument } from '../../src/memory-bridge';
 import { parseEvoHarnessConfig } from '../../src/config';
@@ -131,13 +137,19 @@ export interface ScriptedRunner {
 }
 
 export interface ScriptedRunnerOptions {
-  /** Outcome of each candidate probe in call order; defaults to 'succeed'. */
-  readonly candidateOutcomes?: readonly ('succeed' | 'fail')[];
+  /**
+   * Outcome of each candidate probe in call order; defaults to 'succeed'.
+   *  - 'succeed': clean run with a deliverable
+   *  - 'fail':    repairable tool error (repairable_implementation)
+   *  - 'weak':    timeout without a deliverable (weak_underexplored, not repairable)
+   *  - 'hard':    model refusal (hard_unrecoverable, terminal)
+   */
+  readonly candidateOutcomes?: readonly ('succeed' | 'fail' | 'weak' | 'hard')[];
 }
 
 /**
  * Reference run fails with a tool error; candidate patches succeed unless
- * candidateOutcomes marks that probe index as a repairable failure.
+ * candidateOutcomes marks that probe index as a failure.
  */
 export function createScriptedRunner(
   now: () => number,
@@ -201,6 +213,32 @@ export function createScriptedRunner(
           ],
           failureSignals: [
             { kind: 'tool_error', message: 'candidate exit 2', toolName: 'shell', repairable: true }
+          ]
+        };
+      }
+      if (candidateOutcome === 'weak') {
+        return {
+          status: 'timeout',
+          steps: [
+            { index: 0, at: now(), kind: 'model', text: 'apply the candidate scaffold' },
+            { index: 1, at: now(), kind: 'error', text: 'the candidate run timed out' }
+          ],
+          toolErrors: [],
+          failureSignals: [
+            { kind: 'timeout', message: 'candidate timed out', repairable: false }
+          ]
+        };
+      }
+      if (candidateOutcome === 'hard') {
+        return {
+          status: 'failed',
+          steps: [
+            { index: 0, at: now(), kind: 'model', text: 'apply the candidate scaffold' },
+            { index: 1, at: now(), kind: 'error', text: 'the model refused to continue' }
+          ],
+          toolErrors: [],
+          failureSignals: [
+            { kind: 'model_refusal', message: 'the model refused to continue', repairable: false }
           ]
         };
       }
@@ -588,7 +626,7 @@ export interface E2EBuildOptions {
   readonly maxWidth?: number;
   readonly rolloutBudget?: number;
   /** Outcome of each candidate probe, forwarded to the scripted runner. */
-  readonly candidateOutcomes?: readonly ('succeed' | 'fail')[];
+  readonly candidateOutcomes?: readonly ('succeed' | 'fail' | 'weak' | 'hard')[];
 }
 
 const CONFIG_GROUPS = ['probe', 'memoryBridge', 'dreamRsi', 'logging'] as const;
@@ -761,6 +799,62 @@ export function createRecordingTaxonomy(base: IFailureTaxonomy): RecordingTaxono
 /** Recording taxonomy over the production default taxonomy. */
 export function createDefaultRecordingTaxonomy(): RecordingTaxonomy {
   return createRecordingTaxonomy(createFailureTaxonomy({}));
+}
+
+// ---------------------------------------------------------------------------
+// recording proposer (observes the ProposeRequest the orchestrator builds)
+// ---------------------------------------------------------------------------
+
+export interface RecordingProposer extends IHarnessProposer {
+  readonly requests: ProposeRequest[];
+}
+
+/** Wrap a real proposer, recording every proposal request it receives. */
+export function createRecordingProposer(base: IHarnessProposer): RecordingProposer {
+  const requests: ProposeRequest[] = [];
+  return {
+    requests,
+    async propose(request: ProposeRequest): Promise<ProposedPatch> {
+      requests.push(request);
+      return base.propose(request);
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// seam manager whose permanent-patch disposers always throw on rollback
+// ---------------------------------------------------------------------------
+
+export interface ThrowingRollbackSeams extends ICordisSeamManager {
+  readonly rollbackFailures: readonly string[];
+}
+
+/**
+ * Wrap a seam manager so every permanently mounted patch hands back a disposer
+ * that throws on rollback while the underlying mount still happens. Used to prove
+ * the orchestrator records the rollback failure instead of aborting the run.
+ */
+export function createThrowingRollbackSeams(base: ICordisSeamManager): ThrowingRollbackSeams {
+  const rollbackFailures: string[] = [];
+  return {
+    rollbackFailures,
+    runInIsolatedBranch: (request) => base.runInIsolatedBranch(request),
+    listActiveBranches: () => base.listActiveBranches(),
+    dispose: () => base.dispose(),
+    async applyPermanentPatch(patch: EightSurfacePatch): Promise<SurfacePatchDisposer> {
+      const real = await base.applyPermanentPatch(patch);
+      return {
+        patchId: real.patchId,
+        get active(): boolean {
+          return real.active;
+        },
+        dispose: async (): Promise<void> => {
+          rollbackFailures.push(real.patchId);
+          throw new Error('rollback boom for ' + real.patchId);
+        }
+      };
+    }
+  };
 }
 
 /** Re-export for tests that assert host derivation. */

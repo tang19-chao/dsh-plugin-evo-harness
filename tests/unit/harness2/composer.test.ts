@@ -163,6 +163,14 @@ describe('Harness² composer / evidence-backed selection', () => {
     expect(result.composedPatch?.sessionId).toBe('sess_1');
     expect(result.composedPatch?.edits.guardrails?.kind).toBe('guardrails');
 
+    // Single round: the winner has no parentPatchIds and no candidate matches reference.patchId,
+    // so the composed H* is byte-for-byte the winning patch's edits and lessons.
+    expect(result.composedPatch?.edits).toEqual(beta?.patch.edits);
+    expect(result.composedPatch?.sourceLessonIds).toEqual(beta?.patch.sourceLessonIds ?? []);
+    expect(result.composedPatch?.metadata?.basePatchId).toBeUndefined();
+    expect(result.composedPatch?.metadata?.baseResolution).toBeUndefined();
+    expect(result.composedPatch?.rationale ?? '').not.toContain(' over ');
+
     expect(result.assessments).toHaveLength(3);
     expect(result.assessments.filter((assessment) => assessment.selected)).toHaveLength(1);
     for (const assessment of result.assessments) {
@@ -322,6 +330,304 @@ describe('Harness² composer / evidence-backed selection', () => {
     expect(prompt).toContain('candidate_A');
     expect(prompt).not.toContain('node_x');
     expect(prompt).not.toContain('branch_x');
+  });
+
+  it('merges a multi-round winner onto its lineage parent patch', async () => {
+    const parentPatch = makePatch({
+      id: 'patch_parent',
+      branchId: 'branch_parent',
+      purpose: 'deepen',
+      label: 'exploit:guardrails+skills',
+      sourceLessonIds: ['lesson_parent'],
+      edits: {
+        guardrails: { kind: 'guardrails', formatContract: 'parent contract' },
+        skills: { kind: 'skills', skills: [{ name: 'parent-skill', markdown: '# parent', activate: true }] }
+      }
+    });
+    const childPatch = makePatch({
+      id: 'patch_child',
+      branchId: 'branch_child',
+      purpose: 'deepen',
+      label: 'exploit:guardrails+scripts',
+      parentPatchIds: ['patch_parent'],
+      sourceLessonIds: ['lesson_child'],
+      edits: {
+        guardrails: { kind: 'guardrails', formatContract: 'child contract' },
+        scripts: { kind: 'scripts', scripts: [{ path: 'tools/child.py', language: 'python', code: 'print(2)' }] }
+      }
+    });
+    const parentCandidate = makeCandidate({
+      nodeId: 'node_parent',
+      branchId: 'branch_parent',
+      patch: parentPatch,
+      trajectory: makeTrajectory({
+        id: 'traj_parent',
+        nodeId: 'node_parent',
+        branchId: 'branch_parent',
+        patchId: 'patch_parent',
+        status: 'succeeded',
+        metrics: { steps: 30, toolCalls: 26, toolErrors: 12, durationMs: 9000 },
+        deliverable: { content: 'round one result', format: 'text' }
+      })
+    });
+    const childCandidate = makeCandidate({
+      nodeId: 'node_child',
+      branchId: 'branch_child',
+      patch: childPatch,
+      trajectory: makeTrajectory({
+        id: 'traj_child',
+        nodeId: 'node_child',
+        branchId: 'branch_child',
+        patchId: 'patch_child',
+        status: 'succeeded',
+        metrics: { steps: 3, toolCalls: 2, toolErrors: 0, durationMs: 500 },
+        deliverable: { content: 'round two result that keeps the round one edit', format: 'text' }
+      })
+    });
+
+    const { composer, request } = composeRequest([JUDGE_VERDICT], [parentCandidate, childCandidate]);
+    const result = await composer.compose(request);
+    const composed = result.composedPatch;
+
+    // branch_child sorts first, so the child is candidate_A and also wins on evidence.
+    expect(result.selectedPatch?.id).toBe('patch_child');
+    expect(composed).not.toBeNull();
+    expect(Object.keys(composed?.edits ?? {})).toEqual(['guardrails', 'skills', 'scripts']);
+    // The child overrides the surface both rounds edit ...
+    expect(composed?.edits.guardrails?.kind).toBe('guardrails');
+    expect(composed?.edits.guardrails?.formatContract).toBe('child contract');
+    // ... while the parent-only and child-only surfaces both survive.
+    expect(composed?.edits.skills?.kind).toBe('skills');
+    expect(composed?.edits.skills?.skills[0]?.name).toBe('parent-skill');
+    expect(composed?.edits.scripts?.kind).toBe('scripts');
+    expect(composed?.parentPatchIds).toEqual(['patch_parent', 'patch_child']);
+    expect(composed?.sourceLessonIds).toEqual(['lesson_parent', 'lesson_child']);
+    expect(composed?.metadata?.basePatchId).toBe('patch_parent');
+    expect(composed?.metadata?.baseResolution).toBe('parent');
+    expect(composed?.rationale).toContain('over parent patch patch_parent');
+  });
+
+  it('merges a depth-3 chain in ancestry order so the earliest round survives', async () => {
+    const roundOne = makePatch({
+      id: 'patch_round1',
+      branchId: 'branch_round1',
+      purpose: 'deepen',
+      label: 'exploit:system_prompt',
+      sourceLessonIds: ['lesson_round1'],
+      edits: { system_prompt: { kind: 'system_prompt', mode: 'append', content: 'round one prompt' } }
+    });
+    const roundTwo = makePatch({
+      id: 'patch_round2',
+      branchId: 'branch_round2',
+      purpose: 'deepen',
+      label: 'exploit:system_prompt+guardrails',
+      parentPatchIds: ['patch_round1'],
+      sourceLessonIds: ['lesson_round2'],
+      edits: {
+        system_prompt: { kind: 'system_prompt', mode: 'append', content: 'round two prompt' },
+        guardrails: { kind: 'guardrails', formatContract: 'round two contract' }
+      }
+    });
+    const roundThree = makePatch({
+      id: 'patch_round3',
+      branchId: 'branch_round3',
+      purpose: 'deepen',
+      label: 'exploit:skills',
+      parentPatchIds: ['patch_round2'],
+      sourceLessonIds: ['lesson_round3'],
+      edits: { skills: { kind: 'skills', skills: [{ name: 'round-three-skill', markdown: '# r3', activate: true }] } }
+    });
+    const chain = [
+      { patch: roundOne, steps: 30, toolErrors: 12, durationMs: 9000, deliverableChars: 7 },
+      { patch: roundTwo, steps: 12, toolErrors: 3, durationMs: 3000, deliverableChars: 200 },
+      { patch: roundThree, steps: 3, toolErrors: 0, durationMs: 500, deliverableChars: 2000 }
+    ].map((entry, index) => {
+      const nodeId = 'node_round' + String(index + 1);
+      const branchId = 'branch_round' + String(index + 1);
+      return makeCandidate({
+        nodeId,
+        branchId,
+        patch: entry.patch,
+        trajectory: makeTrajectory({
+          id: 'traj_round' + String(index + 1),
+          nodeId,
+          branchId,
+          patchId: entry.patch.id,
+          status: 'succeeded',
+          metrics: {
+            steps: entry.steps,
+            toolCalls: entry.steps,
+            toolErrors: entry.toolErrors,
+            durationMs: entry.durationMs
+          },
+          deliverable: { content: 'r'.repeat(entry.deliverableChars), format: 'text' }
+        })
+      });
+    });
+
+    const { composer, request } = composeRequest([JUDGE_VERDICT], chain);
+    const result = await composer.compose(request);
+    const composed = result.composedPatch;
+
+    // The third round wins on evidence despite the judge ranking candidate_A (round one) first.
+    expect(result.selectedPatch?.id).toBe('patch_round3');
+    expect(composed).not.toBeNull();
+    // All three rounds contribute; the earliest round's system_prompt edit is not dropped.
+    expect(Object.keys(composed?.edits ?? {})).toEqual(['system_prompt', 'guardrails', 'skills']);
+    expect(composed?.edits.system_prompt?.content).toBe('round two prompt');
+    expect(composed?.edits.guardrails?.formatContract).toBe('round two contract');
+    expect(composed?.edits.skills?.skills[0]?.name).toBe('round-three-skill');
+    expect(composed?.parentPatchIds).toEqual(['patch_round1', 'patch_round2', 'patch_round3']);
+    expect(composed?.sourceLessonIds).toEqual(['lesson_round1', 'lesson_round2', 'lesson_round3']);
+    expect(composed?.metadata?.lineageIds).toEqual(['patch_round1', 'patch_round2']);
+    expect(composed?.metadata?.lineageDepth).toBe(2);
+    expect(composed?.metadata?.baseResolution).toBe('lineage');
+    expect(composed?.metadata?.basePatchId).toBe('patch_round2');
+    expect(composed?.rationale).toContain('over lineage depth 2 [patch_round1 -> patch_round2]');
+  });
+
+  it('terminates deterministically on cyclic, duplicate and missing parent ids', async () => {
+    const loopA = makePatch({
+      id: 'patch_loop_a',
+      branchId: 'branch_loop_a',
+      label: 'loop:system_prompt',
+      parentPatchIds: ['patch_loop_b'],
+      sourceLessonIds: ['lesson_a'],
+      edits: { system_prompt: { kind: 'system_prompt', mode: 'append', content: 'loop a' } }
+    });
+    const loopB = makePatch({
+      id: 'patch_loop_b',
+      branchId: 'branch_loop_b',
+      label: 'loop:guardrails',
+      parentPatchIds: ['patch_loop_a'],
+      sourceLessonIds: ['lesson_b'],
+      edits: { guardrails: { kind: 'guardrails', formatContract: 'loop b contract' } }
+    });
+    const buildLoopCandidate = (
+      patch: typeof loopA,
+      index: number,
+      steps: number,
+      status: 'succeeded' | 'failed' = 'succeeded'
+    ) => {
+      const nodeId = 'node_loop_' + String(index);
+      const branchId = 'branch_loop_' + String(index);
+      return makeCandidate({
+        nodeId,
+        branchId,
+        patch,
+        trajectory: makeTrajectory({
+          id: 'traj_loop_' + String(index),
+          nodeId,
+          branchId,
+          patchId: patch.id,
+          status,
+          metrics: { steps, toolCalls: steps, toolErrors: 0, durationMs: 500 },
+          deliverable: { content: 'loop result ' + String(index), format: 'text' }
+        })
+      });
+    };
+    // Cyclic pair: a -> b -> a. Selecting the better-scoring a must not loop forever.
+    const cyclicRun = composeRequest([JUDGE_VERDICT], [
+      buildLoopCandidate(loopB, 1, 30, 'failed'),
+      buildLoopCandidate(loopA, 2, 3)
+    ]);
+    const cyclic = await cyclicRun.composer.compose(cyclicRun.request);
+    // Branch naming decides the alias order, so assert on the selected patch rather than the alias.
+    expect(cyclic.selectedPatch?.id).toBe('patch_loop_a');
+    expect(cyclic.composedPatch?.parentPatchIds).toEqual(['patch_loop_b', 'patch_loop_a']);
+    expect(cyclic.composedPatch?.sourceLessonIds).toEqual(['lesson_b', 'lesson_a']);
+    expect(cyclic.composedPatch?.metadata?.lineageDepth).toBe(1);
+    expect(cyclic.composedPatch?.rationale).toContain('over parent patch patch_loop_b');
+    expect(Object.keys(cyclic.composedPatch?.edits ?? {})).toEqual(['guardrails', 'system_prompt']);
+
+    // Duplicate parent ids and a parent that is not a candidate are ignored, not merged twice.
+    const duplicated = makePatch({
+      id: 'patch_dup',
+      branchId: 'branch_dup',
+      label: 'exploit:skills',
+      parentPatchIds: ['patch_missing', 'patch_loop_b', 'patch_loop_b'],
+      sourceLessonIds: ['lesson_dup'],
+      edits: { skills: { kind: 'skills', skills: [{ name: 'dup-skill', markdown: '# dup', activate: true }] } }
+    });
+    const dupRun = composeRequest([JUDGE_VERDICT], [
+      buildLoopCandidate(loopB, 1, 30, 'failed'),
+      buildLoopCandidate(loopA, 2, 20, 'failed'),
+      buildLoopCandidate(duplicated, 3, 3)
+    ]);
+    const dup = await dupRun.composer.compose(dupRun.request);
+
+    expect(dup.selectedPatch?.id).toBe('patch_dup');
+    expect(dup.composedPatch?.parentPatchIds).toEqual(['patch_loop_a', 'patch_loop_b', 'patch_dup']);
+    expect(dup.composedPatch?.sourceLessonIds).toEqual(['lesson_a', 'lesson_b', 'lesson_dup']);
+    expect(dup.composedPatch?.metadata?.lineageDepth).toBe(2);
+    expect(dup.composedPatch?.metadata?.baseResolution).toBe('lineage');
+    expect(Object.keys(dup.composedPatch?.edits ?? {})).toEqual(['system_prompt', 'guardrails', 'skills']);
+    expect(dup.composedPatch?.rationale).toContain('over lineage depth 2 [patch_loop_a -> patch_loop_b]');
+  });
+
+  it('falls back to the reference scaffold when the winner has no lineage', async () => {
+    const referencePatch = makePatch({
+      id: 'patch_ref',
+      branchId: 'branch_ref2',
+      purpose: 'initial',
+      label: 'reference:skills',
+      sourceLessonIds: ['lesson_ref'],
+      edits: {
+        skills: { kind: 'skills', skills: [{ name: 'reference-skill', markdown: '# reference', activate: true }] }
+      }
+    });
+    const winnerPatch = makePatch({
+      id: 'patch_winner',
+      branchId: 'branch_winner',
+      origin: 'invariant',
+      guidance: 'guidance_free',
+      label: 'explore_invariant:guardrails',
+      sourceLessonIds: ['lesson_winner'],
+      edits: { guardrails: { kind: 'guardrails', appendRules: ['Cite files.'] } }
+    });
+    const referenceCandidate = makeCandidate({
+      nodeId: 'node_ref_candidate',
+      branchId: 'branch_ref2',
+      patch: referencePatch,
+      trajectory: makeTrajectory({
+        id: 'traj_ref_candidate',
+        nodeId: 'node_ref_candidate',
+        branchId: 'branch_ref2',
+        patchId: 'patch_ref',
+        status: 'succeeded',
+        metrics: { steps: 30, toolCalls: 26, toolErrors: 12, durationMs: 9000 },
+        deliverable: { content: 'reference scaffold result', format: 'text' }
+      })
+    });
+    const winnerCandidate = makeCandidate({
+      nodeId: 'node_winner',
+      branchId: 'branch_winner',
+      patch: winnerPatch,
+      trajectory: makeTrajectory({
+        id: 'traj_winner',
+        nodeId: 'node_winner',
+        branchId: 'branch_winner',
+        patchId: 'patch_winner',
+        status: 'succeeded',
+        metrics: { steps: 3, toolCalls: 2, toolErrors: 0, durationMs: 500 },
+        deliverable: { content: 'winner result that keeps the reference scaffold skill', format: 'text' }
+      })
+    });
+
+    const { composer, request } = composeRequest([JUDGE_VERDICT], [referenceCandidate, winnerCandidate]);
+    const result = await composer.compose(request);
+    const composed = result.composedPatch;
+
+    // branch_ref2 sorts first, so the reference-scaffold candidate is candidate_A; the winner
+    // still wins on evidence although the judge ranked candidate_A first.
+    expect(result.selectedPatch?.id).toBe('patch_winner');
+    expect(composed?.parentPatchIds).toEqual(['patch_ref', 'patch_winner']);
+    expect(composed?.sourceLessonIds).toEqual(['lesson_ref', 'lesson_winner']);
+    expect(composed?.metadata?.basePatchId).toBe('patch_ref');
+    expect(composed?.metadata?.baseResolution).toBe('reference');
+    expect(composed?.rationale).toContain('over reference patch patch_ref');
+    expect(composed?.edits.skills?.skills[0]?.name).toBe('reference-skill');
+    expect(composed?.edits.guardrails?.appendRules).toEqual(['Cite files.']);
   });
 
   it('is deterministic for identical inputs', async () => {

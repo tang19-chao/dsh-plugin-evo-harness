@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { EVO_HARNESS_STAGES, autoFallbackRequested } from '../../src/orchestrator';
+import { createCordisSeamManager, createInMemoryCordisHost } from '../../src/cordis-seams';
 import {
   buildE2E,
   createDefaultRecordingTaxonomy,
   createRecordingPolicy,
   createScriptedRunner,
+  createThrowingRollbackSeams,
+  makeClock,
+  makeIdFactory,
   mem0LikeServer
 } from './fixtures';
 
@@ -282,5 +286,107 @@ describe('end-to-end lifecycle', () => {
     expect(taxonomy.requests[1]?.previousDiagnoses).toEqual([]);
     expect(taxonomy.requests[1]?.attemptIndex).toBe(1);
     expect(taxonomy.requests[1]?.previousDiagnoses?.length ?? 0).toBe(0);
+  });
+
+  it('keeps a repairable failure schedulable after a later non-repairable sibling', async () => {
+    const options = { maxWidth: 2, maxDepth: 2, rolloutBudget: 6, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const { plugin } = buildE2E({
+      ...options,
+      // slot 0 fails repairably (tool_error), slot 1 fails weakly (timeout)
+      candidateOutcomes: ['fail', 'weak'],
+      extra: { deps: { policy } }
+    });
+
+    const result = await plugin.run({
+      sessionId: 'sess-precedence',
+      task: plugin.makeTask({ id: 'task-precedence', prompt: 'Repair the broken pipeline.' }),
+      trigger: 'always'
+    });
+
+    expect(result.probesRun).toBeGreaterThanOrEqual(2);
+    expect(policy.selectBatchRequests.length).toBeGreaterThanOrEqual(2);
+    const second = policy.selectBatchRequests[1];
+    // the later weak_underexplored diagnosis must not hide the repairable failure
+    expect(second?.previousFailure?.category).toBe('repairable_implementation');
+    expect(second?.previousFailure?.repairable).toBe(true);
+
+    const recoverSlot = policy.batchPlans[1]?.slots.find((slot) => slot.slot === 'recover');
+    expect(recoverSlot).toBeDefined();
+    expect(recoverSlot?.repairOfNodeId).toBeDefined();
+  });
+
+  it('still stops on a terminal diagnosis when a repairable sibling failed first', async () => {
+    const options = { maxWidth: 2, maxDepth: 2, rolloutBudget: 6, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const { plugin } = buildE2E({
+      ...options,
+      // slot 0 repairable, slot 1 terminal (model refusal -> hard_unrecoverable)
+      candidateOutcomes: ['fail', 'hard'],
+      extra: { deps: { policy } }
+    });
+
+    const result = await plugin.run({
+      sessionId: 'sess-terminal',
+      task: plugin.makeTask({ id: 'task-terminal', prompt: 'Repair the broken pipeline.' }),
+      trigger: 'always'
+    });
+
+    expect(result.metadata?.stopReason).toBe('failure_taxonomy:hard_unrecoverable');
+    expect(policy.batchPlans).toHaveLength(1);
+  });
+
+  it('replaces the permanent scaffold instead of stacking it across runs', async () => {
+    const host = createInMemoryCordisHost();
+    const { plugin } = buildE2E({ host, dreamEveryNTasks: 100 });
+    const task = plugin.makeTask({ id: 'task-replace', prompt: 'Fix the failing build.' });
+
+    const first = await plugin.run({ sessionId: 'sess-replace', task, trigger: 'always' });
+    expect(first.outcome).toBe('composed');
+    expect(first.composedPatchId).toBeDefined();
+    expect(plugin.orchestrator.activePatchIds()).toEqual([first.composedPatchId]);
+    const activeAfterFirst = host.activeEffects().length;
+    expect(activeAfterFirst).toBe(1);
+
+    const second = await plugin.run({ sessionId: 'sess-replace', task, trigger: 'always' });
+    expect(second.outcome).toBe('composed');
+    expect(second.composedPatchId).not.toBe(first.composedPatchId);
+
+    // exactly one live scaffold, and the previous run's mounts are gone
+    expect(plugin.orchestrator.activePatchIds()).toEqual([second.composedPatchId]);
+    expect(host.activeEffects().length).toBe(1);
+    expect(
+      host.effects.filter(
+        (effect) => effect.active && effect.namespace.indexOf(first.composedPatchId ?? '') >= 0
+      )
+    ).toEqual([]);
+  });
+
+  it('records a throwing patch rollback as a diagnostic without aborting the run', async () => {
+    const host = createInMemoryCordisHost();
+    const now = makeClock();
+    const seams = createCordisSeamManager({
+      host,
+      namespacePrefix: 'harness2',
+      now,
+      createBranchId: makeIdFactory('br-throw')
+    });
+    const throwing = createThrowingRollbackSeams(seams);
+    const { plugin } = buildE2E({
+      host,
+      dreamEveryNTasks: 100,
+      extra: { deps: { seams: throwing } }
+    });
+    const task = plugin.makeTask({ id: 'task-throwing', prompt: 'Fix the failing build.' });
+
+    const first = await plugin.run({ sessionId: 'sess-throwing', task, trigger: 'always' });
+    expect(first.outcome).toBe('composed');
+    expect(first.composedPatchId).toBeDefined();
+
+    const second = await plugin.run({ sessionId: 'sess-throwing', task, trigger: 'always' });
+    expect(second.outcome).toBe('composed');
+    expect(throwing.rollbackFailures).toEqual([first.composedPatchId]);
+    expect(second.diagnostics.join(' ')).toContain('failed to roll back permanent patch');
+    expect(plugin.orchestrator.activePatchIds()).toEqual([second.composedPatchId]);
   });
 });

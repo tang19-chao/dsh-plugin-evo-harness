@@ -261,12 +261,15 @@ describe('three-way batch portfolio', () => {
     expect(exploit?.seedPatchIds).toEqual(['patch-a']);
   });
 
-  it('omits recovery when the failure is not repairable', () => {
+  it('still scans the tree when the supplied failure is not repairable', () => {
     const { request } = withTree({
       previousFailure: makeDiagnosis('weak_underexplored', { repairable: false })
     });
     const batch = policyApi.selectBatch(request);
-    expect(batch.slots.some((slot) => slot.slot === 'recover')).toBe(false);
+    const recovery = batch.slots.find((slot) => slot.slot === 'recover');
+    expect(recovery?.parentNodeId).toBe('b');
+    expect(recovery?.repairOfNodeId).toBe('b');
+    expect(batch.slots.filter((slot) => slot.slot === 'recover')).toHaveLength(1);
     expect(batch.width).toBeLessThanOrEqual(4);
   });
 
@@ -454,7 +457,7 @@ describe('recovery slot from tree evidence', () => {
     expect(unknownExplicit.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('b2');
   });
 
-  it('keeps the current behaviour for a supplied previousFailure', () => {
+  it('keeps repairable previousFailure targeting and ignores an unhelpful diagnosis', () => {
     const tree = treeWithFailures();
     const repairable = policyApi.selectBatch(
       batchRequest({
@@ -467,14 +470,17 @@ describe('recovery slot from tree evidence', () => {
     );
     expect(repairable.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('b2');
 
-    const nonRepairable = policyApi.selectBatch(
+    const siblingDiagnosis = policyApi.selectBatch(
       batchRequest({
         tree: tree.snapshot(),
         previousFailure: makeDiagnosis('weak_underexplored', { repairable: false }),
         round: 10
       })
     );
-    expect(nonRepairable.slots.some((slot) => slot.slot === 'recover')).toBe(false);
+    expect(siblingDiagnosis.slots.filter((slot) => slot.slot === 'recover')).toHaveLength(1);
+    expect(
+      siblingDiagnosis.slots.find((slot) => slot.slot === 'recover')?.parentNodeId
+    ).toBe('b2');
 
     const emptyTree = createDiscoveryTree({
       id: 'tree-only-success',
@@ -510,6 +516,220 @@ describe('recovery slot from tree evidence', () => {
     expect(batch.slots.filter((slot) => slot.slot === 'recover')).toHaveLength(1);
     expect(batch.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('b3');
     expect(batch.slots).toHaveLength(6);
+  });
+});
+
+describe('recovery targeting across rounds', () => {
+  const policyApi = createActivePolicyFromDefaults();
+
+  function roundTree() {
+    const tree = createDiscoveryTree({
+      id: 'tree-rounds',
+      sessionId: 'session-1',
+      taskId: 'task-1',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    tree.addNode(childInput(tree.rootId, { id: 'f1', origin: 'domain', purpose: 'repair' }));
+    tree.recordProbe('f1', {
+      trajectoryId: 'traj-f1',
+      status: 'failed',
+      score: 0.1,
+      failure: makeDiagnosis('repairable_implementation')
+    });
+    tree.addNode(
+      childInput(tree.rootId, {
+        id: 'f2',
+        origin: 'invariant',
+        guidance: 'guidance_free',
+        purpose: 'repair'
+      })
+    );
+    tree.recordProbe('f2', {
+      trajectoryId: 'traj-f2',
+      status: 'failed',
+      score: 0.2,
+      failure: makeDiagnosis('repairable_implementation', {
+        repairHint: 'Repair mount_script then re-probe.'
+      })
+    });
+    tree.updateNode('f1', { updatedAt: 9_000 });
+    tree.updateNode('f2', { updatedAt: 5_000 });
+    return tree;
+  }
+
+  /** Attach a child that marks the parent as already repaired. */
+  function addChild(
+    tree: ReturnType<typeof roundTree>,
+    parentId: string,
+    childId: string,
+    options: { readonly slot?: 'recover'; readonly purpose?: 'repair' | 'deepen' } = {}
+  ): void {
+    tree.addNode({
+      ...childInput(parentId, {
+        id: childId,
+        origin: 'reference',
+        purpose: options.purpose ?? 'repair'
+      }),
+      ...(options.slot === undefined ? {} : { slot: options.slot }),
+      createdAt: 9_500
+    });
+  }
+
+  it('ignores a sibling-level non-repairable diagnosis and repairs the failed node', () => {
+    const tree = roundTree();
+    const withSiblingDiagnosis = policyApi.selectBatch(
+      batchRequest({
+        tree: tree.snapshot(),
+        previousFailure: makeDiagnosis('weak_underexplored', { repairable: false }),
+        round: 1
+      })
+    );
+    const recovery = withSiblingDiagnosis.slots.find((slot) => slot.slot === 'recover');
+    expect(recovery?.parentNodeId).toBe('f1');
+    expect(recovery?.repairOfNodeId).toBe('f1');
+    expect(withSiblingDiagnosis.slots.filter((slot) => slot.slot === 'recover')).toHaveLength(1);
+
+    const withoutDiagnosis = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), round: 2 })
+    );
+    expect(withoutDiagnosis.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe(
+      'f1'
+    );
+  });
+
+  it('produces no recovery slot when no repairable failure exists anywhere', () => {
+    const tree = createDiscoveryTree({
+      id: 'tree-unrepairable',
+      sessionId: 'session-1',
+      taskId: 'task-1',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    tree.addNode(childInput(tree.rootId, { id: 'w1' }));
+    tree.recordProbe('w1', {
+      trajectoryId: 'traj-w1',
+      status: 'failed',
+      score: 0.1,
+      failure: makeDiagnosis('weak_underexplored', {
+        repairable: false,
+        recommendedAction: 'deepen'
+      })
+    });
+    tree.addNode(childInput(tree.rootId, { id: 'h1' }));
+    tree.recordProbe('h1', {
+      trajectoryId: 'traj-h1',
+      status: 'failed',
+      score: 0,
+      failure: makeDiagnosis('hard_unrecoverable', {
+        repairable: false,
+        recommendedAction: 'discard'
+      })
+    });
+
+    const withoutFailure = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), round: 3 })
+    );
+    expect(withoutFailure.slots.some((slot) => slot.slot === 'recover')).toBe(false);
+    expect(withoutFailure.width).toBeGreaterThan(0);
+
+    const repairableDiagnosisButEmptyTree = policyApi.selectBatch(
+      batchRequest({
+        tree: tree.snapshot(),
+        previousFailure: makeDiagnosis('repairable_implementation'),
+        round: 3
+      })
+    );
+    expect(repairableDiagnosisButEmptyTree.slots.some((slot) => slot.slot === 'recover')).toBe(
+      false
+    );
+  });
+
+  it('skips a failed node that already has a recover-slot child', () => {
+    const tree = roundTree();
+    addChild(tree, 'f1', 'f1-recover', { slot: 'recover', purpose: 'deepen' });
+    const batch = policyApi.selectBatch(batchRequest({ tree: tree.snapshot(), round: 4 }));
+    const recovery = batch.slots.find((slot) => slot.slot === 'recover');
+    expect(recovery?.parentNodeId).toBe('f2');
+    expect(batch.slots.filter((slot) => slot.slot === 'recover')).toHaveLength(1);
+  });
+
+  it('skips a failed node that already has a repair-purpose child', () => {
+    const tree = roundTree();
+    addChild(tree, 'f1', 'f1-repair', { purpose: 'repair' });
+    const batch = policyApi.selectBatch(batchRequest({ tree: tree.snapshot(), round: 5 }));
+    expect(batch.slots.filter((slot) => slot.slot === 'recover')).toHaveLength(1);
+    expect(batch.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('f2');
+  });
+
+  it('produces no recovery slot once every repairable failure was already repaired', () => {
+    const tree = roundTree();
+    addChild(tree, 'f1', 'f1-recover', { slot: 'recover', purpose: 'deepen' });
+    addChild(tree, 'f2', 'f2-repair', { purpose: 'repair' });
+    const batch = policyApi.selectBatch(batchRequest({ tree: tree.snapshot(), round: 6 }));
+    expect(batch.slots.some((slot) => slot.slot === 'recover')).toBe(false);
+    expect(batch.width).toBeGreaterThan(0);
+  });
+
+  it('lets an explicit id win over the scan, including an already repaired node', () => {
+    const tree = roundTree();
+    tree.addNode(childInput(tree.rootId, { id: 'f3', origin: 'reference', purpose: 'repair' }));
+    tree.recordProbe('f3', {
+      trajectoryId: 'traj-f3',
+      status: 'failed',
+      score: 0.3,
+      failure: makeDiagnosis('repairable_implementation')
+    });
+    tree.updateNode('f3', { updatedAt: 12_000 });
+    addChild(tree, 'f1', 'f1-recover', { slot: 'recover', purpose: 'deepen' });
+
+    const scanned = policyApi.selectBatch(batchRequest({ tree: tree.snapshot(), round: 7 }));
+    expect(scanned.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('f3');
+
+    const explicit = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), metadata: { repairNodeId: 'f2' }, round: 8 })
+    );
+    expect(explicit.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('f2');
+
+    const explicitAlias = policyApi.selectBatch(
+      batchRequest({
+        tree: tree.snapshot(),
+        metadata: { previousFailureNodeId: 'f2' },
+        round: 9
+      })
+    );
+    expect(explicitAlias.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('f2');
+
+    const explicitRepaired = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), metadata: { repairNodeId: 'f1' }, round: 10 })
+    );
+    expect(explicitRepaired.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe(
+      'f1'
+    );
+  });
+
+  it('preserves the single-slot width requirement and guidance inheritance', () => {
+    const tree = roundTree();
+    const wide = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), grid: grid({ maxWidth: 6, budget: 24 }), round: 11 })
+    );
+    expect(wide.slots.filter((slot) => slot.slot === 'recover')).toHaveLength(1);
+    expect(wide.slots).toHaveLength(6);
+
+    const narrow = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), grid: grid({ maxWidth: 1, budget: 1 }), round: 12 })
+    );
+    expect(narrow.width).toBe(1);
+    expect(narrow.slots.some((slot) => slot.slot === 'recover')).toBe(false);
+
+    const targeted = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), metadata: { repairNodeId: 'f2' }, round: 13 })
+    );
+    const recovery = targeted.slots.find((slot) => slot.slot === 'recover');
+    expect(recovery?.origin).toBe('invariant');
+    expect(recovery?.guidance).toBe('guidance_free');
+    expect(recovery?.seedPatchIds).toEqual(['patch-f2']);
+    expect(recovery?.rationale).toContain('mount_script');
   });
 });
 
