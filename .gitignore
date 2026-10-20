@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# team runtime state (never publish)
+.agent-teams/
+
+# local scratch and upstream verification artifacts
+work/
+outputs/
+%SystemDrive%/
+
+# build and test output
+dist/
+coverage/
+*.tsbuildinfo
+
+# logs and local env
+*.log
+.env
+.env.*
+
+# editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
