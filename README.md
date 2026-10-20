@@ -321,7 +321,8 @@ Stated plainly, because they matter when you evaluate this plugin:
   surrogate score are documented heuristics; the offline dreamer is the only component with a
   monotonic non-regression guarantee (a candidate policy must strictly beat `pi^0`).
 - **Packaging status.** The package is `private`, version `0.1.0`, and is not published to a
-  registry. No CI workflow exists in this repository yet, so no badge is shown. There is **no
+  registry. CI runs `tsc --noEmit` and the full Vitest suite on push and pull requests to
+  `main` (`.github/workflows/ci.yml`); no status badge is shown. There is **no
   LICENSE file**, so the licensing terms are unspecified.
 
 ## Design document
