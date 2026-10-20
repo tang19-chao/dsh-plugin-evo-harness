@@ -226,6 +226,26 @@ describe('pre-write deterministic gate', () => {
     expect(finding?.severity).toBe('warn');
   });
 
+  it('accepts a CJK restraint clause and vetoes it only on genuine majority coverage', async () => {
+    const { bridge } = bridgeWith();
+    const lesson = validLesson({ id: 'L-cjk', whenNotToApply: ['不适用于简单表格任务'] });
+    // The pre-write gate must treat the CJK restraint clause as present.
+    const commit = await bridge.commit(lesson, { scope: branchScope() });
+    expect(commit.accepted).toBe(true);
+    expect(commit.violations.map((violation) => violation.code)).not.toContain('missing_when_not_to_apply');
+
+    // Incidental bigram ("任务") in an unrelated prompt: no veto.
+    const incidental = await bridge.recall({ scope: branchScope(), text: '请帮我完成这个任务' });
+    expect(incidental.positiveLessons.map((entry) => entry.id)).toEqual(['L-cjk']);
+    expect(incidental.suppressedLessons).toEqual([]);
+
+    // A prompt that genuinely covers the clause: vetoed with the matched clause reported.
+    const genuine = await bridge.recall({ scope: branchScope(), text: '简单表格任务的场景' });
+    expect(genuine.positiveLessons).toEqual([]);
+    const suppression = genuine.suppressedLessons.find((entry) => entry.reason === 'when_not_to_apply');
+    expect(suppression?.detail).toContain('不适用于简单表格任务');
+  });
+
   it('reports the gate split (blocking vs warning) for a pure validation call', () => {
     const gate = validateLessonForWrite({
       lesson: validLesson({ whenToApply: [], id: 'L-dup' }),

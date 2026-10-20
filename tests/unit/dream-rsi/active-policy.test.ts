@@ -93,7 +93,8 @@ function batchRequest(overrides: Partial<SelectBatchRequest> = {}): SelectBatchR
       : { previousBestNodeId: overrides.previousBestNodeId }),
     ...(overrides.previousFailure === undefined
       ? {}
-      : { previousFailure: overrides.previousFailure })
+      : { previousFailure: overrides.previousFailure }),
+    ...(overrides.metadata === undefined ? {} : { metadata: overrides.metadata })
   };
 }
 
@@ -321,6 +322,194 @@ describe('three-way batch portfolio', () => {
     expect(domain?.memoryHintIds).toEqual(['lesson-1', 'lesson-2']);
     const invariant = batch.slots.find((slot) => slot.slot === 'explore_invariant');
     expect(invariant?.memoryHintIds).toBeUndefined();
+  });
+});
+
+describe('recovery slot from tree evidence', () => {
+  const policyApi = createActivePolicyFromDefaults();
+
+  function treeWithFailures() {
+    const tree = createDiscoveryTree({
+      id: 'tree-recover',
+      sessionId: 'session-1',
+      taskId: 'task-1',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    tree.addNode(childInput(tree.rootId, { id: 'b1', origin: 'domain', purpose: 'repair' }));
+    tree.recordProbe('b1', {
+      trajectoryId: 'traj-b1',
+      status: 'failed',
+      score: 0.1,
+      failure: makeDiagnosis('repairable_implementation')
+    });
+    tree.addNode(
+      childInput(tree.rootId, {
+        id: 'b2',
+        origin: 'invariant',
+        guidance: 'guidance_free',
+        purpose: 'repair'
+      })
+    );
+    tree.recordProbe('b2', {
+      trajectoryId: 'traj-b2',
+      status: 'failed',
+      score: 0.2,
+      failure: makeDiagnosis('repairable_implementation', {
+        repairHint: 'Repair mount_script then re-probe.'
+      })
+    });
+    tree.updateNode('b1', { updatedAt: 5_000 });
+    tree.updateNode('b2', { updatedAt: 9_000 });
+    return tree;
+  }
+
+  it('targets the most recently updated repairable failure without previousFailure', () => {
+    const tree = treeWithFailures();
+    const batch = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), memoryConfidence: 0.2, round: 3 })
+    );
+    const recoveries = batch.slots.filter((slot) => slot.slot === 'recover');
+    expect(recoveries).toHaveLength(1);
+    const recovery = recoveries[0];
+    expect(recovery?.parentNodeId).toBe('b2');
+    expect(recovery?.repairOfNodeId).toBe('b2');
+    expect(recovery?.origin).toBe('invariant');
+    expect(recovery?.guidance).toBe('guidance_free');
+    expect(recovery?.seedPatchIds).toEqual(['patch-b2']);
+    expect(recovery?.rationale).toContain('mount_script');
+    expect(batch.slots.filter((slot) => slot.slot === 'recover')).toHaveLength(1);
+  });
+
+  it('produces no recovery slot for non-repairable or absent failures', () => {
+    const nonRepairable = createDiscoveryTree({
+      id: 'tree-weak',
+      sessionId: 'session-1',
+      taskId: 'task-1',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    nonRepairable.addNode(childInput(nonRepairable.rootId, { id: 'w1' }));
+    nonRepairable.recordProbe('w1', {
+      trajectoryId: 'traj-w1',
+      status: 'failed',
+      score: 0.1,
+      failure: makeDiagnosis('weak_underexplored', {
+        repairable: false,
+        recommendedAction: 'deepen'
+      })
+    });
+    nonRepairable.addNode(childInput(nonRepairable.rootId, { id: 'h1' }));
+    nonRepairable.recordProbe('h1', {
+      trajectoryId: 'traj-h1',
+      status: 'failed',
+      score: 0,
+      failure: makeDiagnosis('hard_unrecoverable', {
+        repairable: false,
+        recommendedAction: 'discard'
+      })
+    });
+    const weakBatch = policyApi.selectBatch(
+      batchRequest({ tree: nonRepairable.snapshot(), round: 4 })
+    );
+    expect(weakBatch.slots.some((slot) => slot.slot === 'recover')).toBe(false);
+
+    const clean = createDiscoveryTree({
+      id: 'tree-clean',
+      sessionId: 'session-1',
+      taskId: 'task-1',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    clean.recordProbe(clean.rootId, { trajectoryId: 'traj-root', score: 0.5 });
+    clean.addNode(childInput(clean.rootId, { id: 'ok' }));
+    clean.recordProbe('ok', { trajectoryId: 'traj-ok', score: 0.8 });
+    const cleanBatch = policyApi.selectBatch(batchRequest({ tree: clean.snapshot(), round: 5 }));
+    expect(cleanBatch.slots.some((slot) => slot.slot === 'recover')).toBe(false);
+    expect(cleanBatch.width).toBeGreaterThan(0);
+  });
+
+  it('lets an explicit repair node id win over the tree scan', () => {
+    const tree = treeWithFailures();
+    const byRepairNodeId = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), metadata: { repairNodeId: 'b1' }, round: 6 })
+    );
+    expect(byRepairNodeId.slots.filter((slot) => slot.slot === 'recover')).toHaveLength(1);
+    expect(
+      byRepairNodeId.slots.find((slot) => slot.slot === 'recover')?.parentNodeId
+    ).toBe('b1');
+
+    const byAlias = policyApi.selectBatch(
+      batchRequest({
+        tree: tree.snapshot(),
+        metadata: { previousFailureNodeId: 'b1' },
+        round: 7
+      })
+    );
+    expect(byAlias.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('b1');
+
+    const unknownExplicit = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), metadata: { repairNodeId: 'ghost' }, round: 8 })
+    );
+    expect(unknownExplicit.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('b2');
+  });
+
+  it('keeps the current behaviour for a supplied previousFailure', () => {
+    const tree = treeWithFailures();
+    const repairable = policyApi.selectBatch(
+      batchRequest({
+        tree: tree.snapshot(),
+        previousFailure: makeDiagnosis('repairable_implementation', {
+          repairHint: 'Repair mount_script then re-probe.'
+        }),
+        round: 9
+      })
+    );
+    expect(repairable.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('b2');
+
+    const nonRepairable = policyApi.selectBatch(
+      batchRequest({
+        tree: tree.snapshot(),
+        previousFailure: makeDiagnosis('weak_underexplored', { repairable: false }),
+        round: 10
+      })
+    );
+    expect(nonRepairable.slots.some((slot) => slot.slot === 'recover')).toBe(false);
+
+    const emptyTree = createDiscoveryTree({
+      id: 'tree-only-success',
+      sessionId: 'session-1',
+      taskId: 'task-1',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    emptyTree.recordProbe(emptyTree.rootId, { trajectoryId: 'traj-root', score: 0.6 });
+    const withoutCandidates = policyApi.selectBatch(
+      batchRequest({
+        tree: emptyTree.snapshot(),
+        previousFailure: makeDiagnosis('repairable_implementation'),
+        round: 11
+      })
+    );
+    expect(withoutCandidates.slots.some((slot) => slot.slot === 'recover')).toBe(false);
+  });
+
+  it('never exceeds one recovery slot even with several repairable failures', () => {
+    const tree = treeWithFailures();
+    tree.addNode(childInput(tree.rootId, { id: 'b3', origin: 'reference', purpose: 'repair' }));
+    tree.recordProbe('b3', {
+      trajectoryId: 'traj-b3',
+      status: 'failed',
+      score: 0.3,
+      failure: makeDiagnosis('repairable_implementation')
+    });
+    tree.updateNode('b3', { updatedAt: 12_000 });
+    const batch = policyApi.selectBatch(
+      batchRequest({ tree: tree.snapshot(), grid: grid({ maxWidth: 6, budget: 24 }), round: 12 })
+    );
+    expect(batch.slots.filter((slot) => slot.slot === 'recover')).toHaveLength(1);
+    expect(batch.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('b3');
+    expect(batch.slots).toHaveLength(6);
   });
 });
 

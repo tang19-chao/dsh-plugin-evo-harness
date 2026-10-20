@@ -100,14 +100,16 @@ function candidateSet(): readonly ProbeCandidate[] {
   return [alpha, beta, gamma];
 }
 
-function composeRequest(script: readonly (string | Error)[]) {
+function composeRequest(
+  script: readonly (string | Error)[],
+  candidates: readonly ProbeCandidate[] = candidateSet()
+) {
   const model = scriptedModel(script);
   const composer = createAnonymousComposer({
     model,
     now: fixedClock(),
     newId: createDeterministicIdFactory('compose-test')
   });
-  const candidates = candidateSet();
   const request: ComposeRequest = {
     task: makeTask(),
     sessionId: 'sess_1',
@@ -237,6 +239,89 @@ describe('Harness² composer / evidence-backed selection', () => {
     expect(result.assessments).toEqual([]);
     expect(result.adoptionRatios).toEqual({});
     expect(result.rationale).toContain('no candidates');
+  });
+
+  it('exposes every adoption ratio under the alias, branchId and nodeId keys', async () => {
+    const { composer, request } = composeRequest([JUDGE_VERDICT]);
+    const result = await composer.compose(request);
+
+    expect(Object.keys(result.adoptionRatios).sort()).toEqual(
+      [
+        'branch_a',
+        'branch_b',
+        'branch_c',
+        'candidate_A',
+        'candidate_B',
+        'candidate_C',
+        'node_a',
+        'node_b',
+        'node_c'
+      ].sort()
+    );
+    // The alias -> assessment mapping the judge and audits rely on is unchanged.
+    expect(result.assessments.map((assessment) => assessment.alias)).toEqual([
+      'candidate_A',
+      'candidate_B',
+      'candidate_C'
+    ]);
+    expect(result.assessments.map((assessment) => assessment.nodeId)).toEqual(['node_a', 'node_b', 'node_c']);
+    for (const assessment of result.assessments) {
+      const byAlias = result.adoptionRatios[assessment.alias];
+      expect(byAlias).toBe(assessment.adoptionRatio);
+      expect(result.adoptionRatios[assessment.branchId]).toBe(byAlias);
+      expect(result.adoptionRatios[assessment.nodeId]).toBe(byAlias);
+    }
+  });
+
+  it('keeps the three-key mapping collision-safe when identities overlap', async () => {
+    const slow = makeCandidate({
+      nodeId: 'node_x',
+      branchId: 'branch_x',
+      trajectory: makeTrajectory({
+        id: 'traj_node_x',
+        nodeId: 'node_x',
+        branchId: 'branch_x',
+        patchId: 'patch_node_x',
+        status: 'succeeded',
+        metrics: { steps: 30, toolCalls: 26, toolErrors: 12, durationMs: 9000 },
+        deliverable: { content: 'slow result', format: 'text' }
+      })
+    });
+    const fast = makeCandidate({
+      nodeId: 'node_y',
+      // Deliberate collision: this branch id equals the other candidate's node id.
+      branchId: 'node_x',
+      trajectory: makeTrajectory({
+        id: 'traj_node_y',
+        nodeId: 'node_y',
+        branchId: 'node_x',
+        patchId: 'patch_node_y',
+        status: 'succeeded',
+        metrics: { steps: 3, toolCalls: 2, toolErrors: 0, durationMs: 500 },
+        deliverable: { content: 'fast result', format: 'text' }
+      })
+    });
+    const { model, composer, request } = composeRequest([JUDGE_VERDICT], [slow, fast]);
+    const result = await composer.compose(request);
+
+    const slowAssessment = result.assessments.find((assessment) => assessment.nodeId === 'node_x');
+    const fastAssessment = result.assessments.find((assessment) => assessment.nodeId === 'node_y');
+    expect(slowAssessment?.alias).toBe('candidate_A');
+    expect(fastAssessment?.alias).toBe('candidate_B');
+
+    // The colliding key keeps the first writer (candidate_A's own node id).
+    expect(result.adoptionRatios.node_x).toBe(slowAssessment?.adoptionRatio);
+    expect(result.adoptionRatios.node_x).not.toBe(fastAssessment?.adoptionRatio);
+    expect(result.adoptionRatios.branch_x).toBe(slowAssessment?.adoptionRatio);
+    expect(result.adoptionRatios.node_y).toBe(fastAssessment?.adoptionRatio);
+    expect(result.adoptionRatios.candidate_B).toBe(fastAssessment?.adoptionRatio);
+    expect(result.rationale).toContain('adoption key collisions kept the first writer: node_x');
+
+    // Anonymisation is unchanged: the judge still saw aliases only.
+    const prompt = promptText(model);
+    expect(prompt).toContain('candidate_A');
+    expect(prompt).not.toContain('node_x');
+    expect(prompt).not.toContain('branch_x');
   });
 
   it('is deterministic for identical inputs', async () => {

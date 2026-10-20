@@ -65,7 +65,6 @@ import type {
 } from './types/contracts';
 import {
   createDiscoveryTree,
-  generateCandidatePolicies,
   isTerminalFailure
 } from './dream-rsi';
 import type {
@@ -239,10 +238,11 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     this.now = deps.now ?? ((): number => Date.now());
     this.newId = deps.newId ?? ((): string => 'run-' + String(this.count + 1));
     this.createTree = deps.createTree ?? createDiscoveryTree;
-    this.candidatePolicies =
-      deps.candidatePolicies ??
-      ((baseline: MetaSearchPolicy, count: number) =>
-        generateCandidatePolicies(baseline, count, { now: this.now }));
+    // Offline dreaming is driven by the dreamer's own PolicyGenerator (the
+    // deterministic or model-backed one); the orchestrator only forwards an
+    // explicit override. config.dreamRsi.candidatePoliciesCount still bounds the
+    // produced count through the dreamer's policyCount option.
+    this.candidatePolicies = deps.candidatePolicies ?? (() => []);
     this.applyWinningPatch = deps.applyWinningPatch !== false;
     this.treePool = deps.treePool;
   }
@@ -540,18 +540,34 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           trajectories.push(trajectory);
 
           stage('classify', { round: rounds });
+          // Lineage comes from the node's ancestor chain, not from the previous
+          // sibling, so repeated-failure counting accumulates across depths and
+          // 'repeatedly_unpromising' (threshold 3) is reachable.
+          const lineage: readonly FailureDiagnosis[] = tree
+            .ancestorsOf(node.id)
+            .map((ancestor) => ancestor.failure)
+            .filter(
+              (failure): failure is FailureDiagnosis =>
+                failure !== undefined && failure.category !== 'none'
+            );
           const diagnosis: FailureDiagnosis = this.deps.taxonomy.diagnose({
             trajectory,
             node,
-            attemptIndex: rounds,
-            previousDiagnoses: previousFailure === undefined ? [] : [previousFailure],
+            attemptIndex: lineage.length + 1,
+            previousDiagnoses: lineage,
             hasUnexploredDirections: rounds < maxRounds,
             maxDepthReached: rounds >= maxRounds
           });
 
           stage('score', { round: rounds });
+          // Score a snapshot whose status already reflects the probe outcome. The
+          // tree node is still 'probing' until recordProbe, and with no composition
+          // yet a non-succeeded node zeroes the selection signal, so only the
+          // efficiency + error-penalty terms could score (a hard 0.2 ceiling).
+          const probeStatus = nodeStatusFor(trajectory.status);
+          const scoredNode: DiscoveryNode = { ...node, status: probeStatus };
           const score: SurrogateScore = this.deps.scorer.score({
-            node,
+            node: scoredNode,
             trajectory,
             referenceTrajectory: reference,
             weights: config.dreamRsi.surrogateWeights
@@ -559,10 +575,12 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
 
           tree.recordProbe(node.id, {
             trajectoryId: trajectory.id,
-            status: nodeStatusFor(trajectory.status),
+            status: probeStatus,
             score: score.score,
             ...(diagnosis.category === 'none' ? {} : { failure: diagnosis }),
-            metadata: { slot: slot.slot }
+            // surfaceKeys is what ActivePolicy.surfacesFromMetadata reads to focus
+            // exploit/recover slots on the surfaces that actually moved.
+            metadata: { slot: slot.slot, surfaceKeys: [...trajectory.surfaceKeys] }
           });
           candidates.push({
             nodeId: node.id,
@@ -574,7 +592,11 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
             bestScore = score.score;
             previousBestNodeId = node.id;
           }
-          previousFailure = diagnosis.category === 'none' ? undefined : diagnosis;
+          if (diagnosis.category !== 'none') {
+            // Retain the failure: ActivePolicy.findRecoveryTarget needs it to
+            // schedule a recover slot even when a sibling slot just succeeded.
+            previousFailure = diagnosis;
+          }
         }
 
         if (candidates.length === 0) {
@@ -592,6 +614,37 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           metadata: { round: rounds, referenceStatus: reference.status }
         });
         this.composition = composition;
+
+        // Re-score every candidate against the composition that now exists and
+        // persist the final surrogate score plus the adoption ratio, then derive
+        // bestScore/previousBestNodeId from those final values. This is what turns
+        // the selection (0.4) and adoption (0.3) signals on at all.
+        let bestFinalScore = bestScore;
+        for (const candidate of candidates) {
+          const currentNode = tree.getNode(candidate.nodeId);
+          if (currentNode === undefined) {
+            continue;
+          }
+          const finalScore: SurrogateScore = this.deps.scorer.score({
+            node: currentNode,
+            trajectory: candidate.trajectory,
+            referenceTrajectory: reference,
+            composition,
+            weights: config.dreamRsi.surrogateWeights
+          });
+          const assessment = composition.assessments.find(
+            (entry) => entry.nodeId === candidate.nodeId
+          );
+          tree.updateNode(candidate.nodeId, {
+            score: finalScore.score,
+            ...(assessment === undefined ? {} : { adoptionRatio: assessment.adoptionRatio })
+          });
+          if (finalScore.score > bestFinalScore) {
+            bestFinalScore = finalScore.score;
+            previousBestNodeId = candidate.nodeId;
+          }
+        }
+        bestScore = bestFinalScore;
 
         const selected = composition.assessments.some((assessment) => assessment.selected);
         if (selected) {
@@ -645,7 +698,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           trajectories,
           referenceTrajectory: reference,
           recall,
-          scope
+          scope,
+          // The reflector needs the candidate patch bodies to attach
+          // executionPatch.componentDiffs (and to syntax-audit embedded scripts).
+          metadata: { candidatePatches: candidates.map((candidate) => candidate.patch) }
         });
         this.lessons = reflection.lessons;
 
@@ -838,6 +894,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         const outcome = await this.deps.memory.commit(lesson, { scope, enforceGovernance: true });
         if (outcome.accepted && outcome.persisted) {
           committed += 1;
+          await this.promoteLessonIfConfigured(lesson, scope, diagnostics);
           continue;
         }
         const reasons = outcome.violations.map((violation) => violation.code).join(', ');
@@ -849,6 +906,41 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       }
     }
     return committed;
+  }
+
+  /**
+   * promoteOnComposeSuccess: a committed positive lesson is re-stamped into the
+   * global namespace so later sessions can recall it. Promotion problems are
+   * diagnostics and never abort the run; the false setting is respected.
+   */
+  private async promoteLessonIfConfigured(
+    lesson: CanonicalLesson,
+    scope: MemoryScope,
+    diagnostics: string[]
+  ): Promise<void> {
+    if (!this.deps.config.memoryBridge.promoteOnComposeSuccess) {
+      return;
+    }
+    if (lesson.polarity !== 'positive' || scope.kind === 'global') {
+      return;
+    }
+    try {
+      const promotion = await this.deps.memory.promote(lesson, {
+        from: scope,
+        to: { kind: 'global' }
+      });
+      if (!promotion.accepted || !promotion.persisted) {
+        const reasons = promotion.violations.map((violation) => violation.code).join(', ');
+        diagnostics.push(
+          'lesson ' + lesson.id + ' was not promoted to global' +
+            (reasons.length === 0 ? '' : ': ' + reasons)
+        );
+        return;
+      }
+      diagnostics.push('promoted lesson ' + lesson.id + ' to global scope');
+    } catch (error) {
+      diagnostics.push('lesson ' + lesson.id + ' promotion failed: ' + errorMessage(error));
+    }
   }
 
   /** True when the completed-task cadence for offline dreaming has been hit. */

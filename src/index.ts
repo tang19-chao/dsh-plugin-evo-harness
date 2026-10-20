@@ -189,6 +189,7 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
     adapter.forkBranch = async (request: { branchId: string; sessionId: string; namespace: string }) => {
       const result = await fork.call(ctx, request);
       const record = asRecord(result);
+      let disposed = false;
       return {
         branchId: request.branchId,
         namespace: request.namespace,
@@ -197,12 +198,20 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
             ? record.contextId
             : 'ctx-' + request.branchId,
         get isDisposed(): boolean {
-          return false;
+          return disposed;
         },
         dispose: async (): Promise<void> => {
+          if (disposed) {
+            return;
+          }
+          disposed = true;
           const disposer = record === undefined ? undefined : record.dispose;
           if (typeof disposer === 'function') {
-            await (disposer as () => Promise<void>).call(result);
+            try {
+              await (disposer as () => Promise<void>).call(result);
+            } catch {
+              // Record disposed state even on error
+            }
           }
         }
       };
@@ -270,6 +279,7 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
     adapter.acquireSandbox = async (request: unknown) => {
       const result = await acquireSandbox.call(asRecord(ctx)?.sandbox, request);
       const record = asRecord(result);
+      let disposed = false;
       return {
         id:
           record !== undefined && typeof record.id === 'string'
@@ -278,12 +288,20 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
         branchId: String((request as { branchId?: string }).branchId ?? 'unknown'),
         path: record !== undefined && typeof record.path === 'string' ? record.path : null,
         get isDisposed(): boolean {
-          return false;
+          return disposed;
         },
         dispose: async (): Promise<void> => {
+          if (disposed) {
+            return;
+          }
+          disposed = true;
           const disposer = record === undefined ? undefined : record.dispose;
           if (typeof disposer === 'function') {
-            await (disposer as () => Promise<void>).call(result);
+            try {
+              await (disposer as () => Promise<void>).call(result);
+            } catch {
+              // Record disposed state even on error
+            }
           }
         }
       };
@@ -431,7 +449,8 @@ export function buildOrchestratorDeps(
       treePool,
       activePolicy: policy,
       policyCount: config.dreamRsi.candidatePoliciesCount,
-      rhoPreferences: config.dreamRsi.rhoPreferences
+      rhoPreferences: config.dreamRsi.rhoPreferences,
+      modelAdapter: options.model
     });
 
   const deps: EvoHarnessOrchestratorDeps = {

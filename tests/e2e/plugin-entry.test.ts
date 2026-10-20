@@ -1,13 +1,22 @@
+/**
+ * Cordis plugin entrypoint and host-adapter wrapper tests.
+ *
+ * Self-contained by design: this file builds its own host contexts instead of
+ * extending tests/e2e/fixtures.ts (owned by another task). Everything is
+ * in-process and deterministic - no host runtime, network or real LLM.
+ */
 import { describe, expect, it, vi } from 'vitest';
 import pluginDefault, {
   EVO_COMMAND_NAME,
   PLUGIN_NAME,
   apply,
+  buildOrchestratorDeps,
   createCordisHostFromContext,
   createEvoHarnessPlugin,
   hostAdapterSeamCount
 } from '../../src/index';
-import type { EvoHarnessRunResult } from '../../src/types/contracts';
+import { parseEvoHarnessConfig } from '../../src/config';
+import type { DiscoveryNode, DiscoveryTreeSnapshot, EvoHarnessRunResult } from '../../src/types/contracts';
 import {
   createBareContext,
   createFakeContext,
@@ -34,6 +43,44 @@ function buildPlugin(ctx: unknown, options: Record<string, unknown> = {}) {
     },
     ctx
   );
+}
+
+/** Minimal valid tree snapshot for direct offline-dreamer replay assertions. */
+function makeTreeSnapshot(): DiscoveryTreeSnapshot {
+  const node: DiscoveryNode = {
+    id: 'node-1',
+    treeId: 'tree-1',
+    parentId: null,
+    depth: 0,
+    branchId: 'branch-1',
+    patchId: 'patch-1',
+    patchOrigin: 'reference',
+    purpose: 'initial',
+    guidance: 'guidance_free',
+    status: 'succeeded',
+    score: 0.8,
+    adoptionRatio: 0.5,
+    childIds: [],
+    createdAt: 1,
+    updatedAt: 2
+  };
+  return {
+    id: 'tree-1',
+    sessionId: 'sess-tree',
+    taskId: 'task-tree',
+    rootId: node.id,
+    nodes: { [node.id]: node },
+    stats: {
+      nodeCount: 1,
+      maxDepth: 0,
+      maxWidth: 1,
+      scoredNodes: 1,
+      completedNodes: 1
+    },
+    completed: true,
+    createdAt: 1,
+    updatedAt: 2
+  };
 }
 
 describe('plugin entrypoint', () => {
@@ -215,5 +262,235 @@ describe('plugin entrypoint', () => {
     });
     expect(afterDispose.outcome).toBe('failed');
     await plugin.dispose();
+  });
+});
+
+describe('host adapter wrapper disposal state', () => {
+  it('tracks forkBranch disposal state: false before, true after, disposer called once', async () => {
+    const disposeCalls: string[] = [];
+    const ctx = {
+      forkBranch: vi.fn(() => ({
+        contextId: 'child-ctx',
+        dispose: vi.fn(async () => {
+          disposeCalls.push('fork');
+        })
+      })),
+      registerCommand: vi.fn()
+    };
+
+    const adapter = createCordisHostFromContext(ctx);
+    expect(adapter.forkBranch).toBeDefined();
+
+    const branch = await adapter.forkBranch?.({
+      branchId: 'br-test-1',
+      sessionId: 'sess-dispose',
+      namespace: 'test:ns'
+    });
+
+    expect(branch?.isDisposed).toBe(false);
+    expect(branch?.contextId).toBe('child-ctx');
+    expect(disposeCalls).toEqual([]);
+
+    await branch?.dispose();
+    expect(branch?.isDisposed).toBe(true);
+    expect(disposeCalls).toEqual(['fork']);
+
+    // idempotent: a second dispose must not call the underlying disposer again
+    await branch?.dispose();
+    await branch?.dispose();
+    expect(branch?.isDisposed).toBe(true);
+    expect(disposeCalls).toEqual(['fork']);
+  });
+
+  it('tracks acquireSandbox disposal state: false before, true after, disposer called once', async () => {
+    const disposeCalls: string[] = [];
+    const ctx = {
+      sandbox: {
+        acquireWorkspace: vi.fn(() => ({
+          id: 'sandbox-ws-1',
+          path: '/tmp/work',
+          dispose: vi.fn(async () => {
+            disposeCalls.push('sandbox');
+          })
+        }))
+      },
+      registerCommand: vi.fn()
+    };
+
+    const adapter = createCordisHostFromContext(ctx);
+    expect(adapter.acquireSandbox).toBeDefined();
+
+    const sandbox = await adapter.acquireSandbox?.({
+      branchId: 'br-sandbox-1',
+      sessionId: 'sess-dispose',
+      namespace: 'test:ns',
+      patchId: 'patch-1'
+    });
+
+    expect(sandbox?.isDisposed).toBe(false);
+    expect(sandbox?.id).toBe('sandbox-ws-1');
+    expect(sandbox?.path).toBe('/tmp/work');
+
+    await sandbox?.dispose();
+    expect(sandbox?.isDisposed).toBe(true);
+    expect(disposeCalls).toEqual(['sandbox']);
+
+    await sandbox?.dispose();
+    expect(sandbox?.isDisposed).toBe(true);
+    expect(disposeCalls).toEqual(['sandbox']);
+  });
+
+  it('keeps disposal state per branch instance and never shares it between branches', async () => {
+    const disposed: string[] = [];
+    const ctx = {
+      forkBranch: vi.fn((request: { branchId: string }) => ({
+        contextId: 'ctx-' + request.branchId,
+        dispose: vi.fn(async () => {
+          disposed.push(request.branchId);
+        })
+      })),
+      registerCommand: vi.fn()
+    };
+
+    const adapter = createCordisHostFromContext(ctx);
+    const first = await adapter.forkBranch?.({
+      branchId: 'br-a',
+      sessionId: 'sess-a',
+      namespace: 'test:a'
+    });
+    const second = await adapter.forkBranch?.({
+      branchId: 'br-b',
+      sessionId: 'sess-b',
+      namespace: 'test:b'
+    });
+
+    expect(first?.isDisposed).toBe(false);
+    expect(second?.isDisposed).toBe(false);
+
+    await first?.dispose();
+    expect(first?.isDisposed).toBe(true);
+    // disposing branch A must not mark branch B disposed
+    expect(second?.isDisposed).toBe(false);
+    expect(disposed).toEqual(['br-a']);
+
+    await second?.dispose();
+    expect(second?.isDisposed).toBe(true);
+    expect(disposed).toEqual(['br-a', 'br-b']);
+
+    // a third branch created after the others is still live
+    const third = await adapter.forkBranch?.({
+      branchId: 'br-c',
+      sessionId: 'sess-c',
+      namespace: 'test:c'
+    });
+    expect(third?.isDisposed).toBe(false);
+    await third?.dispose();
+    expect(third?.isDisposed).toBe(true);
+    expect(disposed).toEqual(['br-a', 'br-b', 'br-c']);
+  });
+
+  it('records a consistent disposed state when the underlying disposer fails', async () => {
+    const disposeCalls: string[] = [];
+    const ctx = {
+      forkBranch: vi.fn(() => ({
+        contextId: 'child-error',
+        dispose: vi.fn(async () => {
+          disposeCalls.push('fork');
+          throw new Error('underlying dispose error');
+        })
+      })),
+      registerCommand: vi.fn()
+    };
+
+    const adapter = createCordisHostFromContext(ctx);
+    const branch = await adapter.forkBranch?.({
+      branchId: 'br-error',
+      sessionId: 'sess-error',
+      namespace: 'test:ns'
+    });
+    expect(branch?.isDisposed).toBe(false);
+
+    // the wrapper may surface or absorb the failure, but it must never report a
+    // live resource afterwards and must never call the disposer twice
+    try {
+      await branch?.dispose();
+    } catch {
+      // tolerated: propagating the host failure is acceptable behaviour
+    }
+    expect(branch?.isDisposed).toBe(true);
+    expect(disposeCalls).toHaveLength(1);
+
+    try {
+      await branch?.dispose();
+    } catch {
+      // tolerated
+    }
+    expect(branch?.isDisposed).toBe(true);
+    expect(disposeCalls).toHaveLength(1);
+  });
+});
+
+describe('offline dreamer model wiring', () => {
+  it('passes modelAdapter to createOfflineDreamer when a model is configured', async () => {
+    const config = parseEvoHarnessConfig(e2eConfig());
+    const model = createScriptedModel();
+    const diagnostics: string[] = [];
+
+    const { deps } = buildOrchestratorDeps(config, { model, now: makeClock() }, {}, diagnostics);
+
+    const report = await deps.dreamer.replay({
+      trees: [makeTreeSnapshot()],
+      baselinePolicy: deps.policy.policy,
+      candidatePolicies: []
+    });
+
+    // the model-backed PolicyGenerator is the selected generator, so the model
+    // receives exactly one dream_policy completion request
+    const dreamRequests = model.requests.filter((request) => request.purpose === 'dream_policy');
+    expect(dreamRequests).toHaveLength(1);
+    expect(dreamRequests[0]?.responseFormat).toBe('json');
+    expect(report.ranAt).toBeGreaterThan(0);
+  });
+
+  it('keeps the deterministic generator when no model adapter is configured', async () => {
+    const config = parseEvoHarnessConfig(e2eConfig());
+    const diagnostics: string[] = [];
+
+    const { deps } = buildOrchestratorDeps(config, { now: makeClock() }, {}, diagnostics);
+
+    const report = await deps.dreamer.replay({
+      trees: [makeTreeSnapshot()],
+      baselinePolicy: deps.policy.policy,
+      candidatePolicies: []
+    });
+
+    // no model is available, so the deterministic generator drives the dream and
+    // every candidate policy carries its deterministic id prefix
+    expect(report.candidateEvaluations.length).toBeGreaterThan(0);
+    expect(
+      report.candidateEvaluations.every((evaluation) => evaluation.policyId.startsWith('pi-0::dream-'))
+    ).toBe(true);
+  });
+
+  it('lets the model-backed generator fall back to the deterministic generator', async () => {
+    const config = parseEvoHarnessConfig(e2eConfig());
+    const model = createScriptedModel();
+    const diagnostics: string[] = [];
+
+    const { deps } = buildOrchestratorDeps(config, { model, now: makeClock() }, {}, diagnostics);
+
+    const report = await deps.dreamer.replay({
+      trees: [makeTreeSnapshot()],
+      baselinePolicy: deps.policy.policy,
+      candidatePolicies: []
+    });
+
+    // the scripted model answers { "policies": [] }, which the generator cannot
+    // use, so it must fall back instead of failing the dream cycle
+    expect(model.requests.some((request) => request.purpose === 'dream_policy')).toBe(true);
+    expect(report.candidateEvaluations.length).toBeGreaterThan(0);
+    expect(
+      report.candidateEvaluations.every((evaluation) => evaluation.policyId.startsWith('pi-0::dream-'))
+    ).toBe(true);
   });
 });

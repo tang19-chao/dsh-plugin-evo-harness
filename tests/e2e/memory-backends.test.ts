@@ -197,3 +197,165 @@ describe('governance gate', () => {
     expect(server.records.some((record) => record.id === 'lesson_invalid')).toBe(false);
   });
 });
+
+describe('post-compose lesson evidence and cross-session promotion', () => {
+  it('attaches candidate patch componentDiffs to negative lessons', async () => {
+    const server = mem0LikeServer();
+    const config = parseEvoHarnessConfig(e2eConfig({ maxWidth: 2, maxDepth: 1, rolloutBudget: 4 }));
+    const now = makeClock();
+    const memory = createMemoryBridge({ config: config.memoryBridge, clients: [server.client], now });
+    const plugin = createEvoHarnessPlugin(
+      {
+        config,
+        model: createScriptedModel(),
+        clients: [server.client],
+        // candidate 0 fails with a repairable tool error, candidate 1 recovers
+        runBranch: createScriptedRunner(now, { candidateOutcomes: ['fail', 'succeed'] }),
+        now,
+        newId: makeIdFactory('evidence'),
+        deps: { memory }
+      },
+      {}
+    );
+
+    const result = await plugin.run({
+      sessionId: 'sess-evidence',
+      task: plugin.makeTask({ id: 'task-evidence', prompt: 'Fix the failing build.' }),
+      trigger: 'always'
+    });
+
+    expect(result.outcome).toBe('composed');
+    const recalled = await memory.recall({
+      scope: { kind: 'session', sessionId: 'sess-evidence' },
+      text: 'Fix the failing build.',
+      includeNegative: true,
+      limit: 10
+    });
+    expect(recalled.negativeLessons.length).toBeGreaterThanOrEqual(1);
+    const withDiffs = recalled.negativeLessons.find((lesson) => {
+      const diffs = lesson.executionPatch.componentDiffs;
+      return diffs !== undefined && Object.keys(diffs).length > 0;
+    });
+    // pre-fix reflect() received no metadata.candidatePatches, so componentDiffs
+    // was always undefined for negative lessons
+    expect(withDiffs).toBeDefined();
+    expect(Object.keys(withDiffs?.executionPatch.componentDiffs ?? {})).toContain('guardrails');
+  });
+
+  it('promotes committed positive lessons to global scope for later sessions', async () => {
+    const server = mem0LikeServer();
+    const config = parseEvoHarnessConfig(e2eConfig());
+    expect(config.memoryBridge.promoteOnComposeSuccess).toBe(true);
+    const now = makeClock();
+    const memory = createMemoryBridge({ config: config.memoryBridge, clients: [server.client], now });
+    const plugin = createEvoHarnessPlugin(
+      {
+        config,
+        model: createScriptedModel(),
+        clients: [server.client],
+        runBranch: createScriptedRunner(now),
+        now,
+        newId: makeIdFactory('promote'),
+        deps: { memory }
+      },
+      {}
+    );
+
+    const result = await plugin.run({
+      sessionId: 'sess-a',
+      task: plugin.makeTask({ id: 'task-promote', prompt: 'Fix the failing build.' }),
+      trigger: 'always'
+    });
+
+    expect(result.outcome).toBe('composed');
+    expect(result.lessonsCommitted).toBeGreaterThanOrEqual(1);
+    expect(result.diagnostics.join(' ')).toContain('promoted lesson');
+
+    // a later session reads the promoted lesson through its visible global scope
+    const laterSession = await memory.recall({
+      scope: { kind: 'session', sessionId: 'sess-b' },
+      text: 'Fix the failing build.',
+      includeNegative: true,
+      limit: 10
+    });
+    const globalLesson = laterSession.positiveLessons.find(
+      (lesson) => lesson.visibility === 'global'
+    );
+    expect(globalLesson).toBeDefined();
+  });
+
+  it('respects promoteOnComposeSuccess=false', async () => {
+    const server = mem0LikeServer();
+    const config = parseEvoHarnessConfig(
+      e2eConfig({ config: { memoryBridge: { promoteOnComposeSuccess: false } } })
+    );
+    expect(config.memoryBridge.promoteOnComposeSuccess).toBe(false);
+    const now = makeClock();
+    const memory = createMemoryBridge({ config: config.memoryBridge, clients: [server.client], now });
+    const plugin = createEvoHarnessPlugin(
+      {
+        config,
+        model: createScriptedModel(),
+        clients: [server.client],
+        runBranch: createScriptedRunner(now),
+        now,
+        newId: makeIdFactory('nopromo'),
+        deps: { memory }
+      },
+      {}
+    );
+
+    const result = await plugin.run({
+      sessionId: 'sess-nopromo',
+      task: plugin.makeTask({ id: 'task-nopromo', prompt: 'Fix the failing build.' }),
+      trigger: 'always'
+    });
+
+    expect(result.outcome).toBe('composed');
+    expect(result.lessonsCommitted).toBeGreaterThanOrEqual(1);
+    expect(result.diagnostics.join(' ')).not.toContain('promoted lesson');
+
+    const laterSession = await memory.recall({
+      scope: { kind: 'session', sessionId: 'sess-other' },
+      text: 'Fix the failing build.',
+      includeNegative: true,
+      limit: 10
+    });
+    expect(laterSession.positiveLessons).toEqual([]);
+  });
+
+  it('records a promotion failure without aborting the run', async () => {
+    const server = mem0LikeServer();
+    const config = parseEvoHarnessConfig(e2eConfig());
+    const now = makeClock();
+    const memory = createMemoryBridge({ config: config.memoryBridge, clients: [server.client], now });
+    const failingMemory: typeof memory = {
+      ...memory,
+      promote: async () => {
+        throw new Error('promotion backend down');
+      }
+    };
+    const plugin = createEvoHarnessPlugin(
+      {
+        config,
+        model: createScriptedModel(),
+        clients: [server.client],
+        runBranch: createScriptedRunner(now),
+        now,
+        newId: makeIdFactory('promofail'),
+        deps: { memory: failingMemory }
+      },
+      {}
+    );
+
+    const result = await plugin.run({
+      sessionId: 'sess-promofail',
+      task: plugin.makeTask({ id: 'task-promofail', prompt: 'Fix the failing build.' }),
+      trigger: 'always'
+    });
+
+    expect(result.outcome).toBe('composed');
+    expect(result.lessonsCommitted).toBeGreaterThanOrEqual(1);
+    expect(result.diagnostics.join(' ')).toContain('promotion failed');
+  });
+});

@@ -688,11 +688,25 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
         };
       });
 
-      // Keys are the anonymous aliases the judge saw. The alias -> branchId/nodeId mapping
-      // lives in `assessments`, so downstream scoring can index by either key.
+      // Every evaluation is addressable under three keys: the anonymous alias the judge
+      // saw, plus the candidate branchId and nodeId that Dream-RSI's surrogate scorer indexes
+      // (adoptionFromComposition reads ratios[node.branchId] then ratios[node.id]). Identity
+      // is still never added to the judge-facing dossier; this dictionary is internal to the
+      // composition result. First writer wins, so a pathological key collision between two
+      // candidates can never overwrite an existing ratio; collisions are reported in the
+      // rationale instead of being resolved by silently dropping a candidate.
       const adoptionRatios: Record<string, number> = {};
+      const adoptionKeyConflicts: string[] = [];
       for (const evaluation of evaluations) {
-        adoptionRatios[evaluation.alias] = evaluation.adoptionRatio;
+        const keys = [evaluation.alias, evaluation.candidate.branchId, evaluation.candidate.nodeId];
+        for (const key of keys) {
+          const existing = adoptionRatios[key];
+          if (existing === undefined) {
+            adoptionRatios[key] = evaluation.adoptionRatio;
+          } else if (existing !== evaluation.adoptionRatio && !adoptionKeyConflicts.includes(key)) {
+            adoptionKeyConflicts.push(key);
+          }
+        }
       }
 
       let composedPatch: EightSurfacePatch | null = null;
@@ -781,6 +795,9 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
         rationaleParts.push('judge unavailable -> evidence-only adoption ratios (' + judgeUnavailableReason + ')');
       } else if (selected?.judgeRank !== undefined) {
         rationaleParts.push('judge rank of the winner: ' + selected.judgeRank);
+      }
+      if (adoptionKeyConflicts.length > 0) {
+        rationaleParts.push('adoption key collisions kept the first writer: ' + adoptionKeyConflicts.join(', '));
       }
 
       return {

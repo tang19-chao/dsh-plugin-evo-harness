@@ -8,14 +8,24 @@
  */
 import { vi } from 'vitest';
 import type {
+  BatchPlan,
   BranchExecutor,
+  IActivePolicy,
   IModelAdapter,
   IsolatedBranchContext,
+  MetaSearchPolicy,
   ModelRequest,
   ModelResponse,
-  ProbeExecutionResult
+  PlanGridRequest,
+  ProbeExecutionResult,
+  SearchGridPlan,
+  SelectBatchRequest,
+  StopCondition
 } from '../../src/types/contracts';
 import { parseLessonDocument } from '../../src/memory-bridge';
+import { parseEvoHarnessConfig } from '../../src/config';
+import { createActivePolicyFromDefaults, createFailureTaxonomy } from '../../src/dream-rsi';
+import type { FailureDiagnosisRequest, IFailureTaxonomy } from '../../src/dream-rsi';
 import type { McpClient, McpToolCallResult, McpToolDescriptor } from '../../src/memory-bridge';
 import { createCordisHostFromContext, createEvoHarnessPlugin } from '../../src/index';
 import type {
@@ -120,9 +130,21 @@ export interface ScriptedRunner {
   readonly calls: string[];
 }
 
-/** Reference run fails with a tool error; any candidate patch succeeds. */
-export function createScriptedRunner(now: () => number): ScriptedRunner {
+export interface ScriptedRunnerOptions {
+  /** Outcome of each candidate probe in call order; defaults to 'succeed'. */
+  readonly candidateOutcomes?: readonly ('succeed' | 'fail')[];
+}
+
+/**
+ * Reference run fails with a tool error; candidate patches succeed unless
+ * candidateOutcomes marks that probe index as a repairable failure.
+ */
+export function createScriptedRunner(
+  now: () => number,
+  options: ScriptedRunnerOptions = {}
+): ScriptedRunner {
   const calls: string[] = [];
+  let candidateIndex = 0;
   const run = async (context: IsolatedBranchContext): Promise<ProbeExecutionResult> => {
       // The baseline run is the only purpose 'initial', edit-free patch; exploit
       // slots also use origin 'reference' (memory-guided), so origin alone is not
@@ -130,6 +152,12 @@ export function createScriptedRunner(now: () => number): ScriptedRunner {
       const isReference =
         context.patch.purpose === 'initial' && Object.keys(context.patch.edits).length === 0;
       calls.push(isReference ? 'reference' : 'candidate');
+      const candidateOutcome = isReference
+        ? undefined
+        : (options.candidateOutcomes?.[candidateIndex] ?? 'succeed');
+      if (!isReference) {
+        candidateIndex += 1;
+      }
       if (isReference) {
         return {
           status: 'failed',
@@ -150,6 +178,29 @@ export function createScriptedRunner(now: () => number): ScriptedRunner {
           ],
           failureSignals: [
             { kind: 'tool_error', message: 'exit 1', toolName: 'shell', repairable: true }
+          ]
+        };
+      }
+      if (candidateOutcome === 'fail') {
+        return {
+          status: 'failed',
+          steps: [
+            { index: 0, at: now(), kind: 'model', text: 'apply the candidate scaffold' },
+            {
+              index: 1,
+              at: now(),
+              kind: 'tool',
+              toolName: 'shell',
+              toolArguments: { cmd: 'npm test' },
+              error: { name: 'ToolError', message: 'candidate exit 2' }
+            },
+            { index: 2, at: now(), kind: 'error', text: 'the candidate build still fails' }
+          ],
+          toolErrors: [
+            { toolName: 'shell', message: 'candidate exit 2', code: 'E2', stepIndex: 1, retryable: true }
+          ],
+          failureSignals: [
+            { kind: 'tool_error', message: 'candidate exit 2', toolName: 'shell', repairable: true }
           ]
         };
       }
@@ -536,11 +587,25 @@ export interface E2EBuildOptions {
   readonly maxDepth?: number;
   readonly maxWidth?: number;
   readonly rolloutBudget?: number;
+  /** Outcome of each candidate probe, forwarded to the scripted runner. */
+  readonly candidateOutcomes?: readonly ('succeed' | 'fail')[];
 }
 
-/** Base plugin config: deterministic, one round, first-success stop. */
+const CONFIG_GROUPS = ['probe', 'memoryBridge', 'dreamRsi', 'logging'] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Base plugin config: deterministic, one round, first-success stop. Nested
+ * groups (probe/memoryBridge/dreamRsi/logging) are deep-merged so a partial
+ * override such as { memoryBridge: { promoteOnComposeSuccess: false } } cannot
+ * silently drop the rest of the group.
+ */
 export function e2eConfig(options: E2EBuildOptions = {}): Record<string, unknown> {
-  return {
+  const overrides = options.config ?? {};
+  const base: Record<string, unknown> = {
     triggerMode: 'always',
     enabledSurfaces: [
       'system_prompt',
@@ -569,9 +634,16 @@ export function e2eConfig(options: E2EBuildOptions = {}): Record<string, unknown
       rhoPreferences: [0, 0.5, 1],
       surrogateWeights: { selection: 0.4, adoption: 0.3, efficiency: 0.2, toolErrorPenalty: 0.1 }
     },
-    logging: { level: 'silent' },
-    ...(options.config ?? {})
+    logging: { level: 'silent' }
   };
+  const merged: Record<string, unknown> = { ...base, ...overrides };
+  for (const group of CONFIG_GROUPS) {
+    const extra = overrides[group];
+    if (isRecord(extra)) {
+      merged[group] = { ...(isRecord(base[group]) ? (base[group] as Record<string, unknown>) : {}), ...extra };
+    }
+  }
+  return merged;
 }
 
 /** Build a complete plugin over the real modules with injected fakes. */
@@ -579,7 +651,7 @@ export function buildE2E(options: E2EBuildOptions = {}): E2EHarness {
   const server = options.server ?? mem0LikeServer();
   const model = createScriptedModel();
   const now = makeClock();
-  const runner = createScriptedRunner(now);
+  const runner = createScriptedRunner(now, { candidateOutcomes: options.candidateOutcomes });
   const pluginOptions: EvoHarnessPluginOptions = {
     config: e2eConfig(options),
     model,
@@ -592,6 +664,103 @@ export function buildE2E(options: E2EBuildOptions = {}): E2EHarness {
   };
   const plugin = createEvoHarnessPlugin(pluginOptions, options.ctx);
   return { plugin, server, model, runner, now };
+}
+
+// ---------------------------------------------------------------------------
+// recording active policy (observes what the orchestrator hands the scheduler)
+// ---------------------------------------------------------------------------
+
+export interface RecordingPolicy extends IActivePolicy {
+  readonly selectBatchRequests: SelectBatchRequest[];
+  readonly batchPlans: BatchPlan[];
+  readonly planGridRequests: PlanGridRequest[];
+}
+
+export interface RecordingPolicyOverrides {
+  /** Force the grid stop condition while keeping the real policy behaviour. */
+  readonly stopCondition?: StopCondition;
+}
+
+/** Wrap a real ActivePolicy, recording every scheduler interaction. */
+export function createRecordingPolicyFrom(
+  base: IActivePolicy,
+  overrides: RecordingPolicyOverrides = {}
+): RecordingPolicy {
+  const selectBatchRequests: SelectBatchRequest[] = [];
+  const batchPlans: BatchPlan[] = [];
+  const planGridRequests: PlanGridRequest[] = [];
+  let current: MetaSearchPolicy = base.policy;
+  return {
+    selectBatchRequests,
+    batchPlans,
+    planGridRequests,
+    get policy(): MetaSearchPolicy {
+      return current;
+    },
+    planGrid(request: PlanGridRequest): SearchGridPlan {
+      planGridRequests.push(request);
+      const grid = base.planGrid(request);
+      return overrides.stopCondition === undefined
+        ? grid
+        : { ...grid, stopCondition: overrides.stopCondition };
+    },
+    selectBatch(request: SelectBatchRequest): BatchPlan {
+      selectBatchRequests.push(request);
+      const batch = base.selectBatch(request);
+      batchPlans.push(batch);
+      return batch;
+    },
+    update(policy: MetaSearchPolicy): void {
+      current = policy;
+      base.update(policy);
+    }
+  };
+}
+
+/**
+ * Recording policy built exactly like the production wiring in src/index.ts, so
+ * the real ActivePolicy still composes the slot portfolio.
+ */
+export function createRecordingPolicy(
+  options: E2EBuildOptions = {},
+  overrides: RecordingPolicyOverrides = {}
+): RecordingPolicy {
+  const config = parseEvoHarnessConfig(e2eConfig(options));
+  const base = createActivePolicyFromDefaults(
+    {
+      maxWidth: config.dreamRsi.maxWidth,
+      maxDepth: config.dreamRsi.maxDepth,
+      earlyStopThreshold: config.dreamRsi.earlyStopThreshold,
+      minMemoryConfidenceForSkip: config.dreamRsi.minMemoryConfidenceForSkip
+    },
+    { now: makeClock(), maxRecoverySlots: config.dreamRsi.maxRecoverySlots }
+  );
+  return createRecordingPolicyFrom(base, overrides);
+}
+
+// ---------------------------------------------------------------------------
+// recording failure taxonomy (observes lineage handed to the classifier)
+// ---------------------------------------------------------------------------
+
+export interface RecordingTaxonomy extends IFailureTaxonomy {
+  readonly requests: FailureDiagnosisRequest[];
+}
+
+/** Wrap a real taxonomy, recording every diagnosis request. */
+export function createRecordingTaxonomy(base: IFailureTaxonomy): RecordingTaxonomy {
+  const requests: FailureDiagnosisRequest[] = [];
+  return {
+    requests,
+    diagnose(request: FailureDiagnosisRequest) {
+      requests.push(request);
+      return base.diagnose(request);
+    }
+  };
+}
+
+/** Recording taxonomy over the production default taxonomy. */
+export function createDefaultRecordingTaxonomy(): RecordingTaxonomy {
+  return createRecordingTaxonomy(createFailureTaxonomy({}));
 }
 
 /** Re-export for tests that assert host derivation. */

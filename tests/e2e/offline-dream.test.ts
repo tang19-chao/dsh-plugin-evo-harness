@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { buildE2E } from './fixtures';
+import { parseEvoHarnessConfig } from '../../src/config';
+import { createDiscoveryTreePool, createOfflineDreamer } from '../../src/dream-rsi';
+import { createEvoHarnessPlugin } from '../../src/index';
+import {
+  buildE2E,
+  createScriptedModel,
+  createScriptedRunner,
+  e2eConfig,
+  makeClock,
+  makeIdFactory,
+  mem0LikeServer
+} from './fixtures';
 
 describe('offline dream trigger', () => {
   it('runs the zero-execution replay once the cadence is reached', async () => {
@@ -58,5 +69,58 @@ describe('offline dream trigger', () => {
     expect(trees).toHaveLength(2);
     expect(trees.every((tree) => tree.completed)).toBe(true);
     expect(trees.every((tree) => Object.keys(tree.nodes).length >= 2)).toBe(true);
+  });
+
+  it('drives dreaming through the dreamer policy generator instead of shadowing it', async () => {
+    const server = mem0LikeServer();
+    const config = parseEvoHarnessConfig(
+      e2eConfig({ dreamEveryNTasks: 1, config: { dreamRsi: { candidatePoliciesCount: 2 } } })
+    );
+    expect(config.dreamRsi.candidatePoliciesCount).toBe(2);
+    const now = makeClock();
+    const treePool = createDiscoveryTreePool({ maxTrees: 4 });
+    const generatorCalls: number[] = [];
+    const dreamer = createOfflineDreamer({
+      now,
+      treePool,
+      policyCount: config.dreamRsi.candidatePoliciesCount,
+      generatePolicies: (baseline, count) => {
+        generatorCalls.push(count);
+        return Array.from({ length: count }, (_unused, index) => ({
+          ...baseline,
+          id: 'gen-' + String(index + 1),
+          version: baseline.version + 1,
+          parentPolicyId: baseline.id,
+          createdAt: baseline.createdAt + index
+        }));
+      }
+    });
+    const plugin = createEvoHarnessPlugin(
+      {
+        config,
+        model: createScriptedModel(),
+        clients: [server.client],
+        runBranch: createScriptedRunner(now),
+        now,
+        newId: makeIdFactory('gen-dream'),
+        deps: { dreamer, treePool }
+      },
+      {}
+    );
+
+    const result = await plugin.run({
+      sessionId: 'sess-gen',
+      task: plugin.makeTask({ id: 'task-gen', prompt: 'Fix the failing build.' }),
+      trigger: 'always'
+    });
+
+    expect(result.metadata?.dreamTriggered).toBe(true);
+    // the orchestrator must not inject its own deterministic candidate list
+    expect(generatorCalls).toEqual([2]);
+    const report = plugin.orchestrator.dreamReports()[0];
+    expect(report?.candidateEvaluations.map((evaluation) => evaluation.policyId).sort()).toEqual([
+      'gen-1',
+      'gen-2'
+    ]);
   });
 });

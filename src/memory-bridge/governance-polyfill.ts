@@ -449,9 +449,18 @@ export function tokenizeContext(text: string): Set<string> {
 
 /**
  * Whether one whenNotToApply clause matches the current task context.
- * CJK clauses match by run containment; latin clauses match when at least half
- * of their significant tokens appear in the context (single-token clauses must
- * match exactly). Deterministic for a given clause/context pair.
+ *
+ * CJK clauses match in two deterministic steps, mirroring the latin-token rule:
+ *   1. exact full-run containment of any clause run vetoes immediately;
+ *   2. otherwise at least half of the clause's shingles (pooled over all runs)
+ *      must appear in the context — a single incidental common bigram like
+ *      "任务" must not veto "不适用于简单表格任务";
+ * a clause that produces exactly one shingle still matches when that shingle is
+ * present (step 1 covers the 2-character run case).
+ *
+ * Latin clauses match when at least half of their significant tokens appear in
+ * the context (a single-token clause must match exactly). Deterministic for a
+ * given clause/context pair; any matching clause still vetoes the recall.
  */
 export function clauseMatchesContext(clause: string, contextTokens: ReadonlySet<string>): boolean {
   if (typeof clause !== 'string' || clause.trim().length === 0) {
@@ -459,17 +468,29 @@ export function clauseMatchesContext(clause: string, contextTokens: ReadonlySet<
   }
   const cjkRuns = clause.match(CJK_RUN) ?? [];
   if (cjkRuns.length > 0) {
+    // Step 1: the clause's own run appears verbatim in the context.
     for (const run of cjkRuns) {
       if (contextTokens.has(run)) {
         return true;
       }
+    }
+    // Step 2: aggregate shingle coverage must reach the latin-token threshold.
+    const shingles: string[] = [];
+    for (const run of cjkRuns) {
       for (const shingle of cjkShingles(run)) {
-        if (contextTokens.has(shingle)) {
-          return true;
-        }
+        shingles.push(shingle);
       }
     }
-    return false;
+    if (shingles.length === 0) {
+      return false;
+    }
+    let shingleHits = 0;
+    for (const shingle of shingles) {
+      if (contextTokens.has(shingle)) {
+        shingleHits += 1;
+      }
+    }
+    return shingleHits / shingles.length >= 0.5;
   }
   const tokens = (clause.toLowerCase().match(LATIN_TOKEN) ?? []).filter((token) => token.length >= 2);
   if (tokens.length === 0) {

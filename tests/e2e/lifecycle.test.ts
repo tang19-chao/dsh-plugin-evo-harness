@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { EVO_HARNESS_STAGES, autoFallbackRequested } from '../../src/orchestrator';
-import { buildE2E, createScriptedRunner, mem0LikeServer } from './fixtures';
+import {
+  buildE2E,
+  createDefaultRecordingTaxonomy,
+  createRecordingPolicy,
+  createScriptedRunner,
+  mem0LikeServer
+} from './fixtures';
 
 /** Documented lifecycle order; the trace must respect exactly this sequence. */
 const DOCUMENTED_ORDER = [
@@ -181,5 +187,100 @@ describe('end-to-end lifecycle', () => {
 
     expect(result.outcome).toBe('no_probe');
     expect(result.diagnostics.join(' ')).toContain('proposal failed');
+  });
+
+  it('scores above the 0.2 ceiling and persists the adoption ratio after compose', async () => {
+    const { plugin } = buildE2E();
+    const task = plugin.makeTask({ id: 'task-score', prompt: 'Fix the failing build.' });
+
+    const result = await plugin.run({ sessionId: 'sess-score', task, trigger: 'always' });
+
+    expect(result.outcome).toBe('composed');
+    const composition = plugin.orchestrator.lastComposition();
+    const selected = composition?.assessments.find((assessment) => assessment.selected);
+    expect(selected).toBeDefined();
+
+    const tree = plugin.orchestrator.treePool.list()[0];
+    const node = tree?.nodes[selected?.nodeId ?? ''];
+    expect(node).toBeDefined();
+    expect(node?.status).toBe('succeeded');
+    // Pre-fix the node was scored while still 'probing' and without any
+    // composition, so only the efficiency and error-penalty terms could score
+    // (a hard 0.2 ceiling) and adoptionRatio was never written. The post-compose
+    // re-score turns the selection (0.4) and adoption (0.3) signals on.
+    expect(node?.score ?? 0).toBeGreaterThan(0.2);
+    expect(node?.score ?? 0).toBeGreaterThan(0.5);
+    expect(node?.adoptionRatio).toBeCloseTo(selected?.adoptionRatio ?? -1, 6);
+    expect(node?.adoptionRatio ?? 0).toBeGreaterThan(0.5);
+  });
+
+  it('keeps a repairable failure across a succeeding sibling and schedules a recover slot', async () => {
+    const options = { maxWidth: 2, maxDepth: 2, rolloutBudget: 6, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const { plugin } = buildE2E({
+      ...options,
+      candidateOutcomes: ['fail', 'succeed'],
+      extra: { deps: { policy } }
+    });
+    const task = plugin.makeTask({ id: 'task-recover', prompt: 'Fix the failing build.' });
+
+    const result = await plugin.run({ sessionId: 'sess-recover', task, trigger: 'always' });
+
+    expect(result.outcome).toBe('composed');
+    expect(policy.selectBatchRequests.length).toBeGreaterThanOrEqual(2);
+
+    const secondRequest = policy.selectBatchRequests[1];
+    // a sibling success in round 1 must not erase the repairable failure
+    expect(secondRequest?.previousFailure).toBeDefined();
+    expect(secondRequest?.previousFailure?.repairable).toBe(true);
+    expect(secondRequest?.previousFailure?.category).toBe('repairable_implementation');
+
+    // and the real ActivePolicy converts it into a targeted recover slot
+    const secondBatch = policy.batchPlans[1];
+    const recoverSlot = secondBatch?.slots.find((slot) => slot.slot === 'recover');
+    expect(recoverSlot).toBeDefined();
+    expect(recoverSlot?.repairOfNodeId).toBeDefined();
+    expect(recoverSlot?.seedPatchIds?.length ?? 0).toBeGreaterThan(0);
+  });
+
+  it('records probe surfaceKeys in node metadata for the active policy', async () => {
+    const { plugin } = buildE2E();
+    const task = plugin.makeTask({ id: 'task-surfaces', prompt: 'Fix the failing build.' });
+    await plugin.run({ sessionId: 'sess-surfaces', task, trigger: 'always' });
+
+    const tree = plugin.orchestrator.treePool.list()[0];
+    const nodes = Object.values(tree?.nodes ?? {});
+    const withSurfaces = nodes.filter(
+      (node) =>
+        Array.isArray(node.metadata?.surfaceKeys) &&
+        (node.metadata?.surfaceKeys as unknown[]).length > 0
+    );
+    expect(withSurfaces.length).toBeGreaterThanOrEqual(1);
+    expect(withSurfaces[0]?.metadata?.surfaceKeys as unknown[]).toContain('guardrails');
+    expect(withSurfaces[0]?.metadata?.slot).toBeDefined();
+    expect(withSurfaces[0]?.status).toBe('succeeded');
+  });
+
+  it('derives diagnosis lineage from the ancestor chain rather than the previous sibling', async () => {
+    const options = { maxWidth: 2, maxDepth: 1, rolloutBudget: 4, dreamEveryNTasks: 100 } as const;
+    const taxonomy = createDefaultRecordingTaxonomy();
+    const { plugin } = buildE2E({
+      ...options,
+      candidateOutcomes: ['fail', 'fail'],
+      extra: { deps: { taxonomy } }
+    });
+    const task = plugin.makeTask({ id: 'task-lineage', prompt: 'Repair the broken pipeline.' });
+
+    const result = await plugin.run({ sessionId: 'sess-lineage', task, trigger: 'always' });
+
+    expect(result.outcome).toBe('probed');
+    expect(taxonomy.requests).toHaveLength(2);
+    // Both probes are children of the reference root, which carries no failure
+    // diagnosis, so neither has a failed ancestor: a sibling's diagnosis must
+    // never be inherited as 'previousDiagnoses' (pre-fix it was).
+    expect(taxonomy.requests[0]?.previousDiagnoses).toEqual([]);
+    expect(taxonomy.requests[1]?.previousDiagnoses).toEqual([]);
+    expect(taxonomy.requests[1]?.attemptIndex).toBe(1);
+    expect(taxonomy.requests[1]?.previousDiagnoses?.length ?? 0).toBe(0);
   });
 });

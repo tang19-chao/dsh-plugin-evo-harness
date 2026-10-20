@@ -190,10 +190,48 @@ describe('negative firewall', () => {
     expect(recall.suppressedLessons.map((entry) => entry.reason)).toContain('low_confidence');
   });
 
-  it('treats a CJK restraint clause by run containment', () => {
-    const context = tokenizeContext('现在处于离线沙箱环境，无法联网验证');
-    expect(clauseMatchesContext('离线沙箱不可用时', context)).toBe(true);
-    expect(clauseMatchesContext('仅适用于大型代码库', context)).toBe(false);
+  // NOTE (t14, deliberate change): the previous assertion here used the old
+  // single-bigram rule and expected `clauseMatchesContext('离线沙箱不可用时',
+  // ctx)` to be true for a context that only shared three of seven shingles
+  // (离线/线沙/沙箱 = 43%). Under the aggregate >= 50% rule that incidental
+  // overlap no longer vetoes, so the expectation is now false; full-run
+  // containment and genuine majority coverage are asserted instead.
+  it('vetoes immediately when a clause run appears verbatim in the context', () => {
+    const context = tokenizeContext('离线沙箱不可用；后续条件另行确认');
+    expect(context.has('离线沙箱不可用')).toBe(true);
+    expect(clauseMatchesContext('离线沙箱不可用', context)).toBe(true);
+  });
+
+  it('no longer vetoes on a single incidental bigram (回归: 任务)', () => {
+    const context = tokenizeContext('请帮我完成这个任务');
+    expect(context.has('任务')).toBe(true);
+    expect(clauseMatchesContext('不适用于简单表格任务', context)).toBe(false);
+    // The old rule vetoed as soon as one clause shingle appeared in the context.
+    const loose = tokenizeContext('现在处于离线沙箱环境，无法联网验证');
+    expect(clauseMatchesContext('离线沙箱不可用时', loose)).toBe(false);
+  });
+
+  it('still vetoes when the context covers most of the clause shingles', () => {
+    const context = tokenizeContext('简单表格任务的场景');
+    // clause shingles: 不适 适用 用于 于简 简单 单表 表格 格任 任务; covered: 5/9.
+    expect(clauseMatchesContext('不适用于简单表格任务', context)).toBe(true);
+    const weaker = tokenizeContext('这是一个普通任务');
+    expect(clauseMatchesContext('不适用于简单表格任务', weaker)).toBe(false);
+  });
+
+  it('matches a one-shingle clause when that shingle is present', () => {
+    const context = tokenizeContext('处理简单表格任务');
+    expect(clauseMatchesContext('任务', context)).toBe(true);
+    expect(clauseMatchesContext('缓存', context)).toBe(false);
+  });
+
+  it('keeps the latin significant-token threshold unchanged', () => {
+    const context = tokenizeContext('offline sandbox run');
+    expect(clauseMatchesContext('offline sandbox unavailable', context)).toBe(true);
+    expect(clauseMatchesContext('offline cache unavailable', context)).toBe(false);
+    expect(clauseMatchesContext('offline sandbox unavailable environment isolation', context)).toBe(false);
+    expect(clauseMatchesContext('sandbox', context)).toBe(true);
+    expect(clauseMatchesContext('container', context)).toBe(false);
   });
 
   it('exposes the firewall outcome as pure data', () => {

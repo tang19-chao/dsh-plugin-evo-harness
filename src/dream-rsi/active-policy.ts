@@ -746,9 +746,22 @@ class ActivePolicyImpl implements ActivePolicy {
     return best ?? request.tree.nodes[rootId];
   }
 
+  /**
+   * Resolve the single node a recovery slot should repair.
+   *
+   * Targeting order:
+   * 1. an explicit metadata.repairNodeId / previousFailureNodeId wins;
+   * 2. otherwise the most recently updated failed node in the tree whose
+   *    diagnosis is repairable.
+   *
+   * The tree scan also runs when previousFailure is undefined: the orchestrator
+   * clears previousFailure as soon as a later sibling slot succeeds, but the
+   * discovery tree still holds the repairable failure that deserves a targeted
+   * repair. A supplied but non-repairable diagnosis still disables recovery.
+   */
   private findRecoveryTarget(request: SelectBatchRequest): DiscoveryNode | null {
     const failure = request.previousFailure;
-    if (failure === undefined || !failure.repairable) {
+    if (failure !== undefined && !failure.repairable) {
       return null;
     }
     const explicitId =
