@@ -758,6 +758,12 @@ class ActivePolicyImpl implements ActivePolicy {
       if (node.status !== 'succeeded') {
         continue;
       }
+      // The root is the documented fallback (returned below), not a candidate: if it
+      // were scanned, a scoreless root could win the createdAt tie-break against a
+      // real 0-score succeeded candidate and exploitation would deepen from it.
+      if (node.id === rootId) {
+        continue;
+      }
       if (best === undefined) {
         best = node;
         continue;

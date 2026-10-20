@@ -330,8 +330,10 @@ export function replayTree(
     frontier = next;
   }
 
+  // An early stop means the policy already reached its quality threshold, so it
+  // must not be charged an extra phantom probe beyond the stop decision.
   const recoveryWeight = slotWeights.recover;
-  if (recoveryWeight > 0 && probes < budget) {
+  if (!earlyStopped && recoveryWeight > 0 && probes < budget) {
     const failed = firstRepairableFailedNode(tree);
     if (failed !== undefined && !seen.has(failed.id)) {
       seen.add(failed.id);

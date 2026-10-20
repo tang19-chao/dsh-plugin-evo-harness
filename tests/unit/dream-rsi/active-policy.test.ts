@@ -301,6 +301,60 @@ describe('three-way batch portfolio', () => {
     expect(batch.slots.find((slot) => slot.slot === 'recover')?.parentNodeId).toBe('dead');
   });
 
+  it('prefers a zero-scored succeeded candidate over the scoreless root', () => {
+    const tree = createDiscoveryTree({
+      id: 'tree-zero',
+      sessionId: 'session-1',
+      taskId: 'task-1',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    // The root succeeded without a score (so it counts as 0) and is the oldest
+    // node, which used to win the createdAt tie-break against a real candidate.
+    tree.recordProbe(tree.rootId, { trajectoryId: 'traj-root' });
+    tree.addNode(childInput(tree.rootId, { id: 'zero', origin: 'domain', purpose: 'explore' }));
+    tree.recordProbe('zero', { trajectoryId: 'traj-zero', score: 0 });
+    const snapshot = tree.snapshot();
+    expect(snapshot.nodes[tree.rootId]?.status).toBe('succeeded');
+    expect(snapshot.nodes[tree.rootId]?.score).toBeUndefined();
+
+    const batch = policyApi.selectBatch(batchRequest({ tree: snapshot, round: 30 }));
+    const exploit = batch.slots.find((slot) => slot.slot === 'exploit');
+    expect(exploit?.parentNodeId).toBe('zero');
+    expect(exploit?.parentNodeId).not.toBe(tree.rootId);
+    expect(exploit?.seedPatchIds).toEqual(['patch-zero']);
+
+    // An explicit hint at the root is still honoured.
+    const hinted = policyApi.selectBatch(
+      batchRequest({ tree: snapshot, previousBestNodeId: tree.rootId, round: 31 })
+    );
+    expect(hinted.slots.find((slot) => slot.slot === 'exploit')?.parentNodeId).toBe(tree.rootId);
+
+    // With no succeeded candidate the root remains the documented fallback.
+    const deadEnd = createDiscoveryTree({
+      id: 'tree-zero-fallback',
+      sessionId: 'session-1',
+      taskId: 'task-1',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    deadEnd.addNode(
+      childInput(deadEnd.rootId, { id: 'dead', origin: 'domain', purpose: 'explore' })
+    );
+    deadEnd.recordProbe('dead', {
+      trajectoryId: 'traj-dead',
+      status: 'failed',
+      score: 0.95,
+      failure: makeDiagnosis('repairable_implementation')
+    });
+    const fallback = policyApi.selectBatch(
+      batchRequest({ tree: deadEnd.snapshot(), round: 32 })
+    );
+    expect(fallback.slots.find((slot) => slot.slot === 'exploit')?.parentNodeId).toBe(
+      deadEnd.rootId
+    );
+  });
+
   it('still scans the tree when the supplied failure is not repairable', () => {
     const { request } = withTree({
       previousFailure: makeDiagnosis('weak_underexplored', { repairable: false })
@@ -918,5 +972,34 @@ describe('policy lifecycle', () => {
       'invariant',
       'reference'
     ]);
+  });
+});
+
+describe('best-node resolution', () => {
+  it('skips the scoreless root when a real 0-score candidate exists', () => {
+    const tree = createDiscoveryTree({
+      id: 'tree-best-root',
+      sessionId: 'session-1',
+      taskId: 'task-1',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    // the root is succeeded but scoreless and was created first
+    tree.recordProbe(tree.rootId, { trajectoryId: 'traj-root', status: 'succeeded' });
+    tree.addNode(childInput(tree.rootId, { id: 'candidate-1' }));
+    tree.recordProbe('candidate-1', {
+      trajectoryId: 'traj-candidate-1',
+      status: 'succeeded',
+      score: 0
+    });
+
+    const policy = createActivePolicyFromDefaults();
+    const batch = policy.selectBatch(batchRequest({ tree: tree.snapshot() }));
+
+    const exploit = batch.slots.find((slot) => slot.slot === 'exploit');
+    expect(exploit).toBeDefined();
+    // pre-fix the scoreless root won the createdAt tie-break, so exploitation
+    // deepened from the reference root instead of the real candidate
+    expect(exploit?.parentNodeId).toBe('candidate-1');
   });
 });

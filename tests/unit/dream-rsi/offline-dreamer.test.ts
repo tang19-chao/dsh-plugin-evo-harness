@@ -203,6 +203,51 @@ describe('replay primitives', () => {
     expect(outcome.probes).toBe(1);
   });
 
+  it('does not charge a recovery probe after an early stop', () => {
+    const tree = createDiscoveryTree({
+      id: 'tree-early',
+      sessionId: 'session-1',
+      taskId: 'task-1',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    tree.addNode(childInput(tree.rootId, { id: 'good', origin: 'domain', purpose: 'explore' }));
+    tree.recordProbe('good', { trajectoryId: 'traj-good', score: 0.9 });
+    tree.addNode(childInput(tree.rootId, { id: 'broken', origin: 'reference', purpose: 'repair' }));
+    tree.recordProbe('broken', {
+      trajectoryId: 'traj-broken',
+      status: 'failed',
+      score: 0,
+      failure: makeDiagnosis('repairable_implementation')
+    });
+    const snapshot = tree.snapshot();
+
+    // Layer 1 reaches the early-stop threshold (0.8) while a repairable failure
+    // and budget remain: stopping must not be charged an extra phantom probe.
+    const stopped = replayTree(
+      snapshot,
+      makePolicy({ id: 'pi-early-stop', maxWidth: 2, maxDepth: 2 }),
+      1
+    );
+    expect(stopped.earlyStopped).toBe(true);
+    expect(stopped.quality).toBe(0.9);
+    expect(stopped.visitedNodeIds).toEqual([snapshot.rootId, 'good']);
+    expect(stopped.visitedNodeIds).not.toContain('broken');
+    expect(stopped.probes).toBe(1);
+    expect(stopped.probes).toBe(stopped.visitedNodeIds.length - 1);
+
+    // Control: without reaching the threshold the recovery probe still runs.
+    const control = replayTree(
+      snapshot,
+      makePolicy({ id: 'pi-no-early-stop', maxWidth: 1, maxDepth: 3, earlyStopThreshold: 1 }),
+      1
+    );
+    expect(control.earlyStopped).toBe(false);
+    expect(control.probes).toBe(2);
+    expect(control.visitedNodeIds).toEqual([snapshot.rootId, 'good', 'broken']);
+    expect(control.evidence.join(' ')).toContain('recovery probe charged');
+  });
+
   it('charges a recovery probe without inventing a post-repair outcome', () => {
     const tree = createDiscoveryTree({
       id: 'tree-r',
@@ -633,5 +678,48 @@ describe('offline dreamer monotonic replay', () => {
     expect(report.candidateEvaluations).toHaveLength(1);
     expect(report.selectedPolicyId).toBe('pi-shallow::dream-m1');
     expect(report.improved).toBe(true);
+  });
+});
+
+describe('early-stop probe accounting', () => {
+  it('does not charge a recovery probe once the policy early-stopped', () => {
+    const tree = createDiscoveryTree({
+      id: 'tree-early-stop',
+      sessionId: 'session-early',
+      taskId: 'task-early',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    tree.recordProbe(tree.rootId, { trajectoryId: 'traj-root', score: 0.1 });
+    // top of layer 1: reaches the early-stop threshold on the first charged probe
+    tree.addNode(childInput(tree.rootId, { id: 'hot', origin: 'domain', purpose: 'explore' }));
+    tree.recordProbe('hot', { trajectoryId: 'traj-hot', score: 1 });
+    // a repairable failure the recovery injection would otherwise charge a phantom
+    // probe for, even though the policy already decided to stop
+    tree.addNode(
+      childInput(tree.rootId, { id: 'broken', origin: 'reference', purpose: 'repair' })
+    );
+    tree.recordProbe('broken', {
+      trajectoryId: 'traj-broken',
+      status: 'failed',
+      score: 0,
+      failure: makeDiagnosis('repairable_implementation', { repairHint: 'repair it' })
+    });
+
+    const policy = makePolicy({
+      maxWidth: 2,
+      maxDepth: 2,
+      earlyStopThreshold: 0.8,
+      slotWeights: { exploit: 0.4, explore_domain: 0.3, explore_invariant: 0.2, recover: 0.1 }
+    });
+
+    const outcome = replayTree(tree.snapshot(), policy, 1);
+
+    expect(outcome.earlyStopped).toBe(true);
+    // exactly the one charged probe that triggered the stop: the recovery injection
+    // must not add a phantom probe beyond the early-stop decision
+    expect(outcome.probes).toBe(1);
+    expect(outcome.visitedNodeIds).toEqual([tree.rootId, 'hot']);
+    expect(outcome.evidence.some((line) => line.startsWith('recovery probe charged'))).toBe(false);
   });
 });
