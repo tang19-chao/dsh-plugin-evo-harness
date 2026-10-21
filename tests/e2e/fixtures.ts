@@ -631,7 +631,15 @@ export function lingshuLikeServer(serverId = 'lingshu'): MockMemoryServer {
 export interface FakeContext {
   readonly ctx: CordisPluginContext & Record<string, unknown>;
   readonly commands: Map<string, CordisCommandHandler>;
-  readonly events: Map<string, (payload: unknown) => unknown>;
+  /**
+   * Registered listeners, keyed by event name.
+   *
+   * Variadic on purpose: DSH dispatches `session/event` as `(session, event)`,
+   * `agent/error` as `({agent,turn,step,error})` and `agent/status` as
+   * `({status})`, so a fixed single-argument signature would misrepresent the
+   * host contract this fake stands in for.
+   */
+  readonly events: Map<string, (...args: unknown[]) => unknown>;
   readonly info: ReturnType<typeof vi.fn>;
   readonly warn: ReturnType<typeof vi.fn>;
 }
@@ -639,7 +647,7 @@ export interface FakeContext {
 /** A fake host context exposing only the capabilities a host may expose. */
 export function createFakeContext(overrides: Record<string, unknown> = {}): FakeContext {
   const commands = new Map<string, CordisCommandHandler>();
-  const events = new Map<string, (payload: unknown) => unknown>();
+  const events = new Map<string, (...args: unknown[]) => unknown>();
   const info = vi.fn();
   const warn = vi.fn();
   const ctx: CordisPluginContext & Record<string, unknown> = {
@@ -648,7 +656,7 @@ export function createFakeContext(overrides: Record<string, unknown> = {}): Fake
       commands.set(name, handler);
       return () => commands.delete(name);
     },
-    on: (event: string, handler: (payload: unknown) => unknown) => {
+    on: (event: string, handler: (...args: unknown[]) => unknown) => {
       events.set(event, handler);
       return () => events.delete(event);
     },

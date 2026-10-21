@@ -4,19 +4,33 @@
   "private": true,
   "description": "DeepSeek Harness (Cordis) plugin: reversible eight-surface Harness² editing, Dream-RSI online search / offline replay, and a governed Universal MCP memory bridge.",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "lib/index.js",
   "types": "src/index.ts",
   "exports": {
     ".": {
       "types": "./src/index.ts",
-      "import": "./src/index.ts"
-    }
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
   },
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "ARCHITECTURE.md"
+  ],
   "engines": {
     "node": ">=20.19.0"
   },
   "packageManager": "pnpm@11.7.0",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "scripts": {
+    "build": "esbuild src/index.ts --bundle --format=esm --platform=node --target=node20 --outfile=lib/index.js --sourcemap=external --log-level=warning",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
@@ -25,7 +39,11 @@
   },
   "devDependencies": {
     "@types/node": "22.20.5",
+    "esbuild": "0.28.2",
     "typescript": "5.9.3",
     "vitest": "3.2.7"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.4"
   }
 }

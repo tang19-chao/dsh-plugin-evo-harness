@@ -48,6 +48,29 @@ deterministic failures.
 
 ## Install and verify
 
+### Install into a DeepSeek Harness profile (the normal path)
+
+The package ships a `dsh.bundle.patch` layer ([cordis.patch.yml](cordis.patch.yml)) and a
+Node-loadable ESM entry (`lib/index.js`), so `dsh plugin add` installs and mounts it in one
+step. Desktop's profile is reserved for the Electron application, but its own CLI manages it:
+
+```bash
+# from a checkout of this repository (absolute path required)
+dsh plugin --profile desktop add "link:<absolute-path-to-this-repo>"
+```
+
+`dsh plugin` forwards to pnpm inside the profile, then reconciles every new dependency that
+declares `dsh.bundle` into `dsh.profile.bundles`. The plugin is live after the next launch.
+Remove it with `dsh plugin --profile desktop remove dsh-plugin-evo-harness`.
+
+Confirm the composed tree picked the entry up:
+
+```bash
+dsh --profile <name> --dump-config   # look for `id: evo-harness`
+```
+
+### Build and verify from source
+
 Clone the repository and install the pinned toolchain:
 
 ```bash
@@ -55,7 +78,11 @@ git clone <repository-url> dsh-plugin-evo-harness
 cd dsh-plugin-evo-harness
 corepack enable          # optional: activates the pinned pnpm 11.7.0
 pnpm install --frozen-lockfile
+pnpm run build           # bundles src/index.ts to lib/index.js (esbuild)
 ```
+
+`lib/` is a build artifact and is git-ignored: run `pnpm run build` before installing the
+package anywhere, since the loader resolves `main`/`exports` to `lib/index.js`.
 
 The scripts below are quoted verbatim from `package.json` `scripts`; nothing else is needed to
 build the project, because TypeScript is only ever type-checked (`noEmit`) and Vitest
@@ -69,7 +96,7 @@ transpiles on the fly.
 | `pnpm run test:e2e` | `vitest run tests/e2e` | End-to-end suites only |
 | `pnpm run verify` | `pnpm run typecheck && pnpm run test` | The full gate: typecheck, then every suite |
 
-A green checkout currently reports `23` test files and `334` passing tests for `pnpm run test`
+A green checkout currently reports `23` test files and `390` passing tests for `pnpm run test`
 (see [Testing](#testing) for the breakdown). This package is `private` and is not published to
 any registry, so there are no publication steps.
 
@@ -122,6 +149,13 @@ plugins:
       enableAsymmetricGuidance: true     # default: invariant branches stay guidance-free
       offlineDreamTriggerEveryNTasks: 10 # default: completed tasks between offline dream replays
       candidatePoliciesCount: 6          # default: candidate meta-policies per dream
+
+    # Second-level settings page. Every leaf is .volatile(), so the DSH settings
+    # UI can write it and the loader commits it without a restart.
+    modelRoute:
+      provider: "qodercn"    # default: the verified DSH default route
+      model: "dfmodel"
+      reasoningEffort: "max" # high | max | low
 ```
 
 The mountable collaborators are injected in code, not in `cordis.yml`. The plugin exports the
@@ -130,7 +164,7 @@ for you; the snippet below shows the four optional injections that turn a dry ru
 one ([src/index.ts](src/index.ts), `EvoHarnessPluginOptions`):
 
 ```ts
-import { apply } from 'dsh-plugin-evo-harness'; // default export is { name, apply }
+import { apply } from 'dsh-plugin-evo-harness'; // default export is { name, inject, Config, apply }
 
 const plugin = apply(ctx, {
   config: myConfigSection, // the "dsh-plugin-evo-harness" section above (or ctx.config)
@@ -149,11 +183,49 @@ console.log(result.outcome, result.probesRun, result.lessonsCommitted);
 await plugin.dispose();
 ```
 
-The plugin registers the `/evo` slash command, subscribes the `auto_fallback` hook to the host
-events `task:failed` and `tool:error`, and exposes the mounted handle as the `evoHarness`
-service. If the host context exposes no command registrar or event subscriber, the equivalent
-entrypoints `plugin.runFromCommand(args, context)` and `plugin.handleFallbackEvent(payload)` are the
-supported fallbacks, and the reason is recorded in `plugin.diagnostics`.
+The plugin registers the `/evo` slash command through `ctx.commands.register`, subscribes the
+**verified DSH events** below, and exposes the mounted handle as the `evoHarness` service. If the
+host context exposes no command registrar or event subscriber, the equivalent entrypoints
+`plugin.runFromCommand(args, context)` and `plugin.handleFallbackEvent(payload)` are the supported
+fallbacks, and the reason is recorded in `plugin.diagnostics`.
+
+### Trigger contract (verified against the shipped runtime)
+
+The event names and payload shapes below were read out of `resources/app.asar`, not assumed.
+
+| `TurnEndReason.kind` | Meaning for this plugin |
+| :--- | :--- |
+| `completed` | normal end; triggers **only** under `triggerMode: always` |
+| `error` | failure (`reason.error` carries `{message, code}`) |
+| `aborted` / `blocked` / `max-tokens` / `interrupted` / `forked` | observed and ignored |
+
+| DSH event | Payload | Used for |
+| :--- | :--- | :--- |
+| `session/event` | `(session, event)` | `event.type: 'tool/result'` with `event.data.message.isError`; `event.type: 'turn/end'` with `event.data.reason.kind` |
+| `agent/error` | `{agent, turn, step, error}` | always a failure |
+| `agent/status` | `{status: 'idle' \| 'running'}` | `idle` → optional offline dream through `agent.runMaintenance` |
+
+`agent/status` carries **only** `{status}` (the loop emits `{ status }`); the agent comes from the
+fused dispatch payload or `ctx.agents.list()`. `agent.runMaintenance(job)` throws unless the agent
+is idle, so every call is try/catch-wrapped and a lost race is recorded instead of surfaced.
+
+The three modes are genuinely distinct:
+
+| `triggerMode` | Listens for |
+| :--- | :--- |
+| `slash_command` | nothing — `/evo` is the only entry point |
+| `auto_fallback` | failure events only (`tool/result` error, `turn/end` error, `agent/error`) |
+| `always` | failure events **plus** `turn/end` `completed` |
+
+> **Migration note.** Earlier versions documented `task:failed` and `tool:error` as the
+> `auto_fallback` events. Those names do not exist anywhere in DSH, so the hook could never fire.
+> They are no longer defaults; a non-DSH transport that emits them can opt in through
+> `autoFallbackEvents`, and the plugin then warns that the names are unverified.
+
+DSH dispatches `session/event` as a contained fire-and-forget emit, so a listener cannot return a
+run's result. `plugin.settle()` is the deterministic join point: it awaits every trigger-initiated
+run and returns the results. Teardown awaits it too, so a run started by the last event is not
+aborted mid-flight.
 
 ## Configuration reference
 
@@ -168,7 +240,10 @@ rejected with a `ConfigValidationError` carrying every issue (`unknown_key`, `in
 | :--- | :--- | :--- |
 | `schemaVersion` | `1` | Config schema version; a breaking change needs a new contract round |
 | `enabled` | `true` | Mount the plugin |
-| `triggerMode` | `"auto_fallback"` | `auto_fallback` (react to failure events), `always`, or `slash_command` (`/evo`) |
+| `triggerMode` | `"auto_fallback"` | `auto_fallback` (failure events only), `always` (failures + `turn/end completed`), or `slash_command` (`/evo` only) |
+| `modelRoute.provider` | `"qodercn"` | Provider route on the second-level settings page (volatile) |
+| `modelRoute.model` | `"dfmodel"` | Model id on the second-level settings page (volatile) |
+| `modelRoute.reasoningEffort` | `"max"` | `high` \| `max` \| `low` (volatile) |
 | `enabledSurfaces` | all eight | Surfaces eligible for patching, in mounting order |
 | `probe.maxConcurrentProbes` | `4` | Concurrent isolated probes (1-16) |
 | `probe.probeTimeoutMs` | `120000` | Per-probe timeout in ms (1000-600000) |

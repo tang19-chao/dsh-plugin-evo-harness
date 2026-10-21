@@ -10,6 +10,7 @@ outputs/
 %SystemDrive%/
 
 # build and test output
+lib/
 dist/
 coverage/
 *.tsbuildinfo

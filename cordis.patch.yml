@@ -1,0 +1,65 @@
+# dsh-plugin-evo-harness — host bundle patch layer
+#
+# Mounts the plugin into the composed profile tree. DSH resolves the entry by
+# the Node-resolvable package name below (must stay in sync with package.json
+# `name`), then calls its default `{ name, inject, Config, apply }` export.
+#
+# The plugin registers the /evo slash command, subscribes the verified DSH
+# triggers (session/event, agent/error, agent/status), and exposes the mounted
+# handle as the `evoHarness` service. Every injection point (model adapter, MCP
+# clients, runBranch) is resolved from the host at mount time through
+# src/dsh-bridge; this layer only supplies the validated config section.
+#
+# VERIFIED EVENT CONTRACT (resources/app.asar, dsh-tool-cordis api-catalog):
+#   session/event  (session, event) -> event.type 'tool/result' with
+#                                      event.data.message.isError
+#                                   or 'turn/end' with
+#                                      event.data.reason.kind === 'error'
+#                                      ('completed' only under triggerMode 'always')
+#   agent/error    ({agent,turn,step,error})     -> always a failure
+#   agent/status   ({status: 'idle'|'running'})  -> idle offline dream
+# The names 'task:failed' and 'tool:error' do NOT exist in DSH; they are never
+# subscribed unless explicitly listed in `autoFallbackEvents`.
+#
+# Docs: README.md  |  Design: ARCHITECTURE.md
+- insert:
+    - id: evo-harness
+      name: 'dsh-plugin-evo-harness'
+      config:
+        schemaVersion: 1
+        enabled: true
+        # 'auto_fallback' | 'always' | 'slash_command'
+        #   slash_command -> /evo only, no listeners
+        #   auto_fallback -> failure events only
+        #   always        -> failure events + turn/end 'completed'
+        triggerMode: auto_fallback
+        # All eight editable Harness² surfaces, in mounting order.
+        enabledSurfaces:
+          - system_prompt
+          - guardrails
+          - memory
+          - tool_guidance
+          - skills
+          - scripts
+          - subagents
+          - plugins
+        memoryBridge:
+          # 'auto' sniffs every mounted MCP server for a memory driver.
+          mcpServerTarget: auto
+          enableGovernancePolyfill: true
+        dreamRsi:
+          maxOnlineRolloutBudget: 8
+          enableAsymmetricGuidance: true
+          offlineDreamTriggerEveryNTasks: 10
+          candidatePoliciesCount: 6
+        # ── Second-level model page (src/index.ts Config) ────────────────
+        # Every leaf is .volatile(), so the settings UI can write it and the
+        # loader commits it into the running fiber without a restart.
+        # Defaults below mirror MODEL_ROUTE_DEFAULTS in src/dsh-bridge.
+        modelRoute:
+          provider: qodercn
+          model: dfmodel
+          reasoningEffort: max
+      # Loading is opt-in per profile: if the mount throws, the rest of the
+      # profile keeps starting instead of failing the whole boot.
+      disabled: false

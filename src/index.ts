@@ -2,20 +2,22 @@
  * dsh-plugin-evo-harness Cordis plugin entrypoint (integrator-owned).
  *
  * Exports the standard Cordis plugin shape:
- *   - apply(ctx, config)   registers the /evo command and the auto_fallback hook
- *   - default export       { name, apply }
+ *   - Config               volatile schemastery fragment for the settings page
+ *   - apply(ctx, config)   registers /evo and the verified DSH triggers
+ *   - default export       { name, inject, Config, apply }
  *
- * The plugin never assumes host internals it cannot see. Every host capability is
- * probed structurally at mount time:
- *   - ctx.registerCommand / ctx.command   -> /evo slash command
- *   - ctx.on                              -> auto_fallback failure events
+ * Everything host-facing is resolved structurally at mount time:
+ *   - ctx.commands.register({name,description,input,handler}) -> /evo
+ *   - ctx.on('session/event' | 'agent/error' | 'agent/status') -> src/host-triggers.ts
+ *   - ctx.llm / ctx.tools / ctx.agents -> src/dsh-bridge (resolveDshCollaborators)
  *   - ctx.prompt/tools/skills/sandbox/subagents/middleware/evoMemory/fork
- *                                         -> the eight Cordis capability seams
- *   - ctx.logger / ctx.provide            -> diagnostics and service exposure
- * When no host seam is discoverable the plugin mounts an in-process in-memory
- * host adapter so the lifecycle still runs deterministically; this is recorded in
- * plugin.diagnostics and never silently pretends to be a real sandbox.
+ *                                        -> the eight Cordis capability seams
+ *   - ctx.logger / ctx.provide           -> diagnostics and service exposure
+ *
+ * The fabricated event names 'task:failed' / 'tool:error' are NOT DSH events and
+ * are no longer defaults: they survive only behind an explicit opt-in list.
  */
+import z from '@deepseek-ai/schemastery';
 import {
   CONFIG_SCHEMA_VERSION,
   parseEvoHarnessConfig,
@@ -46,6 +48,26 @@ import {
   type EvoHarnessOrchestrator,
   type EvoHarnessOrchestratorDeps
 } from './orchestrator';
+import {
+  createModelConfigFragment,
+  createModelRouteSchema,
+  MODEL_ROUTE_DEFAULTS,
+  resolveDshCollaborators,
+  resolveModelRouteConfig,
+  type DshCollaborators
+} from './dsh-bridge';
+import {
+  DSH_AGENT_ERROR,
+  DSH_AGENT_STATUS,
+  DSH_SESSION_EVENT,
+  LEGACY_TRIGGER_EVENTS,
+  registerDshTriggers,
+  splitModelRoute,
+  unwrapConfigValues,
+  type DshCompletedTurnEvent,
+  type DshFailureEvent,
+  type DshTriggerRegistration
+} from './host-triggers';
 import type {
   BranchExecutor,
   EvoHarnessRunRequest,
@@ -60,8 +82,74 @@ import type {
 /** Name registered with the host; hosts render it as /evo. */
 export const EVO_COMMAND_NAME = 'evo';
 
-/** Host events the auto_fallback hook subscribes to by default. */
-export const DEFAULT_AUTO_FALLBACK_EVENTS = ['task:failed', 'tool:error'] as const;
+/**
+ * Events the auto_fallback hook subscribes to by default.
+ *
+ * These are the VERIFIED DSH names (see src/host-triggers.ts). The previous
+ * values 'task:failed' and 'tool:error' do not exist anywhere in the DSH
+ * runtime, so no listener registered on them could ever fire.
+ */
+export const DEFAULT_AUTO_FALLBACK_EVENTS = [
+  DSH_SESSION_EVENT,
+  DSH_AGENT_ERROR,
+  DSH_AGENT_STATUS
+] as const;
+
+/**
+ * The fabricated pre-fix names. Exported for the explicit opt-in path only;
+ * never registered unless the caller asks for them by name.
+ */
+export const LEGACY_AUTO_FALLBACK_EVENTS = LEGACY_TRIGGER_EVENTS;
+
+/** Configured provider/model/reasoningEffort for the optional second page. */
+export type EvoHarnessModelRoute = {
+  readonly provider: string;
+  readonly model: string;
+  readonly reasoningEffort: string;
+};
+
+/** Verified default route, mirrored by the modelRoute block in cordis.patch.yml. */
+export const modelRouteDefaults: EvoHarnessModelRoute = {
+  provider: MODEL_ROUTE_DEFAULTS.provider,
+  model: MODEL_ROUTE_DEFAULTS.model,
+  reasoningEffort: MODEL_ROUTE_DEFAULTS.reasoningEffort
+};
+
+/**
+ * DSH plugin Config: the volatile fragment the settings page renders.
+ *
+ * Every leaf carries .volatile() — a plain field is frozen into the fiber
+ * config and the settings page cannot save a change to it. The enclosing
+ * `modelRoute` group is deliberately NOT volatile: Cordis rejects a volatile
+ * field under a volatile parent. Defaults mirror cordis.patch.yml.
+ */
+export const Config = createModelConfigFragment(
+  z as unknown as Parameters<typeof createModelConfigFragment>[0]
+);
+
+/**
+ * Persist-safe serializer for the plugin config.
+ *
+ * DSH's loader calls `Config.simplify(validated)` before writing an entry back
+ * to cordis.patch.yml. Default schemastery simplify DROPS undeclared keys, so
+ * saving the model route from the settings page would erase triggerMode,
+ * enabledSurfaces, memoryBridge, dreamRsi and logging. Unwrapping the volatile
+ * references while preserving every key keeps the rest of the entry intact.
+ */
+(Config as unknown as Record<string, unknown>)['simplify'] = unwrapConfigValues;
+
+/**
+ * Services this plugin declares.
+ *
+ * Only `commands` is REQUIRED. Cordis has no optional inject: a name listed
+ * here holds the fiber PENDING until that service mounts, so declaring `llm`,
+ * `tools` or `agents` would silently prevent the plugin (and /evo) from ever
+ * mounting on a profile without them. All three are optional collaborators with
+ * a recorded fallback, so they are read through the throwing-safe probe in
+ * src/dsh-bridge instead, where an absent service is a diagnostic instead of a
+ * stalled fiber.
+ */
+export const pluginInject = ['commands'] as const;
 
 /** Minimal structural view of a Cordis plugin context (all members optional). */
 export interface CordisPluginContext {
@@ -105,10 +193,28 @@ export interface EvoHarnessPluginOptions {
   readonly now?: () => number;
   readonly newId?: () => string;
   readonly commitScope?: (sessionId: string) => MemoryScope;
-  /** Subscribe failure events for auto_fallback; defaults to true. */
+  /** Subscribe the verified DSH triggers; defaults to true. */
   readonly registerAutoFallback?: boolean;
+  /**
+   * Explicit opt-in to event names that are NOT part of DSH.
+   *
+   * The pre-fix defaults 'task:failed' / 'tool:error' do not exist in the DSH
+   * runtime, so they are never registered unless named here.
+   */
   readonly autoFallbackEvents?: readonly string[];
   readonly applyWinningPatch?: boolean;
+  /**
+   * Resolve ctx.llm / ctx.tools / the same-process BranchExecutor through
+   * src/dsh-bridge. Defaults to true; tests inject the three collaborators
+   * directly and do not need a host context.
+   */
+  readonly resolveDshCollaborators?: boolean;
+  /** Override the route explicitly (provider/model/reasoningEffort). */
+  readonly route?: { provider?: string; model?: string; reasoningEffort?: string };
+  /** Enable the idle-dream hook on agent/status; defaults to true. */
+  readonly enableIdleDream?: boolean;
+  /** Override the idle-dream replay body (tests pass a spy). */
+  readonly dream?: () => Promise<unknown> | unknown;
 }
 
 /** Mounted plugin handle returned by apply/createEvoHarnessPlugin. */
@@ -120,9 +226,27 @@ export interface EvoHarnessPlugin {
   readonly registeredCommands: readonly string[];
   readonly registeredEvents: readonly string[];
   readonly hostAdapterSource: 'injected' | 'context' | 'in-memory';
+  /** Effective provider/model/reasoningEffort for model calls. */
+  readonly modelRoute: EvoHarnessModelRoute;
+  /** Resolves once ctx.llm / ctx.tools / runBranch detection settles. */
+  readonly collaborators: Promise<DshCollaborators | undefined>;
   run(request: EvoHarnessRunRequest): Promise<EvoHarnessRunResult>;
   runFromCommand(args: unknown, context?: unknown): Promise<EvoHarnessRunResult>;
   handleFallbackEvent(payload: unknown): Promise<EvoHarnessRunResult | null>;
+  /** Handle one verified DSH failure observation (auto_fallback / always). */
+  handleTriggerFailure(failure: DshFailureEvent): Promise<EvoHarnessRunResult | null>;
+  /** Handle one completed turn; runs only under triggerMode 'always'. */
+  handleTurnCompleted(turn: DshCompletedTurnEvent): Promise<EvoHarnessRunResult | null>;
+  /**
+   * Await every trigger-initiated run that is still in flight, in completion
+   * order.
+   *
+   * DSH dispatches `session/event` as a contained fire-and-forget emit, so the
+   * listener cannot return the run's result. This is the deterministic join
+   * point: the plugin's own teardown uses it, and a caller that wants the
+   * outcome of an event it just dispatched awaits it here.
+   */
+  settle(): Promise<readonly EvoHarnessRunResult[]>;
   makeTask(input: {
     readonly prompt: string;
     readonly id?: string;
@@ -139,6 +263,32 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>;
 }
 
+/**
+ * Read one property without letting the host's proxy throw.
+ *
+ * A live Cordis context resolves property reads through its reflection layer:
+ * reading a service the plugin did not declare in `inject` raises
+ * `cannot get property "<name>" without inject` instead of returning
+ * `undefined`. Structural probing must therefore treat a throw exactly like an
+ * absent capability, or mounting a plugin that probes for optional services
+ * fails the whole fiber.
+ */
+function safeGet(source: unknown, key: string): unknown {
+  if (source === null || typeof source !== 'object') {
+    return undefined;
+  }
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read the host context's plugin config without assuming it is injectable. */
+function contextConfig(ctx: unknown): unknown {
+  return safeGet(ctx, 'config');
+}
+
 function pickFunction(
   source: Record<string, unknown> | undefined,
   names: readonly string[]
@@ -147,7 +297,7 @@ function pickFunction(
     return undefined;
   }
   for (const name of names) {
-    const candidate = source[name];
+    const candidate = safeGet(source, name);
     if (typeof candidate === 'function') {
       return candidate as (...args: unknown[]) => unknown;
     }
@@ -160,7 +310,7 @@ function pickCapability(
   objectName: string,
   methodNames: readonly string[]
 ): ((...args: unknown[]) => unknown) | undefined {
-  const holder = source === undefined ? undefined : asRecord(source[objectName]);
+  const holder = source === undefined ? undefined : asRecord(safeGet(source, objectName));
   return pickFunction(holder, methodNames);
 }
 
@@ -221,63 +371,63 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
   const promptSegment = pickCapability(root, 'prompt', ['registerSegment']);
   if (promptSegment !== undefined) {
     adapter.registerPromptSegment = async (spec: Record<string, unknown>) => {
-      const result = await promptSegment.call(asRecord(ctx)?.prompt, 'system', spec.content, spec);
+      const result = await promptSegment.call(asRecord(safeGet(ctx, 'prompt')), 'system', spec.content, spec);
       return normalizeDisposer(result);
     };
   }
   const permissions = pickCapability(root, 'permissions', ['register', 'addRule', 'guard']);
   if (permissions !== undefined) {
     adapter.registerGuardrails = async (spec: Record<string, unknown>) => {
-      const result = await permissions.call(asRecord(ctx)?.permissions, spec);
+      const result = await permissions.call(asRecord(safeGet(ctx, 'permissions')), spec);
       return normalizeDisposer(result);
     };
   }
   const memoryView = pickCapability(root, 'evoMemory', ['createScopedView', 'scopedView']);
   if (memoryView !== undefined) {
     adapter.registerMemoryScope = async (spec: Record<string, unknown>) => {
-      const result = await memoryView.call(asRecord(ctx)?.evoMemory, spec.scopedViewId, spec);
+      const result = await memoryView.call(asRecord(safeGet(ctx, 'evoMemory')), spec.scopedViewId, spec);
       return normalizeDisposer(result);
     };
   }
   const patchDescriptions = pickCapability(root, 'tools', ['patchDescriptions', 'patchDescription']);
   if (patchDescriptions !== undefined) {
     adapter.patchToolGuidance = async (spec: Record<string, unknown>) => {
-      const result = await patchDescriptions.call(asRecord(ctx)?.tools, spec.descriptions, spec);
+      const result = await patchDescriptions.call(asRecord(safeGet(ctx, 'tools')), spec.descriptions, spec);
       return normalizeDisposer(result);
     };
   }
   const mountSkill = pickCapability(root, 'skills', ['mountDynamic', 'mount']);
   if (mountSkill !== undefined) {
     adapter.mountSkills = async (spec: Record<string, unknown>) => {
-      const result = await mountSkill.call(asRecord(ctx)?.skills, spec.skills, spec);
+      const result = await mountSkill.call(asRecord(safeGet(ctx, 'skills')), spec.skills, spec);
       return normalizeDisposer(result);
     };
   }
   const mountScript = pickCapability(root, 'sandbox', ['mountScript', 'writeFile']);
   if (mountScript !== undefined) {
     adapter.mountScripts = async (spec: Record<string, unknown>) => {
-      const result = await mountScript.call(asRecord(ctx)?.sandbox, spec.scripts, spec);
+      const result = await mountScript.call(asRecord(safeGet(ctx, 'sandbox')), spec.scripts, spec);
       return normalizeDisposer(result);
     };
   }
   const registerSubagent = pickCapability(root, 'subagents', ['register', 'registerSubagent']);
   if (registerSubagent !== undefined) {
     adapter.registerSubagents = async (spec: Record<string, unknown>) => {
-      const result = await registerSubagent.call(asRecord(ctx)?.subagents, spec.agents, spec);
+      const result = await registerSubagent.call(asRecord(safeGet(ctx, 'subagents')), spec.agents, spec);
       return normalizeDisposer(result);
     };
   }
   const useMiddleware = pickCapability(root, 'middleware', ['use', 'register']);
   if (useMiddleware !== undefined) {
     adapter.mountMiddleware = async (spec: Record<string, unknown>) => {
-      const result = await useMiddleware.call(asRecord(ctx)?.middleware, spec.middleware, spec);
+      const result = await useMiddleware.call(asRecord(safeGet(ctx, 'middleware')), spec.middleware, spec);
       return normalizeDisposer(result);
     };
   }
   const acquireSandbox = pickCapability(root, 'sandbox', ['acquireWorkspace', 'createWorkspace']);
   if (acquireSandbox !== undefined) {
     adapter.acquireSandbox = async (request: unknown) => {
-      const result = await acquireSandbox.call(asRecord(ctx)?.sandbox, request);
+      const result = await acquireSandbox.call(asRecord(safeGet(ctx, 'sandbox')), request);
       const record = asRecord(result);
       let disposed = false;
       return {
@@ -489,28 +639,257 @@ export function unconfiguredBranchExecutor(now: () => number): BranchExecutor {
   };
 }
 
+/**
+ * Deferred collaborators.
+ *
+ * `resolveDshCollaborators` is asynchronous (it may resolve schemastery), but a
+ * Cordis `apply` is synchronous. The orchestrator therefore receives stable
+ * FORWARDING collaborator objects whose target is replaced once detection
+ * settles: an early `ctx.llm` call still fails loudly with the documented
+ * message instead of silently succeeding, and a later call uses the real
+ * adapter. No run can observe a half-configured collaborator, because the
+ * forwarding target is assigned before the first run can start.
+ */
+interface CollaboratorHolder {
+  model?: IModelAdapter;
+  runBranch?: BranchExecutor;
+}
+
+function forwardingModel(holder: CollaboratorHolder, missing: () => IModelAdapter): IModelAdapter {
+  return {
+    complete: (request) => (holder.model ?? missing()).complete(request)
+  };
+}
+
+function forwardingBranch(holder: CollaboratorHolder, fallback: BranchExecutor): BranchExecutor {
+  return async (context) => (holder.runBranch ?? fallback)(context);
+}
+
+/** Read the raw plugin config section, splitting out the host-only group. */
+function readPluginSection(options: EvoHarnessPluginOptions, ctx: unknown): {
+  readonly config: Record<string, unknown> | undefined;
+  readonly modelRoute: Record<string, unknown> | undefined;
+} {
+  const raw = options.config ?? contextConfig(ctx);
+  return splitModelRoute(raw);
+}
+
 /** Construct the plugin without touching a host context. */
 export function createEvoHarnessPlugin(
   options: EvoHarnessPluginOptions = {},
   ctx?: unknown
 ): EvoHarnessPlugin {
-  const resolved = parseEvoHarnessConfig(options.config ?? (asRecord(ctx)?.config ?? undefined));
+  const section = readPluginSection(options, ctx);
+  const resolved = parseEvoHarnessConfig(section.config ?? undefined);
   const diagnostics: string[] = [];
-  const { deps, hostAdapterSource } = buildOrchestratorDeps(resolved, options, ctx, diagnostics);
+  const report = (message: string): void => {
+    diagnostics.push(message);
+  };
+
+  /**
+   * Effective model route: the plugin's own options win, then the resolved
+   * `modelRoute` group from the settings page / cordis.patch.yml, then the
+   * verified DSH default. Read with the bridge's reference-unwrapping reader so
+   * a schemastery volatile reference yields its value.
+   */
+  const configuredRoute = resolveModelRouteConfig(section.modelRoute);
+  const modelRoute: EvoHarnessModelRoute = {
+    provider: options.route?.provider ?? configuredRoute.provider,
+    model: options.route?.model ?? configuredRoute.model,
+    reasoningEffort: options.route?.reasoningEffort ?? configuredRoute.reasoningEffort
+  };
+
+  const holder: CollaboratorHolder = {};
+  if (options.model !== undefined) {
+    holder.model = options.model;
+  }
+  if (options.runBranch !== undefined) {
+    holder.runBranch = options.runBranch;
+  }
+
+  /**
+   * Deferred client provider.
+   *
+   * The tools-backed MCP client only exists after collaborator detection
+   * settles, and the memory bridge is constructed synchronously. The bridge
+   * awaits `listClients` on its first initialize(), which is after detection,
+   * so the DSH tool catalogue reaches auto-discovery without a race — and
+   * without a fabricated client when ctx.tools is absent.
+   */
+  const deferredClients = async (): Promise<readonly McpClient[]> => {
+    const detected = await collaborators;
+    if (detected === undefined) {
+      return options.clients ?? [];
+    }
+    return detected.clients;
+  };
+
+  // The orchestrator's three host-facing collaborators are forwarding objects;
+  // the concrete targets arrive from resolveDshCollaborators below.
+  const bridgeOptions: EvoHarnessPluginOptions = {
+    ...options,
+    model: forwardingModel(holder, () => options.model ?? missingModelAdapter()),
+    runBranch: forwardingBranch(holder, unconfiguredBranchExecutor(() => Date.now())),
+    ...(options.clients !== undefined || options.listClients !== undefined
+      ? {}
+      : { listClients: deferredClients })
+  };
+  const { deps, hostAdapterSource } = buildOrchestratorDeps(resolved, bridgeOptions, ctx, diagnostics);
   const orchestrator = createEvoHarnessOrchestrator(deps);
   const disposers: Array<() => void | Promise<void>> = [];
   const registeredCommands: string[] = [];
   const registeredEvents: string[] = [];
   const inFlight = new Set<string>();
+  const triggerDisposers: Array<() => unknown> = [];
+  /** Runs started by a trigger; `settle()` joins them for deterministic teardown. */
+  const triggeredRuns = new Set<Promise<EvoHarnessRunResult | null>>();
+  let disposed = false;
+
+  /** Track one trigger-initiated run and collect its result on completion. */
+  const trackRun = (run: Promise<EvoHarnessRunResult | null>): Promise<EvoHarnessRunResult | null> => {
+    triggeredRuns.add(run);
+    void run.catch(() => undefined).finally(() => {
+      triggeredRuns.delete(run);
+    });
+    return run;
+  };
 
   const log = (level: 'info' | 'warn', message: string): void => {
-    const logger = asRecord(ctx)?.logger;
-    const sink = logger === undefined ? undefined : (logger as Record<string, unknown>)[level];
+    const logger = asRecord(safeGet(ctx, 'logger'));
+    const sink = logger === undefined ? undefined : safeGet(logger, level);
     if (typeof sink === 'function') {
       (sink as (value: string) => void).call(logger, message);
       return;
     }
     diagnostics.push(message);
+  };
+
+  /**
+   * Collaborator detection. Resolved once and shared by every consumer; a
+   * failure here is a diagnostic, never a mount failure.
+   */
+  const collaborators: Promise<DshCollaborators | undefined> = (async () => {
+    if (options.resolveDshCollaborators === false) {
+      report('DSH collaborator detection was disabled by options.resolveDshCollaborators=false');
+      return undefined;
+    }
+    try {
+      const resolvedCollaborators = await resolveDshCollaborators(ctx, {
+        config: section.config,
+        route: modelRoute,
+        ...(options.route === undefined ? {} : { route: options.route }),
+        ...(options.model === undefined ? {} : { model: options.model }),
+        ...(options.runBranch === undefined ? {} : { runBranch: options.runBranch }),
+        ...(options.clients === undefined ? {} : { clients: options.clients }),
+        onDiagnostic: report
+      });
+      if (holder.model === undefined && resolvedCollaborators.model !== undefined) {
+        holder.model = resolvedCollaborators.model;
+      }
+      if (holder.runBranch === undefined) {
+        holder.runBranch = resolvedCollaborators.runBranch;
+      }
+      report(
+        'model route in effect: '
+          + resolvedCollaborators.route.provider
+          + '/'
+          + resolvedCollaborators.route.model
+          + ' (effort '
+          + resolvedCollaborators.route.reasoningEffort
+          + ')'
+      );
+      return resolvedCollaborators;
+    } catch (error) {
+      report(
+        'DSH collaborator detection failed: '
+          + (error instanceof Error ? error.name + ': ' + error.message : String(error))
+      );
+      return undefined;
+    }
+  })();
+
+  // A rejection is already contained inside the async block above; this keeps a
+  // fire-and-forget consumer from surfacing an unhandled rejection.
+  void collaborators.catch(() => undefined);
+
+  /** Build the recovery prompt from a verified failure observation. */
+  const failurePrompt = (failure: DshFailureEvent): string => failure.summary;
+
+  /** One auto_fallback run keyed by session, with an in-flight guard. */
+  const runFallback = async (
+    failure: DshFailureEvent
+  ): Promise<EvoHarnessRunResult | null> => {
+    if (resolved.triggerMode === 'slash_command') {
+      report('triggerMode=slash_command: the failure observation was ignored');
+      return null;
+    }
+    if (disposed) {
+      return null;
+    }
+    const sessionId = failure.sessionId ?? 'session-unknown';
+    if (inFlight.has(sessionId)) {
+      report('auto_fallback: a run is already in flight for ' + sessionId + '; event ignored');
+      return null;
+    }
+    inFlight.add(sessionId);
+    try {
+      return await orchestrator.run({
+        sessionId,
+        task: plugin.makeTask({ prompt: failurePrompt(failure) }),
+        trigger: 'auto_fallback',
+        metadata: {
+          autoFallback: true,
+          dshEvent: failure.dshEvent,
+          dshFailureKind: failure.kind,
+          failureSignals: failure.failureSignals,
+          evidence: failure.evidence
+        }
+      });
+    } catch (error) {
+      report(
+        'auto_fallback run failed: '
+          + (error instanceof Error ? error.name + ': ' + error.message : String(error))
+      );
+      return null;
+    } finally {
+      inFlight.delete(sessionId);
+    }
+  };
+
+  /** One 'always' run for a completed turn, with the same in-flight guard. */
+  const runCompletedTurn = async (
+    turn: DshCompletedTurnEvent
+  ): Promise<EvoHarnessRunResult | null> => {
+    if (resolved.triggerMode !== 'always' || disposed) {
+      return null;
+    }
+    const sessionId = turn.sessionId ?? 'session-unknown';
+    if (inFlight.has(sessionId)) {
+      report('always: a run is already in flight for ' + sessionId + '; turn ignored');
+      return null;
+    }
+    inFlight.add(sessionId);
+    try {
+      return await orchestrator.run({
+        sessionId,
+        task: plugin.makeTask({
+          prompt: 'improve the completed turn' + (turn.turn === undefined ? '' : ' #' + String(turn.turn))
+        }),
+        trigger: 'always',
+        metadata: {
+          dshEvent: turn.dshEvent,
+          completedTurn: turn.evidence
+        }
+      });
+    } catch (error) {
+      report(
+        'always run failed: '
+          + (error instanceof Error ? error.name + ': ' + error.message : String(error))
+      );
+      return null;
+    } finally {
+      inFlight.delete(sessionId);
+    }
   };
 
   const plugin: EvoHarnessPlugin = {
@@ -521,6 +900,8 @@ export function createEvoHarnessPlugin(
     registeredCommands,
     registeredEvents,
     hostAdapterSource,
+    modelRoute,
+    collaborators,
     run: (request) => orchestrator.run(request),
     async runFromCommand(args: unknown, context?: unknown): Promise<EvoHarnessRunResult> {
       const record = asRecord(args);
@@ -545,20 +926,23 @@ export function createEvoHarnessPlugin(
       });
       return orchestrator.run({ sessionId, task, trigger: 'slash_command' });
     },
+    /**
+     * Direct entry point for a failure observation from any transport.
+     *
+     * A host payload (the pre-fix shape with sessionId/task/failureSignals) is
+     * normalized into a verified failure record; the runtime listeners use
+     * handleTriggerFailure with an already-normalized observation.
+     */
     async handleFallbackEvent(payload: unknown): Promise<EvoHarnessRunResult | null> {
       if (resolved.triggerMode === 'slash_command') {
         diagnostics.push('triggerMode=slash_command: the auto_fallback event was ignored');
         return null;
       }
       const record = asRecord(payload);
-      const sessionId =
-        typeof record?.sessionId === 'string' ? (record.sessionId as string) : 'session-unknown';
-      if (inFlight.has(sessionId)) {
-        diagnostics.push('auto_fallback: a run is already in flight for ' + sessionId + '; event ignored');
-        return null;
-      }
       const taskRecord = asRecord(record?.task);
-      const failureSignals = record?.failureSignals;
+      const supplied = record?.failureSignals;
+      const sessionId =
+        typeof record?.sessionId === 'string' ? (record.sessionId as string) : undefined;
       const prompt =
         typeof taskRecord?.prompt === 'string'
           ? (taskRecord.prompt as string)
@@ -567,24 +951,38 @@ export function createEvoHarnessPlugin(
             : typeof record?.message === 'string'
               ? (record.message as string)
               : 'recover from the reported failure';
-      inFlight.add(sessionId);
-      try {
-        return await orchestrator.run({
-          sessionId,
-          task: plugin.makeTask({
-            prompt,
-            ...(typeof taskRecord?.id === 'string' ? { id: taskRecord.id as string } : {})
-          }),
-          trigger: 'auto_fallback',
-          metadata: {
-            autoFallback: true,
-            ...(failureSignals === undefined ? {} : { failureSignals }),
-            ...(record?.toolErrors === undefined ? {} : { toolErrors: record.toolErrors })
+      const failureSignals =
+        Array.isArray(supplied) && supplied.length > 0
+          ? (supplied as readonly { kind: string; message: string }[])
+          : [{ kind: 'unknown', message: prompt }];
+      return runFallback({
+        source: 'session/event',
+        kind: 'agent_error',
+        dshEvent: 'handleFallbackEvent',
+        ...(sessionId === undefined ? {} : { sessionId }),
+        summary: prompt,
+        failureSignals: failureSignals as DshFailureEvent['failureSignals'],
+        evidence: {
+          ...(typeof taskRecord?.id === 'string' ? { taskId: taskRecord.id } : {}),
+          transport: 'direct'
+        }
+      });
+    },
+    handleTriggerFailure: (failure) => trackRun(runFallback(failure)),
+    handleTurnCompleted: (turn) => trackRun(runCompletedTurn(turn)),
+    async settle(): Promise<readonly EvoHarnessRunResult[]> {
+      const results: EvoHarnessRunResult[] = [];
+      // A run can start another only through a later event, so one pass over
+      // the live set is enough; loop anyway in case a run re-enters it.
+      while (triggeredRuns.size > 0) {
+        const pending = [...triggeredRuns];
+        for (const settled of await Promise.all(pending)) {
+          if (settled !== null) {
+            results.push(settled);
           }
-        });
-      } finally {
-        inFlight.delete(sessionId);
+        }
       }
+      return results;
     },
     makeTask(input): ProbeTask {
       const base = input.id ?? 'task-' + input.prompt.slice(0, 32);
@@ -596,6 +994,27 @@ export function createEvoHarnessPlugin(
       };
     },
     async dispose(): Promise<void> {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      // Let in-flight trigger runs finish before tearing the orchestrator down,
+      // so a run started by the last event is not aborted mid-flight.
+      if (triggeredRuns.size > 0) {
+        try {
+          await Promise.all([...triggeredRuns]);
+        } catch {
+          // individual runs already report their own failure
+        }
+      }
+      for (const dispose of triggerDisposers) {
+        try {
+          await dispose();
+        } catch {
+          // a host disposer failure must not strand teardown
+        }
+      }
+      triggerDisposers.length = 0;
       for (const dispose of disposers) {
         try {
           await dispose();
@@ -608,8 +1027,30 @@ export function createEvoHarnessPlugin(
     }
   };
 
+  // DSH's own command service takes precedence: ctx.commands.register({ name,
+  // description, handler }) validates the definition and returns the exact
+  // effect disposer that unregisters it when the fiber unloads.
+  const commandsService = asRecord(safeGet(ctx, 'commands'));
+  const dshRegister = pickFunction(commandsService, ['register']);
+  if (dshRegister !== undefined) {
+    try {
+      const result = dshRegister.call(commandsService, {
+        name: EVO_COMMAND_NAME,
+        description: 'Run a test-time self-evolution pass over the current task',
+        input: { hint: '<task prompt | blank recovers the current task>' },
+        handler: (invocation: unknown) => handleDshCommand(plugin, invocation)
+      });
+      const normalized = normalizeDisposer(result);
+      disposers.push(() => normalized.dispose());
+      registeredCommands.push(EVO_COMMAND_NAME);
+      log('info', 'evo-harness: registered /' + EVO_COMMAND_NAME + ' through ctx.commands');
+    } catch (error) {
+      diagnostics.push('failed to register /evo with ctx.commands: ' + String(error));
+    }
+  }
+
   const registerCommand = pickFunction(asRecord(ctx), ['registerCommand', 'command', 'addCommand']);
-  if (registerCommand !== undefined) {
+  if (registeredCommands.length === 0 && registerCommand !== undefined) {
     try {
       const result = registerCommand.call(ctx, EVO_COMMAND_NAME, (args: unknown, context?: unknown) =>
         plugin.runFromCommand(args, context)
@@ -621,71 +1062,191 @@ export function createEvoHarnessPlugin(
     } catch (error) {
       diagnostics.push('failed to register the /evo command: ' + String(error));
     }
-  } else {
+  } else if (registeredCommands.length === 0) {
     diagnostics.push(
       'the host context exposes no command registrar; plugin.runFromCommand(args) is the fallback entrypoint for /evo'
     );
   }
 
-  if (options.registerAutoFallback !== false && resolved.triggerMode === 'slash_command') {
-    diagnostics.push(
-      'triggerMode=slash_command: auto_fallback listeners were not registered; /evo remains the only entrypoint'
-    );
-  } else if (options.registerAutoFallback !== false) {
-    const on = pickFunction(asRecord(ctx), ['on', 'onEvent', 'subscribe']);
-    const events = options.autoFallbackEvents ?? DEFAULT_AUTO_FALLBACK_EVENTS;
-    if (on !== undefined) {
-      for (const event of events) {
-        try {
-          const result = on.call(ctx, event, (payload: unknown) => plugin.handleFallbackEvent(payload));
-          const normalized = normalizeDisposer(result);
-          disposers.push(() => normalized.dispose());
-          registeredEvents.push(event);
-        } catch (error) {
-          diagnostics.push('failed to subscribe to "' + event + '": ' + String(error));
+  // Verified DSH triggers only: session/event (tool/result errors, turn/end
+  // errors, and — under 'always' — turn/end 'completed'), agent/error, and
+  // agent/status 'idle' for the optional offline dream.
+  if (options.registerAutoFallback === false) {
+    diagnostics.push('trigger registration was disabled by options.registerAutoFallback=false');
+  } else {
+    const dreamEnabled = options.enableIdleDream !== false;
+    // Zero-execution replay of the retained trees. The dreamer's own policy
+    // generator produces the candidates when none are supplied, which is
+    // exactly what the orchestrator's in-run dream does.
+    const dreamRun = async (): Promise<unknown> => {
+      if (options.dream !== undefined) {
+        return options.dream();
+      }
+      const trees = orchestrator.treePool.list();
+      if (trees.length === 0) {
+        return undefined;
+      }
+      return deps.dreamer.replay({
+        trees,
+        baselinePolicy: deps.policy.policy,
+        candidatePolicies: []
+      });
+    };
+    const registration: DshTriggerRegistration = registerDshTriggers(ctx, {
+      triggerMode: resolved.triggerMode,
+      onFailure: (failure) => plugin.handleTriggerFailure(failure),
+      onTurnCompleted: (turn) => plugin.handleTurnCompleted(turn),
+      ...(dreamEnabled
+        ? {
+            dream: {
+              // Gate on retained material: replaying zero trees is pointless.
+              hasMaterial: () => orchestrator.treePool.list().length > 0,
+              run: dreamRun,
+              onDiagnostic: report
+            }
+          }
+        : {}),
+      agents: () => {
+        const agentsService = asRecord(safeGet(ctx, 'agents'));
+        const list = pickFunction(agentsService, ['list']);
+        if (list === undefined) {
+          return [];
         }
-      }
-      if (registeredEvents.length > 0) {
-        log('info', 'evo-harness: auto_fallback subscribed to ' + registeredEvents.join(', '));
-      }
-    } else {
-      diagnostics.push(
-        'the host context exposes no event subscriber; call plugin.handleFallbackEvent(payload) for auto_fallback'
+        try {
+          const live = list.call(agentsService);
+          return Array.isArray(live) ? live : [];
+        } catch {
+          return [];
+        }
+      },
+      ...(options.autoFallbackEvents === undefined
+        ? {}
+        : { legacyEvents: options.autoFallbackEvents }),
+      onDiagnostic: report
+    });
+    for (const name of registration.events) {
+      registeredEvents.push(name);
+    }
+    for (const dispose of registration.disposers) {
+      triggerDisposers.push(dispose);
+    }
+    if (registration.events.length > 0) {
+      log(
+        'info',
+        'evo-harness: triggerMode=' + resolved.triggerMode + ' subscribed to ' + registration.events.join(', ')
       );
     }
   }
+  if (options.autoFallbackEvents !== undefined && options.registerAutoFallback !== false) {
+    diagnostics.push(
+      'options.autoFallbackEvents overrides the verified DSH trigger list; the names supplied are not verified DSH events'
+    );
+  }
 
+  // Exposing the handle is best-effort: a live Cordis context only accepts a
+  // service registration from a fiber that owns it ("cannot provide ... in
+  // inactive context"), so a throw here records a diagnostic instead of failing
+  // the whole mount. Plain object contexts get the property fallback.
   const provide = pickFunction(asRecord(ctx), ['provide', 'set', 'expose']);
+  let exposed = false;
   if (provide !== undefined) {
     try {
       provide.call(ctx, 'evoHarness', plugin);
+      exposed = true;
     } catch (error) {
       diagnostics.push('failed to expose the evoHarness service: ' + String(error));
     }
-  } else {
+  }
+  if (!exposed) {
     const record = asRecord(ctx);
     if (record !== undefined && !Object.isFrozen(record)) {
       try {
         record.evoHarness = plugin;
+        exposed = true;
       } catch (error) {
         diagnostics.push('failed to attach the evoHarness service: ' + String(error));
       }
+    }
+  }
+  if (!exposed && diagnostics.length > 0) {
+    diagnostics.push(
+      'the host exposes no writable service registrar; use the mounted handle returned by apply()'
+    );
+  }
+
+  // Cordis ignores the `apply` return value: the disposers collected above only
+  // run when the fiber unloads if they are registered as a fiber effect. Without
+  // this, a reload would leave the /evo command and the failure listeners
+  // registered against a dead fiber.
+  const registerEffect = pickFunction(asRecord(ctx), ['effect']);
+  if (registerEffect !== undefined) {
+    try {
+      registerEffect.call(ctx, () => () => plugin.dispose());
+    } catch (error) {
+      diagnostics.push('failed to register the fiber disposal effect: ' + String(error));
     }
   }
 
   return plugin;
 }
 
+/**
+ * DSH command adapter: turn one `/evo` invocation into a run result.
+ *
+ * DSH's command service calls the handler with an invocation object that
+ * carries `rawInput` plus the receiving agent. The handler must return a
+ * `{ kind: 'success' | 'error', text }` result instead of throwing, so a
+ * failed evolution pass is reported in the transcript rather than killing the
+ * command.
+ */
+function handleDshCommand(
+  mounted: EvoHarnessPlugin,
+  invocation: unknown
+): Promise<{ kind: 'success' | 'error'; text: string }> {
+  const record = asRecord(invocation);
+  const rawInput = typeof record?.rawInput === 'string' ? (record.rawInput as string) : '';
+  const agent = asRecord(record?.agent);
+  const sessionId =
+    typeof agent?.sessionId === 'string'
+      ? (agent.sessionId as string)
+      : typeof record?.sessionId === 'string'
+        ? (record.sessionId as string)
+        : 'session-unknown';
+  return mounted
+    .runFromCommand({ prompt: rawInput.trim(), sessionId })
+    .then((result) => ({
+      kind: 'success' as const,
+      text: [
+        '/evo ' + result.outcome + ' on task ' + result.taskId,
+        'probes run: ' + String(result.probesRun) + ', lessons committed: ' + String(result.lessonsCommitted)
+      ].join('\n')
+    }))
+    .catch((error: unknown) => ({
+      kind: 'error' as const,
+      text: '/evo failed: ' + (error instanceof Error ? error.message : String(error))
+    }));
+}
 /** Standard Cordis plugin entrypoint. */
 export function apply(ctx: unknown, optionsOrConfig?: unknown): EvoHarnessPlugin {
-  const normalized = normalizePluginOptions(optionsOrConfig, asRecord(ctx)?.config);
+  const normalized = normalizePluginOptions(optionsOrConfig, contextConfig(ctx));
   return createEvoHarnessPlugin(normalized, ctx);
 }
 
 /** Plugin name shared by the default export and the plugin handle. */
 export const PLUGIN_NAME = 'dsh-plugin-evo-harness';
 
-export const plugin = { name: PLUGIN_NAME, apply };
+/** Cordis services this plugin requires before it can mount. */
+export const inject = pluginInject;
+
+/**
+ * The Cordis plugin export.
+ *
+ * `Config` is what makes the second-level settings page render the
+ * provider/model/reasoningEffort pickers: Cordis reads
+ * `runtime.Config['~standard'].validate(config)` at load time and
+ * `Config['simplify']` when persisting an entry.
+ */
+export const plugin = { name: PLUGIN_NAME, inject, Config, apply };
 
 export default plugin;
 

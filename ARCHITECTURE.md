@@ -277,7 +277,12 @@ plugins:
 
   # 2. 挂载本自进化插件
   "dsh-plugin-evo-harness":
-    # 触发模式: 'auto_fallback' (常规执行受阻/报错时介入) | 'always' | 'slash_command' (/evo)
+    # 触发模式 (三者语义严格区分):
+    #   'slash_command' -> 不注册任何监听器, /evo 是唯一入口
+    #   'auto_fallback' -> 仅失败事件 (tool/result 错误、turn/end 错误、agent/error)
+    #   'always'        -> 失败事件 + turn/end 'completed'
+    # 已核验的 DSH 事件: session/event / agent/error / agent/status
+    # (旧默认值 'task:failed'、'tool:error' 在 DSH 中并不存在, 已移除)
     triggerMode: "auto_fallback"
 
     # 记忆桥配置 (兼容任意 MCP 记忆插件)
@@ -298,7 +303,45 @@ plugins:
       enableAsymmetricGuidance: true     # 开启非对称记忆注入 (Invariant 分支屏蔽历史记忆防过拟合)
       offlineDreamTriggerEveryNTasks: 10 # 每完成 10 个任务触发一次后台零成本历史树重放进化
       candidatePoliciesCount: 6          # 每次做梦生成的候选调度策略数 M
+
+    # 二级页面可选模型 (src/index.ts 的 volatile Config 片段)
+    # 三个字段均带 .volatile(): 缺省即被冻结进 fiber config, 设置页无法保存修改。
+    # 组本身不能是 volatile (Cordis 禁止 volatile 字段嵌套在 volatile 父级下)。
+    modelRoute:
+      provider: "qodercn"    # 已核验的 DSH 默认 provider
+      model: "dfmodel"
+      reasoningEffort: "max" # high | max | low
 ```
+
+### 6.3 DSH 宿主事件与配置契约 (verified against resources/app.asar)
+
+上一版把 `auto_fallback` 挂在 `task:failed` / `tool:error` 上。这两个名字在 DSH 运行时中**根本不存在**
+（对 app.asar 全部 JS 文件的检索为零命中），因此该钩子永远不会触发。现改为仅订阅已核验的事件
+（实现见 [src/host-triggers.ts](src/host-triggers.ts)）：
+
+| 事件 | 负载 | 语义 |
+| :--- | :--- | :--- |
+| `session/event` | `(session, event)` | 提交后的追加流；仅解释 `tool/result`(`event.data.message.isError`) 与 `turn/end`(`event.data.reason.kind`) |
+| `agent/error` | `{agent, turn, step, error}` | 恒为失败 |
+| `agent/status` | `{status: 'idle' \| 'running'}` | `idle` → 可选离线做梦 |
+
+关键约束（均已验证，非推测）：
+
+- `TurnEndReasonMap` 的 kind 为 `completed | aborted | blocked | error | max-tokens | interrupted | forked`；
+  只有 `error` 是失败，`completed` 仅在 `triggerMode: always` 下触发。
+- `agent/status` 的负载**只有** `{status}`（agent-loop 的 `setPhase` 发出 `{ status }`），agent 由分发器融合
+  或退回到 `ctx.agents.list()`。
+- `agent.runMaintenance(job)` 在 agent 非 idle 时**抛出** `already has active work`，因此全部 try/catch，
+  抢跑属正常路径而非错误。
+- `session/event` 是 fire-and-forget 的 contains 分发，监听器无法回传结果；`plugin.settle()` 是确定的
+  汇合点（teardown 也会先等待它）。
+- 二级页面配置使用插件的 `static/exported Config`（schemastery）。每个叶子必须 `.volatile()`，否则会被
+  冻结进 fiber config、设置页无法保存；外层 `modelRoute` 组**不能** volatile（Cordis 禁止 volatile 嵌套）。
+- `Config.simplify` 被覆写以保留未声明键：DSH loader 在写回 `cordis.patch.yml` 前调用它，而 schemastery
+  的默认实现会**丢弃** schema 未声明的键，从而抹掉 `triggerMode`/`enabledSurfaces`/`memoryBridge`/
+  `dreamRsi`/`logging`。
+- `inject` 仅声明 `commands`：Cordis 没有 optional inject，声明 `llm`/`tools`/`agents` 会让 fiber 一直
+  PENDING，反而使插件（连同 /evo）无法挂载；这三者是可选协作者，由 src/dsh-bridge 做 throwing-safe 探测。
 
 ---
 

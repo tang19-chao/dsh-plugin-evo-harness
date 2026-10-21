@@ -91,7 +91,7 @@ describe('plugin entrypoint', () => {
     expect(EVO_COMMAND_NAME).toBe('evo');
   });
 
-  it('registers /evo and auto_fallback on a capable host context', async () => {
+  it('registers /evo and the verified DSH triggers on a capable host context', async () => {
     const { ctx, commands, events, info } = createFakeContext();
     const plugin = apply(ctx, {
       config: e2eConfig(),
@@ -104,8 +104,9 @@ describe('plugin entrypoint', () => {
 
     expect(plugin.registeredCommands).toEqual(['evo']);
     expect(commands.has('evo')).toBe(true);
-    expect([...events.keys()].sort()).toEqual(['task:failed', 'tool:error']);
-    expect(plugin.registeredEvents).toEqual(['task:failed', 'tool:error']);
+    // ONLY verified DSH events: 'task:failed' / 'tool:error' do not exist.
+    expect([...events.keys()].sort()).toEqual(['agent/error', 'agent/status', 'session/event']);
+    expect(plugin.registeredEvents).toEqual(['session/event', 'agent/error', 'agent/status']);
     expect(info).toHaveBeenCalled();
     expect((ctx as Record<string, unknown>).evoHarness).toBe(plugin);
     expect(plugin.hostAdapterSource).toBe('in-memory');
@@ -121,15 +122,30 @@ describe('plugin entrypoint', () => {
     expect(commandResult.taskId).toBe('task-cmd');
     expect(commandResult.trigger).toBe('slash_command');
 
-    const onFailure = events.get('task:failed');
-    expect(onFailure).toBeDefined();
-    const fallbackResult = (await onFailure?.({
-      sessionId: 'sess-evt',
-      task: { id: 'task-evt', prompt: 'recover the failed build' },
-      failureSignals: [{ kind: 'tool_error', message: 'exit 1' }]
-    })) as EvoHarnessRunResult | null;
+    // A verified tool/result error: session/event(session, {type,data}).
+    const onSessionEvent = events.get('session/event');
+    expect(onSessionEvent).toBeDefined();
+    // DSH dispatches session/event as a contained fire-and-forget emit, so the
+    // listener returns void; settle() is the join point for its run.
+    onSessionEvent?.(  { id: 'sess-evt' },
+      {
+        type: 'tool/result',
+        data: {
+          turn: 1,
+          step: 2,
+          message: {
+            role: 'tool',
+            toolCallId: 'call-1',
+            isError: true,
+            content: [{ type: 'text', text: 'exit 1' }]
+          }
+        }
+      }
+    );
+    const [fallbackResult] = await plugin.settle();
     expect(fallbackResult?.outcome).toBe('composed');
     expect(fallbackResult?.trigger).toBe('auto_fallback');
+    expect(fallbackResult?.sessionId).toBe('sess-evt');
   });
 
   it('derives the eight capability seams from a Cordis-style context and uses them', async () => {
