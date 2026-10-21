@@ -4,15 +4,24 @@ import {
   autoFallbackRequested,
   resolvePreviousFailure
 } from '../../src/orchestrator';
-import type { FailureCategory, FailureDiagnosis } from '../../src/types/contracts';
+import type {
+  FailureCategory,
+  FailureDiagnosis,
+  ISurrogateScorer,
+  SurrogateScore,
+  SurrogateScoreRequest
+} from '../../src/types/contracts';
 import { createCordisSeamManager, createInMemoryCordisHost } from '../../src/cordis-seams';
+import { createEvoHarnessPlugin } from '../../src/index';
 import {
   buildE2E,
   createDefaultRecordingTaxonomy,
   createRecordingPolicy,
+  createScriptedModel,
   createScriptedRunner,
   createSequencedTaxonomy,
   createThrowingRollbackSeams,
+  e2eConfig,
   makeClock,
   makeIdFactory,
   mem0LikeServer
@@ -510,5 +519,188 @@ describe('end-to-end lifecycle', () => {
 
     expect(result.metadata?.stopReason).toBe('failure_taxonomy:hard_unrecoverable');
     expect(policy.batchPlans).toHaveLength(1);
+  });
+
+  it('recomputes the post-compose best node instead of keeping a phantom pre-compose score', async () => {
+    const options = { maxWidth: 2, maxDepth: 2, rolloutBudget: 8, dreamEveryNTasks: 100 } as const;
+    const policy = createRecordingPolicy(options, { stopCondition: 'max_depth' });
+    const now = makeClock();
+    // Injected scorer: without a composition the FIRST scored candidate carries the
+    // phantom +0.4 selection bonus (0.9 vs 0.2); with the composition the SECOND one
+    // holds the best final score (0.8 vs 0.1). The phantom 0.9 stays above every
+    // final score, so the in-round best and the final best point at different nodes.
+    const scoredOrder: string[] = [];
+    const fakeScorer: ISurrogateScorer = {
+      score(request: SurrogateScoreRequest): SurrogateScore {
+        if (!scoredOrder.includes(request.node.id)) {
+          scoredOrder.push(request.node.id);
+        }
+        const position = scoredOrder.indexOf(request.node.id);
+        const composed = request.composition !== undefined;
+        const score = composed ? (position === 0 ? 0.1 : 0.8) : position === 0 ? 0.9 : 0.2;
+        return {
+          nodeId: request.node.id,
+          score,
+          signals: {
+            selected: composed,
+            adoptionRatio: composed ? score : 0,
+            stepEfficiency: 1,
+            toolErrorRate: 0
+          },
+          weights: request.weights,
+          computedAt: now(),
+          evidence: ['fake scorer composed=' + String(composed)]
+        };
+      }
+    };
+    const { plugin } = buildE2E({ ...options, extra: { deps: { policy, scorer: fakeScorer } } });
+
+    const result = await plugin.run({
+      sessionId: 'sess-phantom',
+      task: plugin.makeTask({ id: 'task-phantom', prompt: 'Improve the failing build.' }),
+      trigger: 'always'
+    });
+
+    expect(scoredOrder.length).toBeGreaterThanOrEqual(2);
+    const phantomBest = scoredOrder[0];
+    const trueFinalBest = scoredOrder[1];
+    expect(phantomBest).not.toBe(trueFinalBest);
+    expect(policy.selectBatchRequests.length).toBeGreaterThanOrEqual(2);
+    // the exploitation pointer must reflect the best FINAL score, not the phantom
+    expect(policy.selectBatchRequests[1]?.previousBestNodeId).toBe(trueFinalBest);
+    expect(result.probesRun).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('configuration enforcement', () => {
+  /** Minimal host context: command + event registrars and a 10-seam adapter. */
+  function makeHostContext(): {
+    readonly ctx: Record<string, unknown>;
+    readonly events: Map<string, (payload: unknown) => unknown>;
+    readonly commands: Map<string, unknown>;
+  } {
+    const events = new Map<string, (payload: unknown) => unknown>();
+    const commands = new Map<string, unknown>();
+    const ctx: Record<string, unknown> = {
+      registerCommand: (name: string, handler: unknown) => {
+        commands.set(name, handler);
+        return () => commands.delete(name);
+      },
+      on: (event: string, handler: (payload: unknown) => unknown) => {
+        events.set(event, handler);
+        return () => events.delete(event);
+      },
+      // a single seam is enough to make the adapter 'context'-derived
+      prompt: { registerSegment: () => undefined },
+      permissions: { register: () => undefined },
+      tools: { patchDescriptions: () => undefined },
+      skills: { mountDynamic: () => undefined },
+      subagents: { register: () => undefined },
+      middleware: { use: () => undefined },
+      sandbox: { mountScript: () => undefined },
+      evoMemory: { createScopedView: () => undefined },
+      fork: () => ({ contextId: 'child' })
+    };
+    return { ctx, events, commands };
+  }
+
+  it('skips a run before planning when config.enabled is false', async () => {
+    const now = makeClock();
+    const plugin = createEvoHarnessPlugin(
+      {
+        config: e2eConfig({ config: { enabled: false } }),
+        model: createScriptedModel(),
+        clients: [mem0LikeServer().client],
+        runBranch: createScriptedRunner(now),
+        now,
+        newId: makeIdFactory('disabled')
+      },
+      {}
+    );
+
+    const result = await plugin.run({
+      sessionId: 'sess-disabled',
+      task: plugin.makeTask({ id: 'task-disabled', prompt: 'Do nothing.' }),
+      trigger: 'always'
+    });
+
+    expect(result.outcome).toBe('skipped');
+    expect(result.probesRun).toBe(0);
+    expect(result.lessonsCommitted).toBe(0);
+    expect(result.diagnostics.join(' ')).toContain('config.enabled=false');
+    // skipped before planning: no batch was ever planned
+    expect(plugin.orchestrator.lastPlan()).toBeNull();
+    expect(plugin.orchestrator.lastTrace()).toEqual(['finalize']);
+  });
+
+  it('skips an auto_fallback trigger under slash_command while /evo still runs', async () => {
+    const { ctx, events, commands } = makeHostContext();
+    const now = makeClock();
+    const plugin = createEvoHarnessPlugin(
+      {
+        config: e2eConfig({ config: { triggerMode: 'slash_command' } }),
+        model: createScriptedModel(),
+        clients: [mem0LikeServer().client],
+        runBranch: createScriptedRunner(now),
+        now,
+        newId: makeIdFactory('slash')
+      },
+      ctx
+    );
+
+    // auto-fallback listeners are never wired under slash_command
+    expect(events.size).toBe(0);
+    expect(plugin.registeredEvents).toEqual([]);
+    expect(plugin.diagnostics.join(' ')).toContain('slash_command');
+    // the manual /evo command is still registered and works
+    expect([...commands.keys()]).toEqual(['evo']);
+
+    const auto = await plugin.run({
+      sessionId: 'sess-slash',
+      task: plugin.makeTask({ id: 'task-slash', prompt: 'Fix it.' }),
+      trigger: 'auto_fallback',
+      metadata: { failureSignals: [{ kind: 'tool_error', message: 'exit 1' }] }
+    });
+    expect(auto.outcome).toBe('skipped');
+    expect(auto.probesRun).toBe(0);
+    expect(auto.diagnostics.join(' ')).toContain('slash_command');
+
+    const explicit = await plugin.runFromCommand('Fix the failing build.');
+    expect(explicit.outcome).toBe('composed');
+    expect(explicit.trigger).toBe('slash_command');
+  });
+
+  it('still runs an auto_fallback trigger under triggerMode auto_fallback when blocked', async () => {
+    const now = makeClock();
+    const plugin = createEvoHarnessPlugin(
+      {
+        config: e2eConfig({ config: { triggerMode: 'auto_fallback' } }),
+        model: createScriptedModel(),
+        clients: [mem0LikeServer().client],
+        runBranch: createScriptedRunner(now),
+        now,
+        newId: makeIdFactory('fallback')
+      },
+      {}
+    );
+
+    const blocked = await plugin.run({
+      sessionId: 'sess-fallback',
+      task: plugin.makeTask({ id: 'task-fallback', prompt: 'Recover the blocked task.' }),
+      trigger: 'auto_fallback',
+      metadata: { failureSignals: [{ kind: 'tool_error', message: 'exit 1' }] }
+    });
+    expect(blocked.outcome).toBe('composed');
+    expect(blocked.probesRun).toBeGreaterThanOrEqual(2);
+
+    // and an auto_fallback trigger with no blocking signal is still skipped
+    const quiet = await plugin.run({
+      sessionId: 'sess-fallback',
+      task: plugin.makeTask({ id: 'task-fallback-quiet', prompt: 'Nothing failed.' }),
+      trigger: 'auto_fallback'
+    });
+    expect(quiet.outcome).toBe('skipped');
+    expect(quiet.probesRun).toBe(0);
+    expect(quiet.diagnostics.join(' ')).toContain('no blocking signal');
   });
 });

@@ -17,6 +17,7 @@ import type {
   DiscoveryNode,
   IActivePolicy,
   IHarnessComposer,
+  ISurrogateScorer,
   IModelAdapter,
   IsolatedBranchContext,
   MetaSearchPolicy,

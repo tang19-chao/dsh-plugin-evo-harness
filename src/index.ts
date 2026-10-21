@@ -546,6 +546,10 @@ export function createEvoHarnessPlugin(
       return orchestrator.run({ sessionId, task, trigger: 'slash_command' });
     },
     async handleFallbackEvent(payload: unknown): Promise<EvoHarnessRunResult | null> {
+      if (resolved.triggerMode === 'slash_command') {
+        diagnostics.push('triggerMode=slash_command: the auto_fallback event was ignored');
+        return null;
+      }
       const record = asRecord(payload);
       const sessionId =
         typeof record?.sessionId === 'string' ? (record.sessionId as string) : 'session-unknown';
@@ -623,7 +627,11 @@ export function createEvoHarnessPlugin(
     );
   }
 
-  if (options.registerAutoFallback !== false) {
+  if (options.registerAutoFallback !== false && resolved.triggerMode === 'slash_command') {
+    diagnostics.push(
+      'triggerMode=slash_command: auto_fallback listeners were not registered; /evo remains the only entrypoint'
+    );
+  } else if (options.registerAutoFallback !== false) {
     const on = pickFunction(asRecord(ctx), ['on', 'onEvent', 'subscribe']);
     const events = options.autoFallbackEvents ?? DEFAULT_AUTO_FALLBACK_EVENTS;
     if (on !== undefined) {

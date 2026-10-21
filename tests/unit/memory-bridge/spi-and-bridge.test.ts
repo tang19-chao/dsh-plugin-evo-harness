@@ -3,12 +3,18 @@
  * recall/commit/promote map onto it; unbound backends degrade deterministically.
  */
 
-import { describe, expect, it } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { describe, expect, it, vi } from 'vitest';
 
 import { createDriverContext } from '../../../src/memory-bridge/auto-discovery';
 import { createMemoryBridge } from '../../../src/memory-bridge/bridge';
 import { createDriverForKind } from '../../../src/memory-bridge/drivers/index';
-import type { McpClient, McpToolDescriptor } from '../../../src/memory-bridge/spi';
+import { callToolWithTimeout, collectText } from '../../../src/memory-bridge/spi';
+import type { McpClient, McpToolCallResult, McpToolDescriptor } from '../../../src/memory-bridge/spi';
 import type { IMemoryBridge } from '../../../src/types/contracts';
 import { vectorFactServer } from './mocks/mock-mcp';
 import {
@@ -240,3 +246,226 @@ describe('UniversalMemoryBridge', () => {
     expect(server.calls.length).toBe(before);
   });
 });
+
+/**
+ * A client that ignores options.signal and never settles: the wedged
+ * stdio/HTTP backend the deadline exists for.
+ */
+function neverSettlingClient(serverId: string): McpClient {
+  return {
+    serverId,
+    async listTools(): Promise<readonly McpToolDescriptor[]> {
+      return [];
+    },
+    callTool(): Promise<McpToolCallResult> {
+      return new Promise<McpToolCallResult>(() => {
+        // Deliberately never settles and ignores the abort signal.
+      });
+    }
+  };
+}
+
+describe('MCP call deadline', () => {
+  it('rejects at the configured deadline even when the client ignores the signal', async () => {
+    const started = Date.now();
+    await expect(
+      callToolWithTimeout(neverSettlingClient('wedged'), 'search_memory', {}, { timeoutMs: 60 })
+    ).rejects.toThrow(/MCP tool "search_memory" timed out after 60ms/);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it('swallows the losing call rejection so no unhandled rejection escapes', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    // A holder object keeps the deferred reject observable to the test without
+    // tripping flow analysis that assumes a let assigned in a callback stays unset.
+    const late: { reject?: (error: Error) => void } = {};
+    const lateFailing: McpClient = {
+      serverId: 'late',
+      async listTools() {
+        return [];
+      },
+      callTool() {
+        return new Promise<McpToolCallResult>((_resolve, reject) => {
+          late.reject = reject;
+        });
+      }
+    };
+    try {
+      await expect(
+        callToolWithTimeout(lateFailing, 'search_memory', {}, { timeoutMs: 40 })
+      ).rejects.toThrow(/timed out/);
+      expect(typeof late.reject).toBe('function');
+      late.reject?.(new Error('late backend failure'));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('rejects promptly for an already-aborted caller signal and forwards the abort', async () => {
+    const caller = new AbortController();
+    caller.abort(new Error('caller cancelled'));
+    const recorder: { signal?: AbortSignal } = {};
+    const client: McpClient = {
+      serverId: 'signal-recorder',
+      async listTools() {
+        return [];
+      },
+      callTool(_name, _args, callOptions) {
+        recorder.signal = callOptions?.signal;
+        return new Promise<McpToolCallResult>(() => {
+          // Ignores the signal: only the caller-abort race can settle this.
+        });
+      }
+    };
+    const started = Date.now();
+    await expect(
+      callToolWithTimeout(client, 'search_memory', {}, { timeoutMs: 5000, signal: caller.signal })
+    ).rejects.toThrow('caller cancelled');
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(recorder.signal?.aborted).toBe(true);
+  });
+
+  it('rejects promptly when the caller aborts mid-flight, reason or not', async () => {
+    const caller = new AbortController();
+    const pending = callToolWithTimeout(neverSettlingClient('wedged'), 'search_memory', {}, {
+      timeoutMs: 5000,
+      signal: caller.signal
+    });
+    const assertion = expect(pending).rejects.toThrow('caller cancelled');
+    caller.abort(new Error('caller cancelled'));
+    await assertion;
+
+    const bare = new AbortController();
+    bare.abort();
+    await expect(
+      callToolWithTimeout(neverSettlingClient('wedged'), 'search_memory', {}, {
+        timeoutMs: 5000,
+        signal: bare.signal
+      })
+    ).rejects.toBeDefined();
+  });
+
+  it('keeps a fast successful call unchanged and clears the deadline timer', async () => {
+    vi.useFakeTimers();
+    try {
+      const fast: McpClient = {
+        serverId: 'fast',
+        async listTools() {
+          return [];
+        },
+        async callTool() {
+          return { content: [{ type: 'text', text: 'ok' }] };
+        }
+      };
+      const before = vi.getTimerCount();
+      const result = await callToolWithTimeout(fast, 'search_memory', { q: 'x' }, { timeoutMs: 5000 });
+      expect(collectText(result)).toBe('ok');
+      // The deadline timer must be cleared on the winning path.
+      expect(vi.getTimerCount()).toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('propagates a client failure unchanged instead of converting it to a timeout', async () => {
+    const failing: McpClient = {
+      serverId: 'failing',
+      async listTools() {
+        return [];
+      },
+      async callTool() {
+        throw new Error('backend exploded');
+      }
+    };
+    await expect(
+      callToolWithTimeout(failing, 'search_memory', {}, { timeoutMs: 5000 })
+    ).rejects.toThrow('backend exploded');
+  });
+
+  it('keeps the deadline timer referenced while the call is in flight', async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const handles: ReturnType<typeof globalThis.setTimeout>[] = [];
+    const spy = vi
+      .spyOn(globalThis, 'setTimeout')
+      .mockImplementation((...args: Parameters<typeof globalThis.setTimeout>) => {
+        const handle = originalSetTimeout(...args);
+        handles.push(handle);
+        return handle;
+      });
+    try {
+      const pending = callToolWithTimeout(neverSettlingClient('wedged'), 'search_memory', {}, { timeoutMs: 60 });
+      // In flight: the deadline timer must be referenced, otherwise a one-shot
+      // process could drain its event loop before the deadline fires (code 13).
+      expect(handles.length).toBeGreaterThan(0);
+      expect(handles.every((handle) => handle.hasRef() === true)).toBe(true);
+      await expect(pending).rejects.toThrow(/timed out/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('clears the deadline timer on settlement so nothing keeps the loop alive', async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = callToolWithTimeout(neverSettlingClient('wedged'), 'search_memory', {}, { timeoutMs: 1000 });
+      const assertion = expect(pending).rejects.toThrow(/timed out/);
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(1000);
+      await assertion;
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects in a one-shot process whose only pending work is the hanging call', () => {
+    const directory = mkdtempSync(join(tmpdir(), 't55-deadline-'));
+    try {
+      const moduleUrl = new URL('../../../src/memory-bridge/spi.ts', import.meta.url).href;
+      writeFileSync(
+        join(directory, 'one-shot.mjs'),
+        [
+          "import { callToolWithTimeout } from '" + moduleUrl + "';",
+          'const client = {',
+          "  serverId: 'one-shot',",
+          '  async listTools() { return []; },',
+          '  callTool() { return new Promise(() => { /* ignores the signal, never settles */ }); }',
+          '};',
+          'try {',
+          "  await callToolWithTimeout(client, 'search_memory', {}, { timeoutMs: 200 });",
+          "  console.log(JSON.stringify({ outcome: 'RESOLVED_UNEXPECTED' }));",
+          '} catch (error) {',
+          "  console.log(JSON.stringify({ outcome: 'REJECTED', message: String(error && error.message) }));",
+          '}',
+          ''
+        ].join('\n')
+      );
+      // Node >= 22.6 exposes type stripping behind this flag; newer runtimes have
+      // it on by default, so the probe keeps the child working on both.
+      const flagProbe = spawnSync(process.execPath, ['--experimental-strip-types', '--no-warnings', '-e', 'process.exit(0)'], {
+        encoding: 'utf8'
+      });
+      const strippingArgs = flagProbe.status === 0 ? ['--experimental-strip-types', '--no-warnings'] : [];
+      const child = spawnSync(process.execPath, [...strippingArgs, join(directory, 'one-shot.mjs')], {
+        encoding: 'utf8',
+        timeout: 20_000
+      });
+      // Pre-fix the child exited 13 (ERR_UNSETTLED_TOPLEVEL_AWAIT) with no output.
+      expect(child.status).not.toBe(13);
+      expect(child.status).toBe(0);
+      const parsed = JSON.parse(String(child.stdout).trim()) as { outcome: string; message: string };
+      expect(parsed.outcome).toBe('REJECTED');
+      expect(parsed.message).toContain('search_memory');
+      expect(parsed.message).toContain('timed out after 200ms');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+

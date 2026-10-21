@@ -385,6 +385,16 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       stage('finalize');
       return result('failed', { failure: { category: 'hard_unrecoverable', message: 'orchestrator disposed' } });
     }
+    if (!config.enabled) {
+      diagnostics.push('plugin disabled (config.enabled=false); the run was skipped');
+      stage('finalize');
+      return result('skipped');
+    }
+    if (request.trigger === 'auto_fallback' && config.triggerMode === 'slash_command') {
+      diagnostics.push('triggerMode=slash_command: auto_fallback is disabled; the run was skipped');
+      stage('finalize');
+      return result('skipped');
+    }
     if (request.trigger === 'auto_fallback' && !autoFallbackRequested(request)) {
       diagnostics.push('auto_fallback trigger observed no blocking signal; the run was skipped');
       stage('finalize');
@@ -702,7 +712,11 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         // persist the final surrogate score plus the adoption ratio, then derive
         // bestScore/previousBestNodeId from those final values. This is what turns
         // the selection (0.4) and adoption (0.3) signals on at all.
-        let bestFinalScore = bestScore;
+        // The pre-compose best was scored without a composition, so it carried a
+        // phantom +0.4 selection bonus. Recompute both values from -1 over the final
+        // scores so a losing candidate cannot keep the exploitation pointer.
+        let bestFinalScore = -1;
+        previousBestNodeId = undefined;
         for (const candidate of candidates) {
           const currentNode = tree.getNode(candidate.nodeId);
           if (currentNode === undefined) {

@@ -243,25 +243,65 @@ export async function callToolWithTimeout(
     return client.callTool(toolName, args, options);
   }
   const controller = new AbortController();
-  const timer = setTimeout(() => {
-    controller.abort(new Error('MCP tool "' + toolName + '" timed out after ' + timeoutMs + 'ms'));
-  }, timeoutMs);
-  const forward = (): void => {
-    controller.abort(options.signal === undefined ? undefined : options.signal.reason);
-  };
-  if (options.signal !== undefined) {
-    if (options.signal.aborted) {
-      forward();
-    } else {
-      options.signal.addEventListener('abort', forward, { once: true });
+  const timeoutError = new Error('MCP tool "' + toolName + '" timed out after ' + timeoutMs + 'ms');
+  let timer: ReturnType<typeof setTimeout> | undefined = undefined;
+  // A client that ignores the abort signal must still not hang the bridge: the
+  // deadline races the call, whichever settles first wins, and the loser's
+  // rejection is swallowed. The timer stays REFERENCED for the whole in-flight
+  // window: if the hanging call is the only pending work (a one-shot process),
+  // an unref'd deadline would let the event loop drain before the timeout fires
+  // and Node would exit with code 13 instead of rejecting. The finally block
+  // below clears the handle on every settlement path, so nothing keeps the
+  // process alive once the call has resolved or rejected.
+  const deadline = new Promise<never>((_resolve, reject) => {
+    const handle = setTimeout(() => {
+      controller.abort(timeoutError);
+      reject(timeoutError);
+    }, timeoutMs);
+    timer = handle;
+    if (typeof handle.ref === 'function') {
+      // Harmless where the handle is already referenced; decisive if the host
+      // ever hands back an unreferenced timer.
+      handle.ref();
     }
+  });
+  // Caller cancellation is a hard rejection as well, so an aborted external
+  // signal settles the call even when the client ignores the signal.
+  const externalSignal = options.signal;
+  let externalAbort: Promise<never> | undefined = undefined;
+  let onExternalAbort: (() => void) | undefined = undefined;
+  if (externalSignal !== undefined) {
+    externalAbort = new Promise<never>((_resolve, reject) => {
+      onExternalAbort = (): void => {
+        const reason: unknown = externalSignal.reason;
+        const error =
+          reason instanceof Error
+            ? reason
+            : new Error('MCP tool "' + toolName + '" was aborted by the caller');
+        controller.abort(error);
+        reject(error);
+      };
+      if (externalSignal.aborted) {
+        onExternalAbort();
+      } else {
+        externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+      }
+    });
+    // Keep the aborted-but-unconsumed rejection handled.
+    externalAbort.catch(() => undefined);
   }
+  const call = client.callTool(toolName, args, { timeoutMs, signal: controller.signal });
+  call.catch(() => undefined);
   try {
-    return await client.callTool(toolName, args, { timeoutMs, signal: controller.signal });
+    return await (externalAbort === undefined
+      ? Promise.race([call, deadline])
+      : Promise.race([call, deadline, externalAbort]));
   } finally {
-    clearTimeout(timer);
-    if (options.signal !== undefined) {
-      options.signal.removeEventListener('abort', forward);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+    if (externalSignal !== undefined && onExternalAbort !== undefined) {
+      externalSignal.removeEventListener('abort', onExternalAbort);
     }
   }
 }

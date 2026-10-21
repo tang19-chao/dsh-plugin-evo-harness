@@ -494,3 +494,53 @@ describe('offline dreamer model wiring', () => {
     ).toBe(true);
   });
 });
+
+describe('config enforcement', () => {
+  it('skips every run when config.enabled is false', async () => {
+    const { ctx } = createFakeContext();
+    const plugin = buildPlugin(ctx, { config: e2eConfig({ config: { enabled: false } }) });
+
+    const result = await plugin.run({
+      sessionId: 'sess-disabled',
+      task: plugin.makeTask({ id: 'task-disabled', prompt: 'Do nothing.' }),
+      trigger: 'always'
+    });
+
+    expect(result.outcome).toBe('skipped');
+    expect(result.probesRun).toBe(0);
+    expect(result.diagnostics.join(' ')).toContain('config.enabled=false');
+  });
+
+  it('does not wire or honour auto_fallback under triggerMode slash_command', async () => {
+    const { ctx, events } = createFakeContext();
+    const plugin = buildPlugin(ctx, {
+      config: e2eConfig({ config: { triggerMode: 'slash_command' } })
+    });
+
+    // listeners are never registered, and an event call is refused outright
+    expect(events.size).toBe(0);
+    expect(plugin.registeredEvents).toEqual([]);
+    expect(plugin.diagnostics.join(' ')).toContain('slash_command');
+    expect(
+      await plugin.handleFallbackEvent({
+        sessionId: 'sess-slash',
+        task: { id: 'task-slash', prompt: 'x' },
+        failureSignals: [{ kind: 'tool_error', message: 'exit 1' }]
+      })
+    ).toBeNull();
+
+    // auto_fallback runs are skipped while the explicit /evo path still works
+    const auto = await plugin.run({
+      sessionId: 'sess-slash',
+      task: plugin.makeTask({ id: 'task-slash', prompt: 'Fix it.' }),
+      trigger: 'auto_fallback',
+      metadata: { failureSignals: [{ kind: 'tool_error', message: 'exit 1' }] }
+    });
+    expect(auto.outcome).toBe('skipped');
+    expect(auto.probesRun).toBe(0);
+    expect(auto.diagnostics.join(' ')).toContain('slash_command');
+
+    const explicit = await plugin.runFromCommand('Fix the failing build.');
+    expect(explicit.outcome).toBe('composed');
+  });
+});
