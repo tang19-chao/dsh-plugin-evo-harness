@@ -59,7 +59,7 @@
  * Every other natural-language rule is recorded as an advisory instead of being
  * silently treated as enforced.
  */
-import type { HarnessComponentKey, MiddlewareHook } from '../types/contracts';
+import type { GuidanceMode, HarnessComponentKey, MiddlewareHook } from '../types/contracts';
 import type { HostAdvisorRequest } from '../types/contracts';
 import type { HostAdvisor } from '../jitrl/host-advisor';
 import type {
@@ -70,6 +70,12 @@ import type {
 } from '../jitrl/host-tool-experience';
 import { normalizeToolActionKey } from '../jitrl/action-normalizer';
 import { abstractHostState } from '../jitrl/state-abstraction';
+import {
+  createScopeRegistry,
+  isInvariantScopeName,
+  type ScopeRegistry,
+  type ScopeRole
+} from '../jitrl/scope-registry';
 import { CordisSeamError } from './errors';
 import type {
   CordisHostAdapter,
@@ -296,6 +302,10 @@ interface MountBase extends HookMountScope {
   readonly surfaceId: string;
   readonly kind: DshHookMountSummary['kind'];
   active: boolean;
+  readonly role?: ScopeRole;
+  readonly origin?: string;
+  readonly guidance?: GuidanceMode;
+  readonly allowAdvice?: boolean;
 }
 
 interface PromptMount extends MountBase {
@@ -419,6 +429,9 @@ export interface DshHookHostAdapter extends CordisHostAdapter {
    * while `hostAdvisor.enabled` is false, so switching it on later has data.
    */
   setHostToolExperienceSink(sink: HostToolExperienceSink | undefined): void;
+  /** Trusted scope registry for branch authorization and invariant isolation. */
+  readonly scopeRegistry?: ScopeRegistry;
+  setScopeRegistry(registry: ScopeRegistry | undefined): void;
   /** Tool results forwarded to the sink since construction. */
   hostToolObservationCount(): number;
   /** Uninstall every listener and clear every mount. Idempotent. */
@@ -443,6 +456,8 @@ export interface DshHookHostAdapterOptions {
   readonly hostAdvisorRuntimeEnabled?: () => boolean;
   /** Host-tool experience producer installed at construction (optional). */
   readonly hostToolExperience?: HostToolExperienceSink;
+  /** Trusted scope registry for branch authorization and invariant isolation. */
+  readonly scopeRegistry?: ScopeRegistry;
 }
 
 function compileDenyRules(
@@ -571,13 +586,21 @@ function readToolObservation(exec: unknown, result: unknown): HostToolObservatio
   const branchId = [...scope.branchIds][0];
   const exitCode = exitCodeOf(exec, result);
   const errorClass = errorClassOf(result);
+  const recExec = asRecord(exec);
+  const recResult = asRecord(result);
+  const origin = (recExec?.['origin'] ?? recResult?.['origin']) as string | undefined;
+  const provenance = (recExec?.['provenance'] ?? recResult?.['provenance']) as string | undefined;
+  const guidance = (recExec?.['guidance'] ?? recResult?.['guidance']) as GuidanceMode | undefined;
   return {
     toolName,
     isError: isToolError(result),
     ...(exitCode === undefined ? {} : { exitCode }),
     ...(errorClass === undefined ? {} : { errorClass }),
     ...(sessionId === undefined ? {} : { sessionId }),
-    ...(branchId === undefined ? {} : { branchId })
+    ...(branchId === undefined ? {} : { branchId }),
+    ...(origin !== undefined ? { origin } : {}),
+    ...(provenance !== undefined ? { provenance } : {}),
+    ...(guidance !== undefined ? { guidance } : {})
   };
 }
 
@@ -660,6 +683,13 @@ export function createDshHookHostAdapter(
   let hostToolSink: HostToolExperienceSink | undefined = options.hostToolExperience;
   let turnEndDisposer: (() => void) | undefined;
   let hostToolObservations = 0;
+  let scopeRegistry: ScopeRegistry | undefined =
+    options.scopeRegistry ??
+    (options.hostToolExperience &&
+    'scopeRegistry' in options.hostToolExperience &&
+    options.hostToolExperience.scopeRegistry
+      ? (options.hostToolExperience.scopeRegistry as ScopeRegistry)
+      : createScopeRegistry());
 
   /** The advisor stays off while `/evo jit off` is in force (repair F1). */
   const advisorRuntimeEnabled = (): boolean => {
@@ -689,6 +719,10 @@ export function createDshHookHostAdapter(
       return decision;
     }
     const scope = readHookScope(payload);
+    const recPayload = asRecord(payload);
+    const origin = recPayload?.['origin'] as string | undefined;
+    const provenance = recPayload?.['provenance'] as string | undefined;
+    const guidance = recPayload?.['guidance'] as GuidanceMode | undefined;
     const observation: HostTurnObservation = {
       kind,
       ...([...scope.sessionIds][0] === undefined
@@ -696,7 +730,10 @@ export function createDshHookHostAdapter(
         : { sessionId: [...scope.sessionIds][0] as string }),
       ...([...scope.branchIds][0] === undefined
         ? {}
-        : { branchId: [...scope.branchIds][0] as string })
+        : { branchId: [...scope.branchIds][0] as string }),
+      ...(origin !== undefined ? { origin } : {}),
+      ...(provenance !== undefined ? { provenance } : {}),
+      ...(guidance !== undefined ? { guidance } : {})
     };
     try {
       await sink.observeTurnEnd(observation);
@@ -770,24 +807,100 @@ export function createDshHookHostAdapter(
     };
   }
 
+  /**
+   * Determine whether an invariant branch is targeted.
+   * Invariant branches must NEVER receive advice under any circumstances (plan §4 R3 / §5.2).
+   */
+  const isInvariantDispatch = (identity: HookScopeIdentity, payloads: readonly unknown[]): boolean => {
+    if (scopeRegistry !== undefined) {
+      const resolved = scopeRegistry.resolve(...payloads);
+      if (resolved !== 'unknown' && (resolved.isInvariant || !resolved.allowAdvice)) {
+        return true;
+      }
+    }
+    for (const branchId of identity.branchIds) {
+      if (isInvariantScopeName(branchId)) {
+        return true;
+      }
+    }
+    for (const payload of payloads) {
+      const rec = asRecord(payload);
+      if (rec !== undefined) {
+        if (
+          rec['isInvariant'] === true ||
+          rec['role'] === 'invariant' ||
+          rec['kind'] === 'invariant' ||
+          rec['guidance'] === 'guidance_free' ||
+          rec['origin'] === 'explore_invariant' ||
+          rec['provenance'] === 'explore_invariant'
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
   /** True when the advisor should evaluate this dispatch (fail-closed on scope). */
   const advisorInScope = (payloads: readonly unknown[]): boolean => {
-    if (
-      advisorScope.branchId === '' &&
-      advisorScope.sessionId === '' &&
-      advisorScope.namespace === ''
-    ) {
-      return true;
-    }
     const identity = readHookScope(...payloads);
-    const total =
-      identity.branchIds.size + identity.sessionIds.size + identity.namespaces.size;
-    // An explicitly scoped advisor never acts on an anonymous dispatch: without
-    // an identity there is no way to prove the dispatch belongs to its branch.
-    if (total === 0) {
+
+    // 1. Invariant branches are strictly prohibited from receiving advice (plan section 4 R3 / 5.2)
+    if (isInvariantDispatch(identity, payloads)) {
       return false;
     }
-    return hookScopeMatches(identity, advisorScope);
+
+    // 2. Explicit advisorScope configured on host:
+    const hasExplicitAdvisorScope =
+      advisorScope.branchId !== '' ||
+      advisorScope.sessionId !== '' ||
+      advisorScope.namespace !== '';
+
+    if (hasExplicitAdvisorScope) {
+      if (advisorScope.branchId !== '') {
+        return identity.branchIds.has(advisorScope.branchId);
+      }
+      if (advisorScope.sessionId !== '') {
+        return identity.sessionIds.has(advisorScope.sessionId);
+      }
+      if (advisorScope.namespace !== '') {
+        return identity.namespaces.has(advisorScope.namespace);
+      }
+    }
+
+    // 3. With ScopeRegistry:
+    if (scopeRegistry !== undefined) {
+      const resolved = scopeRegistry.resolve(...payloads);
+      if (resolved !== 'unknown') {
+        if (!resolved.allowAdvice || resolved.isInvariant) {
+          return false;
+        }
+        return true;
+      }
+    }
+
+    // 4. Unscoped advisor / host-local execution (PR3 / F9 Option 2):
+    // If dispatch explicitly names a branch, but it is NOT registered in ScopeRegistry:
+    // Fail-closed! Unproven branch must never receive advice (PR3 / F2).
+    if (identity.branchIds.size > 0) {
+      return false;
+    }
+
+    // Anonymous dispatch without any scope identity (Option 2):
+    // Ordinary host-local tool executions (e.g. bash) are permitted when the advisor is unscoped.
+    // Gate 4 host premise: probe branch payloads must carry branchId to enable branch scoping.
+    const total =
+      identity.branchIds.size + identity.sessionIds.size + identity.namespaces.size;
+    if (total === 0) {
+      const rec = asRecord(payloads[0]);
+      if (rec !== undefined && typeof rec['name'] === 'string' && rec['name'].trim().length > 0) {
+        return true;
+      }
+      return false;
+    }
+
+    // Ordinary host session (has sessionId):
+    return true;
   };
 
   /** A deny/cancel decided below us is final; the advisor must not touch it. */
@@ -806,8 +919,13 @@ export function createDshHookHostAdapter(
    */
   const advisorRequest = (
     mode: 'advisory' | 'gate',
+    payloads: readonly unknown[],
     toolName?: string
   ): HostAdvisorRequest => {
+    const identity = readHookScope(...payloads);
+    const branchId = [...identity.branchIds][0];
+    const sessionId = [...identity.sessionIds][0];
+    const isInvariant = isInvariantDispatch(identity, payloads);
     const recentTools =
       toolName === undefined
         ? []
@@ -827,6 +945,9 @@ export function createDshHookHostAdapter(
       recentTools,
       errors: [],
       mode,
+      branchId,
+      sessionId,
+      isInvariant,
       adviseThreshold: Number.NaN,
       gateThreshold: Number.NaN,
       minSupport: Number.NaN
@@ -937,7 +1058,7 @@ export function createDshHookHostAdapter(
           advisorCounters.skipped += 1;
         } else if (toolName !== undefined) {
           try {
-            const verdict = await advisor.evaluate(advisorRequest('gate', toolName));
+            const verdict = await advisor.evaluate(advisorRequest('gate', [exec], toolName));
             if (verdict.kind === 'ask') {
               advisorCounters.ask += 1;
               counters.preExecute.applied += 1;
@@ -1016,7 +1137,7 @@ export function createDshHookHostAdapter(
         return decision;
       }
       try {
-        const verdict = await advisor.evaluate(advisorRequest('advisory'));
+        const verdict = await advisor.evaluate(advisorRequest('advisory', [payload]));
         const target = asRecord(decision);
         if (verdict.kind !== 'advisory' || target === undefined) {
           advisorCounters.noop += 1;
@@ -1105,7 +1226,33 @@ export function createDshHookHostAdapter(
       });
     }
     mounts.push(mount);
-    return { dispose: (): void => release(mount) };
+    let scopeHandle: { dispose(): void } | undefined;
+    if (scopeRegistry !== undefined && mount.branchId.length > 0 && mount.sessionId.length > 0) {
+      const isInv =
+        mount.role === 'invariant' ||
+        mount.guidance === 'guidance_free' ||
+        mount.origin === 'explore_invariant' ||
+        isInvariantScopeName(mount.branchId);
+      scopeHandle = scopeRegistry.register({
+        branchId: mount.branchId,
+        sessionId: mount.sessionId,
+        namespace: mount.namespace,
+        role: isInv ? 'invariant' : (mount.role ?? 'domain'),
+        origin: mount.origin,
+        guidance: isInv ? 'guidance_free' : (mount.guidance ?? 'memory'),
+        allowAdvice: isInv ? false : (mount.allowAdvice ?? true)
+      });
+    }
+    return {
+      dispose: (): void => {
+        try {
+          scopeHandle?.dispose();
+        } catch {
+          // idempotent
+        }
+        release(mount);
+      }
+    };
   };
 
   const missingSeam = (
@@ -1201,6 +1348,9 @@ export function createDshHookHostAdapter(
         return;
       }
       hostToolSink = sink;
+      if (sink !== undefined && 'scopeRegistry' in sink && sink.scopeRegistry && scopeRegistry === undefined) {
+        scopeRegistry = sink.scopeRegistry as ScopeRegistry;
+      }
       if (sink === undefined) {
         uninstallTurnEnd();
         return;
@@ -1208,6 +1358,12 @@ export function createDshHookHostAdapter(
       installTurnEnd();
     },
     hostToolObservationCount: (): number => hostToolObservations,
+    get scopeRegistry(): ScopeRegistry | undefined {
+      return scopeRegistry;
+    },
+    setScopeRegistry(registry: ScopeRegistry | undefined): void {
+      scopeRegistry = registry;
+    },
 
     async registerPromptSegment(spec: HostPromptSegmentSpec): Promise<HostDisposer> {
       ensureInstalled();
@@ -1218,6 +1374,7 @@ export function createDshHookHostAdapter(
         }
         return missingSeam('registerPromptSegment', 'system_prompt', spec);
       }
+      const specRec = asRecord(spec);
       return register({
         kind: 'prompt',
         surfaceId: spec.surfaceId,
@@ -1225,6 +1382,10 @@ export function createDshHookHostAdapter(
         sessionId: spec.sessionId,
         namespace: spec.namespace,
         active: true,
+        role: specRec?.['role'] as ScopeRole | undefined,
+        origin: specRec?.['origin'] as string | undefined,
+        guidance: specRec?.['guidance'] as GuidanceMode | undefined,
+        allowAdvice: specRec?.['allowAdvice'] as boolean | undefined,
         segment: spec.segment,
         mode: spec.mode,
         content: spec.content,
@@ -1245,6 +1406,7 @@ export function createDshHookHostAdapter(
       for (const advisory of compiled.advisories) {
         note(advisory);
       }
+      const specRec = asRecord(spec);
       return register({
         kind: 'guardrails',
         surfaceId: spec.surfaceId,
@@ -1252,6 +1414,10 @@ export function createDshHookHostAdapter(
         sessionId: spec.sessionId,
         namespace: spec.namespace,
         active: true,
+        role: specRec?.['role'] as ScopeRole | undefined,
+        origin: specRec?.['origin'] as string | undefined,
+        guidance: specRec?.['guidance'] as GuidanceMode | undefined,
+        allowAdvice: specRec?.['allowAdvice'] as boolean | undefined,
         denyRules: compiled.rules,
         advisories: compiled.advisories
       });
@@ -1266,6 +1432,7 @@ export function createDshHookHostAdapter(
         }
         return missingSeam('mountMiddleware', 'plugins', spec);
       }
+      const specRec = asRecord(spec);
       return register({
         kind: 'middleware',
         surfaceId: spec.surfaceId,
@@ -1273,6 +1440,10 @@ export function createDshHookHostAdapter(
         sessionId: spec.sessionId,
         namespace: spec.namespace,
         active: true,
+        role: specRec?.['role'] as ScopeRole | undefined,
+        origin: specRec?.['origin'] as string | undefined,
+        guidance: specRec?.['guidance'] as GuidanceMode | undefined,
+        allowAdvice: specRec?.['allowAdvice'] as boolean | undefined,
         bindings: spec.middleware.map((entry) => ({ name: entry.name, hook: entry.hook }))
       });
     },

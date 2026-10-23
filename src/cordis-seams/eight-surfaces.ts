@@ -20,6 +20,7 @@ import {
   HARNESS_COMPONENT_KEYS,
   type EightSurfacePatch,
   type GuardrailsSurfaceEdit,
+  type GuidanceMode,
   type HarnessComponentKey,
   type MemorySurfaceEdit,
   type PluginsSurfaceEdit,
@@ -30,6 +31,7 @@ import {
   type SystemPromptSurfaceEdit,
   type ToolGuidanceSurfaceEdit
 } from '../types/contracts';
+import type { ScopeRole } from '../jitrl/scope-registry';
 import type { DisposableLike, DisposalFailure, DisposableRegistry } from './disposable-registry';
 import type {
   CordisHostAdapter,
@@ -60,12 +62,20 @@ export const SURFACE_HOST_METHOD: Readonly<Record<HarnessComponentKey, keyof Cor
   plugins: 'mountMiddleware'
 };
 
-/** Identity of the branch/patch a mount belongs to. */
+/** Identity and provenance of the branch/patch a mount belongs to. */
 export interface SurfaceMountContext {
   readonly sessionId: string;
   readonly branchId: string;
   readonly namespace: string;
   readonly patchId: string;
+  /** Slot provenance (e.g. 'explore_invariant', 'explore_domain'). */
+  readonly origin?: string;
+  /** Guidance mode (e.g. 'guidance_free', 'memory'). */
+  readonly guidance?: GuidanceMode;
+  /** Scope role (e.g. 'invariant', 'domain'). */
+  readonly role?: ScopeRole;
+  /** Whether host advisor may inject advice into this branch. */
+  readonly allowAdvice?: boolean;
 }
 
 /** Handle for one mounted surface; dispose is idempotent. */
@@ -182,7 +192,11 @@ export async function mountSurface(
     surfaceId,
     branchId: context.branchId,
     sessionId: context.sessionId,
-    namespace: context.namespace
+    namespace: context.namespace,
+    ...(context.origin !== undefined ? { origin: context.origin } : {}),
+    ...(context.guidance !== undefined ? { guidance: context.guidance } : {}),
+    ...(context.role !== undefined ? { role: context.role } : {}),
+    ...(context.allowAdvice !== undefined ? { allowAdvice: context.allowAdvice } : {})
   };
   let result: HostDisposer | undefined;
 
@@ -323,6 +337,22 @@ export async function mountEightSurfaces(
   context: SurfaceMountContext,
   options: MountEightSurfacesOptions = {}
 ): Promise<MountedSurfaces> {
+  const isInvariant =
+    context.role === 'invariant' ||
+    context.guidance === 'guidance_free' ||
+    patch.guidance === 'guidance_free' ||
+    context.origin === 'explore_invariant' ||
+    context.origin === 'invariant' ||
+    patch.origin === 'invariant';
+
+  const resolvedContext: SurfaceMountContext = {
+    ...context,
+    origin: context.origin ?? patch.origin,
+    guidance: context.guidance ?? patch.guidance,
+    role: context.role ?? (isInvariant ? 'invariant' : 'domain'),
+    allowAdvice: context.allowAdvice ?? !isInvariant
+  };
+
   const allowed =
     options.enabledSurfaces === undefined ? null : new Set<HarnessComponentKey>(options.enabledSurfaces);
   const handles: SurfaceMountHandle[] = [];
@@ -336,7 +366,7 @@ export async function mountEightSurfaces(
       continue;
     }
     try {
-      const handle = await mountSurface(host, key, edit, context);
+      const handle = await mountSurface(host, key, edit, resolvedContext);
       handles.push(handle);
       keys.push(key);
       if (options.registry !== undefined) {

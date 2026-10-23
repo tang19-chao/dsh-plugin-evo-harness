@@ -50,6 +50,15 @@
  * JitRL statistics mirror contracts append new exports and optional fields only
  * (see the "JitRL Phase 4/5" section below). Nothing already exported was
  * renamed, removed, widened or made required.
+ *
+ * Version 2 also stays current for P6 (plan section 6.1): the per-execution
+ * credit-attribution fields on ExperienceRecord and the legacy/eligibility
+ * filters on ExperienceQuery are OPTIONAL additions, so no existing producer or
+ * consumer changes behaviour. The persisted-record format is versioned
+ * separately by ExperienceRecord.experienceSchemaVersion (see
+ * EXPERIENCE_SCHEMA_VERSION in src/jitrl/experience-store.ts) rather than by
+ * bumping CONTRACT_SCHEMA_VERSION: an old JSONL line still loads, it is simply
+ * classified as legacy and kept out of the new learning neighbourhood.
  */
 
 /** Version of the frozen contract surface. */
@@ -1286,7 +1295,49 @@ export interface AbstractState {
   readonly summary: string;
 }
 
-/** One stored JitRL experience sample observed at a JitLevel. */
+/**
+ * Terminal outcome of the execution an experience record describes.
+ *
+ * P6 PR4 (plan section 6.2) requires these to stay distinguishable: a user
+ * cancellation is not evidence that the action was bad, and an infrastructure
+ * failure is not evidence that the model was bad. Records whose outcome is
+ * `cancelled` or `infrastructure_error` carry `learningEligible: false` and a
+ * zero `learningTarget`: they are kept for audit and excluded from the learning
+ * neighbourhood.
+ */
+export const EXPERIENCE_OUTCOMES = [
+  'succeeded',
+  'failed',
+  'timeout',
+  'aborted',
+  'cancelled',
+  'infrastructure_error'
+] as const;
+export type ExperienceOutcome = (typeof EXPERIENCE_OUTCOMES)[number];
+
+/**
+ * One stored JitRL experience sample observed at a JitLevel.
+ *
+ * P6 PR4 (plan section 6.1) adds the association chain
+ * PreparedProbe -> ProbeCandidate -> Experience as OPTIONAL fields, so every
+ * record written before this round keeps loading unchanged:
+ *
+ *   decisionId / runId / round / slotIndex      which decision produced the action
+ *   scope (scopeKey) / branchId                 which host scope executed it
+ *   treeId / nodeId / parentNodeId / trajectoryId  which trajectory it belongs to
+ *   level / actionKey / guidance                what was done (guidance IS the
+ *                                               guidance provenance)
+ *   policyId / policyVersion                    which policy was in force
+ *   rewardVersion / provenanceVersion / experienceSchemaVersion  how to read it
+ *   observedReturn / attributionBaseline / learningTarget        what it earned
+ *   outcome / learningEligible                  whether it may train the policy
+ *
+ * A record missing `experienceSchemaVersion`/`rewardVersion`/`provenanceVersion`
+ * is LEGACY (plan section 6.5): it stays in the log for audit but is excluded
+ * from the new-version learning neighbourhood by
+ * `ExperienceQuery.excludeLegacy`. Nothing rewrites the original log in place;
+ * the migration that marks records is a separate, reversible pass.
+ */
 export interface ExperienceRecord {
   readonly id: string;
   readonly level: JitLevel;
@@ -1306,6 +1357,33 @@ export interface ExperienceRecord {
   readonly sessionId: string;
   readonly treeId?: string;
   readonly nodeId?: string;
+  readonly branchId?: string;
+  readonly scopeKey?: string;
+  /** P6 PR4 association chain (all optional; legacy records omit them). */
+  readonly decisionId?: string;
+  readonly runId?: string;
+  readonly round?: number;
+  readonly slotIndex?: number;
+  readonly parentNodeId?: string;
+  readonly trajectoryId?: string;
+  /** `<policyId>@v<version>` of the policy that produced the action. */
+  readonly policyVersion?: string;
+  /** Reward-model version that produced reward/return (plan section 6.5). */
+  readonly rewardVersion?: string;
+  /** Provenance-model version that produced the association (plan section 6.5). */
+  readonly provenanceVersion?: string;
+  /** Stored-record schema version; absent means legacy (pre-PR4). */
+  readonly experienceSchemaVersion?: number;
+  /** The action's own measured return (plan section 6.3). */
+  readonly observedReturn?: number;
+  /** Comparable reference/parent baseline for the same context. */
+  readonly attributionBaseline?: number;
+  /** Value used for the level's estimate (observedReturn - baseline, clipped). */
+  readonly learningTarget?: number;
+  /** How the execution ended (plan section 6.2); absent means unknown/legacy. */
+  readonly outcome?: ExperienceOutcome;
+  /** False for cancelled/infrastructure records: audit only, never training. */
+  readonly learningEligible?: boolean;
   /** Creation timestamp in ms since epoch (injected clock). */
   readonly createdAt: number;
   /** True once secrets have been redacted from this record. */
@@ -1336,6 +1414,17 @@ export interface ExperienceQuery {
   readonly policyId?: string;
   /** Drift down-weight factor in [0, 1] applied to stale-policy records. */
   readonly driftRho?: number;
+  /**
+   * P6 PR4 (plan section 6.5): when true, records that carry no
+   * `experienceSchemaVersion` (or an older one than
+   * `minimumExperienceSchemaVersion`) are excluded from the result. Default
+   * false keeps every pre-PR4 caller reading the whole level.
+   */
+  readonly excludeLegacy?: boolean;
+  /** Lowest schema version accepted when `excludeLegacy` is set. */
+  readonly minimumExperienceSchemaVersion?: number;
+  /** Restrict results to records that may train the policy. */
+  readonly learningEligibleOnly?: boolean;
 }
 
 /** Append-only experience store backing all JitRL levels. */
@@ -1596,6 +1685,9 @@ export interface WorkingDirectorySummary {
  */
 export interface HostAdvisorRequest {
   readonly level: 'host_tool';
+  readonly sessionId?: string;
+  readonly branchId?: string;
+  readonly isInvariant?: boolean;
   readonly state: AbstractState;
   /** Most recent host tool calls, newest last. */
   readonly recentTools: readonly HostToolCallObservation[];
@@ -1676,6 +1768,18 @@ export interface JitStatsAggregate {
   /** Drift factor applied to the contributing records, 1 when none. */
   readonly driftRhoApplied?: number;
   readonly updatedAt?: number;
+  /**
+   * P6 PR4 (plan section 6.5): reward-model version of the contributing records.
+   * Aggregates built from legacy (mis-attributed) records are published with
+   * `legacy: true` and a `rewardVersion` below the current one, so a backend
+   * cannot hand the old bias back after the local log was migrated.
+   */
+  readonly rewardVersion?: string;
+  readonly provenanceVersion?: string;
+  /** True when any contributing record lacked per-execution provenance. */
+  readonly legacy?: boolean;
+  /** Number of contributing records excluded as legacy/not learning eligible. */
+  readonly legacyExcluded?: number;
 }
 
 /** Outcome of one mirror write. */

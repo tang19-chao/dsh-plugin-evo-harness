@@ -4,9 +4,10 @@ import {
   CONTRAST_DIMENSIONS,
   computeBehavioralContrasts,
   createAnonymousComposer,
-  scoreCandidateEvidence
+  scoreCandidateEvidence,
+  ADVICE_LEAKAGE_RISK_RECORD
 } from '../../../src/harness2/composer';
-import { createDeterministicIdFactory } from '../../../src/harness2/shared';
+import { createDeterministicIdFactory, stripStructuredAdvice } from '../../../src/harness2/shared';
 import { fixedClock, makeCandidate, makePatch, makeTask, makeTrajectory, promptText, requestAt, scriptedModel } from './fixtures';
 
 const JUDGE_VERDICT = JSON.stringify({
@@ -662,5 +663,100 @@ describe('Harness² composer / pure contrast scoring', () => {
     const score = scoreCandidateEvidence(undefined, candidate);
     expect(score).toBeGreaterThanOrEqual(0);
     expect(score).toBeLessThanOrEqual(1);
+  });
+});
+describe('L2 composer input stripping and free-text canary risk recording', () => {
+  it('strips structured <jitrl_advice> and <anti_patterns_to_avoid> blocks from steps and deliverables', async () => {
+    const rawStepText = 'running task <jitrl_advice mode="advisory" level="host_tool" neighbors="4">recommend write_note</jitrl_advice> done';
+    const cleaned = stripStructuredAdvice(rawStepText);
+    expect(cleaned).toBe('running task  done');
+    expect(cleaned).not.toContain('<jitrl_advice');
+    expect(cleaned).not.toContain('recommend write_note');
+
+    const rawDeliverable = '<anti_patterns_to_avoid>avoid bash</anti_patterns_to_avoid>final deliverable content';
+    const cleanedDeliverable = stripStructuredAdvice(rawDeliverable);
+    expect(cleanedDeliverable).toBe('final deliverable content');
+    expect(cleanedDeliverable).not.toContain('<anti_patterns_to_avoid>');
+
+    // End-to-end composer test: candidate steps containing structured advice are stripped in judge prompt
+    const candidateWithAdvice = makeCandidate({
+      nodeId: 'node_adv',
+      branchId: 'branch_adv',
+      patch: makePatch({ id: 'patch_adv', branchId: 'branch_adv', origin: 'domain', guidance: 'memory' }),
+      trajectory: makeTrajectory({
+        id: 'traj_adv',
+        nodeId: 'node_adv',
+        branchId: 'branch_adv',
+        status: 'succeeded',
+        metrics: { steps: 2, toolCalls: 1, toolErrors: 0, durationMs: 100 },
+        steps: [
+          {
+            index: 0,
+            at: 0,
+            kind: 'tool',
+            toolName: 'read_file',
+            text: 'inspecting code <jitrl_advice neighbors="3">recommend write_note</jitrl_advice>'
+          }
+        ],
+        deliverable: {
+          content: '<anti_patterns_to_avoid>avoid bash</anti_patterns_to_avoid>clean output',
+          format: 'text',
+          contentHash: 'hash_adv'
+        }
+      })
+    });
+
+    const { model, composer, request } = composeRequest([JUDGE_VERDICT], [candidateWithAdvice]);
+    await composer.compose(request);
+
+    const judgePrompt = promptText(model);
+    expect(judgePrompt).not.toContain('<jitrl_advice');
+    expect(judgePrompt).not.toContain('recommend write_note');
+    expect(judgePrompt).not.toContain('<anti_patterns_to_avoid>');
+    expect(judgePrompt).toContain('inspecting code');
+    expect(judgePrompt).toContain('clean output');
+  });
+
+  it('canary/adversarial test: proves free-text restatement risk is explicitly recorded rather than claimed eliminated', async () => {
+    // Model restates advisory statistics in free prose without XML tags
+    const freeTextCanary = 'CANARY_ADVICE_LEAK: the advisor recommended avoiding bash with meanReturn -0.85';
+
+    const candidateWithCanary = makeCandidate({
+      nodeId: 'node_canary',
+      branchId: 'branch_canary',
+      patch: makePatch({ id: 'patch_canary', branchId: 'branch_canary', origin: 'domain', guidance: 'memory' }),
+      trajectory: makeTrajectory({
+        id: 'traj_canary',
+        nodeId: 'node_canary',
+        branchId: 'branch_canary',
+        status: 'succeeded',
+        metrics: { steps: 1, toolCalls: 1, toolErrors: 0, durationMs: 50 },
+        steps: [
+          {
+            index: 0,
+            at: 0,
+            kind: 'model',
+            text: freeTextCanary
+          }
+        ]
+      })
+    });
+
+    const { model, composer, request } = composeRequest([JUDGE_VERDICT], [candidateWithCanary]);
+    await composer.compose(request);
+
+    const judgePrompt = promptText(model);
+
+    // XML tag stripping cannot remove unstructured prose restatements:
+    // the canary text remains visible in the judge prompt
+    expect(judgePrompt).toContain('CANARY_ADVICE_LEAK');
+    expect(judgePrompt).toContain('meanReturn -0.85');
+
+    // Therefore, L2 policy explicitly records and disclaims this residual risk
+    // instead of claiming that XML stripping eliminated all advice leakage:
+    expect(ADVICE_LEAKAGE_RISK_RECORD.policy).toBe('L2_structured_advice_stripping');
+    expect(ADVICE_LEAKAGE_RISK_RECORD.residualRisk).toBe(
+      'free_text_restatement_cannot_be_eliminated_by_xml_stripping_alone'
+    );
   });
 });

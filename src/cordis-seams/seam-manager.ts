@@ -242,6 +242,9 @@ export class CordisSeamManager implements ICordisSeamManager {
       });
       this.sequence += 1;
 
+      const isInvariant =
+        resources.frozenPatch.guidance === 'guidance_free' ||
+        resources.frozenPatch.origin === 'invariant';
       const mounted: MountedSurfaces = await mountEightSurfaces(
         this.host,
         resources.frozenPatch,
@@ -249,7 +252,11 @@ export class CordisSeamManager implements ICordisSeamManager {
           sessionId,
           branchId,
           namespace: resources.namespace,
-          patchId: resources.patchId
+          patchId: resources.patchId,
+          origin: resources.frozenPatch.origin,
+          guidance: resources.frozenPatch.guidance,
+          role: isInvariant ? 'invariant' : 'domain',
+          allowAdvice: !isInvariant
         },
         { registry: resources.registry, enabledSurfaces: this.enabledSurfaces }
       );
@@ -418,10 +425,22 @@ export class CordisSeamManager implements ICordisSeamManager {
     this.permanentPatches.set(patch.id, record);
 
     try {
+      const isInvariant =
+        frozenPatch.guidance === 'guidance_free' ||
+        frozenPatch.origin === 'invariant';
       await mountEightSurfaces(
         this.host,
         frozenPatch,
-        { sessionId: patch.sessionId, branchId, namespace, patchId: patch.id },
+        {
+          sessionId: patch.sessionId,
+          branchId,
+          namespace,
+          patchId: patch.id,
+          origin: frozenPatch.origin,
+          guidance: frozenPatch.guidance,
+          role: isInvariant ? 'invariant' : 'domain',
+          allowAdvice: !isInvariant
+        },
         { registry, enabledSurfaces: this.enabledSurfaces }
       );
     } catch (caught) {

@@ -620,3 +620,173 @@ describe('toExperienceQuery: drift inputs are forwarded to the store', () => {
     expect(query.driftRho).toBe(0.7);
   });
 });
+
+/**
+ * P6 PR5 (plan sections 7.1, 7.4 and 7.5): the retriever is the shared
+ * neighbourhood stage of the single decision kernel. These cases pin the
+ * properties the kernel relies on and that replay previously did NOT have:
+ * a real top-k cut, a bucket-local drift count, and determinism under an
+ * injected clock.
+ */
+describe('P6 PR5: retriever semantics the decision kernel depends on', () => {
+  const CURRENT = 'policy-current';
+  const STALE = 'policy-old';
+
+  it('truncates to exactly k neighbours instead of only noting the overflow', () => {
+    const state = makeState('bucket-a', ['x']);
+    const records = Array.from({ length: 25 }, (_, index) =>
+      makeRecord({ id: 'r' + String(index), state: makeState('bucket-a', ['x']) })
+    );
+    for (const k of [1, 2, 5, 10, 24, 25]) {
+      const scored = retrieveNeighbors(records, state, {
+        k,
+        similarityThreshold: 0
+      });
+      expect(scored).toHaveLength(k);
+    }
+    // Asking for more than exists returns everything, never fabricated entries.
+    const over = retrieveNeighbors(records, state, { k: 100, similarityThreshold: 0 });
+    expect(over).toHaveLength(records.length);
+  });
+
+  it('is a pure function of its inputs under an injected clock', () => {
+    const state = makeState('bucket-a', ['x', 'y']);
+    const records = [
+      makeRecord({ id: 'a', state: makeState('bucket-a', ['x']), createdAt: T0 }),
+      makeRecord({ id: 'b', state: makeState('bucket-a', ['x', 'y']), createdAt: T0 - 500 }),
+      makeRecord({ id: 'c', state: makeState('bucket-b', ['x']), createdAt: T0 - 1_000 })
+    ];
+    const options = { k: 5, similarityThreshold: 0, now: T0, halfLifeMs: 1_000 };
+    const first = retrieveNeighbors(records, state, options);
+    const second = retrieveNeighbors(records, state, options);
+    expect(second).toEqual(first);
+    // Same inputs, same weights: replay can reproduce an online neighbourhood
+    // byte for byte, which is what decision-kernel parity asserts.
+    expect(second.map((entry) => entry.weight)).toEqual(first.map((entry) => entry.weight));
+  });
+
+  it('never amplifies a record whose timestamp is in the future', () => {
+    const state = makeState('bucket-a', ['x']);
+    const future = makeRecord({
+      id: 'future',
+      state: makeState('bucket-a', ['x']),
+      createdAt: T0 + 10_000
+    });
+    const scored = retrieveNeighbors([future], state, {
+      k: 5,
+      similarityThreshold: 0,
+      now: T0,
+      halfLifeMs: 1_000
+    });
+    // Age is clamped to 0, so the weight is the similarity - never > 1.
+    expect(scored[0]?.weight).toBeCloseTo(1, 12);
+    expect(scored[0]?.weight).toBeLessThanOrEqual(1);
+  });
+
+  it('counts drift support per bucket, not per level', () => {
+    const state = makeState('bucket-a', ['x']);
+    // A saturated *other* bucket must not stop the penalty in this bucket: that
+    // is the M3 defect (the old replay counted the whole level). The fresh
+    // records stay a small minority in the relaxed pool so the stale record is
+    // still retrieved, otherwise top-k would hide what we are measuring.
+    const otherBucketFresh = Array.from({ length: 2 }, (_, index) =>
+      makeRecord({
+        id: 'other-' + String(index),
+        state: makeState('bucket-b', ['x']),
+        policyId: CURRENT
+      })
+    );
+    const stale = makeRecord({
+      id: 'stale',
+      state: makeState('bucket-a', ['x']),
+      policyId: STALE
+    });
+    const scored = retrieveNeighbors([...otherBucketFresh, stale], state, {
+      k: 10,
+      similarityThreshold: 0,
+      policyId: CURRENT,
+      driftRho: 0.5
+    });
+    const staleEntry = scored.find((entry) => entry.record.id === 'stale');
+    expect(staleEntry).toBeDefined();
+    // The bucket holds zero fresh records, so the penalty is in force even though
+    // the level as a whole already has fresh evidence.
+    expect(staleEntry?.driftWeight).toBeCloseTo(0.5, 12);
+  });
+
+  it('saturates only when the same bucket holds k fresh records', () => {
+    const state = makeState('bucket-a', ['x']);
+    const fresh = (id: string): ExperienceRecord =>
+      makeRecord({ id, state: makeState('bucket-a', ['x']), policyId: CURRENT });
+    const stale = makeRecord({
+      id: 'stale',
+      state: makeState('bucket-a', ['x']),
+      policyId: STALE
+    });
+    // k = 3 with two fresh records in the bucket: the penalty still applies.
+    const below = retrieveNeighbors([fresh('f1'), fresh('f2'), stale], state, {
+      k: 3,
+      similarityThreshold: 0,
+      policyId: CURRENT,
+      driftRho: 0.5
+    });
+    expect(below.find((entry) => entry.record.id === 'stale')?.driftWeight).toBeCloseTo(0.5, 12);
+    // Push the bucket to exactly k fresh records: the penalty stops.
+    const at = retrieveNeighbors([fresh('f1'), fresh('f2'), fresh('f3'), stale], state, {
+      k: 3,
+      similarityThreshold: 0,
+      policyId: CURRENT,
+      driftRho: 0.5
+    });
+    const saturated = at.find((entry) => entry.record.id === 'stale');
+    if (saturated !== undefined) {
+      expect(saturated.driftWeight).toBeUndefined();
+    }
+  });
+
+  it('keeps the level-wide relaxation and still applies drift inside it', () => {
+    const state = makeState('bucket-a', ['x']);
+    const crossBucket = makeRecord({
+      id: 'cross',
+      state: makeState('bucket-b', ['x']),
+      policyId: STALE
+    });
+    const scored = retrieveNeighbors([crossBucket], state, {
+      k: 10,
+      similarityThreshold: 0,
+      policyId: CURRENT,
+      driftRho: 0.5
+    });
+    // Fewer than k/2 exact hits, so the pool relaxes to the whole level, and the
+    // stale record is still down-weighted by its own policy.
+    expect(scored.map((entry) => entry.record.id)).toEqual(['cross']);
+    expect(scored[0]?.driftWeight).toBeCloseTo(0.5, 12);
+  });
+
+  it('treats the causal cutoff as inclusive', () => {
+    const state = makeState('bucket-a', ['x']);
+    const atCutoff = makeRecord({ id: 'at', state: makeState('bucket-a', ['x']), createdAt: T0 });
+    const afterCutoff = makeRecord({
+      id: 'after',
+      state: makeState('bucket-a', ['x']),
+      createdAt: T0 + 1
+    });
+    const scored = retrieveNeighbors([atCutoff, afterCutoff], state, {
+      k: 5,
+      similarityThreshold: 0,
+      before: T0
+    });
+    expect(scored.map((entry) => entry.record.id)).toEqual(['at']);
+  });
+
+  it('drops a record with a non-finite timestamp from the neighbourhood', () => {
+    const state = makeState('bucket-a', ['x']);
+    const broken = makeRecord({ id: 'broken', state: makeState('bucket-a', ['x']) });
+    const scored = retrieveNeighbors(
+      [{ ...broken, createdAt: Number.NaN }],
+      state,
+      { k: 5, similarityThreshold: 0 }
+    );
+    expect(scored).toEqual([]);
+  });
+});

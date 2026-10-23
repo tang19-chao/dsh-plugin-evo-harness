@@ -10,7 +10,7 @@ import {
   SECRET_PATTERNS,
   SECRET_PLACEHOLDER,
   redactAbsolutePaths,
-  redactSecrets
+  redactSecrets, checkTokenBudget, countTokens, estimateConservativeTokens, DEFAULT_ADVISORY_TOKEN_BUDGET, CONSERVATIVE_FALLBACK_CHAR_LIMIT, CONSERVATIVE_FALLBACK_BYTE_LIMIT
 } from '../../../src/jitrl/redaction';
 
 describe('secret pattern set', () => {
@@ -196,5 +196,85 @@ describe('structured keys and paths survive blobs (P3-FIX3)', () => {
   it('still folds realistic high-entropy blobs', () => {
     expect(redactSecrets('Abcdefghijklmnopqrstuvwxyz0123456789AbCdEfGh')).toBe('<secret>');
     expect(redactSecrets('Abcdefghijklmnopqrstuvwxyz0123456789+/AbCdEfGhIjKlMnOp')).toBe('<secret>');
+  });
+});
+
+describe('M2 tokenizer budget and measurement governance', () => {
+  it('supports injecting a custom model tokenizer and reports exact: true', () => {
+    const mockTokenizer = (text: string): number => text.split(/\s+/).filter(Boolean).length;
+    const input = 'hello world from custom tokenizer';
+    const result = checkTokenBudget(input, { tokenizer: mockTokenizer, maxTokens: 10 });
+
+    expect(result.exact).toBe(true);
+    expect(result.tokenCount).toBe(5);
+    expect(result.fits).toBe(true);
+    expect(result.truncated).toBe(false);
+    expect(result.note).toContain('injected model tokenizer');
+  });
+
+  it('rejects over-budget text under injected tokenizer without silent truncation', () => {
+    const mockTokenizer = (text: string): number => text.length;
+    const input = 'abcdefghijklm';
+    const result = checkTokenBudget(input, { tokenizer: mockTokenizer, maxTokens: 5 });
+
+    expect(result.exact).toBe(true);
+    expect(result.tokenCount).toBe(13);
+    expect(result.fits).toBe(false);
+    expect(result.truncated).toBe(false);
+    expect(result.note).toContain('Exceeds injected model tokenizer budget');
+  });
+
+  it('falls back to conservative char/byte limits and explicitly disclaims <= 300 tokens equivalence', () => {
+    const input = 'standard advice prose';
+    const result = checkTokenBudget(input);
+
+    expect(result.exact).toBe(false);
+    expect(result.fits).toBe(true);
+    expect(result.truncated).toBe(false);
+    expect(result.note).toContain('does NOT claim equivalence to real model <= 300 tokens');
+    expect(result.charLength).toBe(input.length);
+    expect(result.byteLength).toBeGreaterThan(0);
+  });
+
+  describe('four input categories: high-entropy, CJK, emoji, JSON', () => {
+    const categories = [
+      {
+        name: 'high-entropy identifiers',
+        fitting: 'node:deadbeef0123456789abcdef0123456789+ghp_validTokenString12345',
+        overBudget: 'x'.repeat(450) + '_deadbeef_' + 'y'.repeat(100)
+      },
+      {
+        name: 'CJK text',
+        fitting: '深度学习模型自适应优化与强化学习状态经验回放系统测试',
+        overBudget: '这是一段非常长的中文测试内容用于验证超出保守上限的场景。'.repeat(20)
+      },
+      {
+        name: 'emoji sequences',
+        fitting: '🚀 🤖 💡 🎉 👨‍👩‍👧‍👦 ✨ 🔍',
+        overBudget: '🚀 🤖 💡 🎉 👨‍👩‍👧‍👦 ✨ 🔍'.repeat(50)
+      },
+      {
+        name: 'JSON payloads',
+        fitting: JSON.stringify({ action: 'tool_call', target: 'bash', params: { cmd: 'ls -la' }, safe: true }),
+        overBudget: JSON.stringify({ array: Array.from({ length: 60 }, (_, i) => ({ id: i, label: 'item_' + i, hash: 'h_' + i })) })
+      }
+    ];
+
+    for (const cat of categories) {
+      it('evaluates ' + cat.name + ' within budget: fits=true and no silent truncation', () => {
+        const result = checkTokenBudget(cat.fitting);
+        expect(result.fits).toBe(true);
+        expect(result.truncated).toBe(false);
+        expect(result.tokenCount).toBeGreaterThan(0);
+        expect(result.charLength).toBe(cat.fitting.length);
+      });
+
+      it('evaluates ' + cat.name + ' over budget: fits=false without silent truncation', () => {
+        const result = checkTokenBudget(cat.overBudget);
+        expect(result.fits).toBe(false);
+        expect(result.truncated).toBe(false);
+        expect(result.note).toContain('Exceeds conservative heuristic budget');
+      });
+    }
   });
 });

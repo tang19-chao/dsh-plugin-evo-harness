@@ -28,6 +28,7 @@ import {
 import { parseEvoHarnessConfig, validateEvoHarnessConfig } from '../../../src/config';
 import { abstractMetaState } from '../../../src/jitrl/state-abstraction';
 import { normalizeMetaAction } from '../../../src/jitrl/action-normalizer';
+import { EXPERIENCE_SCHEMA_VERSION } from '../../../src/jitrl/experience-store';
 import { readJitDiagnostics } from '../../../src/jitrl/jit-active-policy';
 import { e2eConfig } from '../../e2e/fixtures';
 
@@ -161,6 +162,12 @@ function surfaceHistory(
     sessionId: 'session-p3fix1',
     treeId: 'tree-p3fix1',
     nodeId: 'node-' + String(index),
+    // Fixture-gap repair (t28): the live writer always stamps the current
+    // experience schema version (orchestrator recordOnlineExperience). Without
+    // it these records are LEGACY, and a learning-facing neighbourhood
+    // correctly excludes all of them - which is what made this test depend on
+    // the filter being unimplemented.
+    experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
     createdAt: T0 - 100,
     redacted: true
   }));

@@ -39,6 +39,8 @@
     "check:docs": "node scripts/verify-readme-counts.mjs",
     "bench:jitrl": "node scripts/bench-jitrl-query.mjs",
     "eval:jitrl": "node scripts/eval-jitrl.mjs",
+    "eval:build": "node scripts/eval/build-eval.mjs",
+    "eval:jitrl:baseline": "node scripts/eval-jitrl.mjs --baseline docs/reports/p6-eval-baseline.md",
     "verify": "pnpm run typecheck && pnpm run test"
   },
   "devDependencies": {

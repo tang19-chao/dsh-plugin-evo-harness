@@ -32,6 +32,13 @@ import {
 } from '../../../src/dream-rsi/active-policy';
 import { abstractMetaState } from '../../../src/jitrl/state-abstraction';
 import { normalizeMetaAction } from '../../../src/jitrl/action-normalizer';
+import { EXPERIENCE_SCHEMA_VERSION } from '../../../src/jitrl/experience-store';
+import { DEFAULT_EVO_HARNESS_CONFIG } from '../../../src/config';
+import {
+  baseEffectivePolicyConfig,
+  createEffectivePolicyConfigProvider,
+  type EffectivePolicyConfigProvider
+} from '../../../src/jitrl/decision-kernel';
 import {
   DEFAULT_DERIVED_CACHE_ENTRIES,
   MAX_DERIVED_CACHE_ENTRIES,
@@ -200,6 +207,10 @@ function makeMetaRecord(options: {
   readonly createdAt?: number;
   readonly guidance?: 'memory' | 'guidance_free';
   readonly actionSuffix?: boolean;
+  /** Omit the schema version to model a pre-PR4 (legacy) record. */
+  readonly omitSchemaVersion?: boolean;
+  /** Explicit learning-eligibility override (cancelled/infrastructure cases). */
+  readonly learningEligible?: boolean;
 }): ExperienceRecord {
   // Exactly what buildMetaState(makeRequest()) produces, so the synthetic
   // history is a genuine nearest-neighbour match (Jaccard 1) for the request.
@@ -226,6 +237,16 @@ function makeMetaRecord(options: {
     sessionId: 'session-jit',
     treeId: 'tree-jit',
     nodeId: options.id,
+    // Fixture histories model evidence the live writer produces, and the live
+    // writer always stamps the current schema version (orchestrator
+    // recordOnlineExperience). Without it these records would be LEGACY and a
+    // learning-facing neighbourhood would - correctly - exclude all of them.
+    ...(options.omitSchemaVersion === true
+      ? {}
+      : { experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION }),
+    ...(options.learningEligible === undefined
+      ? {}
+      : { learningEligible: options.learningEligible }),
     createdAt: options.createdAt ?? T0 - 1000,
     redacted: true
   };
@@ -1543,6 +1564,131 @@ describe('repair H1: online decisions read the hot-swapped jit hyperparameters',
       expect(Number.isFinite(beta)).toBe(true);
       expect(beta).toBeCloseTo(1, 9);
     }
+  });
+});
+
+/**
+ * P6 PR5 (plan section 7.3): the decorator consumes a versioned
+ * EffectivePolicyConfig, so a hot swap is visible per decision and the consumer
+ * cache is invalidated by version rather than by coincidence.
+ */
+describe('P6 PR5: effective policy config provider', () => {
+  function provider(): EffectivePolicyConfigProvider {
+    return createEffectivePolicyConfigProvider({
+      initial: baseEffectivePolicyConfig({
+        jitrl: DEFAULT_EVO_HARNESS_CONFIG.jitrl,
+        halfLifeMs: 60_000
+      }),
+      now: () => T0
+    });
+  }
+
+  it('records the consumed version on every decision', () => {
+    const configs = provider();
+    const jit = createJitActivePolicy({
+      inner: recordingInner(),
+      experiences: invariantLovingHistory(),
+      config: NO_SURFACES,
+      now: () => T0,
+      rng: NO_EXPLORE,
+      policyConfigProvider: configs
+    });
+    const first = readJitDiagnostics(jit.selectBatch(makeRequest()));
+    expect(first?.policyVersion).toBe('config@v0');
+    // The read was logged, so the version is auditable rather than inferred.
+    expect(configs.consumptionLog().map((entry) => entry.consumer)).toEqual(['level1']);
+
+    configs.publish({ policy: { ...makeBasePolicy(), id: 'pi-0', version: 12 } });
+    const second = readJitDiagnostics(jit.selectBatch(makeRequest()));
+    expect(second?.policyVersion).toBe('pi-0@v12');
+    expect(configs.consumptionLog()).toHaveLength(2);
+  });
+
+  it('applies a published L1 beta on the very next decision', () => {
+    const configs = provider();
+    const jit = createJitActivePolicy({
+      inner: recordingInner(),
+      experiences: invariantLovingHistory(),
+      config: { ...NO_SURFACES, beta: 0.5 },
+      now: () => T0,
+      rng: NO_EXPLORE,
+      policyConfigProvider: configs
+    });
+    const before = readJitDiagnostics(jit.selectBatch(makeRequest()));
+    expect(before).toBeDefined();
+    const beforeKl = before?.klToPrior ?? Number.NaN;
+    expect(beforeKl).toBeGreaterThan(0);
+
+    // Publish a larger temperature through the provider only.
+    configs.publish({ level1: { beta: 2 } });
+    const after = readJitDiagnostics(jit.selectBatch(makeRequest()));
+    const afterKl = after?.klToPrior ?? Number.NaN;
+    expect(afterKl).toBeGreaterThan(beforeKl);
+    // The provider is the authority: the constructor beta is no longer read.
+    expect(after?.policyVersion).toBe(configs.versionTag());
+  });
+
+  it('invalidates the derived-policy cache when the version changes', () => {
+    const configs = provider();
+    const jit = createJitActivePolicy({
+      inner: recordingInner(),
+      experiences: invariantLovingHistory(),
+      config: NO_SURFACES,
+      now: () => T0,
+      rng: NO_EXPLORE,
+      policyConfigProvider: configs
+    });
+    jit.selectBatch(makeRequest());
+    const missesAfterFirst = jit.cacheStats().misses;
+    expect(missesAfterFirst).toBeGreaterThan(0);
+
+    configs.publish({ policy: { ...makeBasePolicy(), id: 'pi-0', version: 21 } });
+    jit.selectBatch(makeRequest());
+    // A version bump forces a rebuild even when the weight vector repeats.
+    expect(jit.cacheStats().misses).toBeGreaterThan(missesAfterFirst);
+  });
+
+  it('reports the ignored dimensions and the filter trace per decision', () => {
+    const jit = createJitActivePolicy({
+      inner: recordingInner(),
+      experiences: invariantLovingHistory(),
+      config: NO_SURFACES,
+      now: () => T0,
+      rng: NO_EXPLORE
+    });
+    const diagnostics = readJitDiagnostics(jit.selectBatch(makeRequest()));
+    expect(diagnostics?.ignoredDimensions).toEqual(['lambda', 'alpha', 'gamma']);
+    // Without a provider there is no published version to name, and the filter
+    // trace still explains the neighbourhood size.
+    expect(diagnostics?.policyVersion).toBeUndefined();
+    expect(diagnostics?.filter?.records).toBe(invariantLovingHistory().length);
+    expect(diagnostics?.filter?.kept).toBeGreaterThan(0);
+  });
+
+  it('falls back to the live policy block when no provider is injected', () => {
+    // Repair H1 must keep working without a provider (pre-PR5 wiring).
+    const jit = createJitActivePolicy({
+      inner: recordingInner(),
+      experiences: invariantLovingHistory(),
+      config: { ...NO_SURFACES, beta: 0.5 },
+      now: () => T0,
+      rng: NO_EXPLORE
+    });
+    const before = readJitDiagnostics(jit.selectBatch(makeRequest()));
+    jit.update({
+      ...makeBasePolicy(),
+      jit: {
+        beta: 2,
+        lambda: 0.05,
+        alpha: 5,
+        k: 10,
+        gamma: 0.5,
+        similarityThreshold: 0.3
+      }
+    });
+    const after = readJitDiagnostics(jit.selectBatch(makeRequest()));
+    expect(after?.klToPrior ?? 0).toBeGreaterThan(before?.klToPrior ?? 0);
+    expect(after?.policyVersion).toBeUndefined();
   });
 });
 

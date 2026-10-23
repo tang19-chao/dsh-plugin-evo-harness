@@ -23,6 +23,8 @@ import {
 } from '../../../src/index';
 import type { AssemblyShape, HookFixture } from './hook-fixtures';
 import { createHookFixture, emptyAssembly } from './hook-fixtures';
+import { createScopeRegistry } from '../../../src/jitrl/scope-registry';
+import type { HostAdvisor } from '../../../src/jitrl/host-advisor';
 
 function dispatchAssemble(
   fixture: HookFixture,
@@ -41,6 +43,23 @@ function dispatchPreExecute(
   const listener = fixture.listener('tools/pre-execute');
   const next = (): Promise<Record<string, unknown>> => Promise.resolve({ kind: 'allow' });
   return Promise.resolve(listener(exec, next)) as Promise<Record<string, unknown>>;
+}
+
+function dispatchPreStep(
+  fixture: HookFixture,
+  payload: unknown,
+  stepDecision: Record<string, unknown> = { kind: 'enter', messages: [] }
+): Promise<Record<string, unknown>> {
+  const listener = fixture.listener('agent/pre-step');
+  const next = (): Promise<Record<string, unknown>> => Promise.resolve(stepDecision);
+  return Promise.resolve(listener(payload, next)) as Promise<Record<string, unknown>>;
+}
+
+function createMockHostAdvisor(evaluate: (req: unknown) => Promise<unknown>): HostAdvisor {
+  return {
+    evaluate: evaluate as unknown as HostAdvisor['evaluate'],
+    diagnostics: () => []
+  };
 }
 
 const baseSpec = {
@@ -401,6 +420,503 @@ function specFor(branchId: string): typeof baseSpec {
     namespace: 'harness2:probe_' + branchId
   };
 }
+
+describe('advisor and scope boundary enforcement (Plan §4 R3 / §5.2)', () => {
+  it('fails closed on advice injection when advisor has no scope, but never denies host execution', async () => {
+    const fixture = createHookFixture();
+    const evaluate = vi.fn().mockResolvedValue({ kind: 'ask', reason: 'advisor want to ask' });
+    const mockAdvisor = createMockHostAdvisor(evaluate);
+    const registry = createScopeRegistry();
+    const adapter = createDshHookHostAdapter(fixture.ctx, {
+      hostAdvisor: mockAdvisor,
+      hostAdvisorMode: 'gate',
+      scopeRegistry: registry
+      // no hostAdvisorScope, unregistered branch
+    });
+    adapter.install();
+
+    // Host tool execution should pass through unhindered (returns { kind: 'allow' })
+    const result = await dispatchPreExecute(fixture, {
+      name: 'read_file',
+      branchId: 'br-unknown',
+      sessionId: 'sess-1'
+    });
+    expect(result).toEqual({ kind: 'allow' });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(adapter.hostAdvisorStats().skipped).toBe(1);
+    expect(adapter.stats().deniedToolCalls).toBe(0);
+
+    // Host pre-step should also pass through without advice
+    const stepResult = await dispatchPreStep(fixture, {
+      agent: { id: 'sess-1', branchId: 'br-unknown' }
+    });
+    expect(stepResult).toEqual({ kind: 'enter', messages: [] });
+    expect(stepResult['additionalContexts']).toBeUndefined();
+
+    await adapter.dispose();
+  });
+
+  it('explicitly forbids advice for invariant branches in both advisory and gate modes', async () => {
+    const fixture = createHookFixture();
+    const evaluate = vi.fn().mockResolvedValue({
+      kind: 'ask',
+      reason: 'invariant branch must never trigger this'
+    });
+    const mockAdvisor = createMockHostAdvisor(evaluate);
+    const registry = createScopeRegistry();
+    const adapter = createDshHookHostAdapter(fixture.ctx, {
+      hostAdvisor: mockAdvisor,
+      hostAdvisorMode: 'gate',
+      hostAdvisorScope: { branchId: 'inv-branch-1' },
+      scopeRegistry: registry
+    });
+    adapter.install();
+
+    registry.register({
+      branchId: 'inv-branch-1',
+      sessionId: 'sess-inv',
+      role: 'invariant'
+    });
+
+    // 1) Gate mode with invariant branchId naming convention or registered invariant
+    const gateResult = await dispatchPreExecute(fixture, {
+      name: 'shell',
+      branchId: 'inv-branch-1',
+      sessionId: 'sess-inv'
+    });
+    expect(gateResult).toEqual({ kind: 'allow' });
+    expect(evaluate).not.toHaveBeenCalled();
+
+    // 2) Advisory mode with invariant branch
+    const advisoryAdapter = createDshHookHostAdapter(fixture.ctx, {
+      hostAdvisor: createMockHostAdvisor(
+        vi.fn().mockResolvedValue({ kind: 'advisory', text: 'Forbidden advice' })
+      ),
+      hostAdvisorMode: 'advisory',
+      scopeRegistry: registry
+    });
+    advisoryAdapter.install();
+
+    const stepResult = await dispatchPreStep(fixture, {
+      branchId: 'inv-branch-1',
+      agent: { id: 'sess-inv' }
+    });
+    expect(stepResult).toEqual({ kind: 'enter', messages: [] });
+    expect(stepResult['additionalContexts']).toBeUndefined();
+
+    // 3) Payload with explicit isInvariant: true or role: 'invariant'
+    const flaggedResult = await dispatchPreExecute(fixture, {
+      name: 'python',
+      branchId: 'br-other',
+      sessionId: 'sess-other',
+      isInvariant: true
+    });
+    expect(flaggedResult).toEqual({ kind: 'allow' });
+    expect(evaluate).not.toHaveBeenCalled();
+
+    await adapter.dispose();
+    await advisoryAdapter.dispose();
+  });
+
+  it('fails closed on advice for anonymous dispatches without auto-denying host execution', async () => {
+    const fixture = createHookFixture();
+    const evaluate = vi.fn().mockResolvedValue({ kind: 'ask', reason: 'gate should not run' });
+    const mockAdvisor = createMockHostAdvisor(evaluate);
+    const adapter = createDshHookHostAdapter(fixture.ctx, {
+      hostAdvisor: mockAdvisor,
+      hostAdvisorMode: 'gate',
+      hostAdvisorScope: { branchId: 'domain-br' }
+    });
+    adapter.install();
+
+    // Anonymous dispatch: no branchId, no sessionId
+    const result = await dispatchPreExecute(fixture, { name: 'bash' });
+    expect(result).toEqual({ kind: 'allow' });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(adapter.hostAdvisorStats().skipped).toBe(1);
+
+    await adapter.dispose();
+  });
+
+  it('delivers advice and gate ask to authorized domain branches', async () => {
+    const gateFixture = createHookFixture();
+    const gateEvaluate = vi.fn().mockResolvedValue({
+      kind: 'ask',
+      reason: 'Destructive tool requires confirmation',
+      suggestedActionKey: 'tool:read_delta'
+    });
+    const gateAdvisor = createMockHostAdvisor(gateEvaluate);
+    const registry = createScopeRegistry();
+    registry.register({
+      branchId: 'domain-main',
+      sessionId: 'sess-domain',
+      role: 'domain'
+    });
+
+    const gateAdapter = createDshHookHostAdapter(gateFixture.ctx, {
+      hostAdvisor: gateAdvisor,
+      hostAdvisorMode: 'gate',
+      scopeRegistry: registry
+    });
+    gateAdapter.install();
+
+    const gateResult = await dispatchPreExecute(gateFixture, {
+      name: 'rm_rf',
+      branchId: 'domain-main',
+      sessionId: 'sess-domain'
+    });
+    expect(gateResult).toEqual({
+      kind: 'ask',
+      reason: 'Destructive tool requires confirmation',
+      suggestedActionKey: 'tool:read_delta'
+    });
+    expect(gateEvaluate).toHaveBeenCalledTimes(1);
+    const firstCall = gateEvaluate.mock.calls[0];
+    expect(firstCall).toBeDefined();
+    const passedReq = firstCall![0];
+    expect(passedReq.branchId).toBe('domain-main');
+    expect(passedReq.sessionId).toBe('sess-domain');
+    expect(passedReq.isInvariant).toBe(false);
+
+    await gateAdapter.dispose();
+
+    // Advisory mode delivers rendered advice to additionalContexts
+    const advFixture = createHookFixture();
+    const advisoryEvaluate = vi.fn().mockResolvedValue({
+      kind: 'advisory',
+      text: 'Consider using tool:check_preconditions first'
+    });
+    const advAdapter = createDshHookHostAdapter(advFixture.ctx, {
+      hostAdvisor: createMockHostAdvisor(advisoryEvaluate),
+      hostAdvisorMode: 'advisory',
+      scopeRegistry: registry
+    });
+    advAdapter.install();
+
+    const advResult = await dispatchPreStep(advFixture, {
+      branchId: 'domain-main',
+      agent: { id: 'sess-domain' }
+    });
+    expect(advResult['additionalContexts']).toEqual(['Consider using tool:check_preconditions first']);
+
+    await advAdapter.dispose();
+  });
+
+  it('ensures host deny rules take precedence over advisor and advisor cannot override deny', async () => {
+    const fixture = createHookFixture();
+    const evaluate = vi.fn().mockResolvedValue({
+      kind: 'ask',
+      reason: 'Advisor asks user for permission'
+    });
+    const mockAdvisor = createMockHostAdvisor(evaluate);
+    const registry = createScopeRegistry();
+    registry.register({
+      branchId: 'domain-main',
+      sessionId: 'sess-domain',
+      role: 'domain'
+    });
+
+    const adapter = createDshHookHostAdapter(fixture.ctx, {
+      hostAdvisor: mockAdvisor,
+      hostAdvisorMode: 'gate',
+      scopeRegistry: registry,
+      denyTools: [{ toolName: 'forbidden_tool', reason: 'Strict security deny policy' }]
+    });
+    adapter.install();
+
+    // When host deny rule matches, it immediately denies without advisor evaluation
+    const result = await dispatchPreExecute(fixture, {
+      name: 'forbidden_tool',
+      branchId: 'domain-main',
+      sessionId: 'sess-domain'
+    });
+    expect(result).toEqual({ kind: 'deny', reason: 'Strict security deny policy' });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(adapter.stats().deniedToolCalls).toBe(1);
+
+    // Next listener in the waterfall returns deny: adapter must not override it
+    const listener = fixture.listener('tools/pre-execute');
+    const downstreamDeny = (await Promise.resolve(
+      listener({ name: 'other_tool', branchId: 'domain-main', sessionId: 'sess-domain' }, () =>
+        Promise.resolve({ kind: 'deny', reason: 'downstream host policy' })
+      )
+    )) as Record<string, unknown>;
+    expect(downstreamDeny).toEqual({ kind: 'deny', reason: 'downstream host policy' });
+    expect(evaluate).not.toHaveBeenCalled();
+
+    await adapter.dispose();
+  });
+
+  it('rejects untrusted payload self-proclaiming domain role without prior registration', async () => {
+    const fixture = createHookFixture();
+    const evaluate = vi.fn().mockResolvedValue({ kind: 'ask', reason: 'should not run' });
+    const mockAdvisor = createMockHostAdvisor(evaluate);
+    const registry = createScopeRegistry();
+
+    // Notice: branch "rogue-br" is NEVER registered in registry!
+    const adapter = createDshHookHostAdapter(fixture.ctx, {
+      hostAdvisor: mockAdvisor,
+      hostAdvisorMode: 'gate',
+      scopeRegistry: registry
+      // unscoped advisor: relies on ScopeRegistry
+    });
+    adapter.install();
+
+    // Rogue payload self-claims domain role and allowAdvice: true
+    const roguePayload = {
+      name: 'write_file',
+      branchId: 'rogue-br',
+      sessionId: 'sess-rogue',
+      role: 'domain',
+      allowAdvice: true
+    };
+    expect(registry.resolve(roguePayload)).toBe('unknown');
+
+    const result = await dispatchPreExecute(fixture, roguePayload);
+    // Passes through host without advice or deny
+    expect(result).toEqual({ kind: 'allow' });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(adapter.hostAdvisorStats().skipped).toBe(1);
+
+    await adapter.dispose();
+  });
+  it('fails closed on advice injection for unproven branch without registry injection (F1/F2/F7/F10)', async () => {
+    const fixture = createHookFixture();
+    const evaluate = vi.fn().mockResolvedValue({
+      kind: 'advisory',
+      text: 'EXTERNAL_MEMORY_ADVICE_SHOULD_NOT_REACH_INVARIANT'
+    });
+    const mockAdvisor = createMockHostAdvisor(evaluate);
+
+    const records: unknown[] = [];
+    const mockSink = {
+      observeToolCall: vi.fn(async (obs) => { records.push(obs); }),
+      observeTurnEnd: vi.fn(async () => {})
+    };
+
+    // Notice: NO scopeRegistry passed, NO hostAdvisorScope passed (production default)
+    const adapter = createDshHookHostAdapter(fixture.ctx, {
+      hostAdvisor: mockAdvisor,
+      hostAdvisorMode: 'advisory',
+      hostToolExperience: mockSink
+    });
+    adapter.install();
+
+    // 1) agent/pre-step on neutral-named unproven branch sess-a1::tree-1::r1-s1 (no 'inv', slot s1)
+    const stepResult = await dispatchPreStep(fixture, {
+      branchId: 'sess-a1::tree-1::r1-s1',
+      sessionId: 'sess-a1'
+    });
+    // Must NOT evaluate advisor, must NOT inject additionalContexts
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(stepResult['additionalContexts']).toBeUndefined();
+    expect(adapter.hostAdvisorStats().skipped).toBe(1);
+
+    // 2) tools/pre-execute on unproven branch
+    const preResult = await dispatchPreExecute(fixture, {
+      name: 'probe_tool',
+      branchId: 'sess-a1::tree-1::r1-s1',
+      sessionId: 'sess-a1'
+    });
+    // Host pass-through: allows without auto-deny, advisor not evaluated
+    expect(preResult).toEqual({ kind: 'allow' });
+    expect(evaluate).not.toHaveBeenCalled();
+
+    // 3) Anonymous dispatch: fail-closed (Option 1 / F9)
+    const anonResult = await dispatchPreStep(fixture, {});
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(anonResult['additionalContexts']).toBeUndefined();
+
+    // 4) Clean dispose
+    await adapter.dispose();
+  });
+
+  it('provenance plumbing enforces invariant isolation for neutral-named slot (F3-PLUMB / Acceptance 1 & 2)', async () => {
+    const fixture = createHookFixture();
+    const evaluate = vi.fn().mockResolvedValue({
+      kind: 'advisory',
+      text: 'ADVICE_MUST_BE_BLOCKED_BY_PROVENANCE'
+    });
+    const mockAdvisor = createMockHostAdvisor(evaluate);
+    const registry = createScopeRegistry();
+
+    const adapter = createDshHookHostAdapter(fixture.ctx, {
+      hostAdvisor: mockAdvisor,
+      hostAdvisorMode: 'advisory',
+      scopeRegistry: registry
+    });
+    adapter.install();
+
+    // Neutral branch name: sess-a1::tree-1::r1-s1 (no 'inv' in session, slot s1)
+    const neutralBranch = 'sess-a1::tree-1::r1-s1';
+    const neutralSession = 'sess-a1';
+
+    // Mount surface with invariant provenance (origin: explore_invariant, guidance: guidance_free)
+    const unmount = await adapter.registerPromptSegment({
+      surfaceId: 'surface-inv',
+      branchId: neutralBranch,
+      sessionId: neutralSession,
+      namespace: 'ns-inv',
+      segment: 'evo-harness-prompt',
+      mode: 'append',
+      content: 'invariant prompt segment',
+      origin: 'explore_invariant',
+      guidance: 'guidance_free',
+      role: 'invariant',
+      allowAdvice: false
+    } as any);
+
+    // Provenance registration verified in scopeRegistry
+    const registered = registry.get(neutralBranch);
+    expect(registered).toBeDefined();
+    expect(registered?.isInvariant).toBe(true);
+    expect(registered?.allowAdvice).toBe(false);
+    expect(registered?.guidance).toBe('guidance_free');
+
+    // Pre-step on invariant slot: advice strictly prohibited!
+    const stepResult = await dispatchPreStep(fixture, {
+      branchId: neutralBranch,
+      sessionId: neutralSession
+    });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(stepResult['additionalContexts']).toBeUndefined();
+
+    // Pre-execute on invariant slot: pass-through without advisor evaluation
+    const preResult = await dispatchPreExecute(fixture, {
+      name: 'probe_tool',
+      branchId: neutralBranch,
+      sessionId: neutralSession
+    });
+    expect(preResult).toEqual({ kind: 'allow' });
+    expect(evaluate).not.toHaveBeenCalled();
+
+    await unmount.dispose();
+    await adapter.dispose();
+  });
+
+  it('counterfactual on identical branchId: provenance directly drives advisor advice outcome (F3/F10)', async () => {
+    const fixture = createHookFixture();
+    const evaluate = vi.fn().mockResolvedValue({
+      kind: 'advisory',
+      text: 'DOMAIN_ADVICE_PAYLOAD'
+    });
+    const mockAdvisor = createMockHostAdvisor(evaluate);
+    const registry = createScopeRegistry();
+
+    const adapter = createDshHookHostAdapter(fixture.ctx, {
+      hostAdvisor: mockAdvisor,
+      hostAdvisorMode: 'advisory',
+      scopeRegistry: registry
+    });
+    adapter.install();
+
+    // Exact same branchId: sess-a1::tree-1::r1-s1
+    const testBranch = 'sess-a1::tree-1::r1-s1';
+    const testSession = 'sess-a1';
+
+    // Phase A: Mount with domain provenance -> Advisor MUST evaluate and inject advice
+    const domainUnmount = await adapter.registerPromptSegment({
+      surfaceId: 'surface-dom',
+      branchId: testBranch,
+      sessionId: testSession,
+      namespace: 'ns-dom',
+      segment: 'evo-harness-prompt',
+      mode: 'append',
+      content: 'domain prompt',
+      origin: 'explore_domain',
+      guidance: 'memory',
+      role: 'domain',
+      allowAdvice: true
+    } as any);
+
+    const stepA = await dispatchPreStep(fixture, {
+      branchId: testBranch,
+      sessionId: testSession
+    });
+    expect(evaluate).toHaveBeenCalledTimes(1);
+    expect(stepA['additionalContexts']).toEqual(['DOMAIN_ADVICE_PAYLOAD']);
+    expect(adapter.hostAdvisorStats().advisory).toBe(1);
+    await domainUnmount.dispose();
+
+    // Phase B: Mount the EXACT SAME branchId with invariant provenance -> Advisor MUST NOT evaluate
+    evaluate.mockClear();
+    const invUnmount = await adapter.registerPromptSegment({
+      surfaceId: 'surface-inv',
+      branchId: testBranch,
+      sessionId: testSession,
+      namespace: 'ns-inv',
+      segment: 'evo-harness-prompt',
+      mode: 'append',
+      content: 'invariant prompt',
+      origin: 'explore_invariant',
+      guidance: 'guidance_free',
+      role: 'invariant',
+      allowAdvice: false
+    } as any);
+
+    const stepB = await dispatchPreStep(fixture, {
+      branchId: testBranch,
+      sessionId: testSession
+    });
+    // Advisor must NOT be called for invariant branch!
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(stepB['additionalContexts']).toBeUndefined();
+
+    await invUnmount.dispose();
+    await adapter.dispose();
+  });
+
+  it('proves slot -s2 domain branch is NOT falsely isolated and receives advice (Acceptance 1 / F3-RESIDUAL)', async () => {
+    const fixture = createHookFixture();
+    const evaluate = vi.fn().mockResolvedValue({
+      kind: 'advisory',
+      text: 'S2_DOMAIN_BRANCH_ADVICE'
+    });
+    const mockAdvisor = createMockHostAdvisor(evaluate);
+    const registry = createScopeRegistry();
+
+    const adapter = createDshHookHostAdapter(fixture.ctx, {
+      hostAdvisor: mockAdvisor,
+      hostAdvisorMode: 'advisory',
+      scopeRegistry: registry
+    });
+    adapter.install();
+
+    // Slot -s2 domain branch: sess-a1::tree-1::r0-s2
+    const s2Branch = 'sess-a1::tree-1::r0-s2';
+    const s2Session = 'sess-a1';
+
+    const unmount = await adapter.registerPromptSegment({
+      surfaceId: 'surface-s2',
+      branchId: s2Branch,
+      sessionId: s2Session,
+      namespace: 'ns-s2',
+      segment: 'evo-harness-prompt',
+      mode: 'append',
+      content: 's2 domain prompt',
+      origin: 'explore_domain',
+      guidance: 'memory',
+      role: 'domain',
+      allowAdvice: true
+    } as any);
+
+    const reg = registry.get(s2Branch);
+    expect(reg?.isInvariant).toBe(false);
+    expect(reg?.allowAdvice).toBe(true);
+
+    const step = await dispatchPreStep(fixture, {
+      branchId: s2Branch,
+      sessionId: s2Session
+    });
+    // Slot -s2 domain branch receives advice and is NOT falsely isolated!
+    expect(evaluate).toHaveBeenCalledTimes(1);
+    expect(step['additionalContexts']).toEqual(['S2_DOMAIN_BRANCH_ADVICE']);
+
+    await unmount.dispose();
+    await adapter.dispose();
+  });
+});
+
 
 /** Kept for the typed event-name contract used by the fixture assertions. */
 export type { DshHookEventName };

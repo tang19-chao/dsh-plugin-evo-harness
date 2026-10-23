@@ -129,11 +129,11 @@ export interface JitRlRewardConfig {
 /** L3 host tool-call advisor settings (experimental, default off). */
 export interface JitRlHostAdvisorConfig {
   enabled: boolean;
-  /** 'advisory' annotates decisions; 'gate' may block host tool calls. */
+  /** 'advisory' annotates decisions; 'gate' requests user confirmation and never automatically denies (请求用户确认，永不自动 deny). */
   mode: 'advisory' | 'gate';
   /** Mean neighbour return below which the advisor suggests an alternative. */
   adviseThreshold: number;
-  /** Mean neighbour return below which 'gate' mode blocks the call. */
+  /** Mean neighbour return below which 'gate' mode requests user confirmation; never automatically denies (请求用户确认，永不自动 deny). */
   gateThreshold: number;
   /** Minimum neighbour support before the advisor acts. */
   minSupport: number;

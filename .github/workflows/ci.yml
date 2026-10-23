@@ -40,6 +40,14 @@ jobs:
       - name: Typecheck
         run: pnpm exec tsc --noEmit
 
+      # P6 PR1 / R7: run the command users actually type, as a child process.
+      # The ablation e2e suite imports the library and cannot catch a broken
+      # entry point (that is how ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX slipped
+      # through), so the documented CLI is exercised here directly - no pnpm
+      # wrapper and no --experimental-* flag, exactly as documented.
+      - name: Run default eval CLI
+        run: node scripts/eval-jitrl.mjs --json
+
       - name: Run tests
         run: pnpm exec vitest run --reporter=default --reporter=json --outputFile=test-results.json
 

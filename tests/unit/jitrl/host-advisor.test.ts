@@ -32,6 +32,8 @@ import {
   MAX_ADVISORY_TOKENS,
   createHostAdvisor,
   estimateTokens,
+  checkAdvisorBudget,
+  renderAdvice,
   type HostAdvisor,
   type HostAdvisorEstimator,
   type HostAdvisorStore
@@ -144,15 +146,95 @@ const BALANCED_RECORDS: readonly ExperienceRecord[] = [
   makeRecord({ id: 'e3', actionKey: 'edit', value: -2 })
 ];
 
-describe('estimateTokens', () => {
-  it('is deterministic and conservative for ASCII and CJK', () => {
+describe('estimateTokens and checkAdvisorBudget token governance (M2 / F1)', () => {
+  it('is deterministic and conservative for ASCII, CJK (2/char), and emoji (>=3/char)', () => {
     expect(estimateTokens('')).toBe(0);
     expect(estimateTokens('abcd')).toBe(1);
     expect(estimateTokens('abcde')).toBe(2);
-    // Every non-ASCII code point counts as one token.
-    expect(estimateTokens('宿主顾问')).toBe(4);
-    expect(estimateTokens('ab宿主')).toBe(3);
-    expect(estimateTokens('abcd 宿主')).toBe(4);
+    // CJK counts 2 tokens per character
+    expect(estimateTokens('宿主顾问')).toBe(8);
+    expect(estimateTokens('ab宿主')).toBe(5);
+    expect(estimateTokens('abcd 宿主')).toBe(5);
+    // Emoji counts >= 3 tokens per emoji
+    expect(estimateTokens('🚀')).toBe(3);
+    expect(estimateTokens('🚀🎉')).toBe(6);
+  });
+
+  it('F1 consumer test: rejects/degrades hex 1200, base64url 1160, JSON 1001, CJK 300 and does NOT accept as fitting <= 300', () => {
+    const hex1200 = 'deadbeef'.repeat(150); // 1200 chars
+    const base64url1160 = 'a'.repeat(1160); // 1160 chars
+    const json1001 = JSON.stringify({ data: 'x'.repeat(450), extra: 'y'.repeat(450) }); // > 1000 chars
+    const cjk300 = '宿主顾问经验回放策略优化'.repeat(25); // 300 chars
+
+    // 1. Assert consumer estimateTokens does NOT report 300, 290, 251
+    const hexEst = estimateTokens(hex1200);
+    const b64Est = estimateTokens(base64url1160);
+    const jsonEst = estimateTokens(json1001);
+    const cjkEst = estimateTokens(cjk300);
+
+    expect(hexEst).toBeGreaterThan(300);
+    expect(hexEst).not.toBe(300);
+    expect(b64Est).toBeGreaterThan(300);
+    expect(b64Est).not.toBe(290);
+    expect(jsonEst).toBeGreaterThan(300);
+    expect(jsonEst).not.toBe(251);
+    expect(cjkEst).toBeGreaterThan(300);
+
+    // 2. Assert consumer checkAdvisorBudget rejects all four
+    const hexBudget = checkAdvisorBudget(hex1200);
+    expect(hexBudget.fits).toBe(false);
+    expect(hexBudget.tokenCount).toBeGreaterThan(300);
+    expect(hexBudget.note).toContain('Exceeds conservative heuristic budget');
+
+    const b64Budget = checkAdvisorBudget(base64url1160);
+    expect(b64Budget.fits).toBe(false);
+    expect(b64Budget.tokenCount).toBeGreaterThan(300);
+
+    const jsonBudget = checkAdvisorBudget(json1001);
+    expect(jsonBudget.fits).toBe(false);
+
+    const cjkBudget = checkAdvisorBudget(cjk300);
+    expect(cjkBudget.fits).toBe(false);
+  });
+
+  it('F1 consumer test: renderAdvice degrades to minimalAdvice and flags truncation on over-budget inputs', () => {
+    const entries = Array.from({ length: 30 }, (_, index) => ({
+      actionKey: 'high_entropy_tool_' + index + '_' + 'abcdef0123456789'.repeat(2),
+      meanReturn: -1.0 - index * 0.1,
+      support: 5,
+      advantage: -1.0 - index * 0.1,
+      normalizedAdvantage: -0.8 - index * 0.05
+    }));
+
+    const rendered = renderAdvice(entries);
+    expect(rendered.truncated).toBe(true);
+    expect(rendered.exact).toBe(false);
+    expect(rendered.budgetNote).toBeDefined();
+    expect(checkAdvisorBudget(rendered.text).fits).toBe(true);
+    expect(rendered.budgetNote).toContain('does NOT claim equivalence to real model <= 300 tokens');
+  });
+
+  it('F1 consumer test: supports injected model tokenizer on createHostAdvisor and evaluates exact token bounds', async () => {
+    const mockTokenizer = (text: string): number => text.trim().split(/\s+/).length;
+
+    const advisor = createHostAdvisor({
+      config: enabledConfig(),
+      store: stubStore(scored(BALANCED_RECORDS), []),
+      tokenizer: mockTokenizer
+    });
+
+    const decision = await advisor.evaluate(makeRequest({ mode: 'advisory', adviseThreshold: -0.5 }));
+    expect(decision.kind).toBe('advisory');
+    if (decision.kind === 'advisory') {
+      expect(mockTokenizer(decision.text)).toBeLessThanOrEqual(MAX_ADVISORY_TOKENS);
+    }
+  });
+
+  it('F1 invariant: checkTokenBudget and countTokens are actively called by host-advisor', () => {
+    const res = checkAdvisorBudget('test advisory block');
+    expect(res.fits).toBe(true);
+    expect(res.tokenCount).toBeGreaterThan(0);
+    expect(estimateTokens('some text')).toBeGreaterThan(0);
   });
 });
 

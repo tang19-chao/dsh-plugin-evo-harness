@@ -42,9 +42,24 @@ import {
 } from '../types/contracts';
 import { normalizeMetaAction } from './action-normalizer';
 import { abstractMetaState, type JitReferenceStatus } from './state-abstraction';
+import {
+  CURRENT_PROVENANCE_VERSION,
+  CURRENT_REWARD_VERSION,
+  EXPERIENCE_SCHEMA_VERSION,
+  LEGACY_VERSION_TAG,
+  isLegacyStoredExperience
+} from './experience-store';
 
 /** Prefix of every backfilled record id; keeps backfill ids recognisable. */
 export const BACKFILL_RECORD_PREFIX = 'jit-l1';
+
+/**
+ * Reward/provenance versions of a REBUILT record (plan section 6.5 item 3).
+ * Distinct from the live online versions so a reader can tell "recomputed from
+ * the persisted tree" apart from "attributed at execution time".
+ */
+export const BACKFILL_REWARD_VERSION = 'r2/backfill-tree-v1';
+export const BACKFILL_PROVENANCE_VERSION = 'p2/backfill-tree-v1';
 
 /** Default discount applied along a tree path (config `jitrl.gamma`). */
 export const DEFAULT_BACKFILL_GAMMA = 0.5;
@@ -416,6 +431,34 @@ export async function backfillFromTreePool(
         sessionId: stringOrUndefined(tree.sessionId) ?? 'unknown',
         treeId: tree.id,
         nodeId: node.id,
+        // P6 PR4 (plan section 6.5 item 3): a cold-start record IS a rebuild -
+        // it is recomputed from the persisted discovery tree, not copied from a
+        // previously mis-attributed online sample. It therefore carries the
+        // current schema version plus the association the tree can prove
+        // (node, parent, round) and is marked with the backfill reward version
+        // so a reader can tell rebuilt evidence from live attribution.
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        rewardVersion: BACKFILL_REWARD_VERSION,
+        provenanceVersion: BACKFILL_PROVENANCE_VERSION,
+        ...(typeof node.parentId === 'string' ? { parentNodeId: node.parentId } : {}),
+        ...(typeof node.round === 'number' && Number.isInteger(node.round)
+          ? { round: node.round }
+          : {}),
+        ...(typeof node.trajectoryId === 'string' ? { trajectoryId: node.trajectoryId } : {}),
+        ...(typeof node.slotIndex === 'number' && Number.isInteger(node.slotIndex)
+          ? { slotIndex: node.slotIndex }
+          : {}),
+        observedReturn: treeReturn,
+        // The rebuild has no comparable reference run: the tree's own root is
+        // the anchor, so the baseline is the root's return (0 when the root is
+        // this node, i.e. no contrast exists).
+        attributionBaseline: finiteOr(walk.returns.get(tree.rootId), 0),
+        learningTarget: clampReward(
+          treeReturn - finiteOr(walk.returns.get(tree.rootId), 0),
+          clip
+        ),
+        outcome: node.status === 'succeeded' ? 'succeeded' : 'failed',
+        learningEligible: true,
         createdAt: finiteOr(node.updatedAt, finiteOr(node.createdAt, fallbackCreatedAt)),
         redacted: true
       });
@@ -444,4 +487,130 @@ export async function backfillFromTreePool(
     treeCount: trees.length,
     diagnostics
   };
+}
+
+// ---------------------------------------------------------------------------
+// P6 PR4: legacy isolation and reversible migration (plan section 6.5)
+// ---------------------------------------------------------------------------
+
+/** Counts and marked copies produced by one migration pass. */
+export interface ExperienceMigrationResult {
+  /** Records already at or above the current schema version (untouched). */
+  readonly current: number;
+  /** Records that predate per-execution attribution. */
+  readonly legacy: number;
+  /** Records excluded from the new neighbourhood because they are legacy. */
+  readonly excludedFromLearning: number;
+  /** Legacy records that were also marked not learning eligible. */
+  readonly excludedIneligible: number;
+  /**
+   * MARKED COPIES of the legacy records: same ids, same payload, stamped with
+   * the legacy version tag and `learningEligible: false`. The originals in the
+   * source log are never modified (plan section 6.5 item 4).
+   */
+  readonly marked: readonly ExperienceRecord[];
+  readonly diagnostics: readonly string[];
+}
+
+/**
+ * Plan (and optionally perform) the migration of a historical experience
+ * snapshot.
+ *
+ * Contract (plan section 6.5):
+ *   - the ORIGINAL log is never rewritten in place: this function only reads
+ *     `options.records` and produces copies;
+ *   - the result counts new vs legacy samples, so an operator can see how much
+ *     history is being quarantined;
+ *   - `marked` holds legacy records stamped with `LEGACY_VERSION_TAG` for a
+ *     separate audit sink. Dropping that sink IS the rollback: the source log
+ *     was never touched, so re-reading it restores the pre-migration state;
+ *   - `apply` is the only side effect, and it appends the marked copies through
+ *     the injected sink (a different log in production).
+ */
+export async function migrateExperienceRecords(options: {
+  readonly records: readonly ExperienceRecord[];
+  /** Audit sink for the marked legacy copies; omit for a dry run. */
+  readonly auditSink?: ExperienceAppendSink;
+  /** Append the marked copies to the audit sink (default false = dry run). */
+  readonly apply?: boolean;
+  readonly minimumSchemaVersion?: number;
+}): Promise<ExperienceMigrationResult> {
+  const minimum = options.minimumSchemaVersion ?? EXPERIENCE_SCHEMA_VERSION;
+  const diagnostics: string[] = [];
+  const marked: ExperienceRecord[] = [];
+  let current = 0;
+  let legacy = 0;
+  let excludedIneligible = 0;
+
+  for (const record of options.records) {
+    const version = record.experienceSchemaVersion;
+    const isLegacy = version === undefined || !Number.isFinite(version) || version < minimum;
+    if (!isLegacy) {
+      current += 1;
+      continue;
+    }
+    legacy += 1;
+    if (record.learningEligible === false) {
+      excludedIneligible += 1;
+    }
+    marked.push({
+      ...record,
+      // The tag makes the quarantine explicit and reversible: a reader that
+      // only trusts CURRENT_REWARD_VERSION never picks these up, and dropping
+      // the audit sink removes them without touching the source log.
+      rewardVersion: LEGACY_VERSION_TAG,
+      provenanceVersion: LEGACY_VERSION_TAG,
+      learningEligible: false
+    });
+  }
+
+  if (options.apply === true && options.auditSink !== undefined && marked.length > 0) {
+    try {
+      await options.auditSink.append(marked);
+    } catch (error) {
+      diagnostics.push(
+        'migration: the audit sink rejected the marked batch (' +
+          (error instanceof Error ? error.name : 'unknown error') +
+          '); the source log is untouched'
+      );
+    }
+  } else if (options.apply === true && options.auditSink === undefined) {
+    diagnostics.push('migration: apply requested without an audit sink; nothing was written');
+  }
+
+  return {
+    current,
+    legacy,
+    excludedFromLearning: legacy,
+    excludedIneligible,
+    marked,
+    diagnostics
+  };
+}
+
+/**
+ * Split a snapshot into the records the NEW learning neighbourhood may use and
+ * the ones it must ignore (plan section 6.5). Pure, so replay and the online
+ * path can share exactly one rule.
+ */
+export function partitionExperienceRecords(
+  records: readonly ExperienceRecord[],
+  minimumSchemaVersion: number = EXPERIENCE_SCHEMA_VERSION
+): {
+  readonly learning: readonly ExperienceRecord[];
+  readonly auditOnly: readonly ExperienceRecord[];
+} {
+  const learning: ExperienceRecord[] = [];
+  const auditOnly: ExperienceRecord[] = [];
+  for (const record of records) {
+    const version = record.experienceSchemaVersion;
+    const legacy =
+      version === undefined || !Number.isFinite(version) || version < minimumSchemaVersion;
+    if (legacy || record.learningEligible === false) {
+      auditOnly.push(record);
+    } else {
+      learning.push(record);
+    }
+  }
+  return { learning, auditOnly };
 }

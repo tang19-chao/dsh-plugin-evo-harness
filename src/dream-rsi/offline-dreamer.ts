@@ -50,6 +50,11 @@ import type {
 import { BATCH_SLOT_KINDS, DREAM_RHO_PREFERENCES } from '../types/contracts';
 import { DEFAULT_EVO_HARNESS_CONFIG } from '../config';
 import {
+  REPLAY_GATE_BOUNDARY,
+  decideReplayPublication,
+  type ReplayPublicationDecision
+} from '../jitrl/decision-kernel';
+import {
   DEFAULT_SLOT_WEIGHTS,
   HARD_POLICY_LIMITS,
   SEARCH_SLOT_KINDS,
@@ -222,10 +227,23 @@ export function sanitizeJitHyperparams(raw: unknown, fallback: JitHyperparams): 
   return { jit, diagnostics };
 }
 
-/** Config subset that drives jit hyperparameter perturbation. */
+/**
+ * Config subset that drives jit hyperparameter perturbation.
+ *
+ * P6 PR5 (plan section 7.2) narrows the swept dimensions to beta, k and
+ * similarityThreshold: only those three have a demonstrated effect on the
+ * *deterministic* part of the decision (temperature, neighbour budget, Jaccard
+ * cut), which is what a replay can rank without the ranking following an RNG.
+ * `candidateJitLambdas` is still accepted for backwards compatibility and still
+ * reported on the grid, but it no longer drives candidate generation - see
+ * POLICY_IGNORED_DIMENSIONS in src/jitrl/decision-kernel.ts.
+ */
 export interface JitPerturbationConfig {
   readonly hyperparamPerturbation?: boolean;
   readonly candidateJitBetas?: readonly number[];
+  readonly candidateJitKs?: readonly number[];
+  readonly candidateJitSimilarityThresholds?: readonly number[];
+  /** @deprecated Not swept since P6 PR5; kept so old configs still load. */
   readonly candidateJitLambdas?: readonly number[];
 }
 
@@ -233,12 +251,56 @@ export interface JitPerturbationConfig {
 export interface JitPerturbationGrid {
   readonly enabled: boolean;
   readonly betas: readonly number[];
+  readonly ks: readonly number[];
+  readonly similarityThresholds: readonly number[];
+  /**
+   * Legacy grid, retained for backwards compatibility and *not* consumed by
+   * {@link generateCandidatePolicies} since P6 PR5. Present so a caller reading
+   * the grid can report "this dimension is configured but ignored" instead of
+   * silently losing the value.
+   */
   readonly lambdas: readonly number[];
+  /** Dimensions configured here but deliberately not swept, with the reason. */
+  readonly ignored: readonly JitIgnoredDimension[];
+}
+
+/** One ignored dimension and why it is not swept (re-exported shape). */
+export interface JitIgnoredDimension {
+  readonly dimension: 'lambda' | 'alpha' | 'gamma';
+  readonly reason: string;
 }
 
 /** Built-in perturbation grids, mirroring the frozen jitrl.dream defaults. */
 export const DEFAULT_JIT_BETAS = [0.5, 1, 2] as const;
+export const DEFAULT_JIT_KS = [5, 10, 20] as const;
+export const DEFAULT_JIT_SIMILARITY_THRESHOLDS = [0.2, 0.3, 0.5] as const;
+/** @deprecated Kept for config compatibility; no longer drives candidates. */
 export const DEFAULT_JIT_LAMBDAS = [0.02, 0.05, 0.1] as const;
+
+/**
+ * Dimensions deliberately kept out of the search grid (plan section 7.2).
+ *
+ * Kept in step with POLICY_IGNORED_DIMENSIONS in src/jitrl/decision-kernel.ts;
+ * duplicated here as a local constant so this module stays importable without
+ * the JitRL kernel (offline-dreamer is also used by non-JitRL deployments).
+ */
+export const JIT_IGNORED_DIMENSIONS: readonly JitIgnoredDimension[] = [
+  {
+    dimension: 'lambda',
+    reason:
+      'not swept since P6 PR5: the exploration draw is a Bernoulli event per unsupported action, so candidate ranking would follow the seed; requires multi-seed averaging in replay first'
+  },
+  {
+    dimension: 'alpha',
+    reason:
+      'not swept since P6 PR5: the optimism bonus only applies to unexplored actions, so its effect is indistinguishable from the exploration draw; pairs with lambda'
+  },
+  {
+    dimension: 'gamma',
+    reason:
+      'frozen since P6 PR5: persisted returns were discounted with the previous gamma and carry no per-step reward series, so a gamma change cannot be recomputed; needs stored reward decomposition plus versioned recalculation'
+  }
+];
 
 function finiteGrid(values: readonly number[] | undefined): readonly number[] {
   const out: number[] = [];
@@ -250,29 +312,64 @@ function finiteGrid(values: readonly number[] | undefined): readonly number[] {
   return out;
 }
 
+function finiteIntegerGrid(values: readonly number[] | undefined): readonly number[] {
+  const out: number[] = [];
+  for (const value of values ?? []) {
+    if (Number.isFinite(value) && value >= 1 && Math.floor(value) === value && !out.includes(value)) {
+      out.push(value);
+    }
+  }
+  return out;
+}
+
+/** Thresholds must stay inside [0, 1] because the retriever rejects anything else. */
+function finiteUnitGrid(values: readonly number[] | undefined): readonly number[] {
+  const out: number[] = [];
+  for (const value of values ?? []) {
+    if (Number.isFinite(value) && value >= 0 && value <= 1 && !out.includes(value)) {
+      out.push(value);
+    }
+  }
+  return out;
+}
+
 /**
  * Resolve the jit perturbation grid by candidate index: candidate i takes
- * betas[i % betas.length] together with lambdas[i % lambdas.length], while
- * alpha/k/gamma/similarityThreshold stay inherited from the baseline. The
- * (beta, lambda) pair is replaced as a whole and never merged element-wise with
- * the baseline record, so the candidate sequence is deterministic and
- * reproducible (plan section 7.3-1).
+ * betas[i % |betas|], ks[i % |ks|] and similarityThresholds[i % |thresholds|],
+ * while alpha, gamma and lambda stay inherited from the baseline (plan section
+ * 7.2). The swept triple is replaced as a whole and never merged element-wise
+ * with the baseline record, so the candidate sequence is deterministic.
  *
  * `hyperparamPerturbation: false` disables perturbation; an empty or fully
- * invalid grid falls back to the built-in default grids.
+ * invalid grid falls back to the built-in default grid for that dimension.
  */
 export function resolveJitPerturbationGrid(
   config: JitPerturbationConfig = DEFAULT_EVO_HARNESS_CONFIG.jitrl.dream
 ): JitPerturbationGrid {
-  if (!(config.hyperparamPerturbation ?? true)) {
-    return { enabled: false, betas: [], lambdas: [] };
-  }
   const betas = finiteGrid(config.candidateJitBetas);
-  const lambdas = finiteGrid(config.candidateJitLambdas);
+  const ks = finiteIntegerGrid(config.candidateJitKs);
+  const thresholds = finiteUnitGrid(config.candidateJitSimilarityThresholds);
+  // The legacy lambda grid is reported verbatim (or as the built-in default) but
+  // is never consumed: keeping it visible is what makes "ignored" auditable.
+  const lambdas = finiteUnitGrid(config.candidateJitLambdas);
+  if (!(config.hyperparamPerturbation ?? true)) {
+    return {
+      enabled: false,
+      betas: [],
+      ks: [],
+      similarityThresholds: [],
+      lambdas: [],
+      ignored: JIT_IGNORED_DIMENSIONS
+    };
+  }
   return {
     enabled: true,
     betas: betas.length > 0 ? betas : [...DEFAULT_JIT_BETAS],
-    lambdas: lambdas.length > 0 ? lambdas : [...DEFAULT_JIT_LAMBDAS]
+    ks: ks.length > 0 ? ks : [...DEFAULT_JIT_KS],
+    similarityThresholds:
+      thresholds.length > 0 ? thresholds : [...DEFAULT_JIT_SIMILARITY_THRESHOLDS],
+    lambdas: lambdas.length > 0 ? lambdas : [...DEFAULT_JIT_LAMBDAS],
+    ignored: JIT_IGNORED_DIMENSIONS
   };
 }
 
@@ -1157,12 +1254,16 @@ export interface CandidatePolicyOptions {
  * ratios, early-stop thresholds and slot allocations, plus - since Phase 4 - the
  * JitRL hyperparameters (plan section 7.3-1).
  *
- * The jit record of candidate i is the baseline record with (beta, lambda)
- * replaced by the grid pair at index i modulo the grid length; alpha, k, gamma
- * and similarityThreshold are inherited unchanged. When the baseline carries no
- * jit record the frozen kernel defaults are the inheritance base, so the
- * perturbation grid is always usable. Perturbation switched off leaves each
- * candidate with the baseline's own jit record (or none).
+ * P6 PR5 (plan section 7.2) sweeps only beta, k and similarityThreshold. Those
+ * three change the *deterministic* part of the decision (KL temperature,
+ * neighbour budget, Jaccard cut), so a replay can rank them. lambda, alpha and
+ * gamma are inherited from the baseline and reported in `metadata.jitIgnored`,
+ * because a stochastic exploration draw or an unrecomputable old return must not
+ * decide which candidate wins.
+ *
+ * When the baseline carries no jit record the frozen kernel defaults are the
+ * inheritance base, so the perturbation grid is always usable. Perturbation
+ * switched off leaves each candidate with the baseline's own jit record (or none).
  *
  * The sequence is a pure function of (baseline, count, options): the same input
  * always yields the same candidates.
@@ -1189,11 +1290,15 @@ export function generateCandidatePolicies(
     const jit: JitHyperparams | undefined = grid.enabled
       ? {
           beta: grid.betas[index % grid.betas.length] ?? baseJit.beta,
-          lambda: grid.lambdas[index % grid.lambdas.length] ?? baseJit.lambda,
+          // Inherited, never swept (plan section 7.2); also listed in
+          // metadata.jitIgnored so the choice is auditable, not implicit.
+          lambda: baseJit.lambda,
           alpha: baseJit.alpha,
-          k: baseJit.k,
+          k: grid.ks[index % grid.ks.length] ?? baseJit.k,
           gamma: baseJit.gamma,
-          similarityThreshold: baseJit.similarityThreshold
+          similarityThreshold:
+            grid.similarityThresholds[index % grid.similarityThresholds.length] ??
+            baseJit.similarityThreshold
         }
       : baseline.jit;
     const id = prefix + String(index + 1);
@@ -1219,7 +1324,12 @@ export function generateCandidatePolicies(
           : {
               jitSource: grid.enabled ? 'grid' : 'baseline',
               jitBeta: jit.beta,
-              jitLambda: jit.lambda
+              jitK: jit.k,
+              jitSimilarityThreshold: jit.similarityThreshold,
+              // The legacy keys stay for old consumers; they now report the
+              // inherited value rather than a perturbed one.
+              jitLambda: jit.lambda,
+              jitIgnored: grid.ignored.map((entry) => entry.dimension)
             })
       },
       ...(jit === undefined ? {} : { jit })
@@ -1437,6 +1547,55 @@ export interface OfflineDreamerOptions {
   readonly jitHook?: JitReplayHook;
   /** Drift down-weight factor forwarded to the hook; defaults to config 0.7. */
   readonly driftRho?: number;
+  /**
+   * P6 PR5 (plan section 7.4): record the suggested policy without publishing
+   * it. Shadow mode never calls applyPolicy, so a suggestion cannot reach the
+   * live policy without a real canary budget and human confirmation.
+   */
+  readonly shadowMode?: boolean;
+  /**
+   * P6 PR5 (plan section 7.4): candidate generation/selection and final
+   * validation must not use the same trees. When > 0, the last N replayed trees
+   * (by the caller's order) are held out: candidates are selected on the
+   * remaining trees and the winner must also beat the baseline on the holdout.
+   */
+  readonly holdoutTreeCount?: number;
+}
+
+/** One candidate's comparison against the incumbent, for the shadow log. */
+export interface CandidateComparison {
+  readonly policyId: string;
+  readonly hypervolume: number;
+  /** Signed difference to the baseline; negative means worse. */
+  readonly delta: number;
+  /** Strict improvement above epsilon on the selection trees. */
+  readonly improved: boolean;
+  /** Whether the candidate is the selected winner. */
+  readonly selected: boolean;
+}
+
+/**
+ * Shadow record of one dream cycle (plan section 7.4).
+ *
+ * It states what the replay *suggested* and how it differed from the policy in
+ * force, without publishing anything. `published: false` is what distinguishes a
+ * shadow record from an applied hot swap.
+ */
+export interface DreamShadowRecord {
+  readonly suggestedPolicyId: string;
+  readonly incumbentPolicyId: string;
+  /** True only when a real publication happened (never in shadow mode). */
+  readonly published: boolean;
+  readonly comparisons: readonly CandidateComparison[];
+  /** Trees used to generate/select candidates. */
+  readonly selectionTreeIds: readonly string[];
+  /** Trees kept aside for validation; empty when no holdout was configured. */
+  readonly holdoutTreeIds: readonly string[];
+  /** Winner's hypervolume on the holdout, when a holdout was configured. */
+  readonly holdoutHypervolume?: number;
+  readonly baselineHypervolume?: number;
+  /** Bound declaration: the gate only holds on this fixed historical replay. */
+  readonly boundary: string;
 }
 
 function isBetterEvaluation(
@@ -1458,6 +1617,23 @@ function isBetterEvaluation(
   return false;
 }
 
+/**
+ * Extended report of one dream cycle: the contract shape plus the publication
+ * verdict and the shadow record (plan section 7.4).
+ *
+ * Additive on purpose: `IOfflineDreamer.replay` still returns
+ * `DreamReplayReport`, and this subtype is assignable to it, so no contract in
+ * src/types/contracts.ts had to change and every pre-PR5 consumer keeps working.
+ */
+export interface DreamReplayReportWithShadow extends DreamReplayReport {
+  /** Whether the winning candidate may be published, and why. */
+  readonly publication: ReplayPublicationDecision;
+  /** What was suggested versus what is in force; recording never publishes. */
+  readonly shadow: DreamShadowRecord;
+  /** Dimensions this cycle did not search, with the reason (§7.2). */
+  readonly ignoredDimensions: readonly JitIgnoredDimension[];
+}
+
 class OfflineDreamerImpl implements IOfflineDreamer {
   private readonly now: () => number;
   private readonly treePool: IDiscoveryTreePool | undefined;
@@ -1470,6 +1646,8 @@ class OfflineDreamerImpl implements IOfflineDreamer {
   private readonly experiences: readonly ExperienceRecord[] | undefined;
   private readonly jitHook: JitReplayHook | undefined;
   private readonly driftRho: number | undefined;
+  private readonly shadowMode: boolean;
+  private readonly holdoutTreeCount: number;
 
   constructor(options: OfflineDreamerOptions) {
     this.now = options.now ?? ((): number => Date.now());
@@ -1480,6 +1658,11 @@ class OfflineDreamerImpl implements IOfflineDreamer {
     this.epsilon = Math.max(1e-12, finiteOr(options.hypervolumeEpsilon ?? 1e-9, 1e-9));
     this.experiences = options.experiences;
     this.jitHook = options.jitHook;
+    this.shadowMode = options.shadowMode === true;
+    this.holdoutTreeCount = Math.max(
+      0,
+      Math.floor(finiteOr(options.holdoutTreeCount ?? 0, 0))
+    );
     this.driftRho =
       options.driftRho === undefined
         ? undefined
@@ -1501,7 +1684,7 @@ class OfflineDreamerImpl implements IOfflineDreamer {
           });
   }
 
-  async replay(request: OfflineDreamRequest): Promise<DreamReplayReport> {
+  async replay(request: OfflineDreamRequest): Promise<DreamReplayReportWithShadow> {
     const ranAt = this.now();
     const rhos = normalizeRhoPreferences(
       request.rhoPreferences ?? this.rhoPreferences
@@ -1530,7 +1713,18 @@ class OfflineDreamerImpl implements IOfflineDreamer {
         improved: false,
         selectedPolicyId: baseline.id,
         replayedTreeIds: [],
-        rhoPreferences: rhos
+        rhoPreferences: rhos,
+        publication: decideReplayPublication({ improved: false }),
+        shadow: {
+          suggestedPolicyId: baseline.id,
+          incumbentPolicyId: baseline.id,
+          published: false,
+          comparisons: [],
+          selectionTreeIds: [],
+          holdoutTreeIds: [],
+          boundary: REPLAY_GATE_BOUNDARY
+        },
+        ignoredDimensions: JIT_IGNORED_DIMENSIONS
       };
     }
 
@@ -1565,14 +1759,30 @@ class OfflineDreamerImpl implements IOfflineDreamer {
       candidates.push(candidate);
     }
 
-    const baselineRun = replayPolicy(trees, baseline, rhos, replayOptions);
+    // Plan section 7.4: candidate generation/selection and the final validation
+    // must not reuse the same trees. The holdout is the tail of the caller's
+    // order, so the split is deterministic and auditable rather than random.
+    const holdoutCount = Math.min(this.holdoutTreeCount, Math.max(0, trees.length - 1));
+    const selectionTrees =
+      holdoutCount > 0 ? trees.slice(0, trees.length - holdoutCount) : trees;
+    const holdoutTrees = holdoutCount > 0 ? trees.slice(trees.length - holdoutCount) : [];
+
+    const baselineRun = replayPolicy(selectionTrees, baseline, rhos, replayOptions);
     const candidateRuns = candidates.map((candidate) =>
-      replayPolicy(trees, candidate, rhos, replayOptions)
+      replayPolicy(selectionTrees, candidate, rhos, replayOptions)
     );
+    // A shared cost ceiling keeps the policies comparable: a candidate must not
+    // look better only because it was scored against a different probe budget.
     let ceiling = baselineRun.maxProbes;
     for (const run of candidateRuns) {
       if (run.maxProbes > ceiling) {
         ceiling = run.maxProbes;
+      }
+    }
+    if (holdoutTrees.length > 0) {
+      const holdoutBaselineRun = replayPolicy(holdoutTrees, baseline, rhos, replayOptions);
+      if (holdoutBaselineRun.maxProbes > ceiling) {
+        ceiling = holdoutBaselineRun.maxProbes;
       }
     }
     const baselineEvaluation = toPolicyEvaluation(baselineRun, ceiling);
@@ -1595,15 +1805,70 @@ class OfflineDreamerImpl implements IOfflineDreamer {
       }
     }
 
-    const improved =
+    const improvedOnSelection =
       bestCandidate !== undefined &&
       bestCandidate.evaluation.hypervolume > baselineEvaluation.hypervolume + this.epsilon;
 
-    // Hot-swap stays monotone: only a strictly better candidate replaces the
-    // incumbent, and the winner carries pi *and* its jit hyperparameters.
-    if (improved && bestCandidate !== undefined && this.applyPolicy !== undefined) {
+    // Plan section 7.4: a winner must also hold up on trees it was not selected
+    // on. Without that, picking the best of several candidates on one batch and
+    // calling it generalisation is exactly the defect this gate removes.
+    let validatedOnHoldout: boolean | undefined;
+    let holdoutHypervolume: number | undefined;
+    let holdoutBaselineHypervolume: number | undefined;
+    if (improvedOnSelection && holdoutTrees.length > 0 && bestCandidate !== undefined) {
+      const holdoutBaselineRun = replayPolicy(holdoutTrees, baseline, rhos, replayOptions);
+      const holdoutWinnerRun = replayPolicy(
+        holdoutTrees,
+        bestCandidate.policy,
+        rhos,
+        replayOptions
+      );
+      holdoutBaselineHypervolume = toPolicyEvaluation(
+        holdoutBaselineRun,
+        ceiling
+      ).hypervolume;
+      holdoutHypervolume = toPolicyEvaluation(holdoutWinnerRun, ceiling).hypervolume;
+      validatedOnHoldout = holdoutHypervolume > holdoutBaselineHypervolume + this.epsilon;
+    }
+
+    const publication = decideReplayPublication({
+      improved: improvedOnSelection,
+      shadowMode: this.shadowMode,
+      ...(validatedOnHoldout === undefined ? {} : { validatedOnHoldout })
+    });
+    const improved = improvedOnSelection;
+
+    // Hot-swap stays monotone AND gated: only a strictly better candidate that
+    // passed the publication gate replaces the incumbent, and the winner carries
+    // pi *and* its jit hyperparameters.
+    if (publication.publish && bestCandidate !== undefined && this.applyPolicy !== undefined) {
       await this.applyPolicy(bestCandidate.policy);
     }
+
+    // Shadow record (plan section 7.4): what was suggested, how it differed, and
+    // whether anything was published. Recording does not publish.
+    const shadow: DreamShadowRecord = {
+      suggestedPolicyId: bestCandidate?.policy.id ?? baseline.id,
+      incumbentPolicyId: baseline.id,
+      published: publication.publish,
+      comparisons: candidateEvaluations.map((evaluation) => ({
+        policyId: evaluation.policyId,
+        hypervolume: evaluation.hypervolume,
+        delta: evaluation.hypervolume - baselineEvaluation.hypervolume,
+        improved: evaluation.hypervolume > baselineEvaluation.hypervolume + this.epsilon,
+        selected:
+          publication.publish && bestCandidate !== undefined
+            ? evaluation.policyId === bestCandidate.policy.id
+            : false
+      })),
+      selectionTreeIds: baselineRun.treeIds,
+      holdoutTreeIds: holdoutTrees.map((tree) => tree.id),
+      ...(holdoutHypervolume === undefined ? {} : { holdoutHypervolume }),
+      ...(holdoutBaselineHypervolume === undefined
+        ? {}
+        : { baselineHypervolume: holdoutBaselineHypervolume }),
+      boundary: REPLAY_GATE_BOUNDARY
+    };
 
     return {
       ranAt,
@@ -1614,14 +1879,30 @@ class OfflineDreamerImpl implements IOfflineDreamer {
       selectedPolicyId:
         improved && bestCandidate !== undefined ? bestCandidate.evaluation.policyId : baseline.id,
       replayedTreeIds: baselineRun.treeIds,
-      rhoPreferences: rhos
+      rhoPreferences: rhos,
+      publication,
+      shadow,
+      ignoredDimensions: JIT_IGNORED_DIMENSIONS
     };
   }
+}
+
+/**
+ * Zero-execution offline replay engine plus the additive PR5 report fields.
+ *
+ * Widening the factory's return type (rather than the contract in
+ * src/types/contracts.ts) keeps every existing consumer compiling: this
+ * interface is assignable to `IOfflineDreamer`, so a caller that only knows the
+ * original contract sees exactly the original surface, while a caller that wants
+ * the publication verdict and the shadow record gets them typed.
+ */
+export interface IOfflineDreamerWithShadow extends IOfflineDreamer {
+  replay(request: OfflineDreamRequest): Promise<DreamReplayReportWithShadow>;
 }
 
 /** Create the zero-execution offline dreamer. */
 export function createOfflineDreamer(
   options: OfflineDreamerOptions = {}
-): IOfflineDreamer {
+): IOfflineDreamerWithShadow {
   return new OfflineDreamerImpl(options);
 }

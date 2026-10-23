@@ -30,15 +30,53 @@
 
 import type {
   AbstractState,
+  ExperienceOutcome,
   ExperienceQuery,
   ExperienceRecord,
   JitLevel,
   GuidanceMode
 } from '../types/contracts';
+import { EXPERIENCE_OUTCOMES } from '../types/contracts';
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+/**
+ * Current persisted-record schema version (P6 PR4, plan section 6.5).
+ *
+ * This is NOT the contracts version: CONTRACT_SCHEMA_VERSION stays 2 because
+ * every added ExperienceRecord field is optional. A stored line is versioned
+ * separately so an old JSONL file keeps loading while the new learning
+ * neighbourhood can tell mis-attributed history apart:
+ *
+ *   1 (or absent)  legacy: written before per-execution credit attribution.
+ *                  Kept for audit, excluded from the new neighbourhood by
+ *                  `ExperienceQuery.excludeLegacy`.
+ *   2              current: carries decisionId/runId/round/slotIndex/
+ *                  trajectoryId/rewardVersion/provenanceVersion and its own
+ *                  observedReturn/attributionBaseline/learningTarget.
+ *
+ * Migration strategy (plan section 6.5): the original log is never rewritten in
+ * place. `migrateExperienceRecords()` in ./backfill.ts counts new vs legacy
+ * samples and produces MARKED COPIES for a separate audit sink; dropping that
+ * sink rolls the migration back. Readers opt in through `excludeLegacy`, and
+ * `partitionByVersion()` gives the mirror the same rule so an old remote
+ * aggregate cannot reintroduce the bias.
+ */
+export const EXPERIENCE_SCHEMA_VERSION = 2 as const;
+
+/** Schema version of a record written before per-execution attribution. */
+export const LEGACY_EXPERIENCE_SCHEMA_VERSION = 1 as const;
+
+/** Reward-model version stamped on every record written by this round. */
+export const CURRENT_REWARD_VERSION = 'r2/verifiable-v1' as const;
+
+/** Provenance-model version stamped on every record written by this round. */
+export const CURRENT_PROVENANCE_VERSION = 'p2/per-execution-v1' as const;
+
+/** Marker written into the version fields of a migrated legacy record. */
+export const LEGACY_VERSION_TAG = 'legacy' as const;
 
 /** Half-life of the retrieval weight in ms when the caller omits one (30 days). */
 export const DEFAULT_EXPERIENCE_HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -122,8 +160,44 @@ export interface StoredExperience {
   readonly sessionId: string;
   readonly treeId: string | undefined;
   readonly nodeId: string | undefined;
+  readonly branchId: string | undefined;
+  readonly scopeKey: string | undefined;
+  // P6 PR4 association chain (undefined on legacy records).
+  readonly decisionId: string | undefined;
+  readonly runId: string | undefined;
+  readonly round: number | undefined;
+  readonly slotIndex: number | undefined;
+  readonly parentNodeId: string | undefined;
+  readonly trajectoryId: string | undefined;
+  readonly policyVersion: string | undefined;
+  readonly rewardVersion: string | undefined;
+  readonly provenanceVersion: string | undefined;
+  readonly experienceSchemaVersion: number | undefined;
+  readonly observedReturn: number | undefined;
+  readonly attributionBaseline: number | undefined;
+  readonly learningTarget: number | undefined;
+  readonly outcome: ExperienceOutcome | undefined;
+  readonly learningEligible: boolean | undefined;
   readonly createdAt: number;
   readonly redacted: boolean;
+}
+
+/**
+ * True when a stored record predates per-execution credit attribution, i.e. it
+ * carries no schema version or one below `minimum` (plan section 6.5). Such a
+ * record may still be read for audit, but it must not train the new policy.
+ */
+export function isLegacyStoredExperience(
+  record: StoredExperience,
+  minimum: number = EXPERIENCE_SCHEMA_VERSION
+): boolean {
+  const version = record.experienceSchemaVersion;
+  return version === undefined || !Number.isFinite(version) || version < minimum;
+}
+
+/** True when a record may train the policy (explicit false, or legacy). */
+export function isLearningEligible(record: StoredExperience): boolean {
+  return record.learningEligible !== false && !isLegacyStoredExperience(record);
 }
 
 function normalizeRecord(value: unknown): StoredExperience {
@@ -222,6 +296,33 @@ function normalizeRecord(value: unknown): StoredExperience {
   if (typeof redacted !== 'boolean') {
     throw new ExperienceRecordError('missing_field', 'experience record redacted must be a boolean', 'redacted');
   }
+  // P6 PR4 association chain: every field is optional, so a pre-PR4 record
+  // normalizes exactly as before and simply stays legacy. A present field with
+  // the wrong type is still a producer bug and is rejected (never guessed).
+  const branchId = optionalString(value, 'branchId');
+  const scopeKey = optionalString(value, 'scopeKey');
+  const decisionId = optionalString(value, 'decisionId');
+  const runId = optionalString(value, 'runId');
+  const parentNodeId = optionalString(value, 'parentNodeId');
+  const trajectoryId = optionalString(value, 'trajectoryId');
+  const policyVersion = optionalString(value, 'policyVersion');
+  const rewardVersion = optionalString(value, 'rewardVersion');
+  const provenanceVersion = optionalString(value, 'provenanceVersion');
+  const round = optionalInteger(value, 'round');
+  const slotIndex = optionalInteger(value, 'slotIndex');
+  const experienceSchemaVersion = optionalInteger(value, 'experienceSchemaVersion');
+  const observedReturn = optionalNumber(value, 'observedReturn');
+  const attributionBaseline = optionalNumber(value, 'attributionBaseline');
+  const learningTarget = optionalNumber(value, 'learningTarget');
+  const outcome = optionalOutcome(value, 'outcome');
+  const learningEligibleRaw = readField(value, 'learningEligible');
+  if (learningEligibleRaw !== undefined && typeof learningEligibleRaw !== 'boolean') {
+    throw new ExperienceRecordError(
+      'invalid_field',
+      'experience record learningEligible must be a boolean',
+      'learningEligible'
+    );
+  }
   return {
     id,
     level,
@@ -237,9 +338,90 @@ function normalizeRecord(value: unknown): StoredExperience {
     sessionId,
     treeId: treeIdValue as string | undefined,
     nodeId: nodeIdValue as string | undefined,
+    branchId,
+    scopeKey,
+    decisionId,
+    runId,
+    round,
+    slotIndex,
+    parentNodeId,
+    trajectoryId,
+    policyVersion,
+    rewardVersion,
+    provenanceVersion,
+    experienceSchemaVersion,
+    observedReturn,
+    attributionBaseline,
+    learningTarget,
+    outcome,
+    learningEligible: learningEligibleRaw as boolean | undefined,
     createdAt,
     redacted
   };
+}
+
+/** Read an optional non-empty string field, rejecting a wrong type. */
+function optionalString(source: object, field: string): string | undefined {
+  const value = readField(source, field);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'string') {
+    throw new ExperienceRecordError(
+      'invalid_field',
+      'experience record ' + field + ' must be a string',
+      field
+    );
+  }
+  return value;
+}
+
+/** Read an optional finite number field, rejecting a wrong type. */
+function optionalNumber(source: object, field: string): number | undefined {
+  const value = readField(source, field);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new ExperienceRecordError(
+      'invalid_field',
+      'experience record ' + field + ' must be finite',
+      field
+    );
+  }
+  return value;
+}
+
+/** Read an optional integer field, rejecting a wrong type. */
+function optionalInteger(source: object, field: string): number | undefined {
+  const value = readField(source, field);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    throw new ExperienceRecordError(
+      'invalid_field',
+      'experience record ' + field + ' must be an integer',
+      field
+    );
+  }
+  return value;
+}
+
+/** Read the optional execution outcome, rejecting an unknown spelling. */
+function optionalOutcome(source: object, field: string): ExperienceOutcome | undefined {
+  const value = readField(source, field);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'string' || !(EXPERIENCE_OUTCOMES as readonly string[]).includes(value)) {
+    throw new ExperienceRecordError(
+      'invalid_field',
+      'experience record outcome is not an ExperienceOutcome',
+      field
+    );
+  }
+  return value as ExperienceOutcome;
 }
 
 /** Validate a batch, dropping duplicate ids inside the batch. Never echoes payloads. */
@@ -296,6 +478,31 @@ export function toExperienceRecord(stored: StoredExperience): ExperienceRecord {
     sessionId: stored.sessionId,
     ...(stored.treeId === undefined ? {} : { treeId: stored.treeId }),
     ...(stored.nodeId === undefined ? {} : { nodeId: stored.nodeId }),
+    ...(stored.branchId === undefined ? {} : { branchId: stored.branchId }),
+    ...(stored.scopeKey === undefined ? {} : { scopeKey: stored.scopeKey }),
+    ...(stored.decisionId === undefined ? {} : { decisionId: stored.decisionId }),
+    ...(stored.runId === undefined ? {} : { runId: stored.runId }),
+    ...(stored.round === undefined ? {} : { round: stored.round }),
+    ...(stored.slotIndex === undefined ? {} : { slotIndex: stored.slotIndex }),
+    ...(stored.parentNodeId === undefined ? {} : { parentNodeId: stored.parentNodeId }),
+    ...(stored.trajectoryId === undefined ? {} : { trajectoryId: stored.trajectoryId }),
+    ...(stored.policyVersion === undefined ? {} : { policyVersion: stored.policyVersion }),
+    ...(stored.rewardVersion === undefined ? {} : { rewardVersion: stored.rewardVersion }),
+    ...(stored.provenanceVersion === undefined
+      ? {}
+      : { provenanceVersion: stored.provenanceVersion }),
+    ...(stored.experienceSchemaVersion === undefined
+      ? {}
+      : { experienceSchemaVersion: stored.experienceSchemaVersion }),
+    ...(stored.observedReturn === undefined ? {} : { observedReturn: stored.observedReturn }),
+    ...(stored.attributionBaseline === undefined
+      ? {}
+      : { attributionBaseline: stored.attributionBaseline }),
+    ...(stored.learningTarget === undefined ? {} : { learningTarget: stored.learningTarget }),
+    ...(stored.outcome === undefined ? {} : { outcome: stored.outcome }),
+    ...(stored.learningEligible === undefined
+      ? {}
+      : { learningEligible: stored.learningEligible }),
     createdAt: stored.createdAt,
     redacted: stored.redacted
   };
@@ -411,6 +618,22 @@ export function validateExperienceQuery(query: ExperienceQuery, halfLifeMs: numb
   }
   if (query.guidanceFilter !== undefined && guidanceOf(query.guidanceFilter) === undefined) {
     throw new RangeError('query: guidanceFilter must be a GuidanceMode');
+  }
+  if (query.excludeLegacy !== undefined && typeof query.excludeLegacy !== 'boolean') {
+    throw new TypeError('query: excludeLegacy must be a boolean');
+  }
+  if (
+    query.minimumExperienceSchemaVersion !== undefined &&
+    (!Number.isInteger(query.minimumExperienceSchemaVersion) ||
+      query.minimumExperienceSchemaVersion < 1)
+  ) {
+    throw new RangeError('query: minimumExperienceSchemaVersion must be a positive integer');
+  }
+  if (
+    query.learningEligibleOnly !== undefined &&
+    typeof query.learningEligibleOnly !== 'boolean'
+  ) {
+    throw new TypeError('query: learningEligibleOnly must be a boolean');
   }
   if (!Number.isFinite(halfLifeMs) || halfLifeMs < 0) {
     throw new RangeError('query: halfLifeMs must be a finite number >= 0');
@@ -704,7 +927,10 @@ function matchesBaseFilters(
   record: StoredExperience,
   level: JitLevel,
   guidanceFilter: GuidanceMode | undefined,
-  before: number | undefined
+  before: number | undefined,
+  excludeLegacy: boolean,
+  minimumSchemaVersion: number,
+  learningEligibleOnly: boolean
 ): boolean {
   if (record.level !== level) {
     return false;
@@ -716,6 +942,14 @@ function matchesBaseFilters(
     return false;
   }
   if (before !== undefined && record.createdAt > before) {
+    return false;
+  }
+  // Plan section 6.5: mis-attributed history stays readable for audit but never
+  // enters the new-version learning neighbourhood.
+  if (excludeLegacy && isLegacyStoredExperience(record, minimumSchemaVersion)) {
+    return false;
+  }
+  if (learningEligibleOnly && !isLearningEligible(record)) {
     return false;
   }
   return true;
@@ -761,6 +995,13 @@ export function executeExperienceQuery(
   const level = query.level;
   const guidanceFilter = query.guidanceFilter;
   const before = query.before;
+  const excludeLegacy = query.excludeLegacy === true;
+  const minimumSchemaVersion =
+    query.minimumExperienceSchemaVersion !== undefined &&
+    Number.isInteger(query.minimumExperienceSchemaVersion)
+      ? query.minimumExperienceSchemaVersion
+      : EXPERIENCE_SCHEMA_VERSION;
+  const learningEligibleOnly = query.learningEligibleOnly === true;
 
   // Stage 1a: exact (level, bucket) pre-filter.
   const bucketRecords = index.exactBucketRecords(level, query.state.bucket);
@@ -782,7 +1023,17 @@ export function executeExperienceQuery(
     if (record === undefined) {
       continue;
     }
-    if (!matchesBaseFilters(record, level, guidanceFilter, before)) {
+    if (
+      !matchesBaseFilters(
+        record,
+        level,
+        guidanceFilter,
+        before,
+        excludeLegacy,
+        minimumSchemaVersion,
+        learningEligibleOnly
+      )
+    ) {
       continue;
     }
     const similarity = experienceJaccard(query.state.tokens, record.tokens);
@@ -897,6 +1148,109 @@ export function malformedLineDiagnostic(lineNumber: number, reason: string): Exp
     level: 'warn',
     code: 'experience_store_malformed_line',
     message: 'ignored malformed JSONL line ' + lineNumber + ': ' + reason
+  };
+}
+
+/**
+ * Split a raw experience snapshot into the records the NEW learning
+ * neighbourhood may use and the ones that are audit-only (plan section 6.5).
+ *
+ * This is the single rule every consumer (online retrieval, replay, mirror
+ * aggregation) must apply, so a legacy record cannot be re-imported from a
+ * remote aggregate after the local log was migrated. Pure and dependency free.
+ */
+export function partitionByVersion(
+  records: readonly ExperienceRecord[],
+  minimumSchemaVersion: number = EXPERIENCE_SCHEMA_VERSION
+): {
+  readonly learning: readonly ExperienceRecord[];
+  readonly legacy: readonly ExperienceRecord[];
+  readonly ineligible: readonly ExperienceRecord[];
+} {
+  const learning: ExperienceRecord[] = [];
+  const legacy: ExperienceRecord[] = [];
+  const ineligible: ExperienceRecord[] = [];
+  for (const record of records) {
+    const version = record.experienceSchemaVersion;
+    const isLegacy =
+      version === undefined || !Number.isFinite(version) || version < minimumSchemaVersion;
+    if (isLegacy) {
+      legacy.push(record);
+      continue;
+    }
+    if (record.learningEligible === false) {
+      ineligible.push(record);
+      continue;
+    }
+    learning.push(record);
+  }
+  return { learning, legacy, ineligible };
+}
+
+/**
+ * Per-record legacy classification for a raw snapshot (plan section 6.5), so a
+ * caller can annotate rather than drop. `legacy` means the record predates
+ * per-execution attribution; `ineligible` means it carries an outcome that may
+ * not train (cancelled / aborted / infrastructure).
+ */
+export function classifyExperienceVersion(
+  record: ExperienceRecord,
+  minimumSchemaVersion: number = EXPERIENCE_SCHEMA_VERSION
+): 'current' | 'legacy' | 'ineligible' {
+  const version = record.experienceSchemaVersion;
+  if (version === undefined || !Number.isFinite(version) || version < minimumSchemaVersion) {
+    return 'legacy';
+  }
+  return record.learningEligible === false ? 'ineligible' : 'current';
+}
+
+/**
+ * Version isolation for the aggregate-statistics mirror (plan section 6.5
+ * item 5: "mirror 中旧版本聚合也要隔离").
+ *
+ * The mirror publishes one row per (level, bucket, actionKey). If those rows
+ * were built from a snapshot that still holds legacy (mis-attributed) records,
+ * a backend would hand the old bias back after the local log was migrated. This
+ * helper produces exactly the input the aggregator may see, plus the audit
+ * counts that explain what was withheld:
+ *
+ *   - `current`: records at the current schema version and learning eligible;
+ *   - `legacy`: records that predate per-execution attribution;
+ *   - `ineligible`: current records whose outcome may not train.
+ *
+ * The caller aggregates `current` only and reports `legacyExcluded` /
+ * `legacy: true` on the resulting rows, so a reader of the mirror can tell an
+ * isolated snapshot from a clean one without parsing payloads.
+ */
+export function mirrorVisibleRecords(
+  records: readonly ExperienceRecord[],
+  minimumSchemaVersion: number = EXPERIENCE_SCHEMA_VERSION
+): {
+  readonly current: readonly ExperienceRecord[];
+  readonly legacyExcluded: number;
+  readonly ineligibleExcluded: number;
+  /** True when anything was withheld, i.e. the aggregate is a partial view. */
+  readonly isolated: boolean;
+  /** True when any visible record was written by a different reward version. */
+  readonly mixedRewardVersions: boolean;
+  /** The newest reward version among the visible records (undefined when none). */
+  readonly rewardVersion: string | undefined;
+} {
+  const { learning, legacy, ineligible } = partitionByVersion(records, minimumSchemaVersion);
+  const versions = new Set<string>();
+  for (const record of learning) {
+    if (typeof record.rewardVersion === 'string' && record.rewardVersion.length > 0) {
+      versions.add(record.rewardVersion);
+    }
+  }
+  const rewardVersion = versions.size > 0 ? [...versions].sort()[versions.size - 1] : undefined;
+  return {
+    current: learning,
+    legacyExcluded: legacy.length,
+    ineligibleExcluded: ineligible.length,
+    isolated: legacy.length > 0 || ineligible.length > 0,
+    mixedRewardVersions: versions.size > 1,
+    rewardVersion
   };
 }
 

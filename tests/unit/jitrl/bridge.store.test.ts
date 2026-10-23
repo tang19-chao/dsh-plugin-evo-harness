@@ -15,6 +15,7 @@ import type { JitLevel, JitStatsAggregate } from '../../../src/types/contracts';
 import {
   JITRL_STAT_TAG,
   createJitBridgeMirrorStore,
+  MAX_DIAGNOSTIC_LENGTH,
   type BridgeMirrorStoreOptions,
   type JitMirrorMcpClient,
   type JitMirrorToolDescriptor
@@ -351,7 +352,109 @@ describe('enabled mirror under failure', () => {
     expect(result.diagnostics[0]).toContain('no aggregate write tool');
   });
 
-  it('degrades when enabled but no client is injected', async () => {
+it('L3 governance: redacts and bounds diagnostics when backend echoes raw secret payload and long text', async () => {
+    const rawSecret = 'ghp_SECRET_TOKEN_1234567890abcdefghijklmnopqrstuv';
+    const rawPath = '/usr/local/secret/keys.pem';
+    const client = new FakeMirrorClient();
+    client.failWhen = () => true;
+    // Override callTool to throw an error echoing the raw payload and long text
+    client.callTool = async (tool: string, args: Record<string, unknown>) => {
+      throw new Error(
+        'Backend failed on payload: ' + rawSecret + ' at ' + rawPath + ' ' + 'repeated info '.repeat(25)
+      );
+    };
+
+    const store = makeStore(client);
+    const result = await store.mirror([aggregate()]);
+
+    expect(result.degraded).toBe(true);
+    expect(result.written).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.diagnostics.length).toBeGreaterThan(0);
+
+    for (const diag of result.diagnostics) {
+      // Must not leak the raw secret
+      expect(diag).not.toContain(rawSecret);
+      // Must not leak absolute paths
+      expect(diag).not.toContain(rawPath);
+      // Redaction placeholders must be present
+      expect(diag).toContain('<secret>');
+      expect(diag).toContain('<path>');
+      // Must be bounded in length
+      expect(diag.length).toBeLessThanOrEqual(MAX_DIAGNOSTIC_LENGTH);
+    }
+  });
+
+  it('L3 governance: redacts and bounds serverId and backend exceptions in diagnostics when listTools fails', async () => {
+    const rawServerSecret = 'ghp_SERVER_SECRET_9876543210zyxwvutsrq';
+    const rawServerPath = 'C:\\Secret\\ServerConfig\\path.json';
+    const client = new FakeMirrorClient(
+      [{ name: 'write_note' }],
+      'server-' + rawServerSecret
+    );
+    client.listToolsError = new Error(
+      'transport error on ' + rawServerPath + ' using ' + rawServerSecret + ': ' + 'error details '.repeat(30)
+    );
+
+    const store = makeStore(client);
+    const result = await store.mirror([aggregate()]);
+
+    expect(result.degraded).toBe(true);
+    expect(result.diagnostics.length).toBeGreaterThan(0);
+    const diag = result.diagnostics[0]!;
+
+    expect(diag).not.toContain(rawServerSecret);
+    expect(diag).not.toContain(rawServerPath);
+    expect(diag).toContain('<secret>');
+    expect(diag).toContain('<path>');
+    expect(diag).toContain('server:');
+    expect(diag.length).toBeLessThanOrEqual(MAX_DIAGNOSTIC_LENGTH);
+  });
+
+  it('F2 acceptance: backend echoing serverId, namespace, RAW_PAYLOAD, ghp_ and absolute path masks all sensitive data and bounds length <= 200', async () => {
+    const rawServerId = 'mem0-prod-server-7f3a';
+    const rawNamespace = 'tenant/secret-space';
+    const rawPayload = 'RAW_PAYLOAD_INTERNAL_STATE_999888';
+    const rawSecret = 'ghp_BACKEND_ECHO_TOKEN_1234567890abcdefgh';
+    const rawPath = '/var/log/app/secrets/vault.key';
+
+    const client = new FakeMirrorClient([{ name: 'write_note' }], rawServerId);
+    client.failWhen = () => true;
+    client.callTool = async () => {
+      throw new Error(
+        `Backend failed: server=${rawServerId} namespace=${rawNamespace} payload=${rawPayload} secret=${rawSecret} path=${rawPath} ` +
+          'extra-context-'.repeat(20)
+      );
+    };
+
+    const store = makeStore(client);
+    const result = await store.mirror([aggregate()]);
+
+    expect(result.degraded).toBe(true);
+    expect(result.diagnostics.length).toBeGreaterThan(0);
+
+    for (const diag of result.diagnostics) {
+      // Must not leak serverId
+      expect(diag).not.toContain(rawServerId);
+      // Must not leak namespace
+      expect(diag).not.toContain(rawNamespace);
+      // Must not leak RAW_PAYLOAD
+      expect(diag).not.toContain('RAW_PAYLOAD');
+      expect(diag).not.toContain(rawPayload);
+      // Must not leak raw secrets or absolute paths
+      expect(diag).not.toContain(rawSecret);
+      expect(diag).not.toContain(rawPath);
+      // Must contain masked forms and placeholders
+      expect(diag).toContain('ns:');
+      expect(diag).toContain('<payload>');
+      expect(diag).toContain('<secret>');
+      expect(diag).toContain('<path>');
+      // Must be bounded in length <= 200
+      expect(diag.length).toBeLessThanOrEqual(MAX_DIAGNOSTIC_LENGTH);
+    }
+  });
+
+    it('degrades when enabled but no client is injected', async () => {
     const store = makeStore(undefined);
 
     const result = await store.mirror([aggregate()]);

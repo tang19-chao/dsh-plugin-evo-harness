@@ -36,9 +36,10 @@
  *   - an injected store/retriever that throws, or a malformed retrieval result,
  *     degrades to noop with a diagnostic and never propagates to the host turn.
  *   - the injected text is bounded by MAX_ADVISORY_TOKENS (300) using
- *     estimateTokens(), a deterministic, dependency-free estimator; when the
- *     evidence does not fit, lines are dropped (tag structure survives) and a
- *     `advisory_truncated` diagnostic is recorded.
+ *     checkTokenBudget() from redaction.ts (supporting injected ModelTokenizer,
+ *     or falling back to conservative character/byte/entropy-aware limits);
+ *     when the evidence does not fit, lines are dropped and an `advisory_truncated`
+ *     diagnostic is recorded (explicitly noting heuristic estimation, not real token count).
  *   - only statistics leave this module: action keys, neighbour counts, mean
  *     returns and advantages. Raw ExperienceRecords are never rendered.
  *
@@ -64,7 +65,13 @@ import {
   type ScoredExperience,
   type WorkingDirectorySummary
 } from '../types/contracts';
-import { redactSecrets } from './redaction';
+import {
+  checkTokenBudget,
+  countTokens,
+  redactSecrets,
+  type ModelTokenizer,
+  type TokenBudgetResult
+} from './redaction';
 import { abstractHostState } from './state-abstraction';
 import { toExperienceQuery } from './retriever';
 import {
@@ -106,26 +113,30 @@ type NoDenyDecisionKind = Extract<HostAdvisorDecisionKind, 'deny'> extends never
 export const HOST_ADVISOR_NEVER_DENIES: NoDenyDecisionKind = true;
 
 /**
- * Deterministic, dependency-free token estimate.
+ * Token budget estimator for host advice.
  *
- * ASCII characters count 4 per token (the usual English average; conservative
- * for code and identifiers) and every non-ASCII code point counts as one token
- * (CJK is >= 1 token per character). The estimator never needs a tokenizer, so
- * the 300-token budget is reproducible across machines and test runs, and it
- * errs high rather than low for the mixed-language advice this module emits.
+ * GOVERNANCE NOTE (M2):
+ * A heuristic character or byte estimate CANNOT be claimed equivalent to real
+ * model tokens (<= 300 tokens). Uses injected ModelTokenizer when available,
+ * or delegates to conservative high-entropy aware heuristic (countTokens)
+ * from redaction.ts.
  */
-export function estimateTokens(text: string): number {
-  let narrow = 0;
-  let wide = 0;
-  for (const character of text) {
-    const codePoint = character.codePointAt(0) ?? 0;
-    if (codePoint > 0x7f) {
-      wide += 1;
-    } else {
-      narrow += 1;
-    }
-  }
-  return Math.ceil(narrow / 4) + wide;
+export function estimateTokens(text: string, tokenizer?: ModelTokenizer): number {
+  return countTokens(text, tokenizer);
+}
+
+/**
+ * Check whether an advisory string fits within the host advisor budget.
+ * Production helper wiring checkTokenBudget from redaction.ts.
+ */
+export function checkAdvisorBudget(
+  text: string,
+  tokenizer?: ModelTokenizer
+): TokenBudgetResult {
+  return checkTokenBudget(text, {
+    tokenizer,
+    maxTokens: MAX_ADVISORY_TOKENS
+  });
 }
 
 /** Minimal, always-budget-safe advisory block used as the truncation floor. */
@@ -155,7 +166,7 @@ function formatNumber(value: number): string {
 }
 
 /** One evidenced tool action, as consumed by the decision rules and renderer. */
-interface ActionEvidence {
+export interface ActionEvidence {
   readonly actionKey: string;
   /** Weighted mean neighbour return for this action (Q estimate). */
   readonly meanReturn: number;
@@ -195,6 +206,8 @@ export interface HostAdvisorOptions {
   readonly retriever?: HostAdvisorRetriever;
   /** Value estimator seam; defaults to estimateActionValues. */
   readonly estimator?: HostAdvisorEstimator;
+  /** Injected model tokenizer for exact token budget measurement. */
+  readonly tokenizer?: ModelTokenizer;
   /** Injected clock; when present it also causally truncates retrieval at now. */
   readonly now?: () => number;
   /** Injected randomness forwarded to the estimator. */
@@ -391,23 +404,26 @@ function evidenceLine(prefix: string, evidence: ActionEvidence): string {
   );
 }
 
-interface RenderedAdvice {
+export interface RenderedAdvice {
   readonly text: string;
   readonly antiPatterns: readonly string[];
   readonly truncated: boolean;
+  readonly exact?: boolean;
+  readonly budgetNote?: string;
 }
 
 /**
- * Render the advisory block under the hard token budget.
+ * Render the advisory block under the token budget.
  *
- * Recommendations (A-tilde > 0) come first, best first; anti-patterns
- * (A-tilde < 0) live inside <anti_patterns_to_avoid>, most negative first.
- * When the assembly exceeds MAX_ADVISORY_TOKENS the least informative lines
- * are dropped (the tags and therefore the block structure always survive) and,
- * if even the tags cannot fit, a fixed minimal block is emitted. Every drop is
- * recorded as a diagnostic; the returned text is always within budget.
+ * Uses checkTokenBudget() from redaction.ts. When an injected ModelTokenizer
+ * is present, token limits are evaluated exactly. In fallback mode without
+ * a tokenizer, conservative character, byte, and high-entropy token limits
+ * are enforced to prevent prompt bloat without claiming token equivalence.
  */
-function renderAdvice(entries: readonly ActionEvidence[]): RenderedAdvice {
+export function renderAdvice(
+  entries: readonly ActionEvidence[],
+  tokenizer?: ModelTokenizer
+): RenderedAdvice {
   const sorted = [...entries].sort(compareWorstFirst);
   const recommendable = sorted
     .filter((entry) => entry.normalizedAdvantage > 0)
@@ -444,9 +460,10 @@ function renderAdvice(entries: readonly ActionEvidence[]): RenderedAdvice {
   const neighborCount = entries.reduce((total, entry) => total + entry.support, 0);
   let truncated = false;
 
-  const fits = (recommend: readonly string[], avoid: readonly string[]): boolean =>
-    estimateTokens(header(neighborCount, truncated) + '\n' + assemble(recommend, avoid)) <=
-    MAX_ADVISORY_TOKENS;
+  const fits = (recommend: readonly string[], avoid: readonly string[]): boolean => {
+    const candidate = header(neighborCount, truncated) + '\n' + assemble(recommend, avoid);
+    return checkAdvisorBudget(candidate, tokenizer).fits;
+  };
 
   while (!fits(recommendLines, avoidLines)) {
     if (avoidLines.length >= recommendLines.length && avoidLines.length > 0) {
@@ -461,12 +478,19 @@ function renderAdvice(entries: readonly ActionEvidence[]): RenderedAdvice {
 
   let text =
     header(neighborCount, truncated) + '\n' + assemble(recommendLines, avoidLines);
-  if (estimateTokens(text) > MAX_ADVISORY_TOKENS) {
+  const budget = checkAdvisorBudget(text, tokenizer);
+  if (!budget.fits) {
     text = minimalAdvice(neighborCount);
     truncated = true;
   }
 
-  return { text, antiPatterns: avoidLines, truncated };
+  return {
+    text,
+    antiPatterns: avoidLines,
+    truncated,
+    exact: budget.exact,
+    budgetNote: budget.note
+  };
 }
 
 function toDiagnostics(
@@ -673,12 +697,14 @@ export function createHostAdvisor(options: HostAdvisorOptions): HostAdvisor {
     }
 
     if (target.normalizedAdvantage < adviseThreshold) {
-      const rendered = renderAdvice(evidence);
+      const rendered = renderAdvice(evidence, options.tokenizer);
       if (rendered.truncated) {
         diagnostics.push(
-          'advisory_truncated: evidence trimmed to fit ' +
-            String(MAX_ADVISORY_TOKENS) +
-            ' tokens'
+          options.tokenizer !== undefined
+            ? 'advisory_truncated: evidence trimmed to fit tokenizer budget (' +
+                String(MAX_ADVISORY_TOKENS) +
+                ' tokens)'
+            : 'advisory_truncated: evidence trimmed to fit estimated budget (heuristic/not real tokens)'
         );
       }
       const advisory: HostAdvisorAdvisoryDecision = {
@@ -703,6 +729,9 @@ export function createHostAdvisor(options: HostAdvisorOptions): HostAdvisor {
       if (!hostAdvisor.enabled) {
         // Default-off must cost nothing: no store, retriever or estimator call.
         return noopDecision('host_advisor_disabled');
+      }
+      if (request.isInvariant === true) {
+        return noopDecision('invariant_branch_prohibits_advice');
       }
       try {
         return await evaluateEnabled(request);

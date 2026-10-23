@@ -13,14 +13,20 @@ import type {
   JitLevel
 } from '../../../src/types/contracts';
 import {
+  CURRENT_PROVENANCE_VERSION,
+  CURRENT_REWARD_VERSION,
   DEFAULT_EXPERIENCE_HALF_LIFE_MS,
+  EXPERIENCE_SCHEMA_VERSION,
   ExperienceIndex,
   ExperienceRecordError,
   compareStoredExperiences,
   executeExperienceQuery,
   experienceJaccard,
   experienceWeight,
+  isLearningEligible,
+  isLegacyStoredExperience,
   isValidExperienceRecord,
+  mirrorVisibleRecords,
   normalizeExperienceRecords,
   planCompaction,
   type StoredExperience
@@ -508,5 +514,205 @@ describe('experience store query path cost', () => {
     const elapsed = Date.now() - started;
     expect(scored.length).toBeLessThanOrEqual(8);
     expect(elapsed).toBeLessThan(25);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P6 PR4 / plan section 6.5: version fields, legacy isolation, mirror rule
+// ---------------------------------------------------------------------------
+
+describe('P6 PR4: record versions and legacy isolation', () => {
+  const STATE = { level: 'meta' as const, bucket: 'task|pr4', tokens: ['pr4'], summary: '' };
+
+  function record(id: string, overrides: Partial<ExperienceRecord> = {}): ExperienceRecord {
+    return {
+      id,
+      level: 'meta',
+      state: STATE,
+      actionKey: 'slot:exploit',
+      reward: 1,
+      return: 1,
+      rewardSources: { surrogate: 1 },
+      guidance: 'memory',
+      policyId: 'policy-pr4',
+      sessionId: 'session-pr4',
+      createdAt: 100,
+      redacted: true,
+      ...overrides
+    };
+  }
+
+  const CURRENT: Partial<ExperienceRecord> = {
+    experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+    rewardVersion: CURRENT_REWARD_VERSION,
+    provenanceVersion: CURRENT_PROVENANCE_VERSION,
+    outcome: 'succeeded',
+    learningEligible: true,
+    observedReturn: 1,
+    attributionBaseline: 0,
+    learningTarget: 1,
+    trajectoryId: 'traj-pr4',
+    round: 1,
+    slotIndex: 0
+  };
+
+  it('normalizes every optional association field and keeps the rest untouched', () => {
+    const normalized = normalizeExperienceRecords([
+      record('pr4-full', {
+        ...CURRENT,
+        branchId: 'branch-pr4',
+        scopeKey: 'session-pr4::branch-pr4',
+        decisionId: 'jit-decision-run-1-r1-s0',
+        runId: 'run-1',
+        parentNodeId: 'root',
+        policyVersion: 'policy-pr4@v7'
+      })
+    ]);
+    const stored = normalized[0];
+    expect(stored?.decisionId).toBe('jit-decision-run-1-r1-s0');
+    expect(stored?.runId).toBe('run-1');
+    expect(stored?.round).toBe(1);
+    expect(stored?.slotIndex).toBe(0);
+    expect(stored?.parentNodeId).toBe('root');
+    expect(stored?.trajectoryId).toBe('traj-pr4');
+    expect(stored?.branchId).toBe('branch-pr4');
+    expect(stored?.scopeKey).toBe('session-pr4::branch-pr4');
+    expect(stored?.policyVersion).toBe('policy-pr4@v7');
+    expect(stored?.rewardVersion).toBe(CURRENT_REWARD_VERSION);
+    expect(stored?.provenanceVersion).toBe(CURRENT_PROVENANCE_VERSION);
+    expect(stored?.experienceSchemaVersion).toBe(EXPERIENCE_SCHEMA_VERSION);
+    expect(stored?.observedReturn).toBe(1);
+    expect(stored?.attributionBaseline).toBe(0);
+    expect(stored?.learningTarget).toBe(1);
+    expect(stored?.outcome).toBe('succeeded');
+    expect(stored?.learningEligible).toBe(true);
+  });
+
+  it('rejects a wrong-typed association field instead of guessing', () => {
+    expect(() => normalizeExperienceRecords([record('bad-round', { round: 1.5 })])).toThrow(
+      ExperienceRecordError
+    );
+    expect(() =>
+      normalizeExperienceRecords([
+        record('bad-outcome', { outcome: 'exploded' as unknown as ExperienceRecord['outcome'] })
+      ])
+    ).toThrow(ExperienceRecordError);
+    expect(() =>
+      normalizeExperienceRecords([
+        record('bad-eligible', { learningEligible: 'yes' as unknown as boolean })
+      ])
+    ).toThrow(ExperienceRecordError);
+  });
+
+  it('keeps a pre-PR4 record loadable and classifies it as legacy', () => {
+    const legacy = record('legacy-plain');
+    const normalized = normalizeExperienceRecords([legacy]);
+    expect(normalized[0]?.experienceSchemaVersion).toBeUndefined();
+    expect(isLegacyStoredExperience(normalized[0] as StoredExperience)).toBe(true);
+    expect(isLearningEligible(normalized[0] as StoredExperience)).toBe(false);
+    const current = normalizeExperienceRecords([record('current-plain', CURRENT)])[0];
+    expect(isLegacyStoredExperience(current as StoredExperience)).toBe(false);
+    expect(isLearningEligible(current as StoredExperience)).toBe(true);
+  });
+
+  it('excludes legacy records from a version-filtered query but keeps them queryable', async () => {
+    const store = createMemoryExperienceStore({ now: () => 100 });
+    await store.append([
+      record('legacy-1'),
+      record('current-1', CURRENT),
+      record('ineligible-1', { ...CURRENT, learningEligible: false })
+    ]);
+
+    const all = await store.query({ level: 'meta', state: STATE, k: 10, similarityThreshold: 0 });
+    expect(all.map((entry) => entry.record.id).sort()).toEqual([
+      'current-1',
+      'ineligible-1',
+      'legacy-1'
+    ]);
+
+    const learning = await store.query({
+      level: 'meta',
+      state: STATE,
+      k: 10,
+      similarityThreshold: 0,
+      excludeLegacy: true
+    });
+    expect(learning.map((entry) => entry.record.id).sort()).toEqual(['current-1', 'ineligible-1']);
+
+    const eligible = await store.query({
+      level: 'meta',
+      state: STATE,
+      k: 10,
+      similarityThreshold: 0,
+      excludeLegacy: true,
+      learningEligibleOnly: true
+    });
+    expect(eligible.map((entry) => entry.record.id)).toEqual(['current-1']);
+
+    // Audit access survives: nothing was deleted.
+    expect(await store.size('meta')).toBe(3);
+  });
+
+  it('accepts an explicit minimum schema version', async () => {
+    const store = createMemoryExperienceStore({ now: () => 100 });
+    await store.append([record('v2', CURRENT), record('v1', { experienceSchemaVersion: 1 })]);
+    const atOne = await store.query({
+      level: 'meta',
+      state: STATE,
+      k: 10,
+      similarityThreshold: 0,
+      excludeLegacy: true,
+      minimumExperienceSchemaVersion: 1
+    });
+    expect(atOne.map((entry) => entry.record.id).sort()).toEqual(['v1', 'v2']);
+  });
+
+  it('validates the new query filters instead of silently ignoring them', () => {
+    const base: ExperienceQuery = { level: 'meta', state: STATE, k: 1, similarityThreshold: 0 };
+    expect(() =>
+      executeExperienceQuery(new ExperienceIndex(), {
+        ...base,
+        excludeLegacy: 'yes' as unknown as boolean
+      })
+    ).toThrow(TypeError);
+    expect(() =>
+      executeExperienceQuery(new ExperienceIndex(), {
+        ...base,
+        minimumExperienceSchemaVersion: 0
+      })
+    ).toThrow(RangeError);
+    expect(() =>
+      executeExperienceQuery(new ExperienceIndex(), {
+        ...base,
+        learningEligibleOnly: 'no' as unknown as boolean
+      })
+    ).toThrow(TypeError);
+  });
+
+  it('isolates legacy records from the mirror-visible snapshot', () => {
+    const visible = mirrorVisibleRecords([
+      record('legacy-1'),
+      record('current-1', CURRENT),
+      record('ineligible-1', { ...CURRENT, learningEligible: false })
+    ]);
+    expect(visible.current.map((entry) => entry.id)).toEqual(['current-1']);
+    expect(visible.legacyExcluded).toBe(1);
+    expect(visible.ineligibleExcluded).toBe(1);
+    expect(visible.isolated).toBe(true);
+    expect(visible.rewardVersion).toBe(CURRENT_REWARD_VERSION);
+    expect(visible.mixedRewardVersions).toBe(false);
+
+    const clean = mirrorVisibleRecords([record('current-2', CURRENT)]);
+    expect(clean.isolated).toBe(false);
+    expect(clean.legacyExcluded).toBe(0);
+  });
+
+  it('flags a mirror snapshot that mixes reward versions', () => {
+    const visible = mirrorVisibleRecords([
+      record('current-a', CURRENT),
+      record('current-b', { ...CURRENT, rewardVersion: 'r1/legacy-vector' })
+    ]);
+    expect(visible.mixedRewardVersions).toBe(true);
+    expect(visible.isolated).toBe(false);
   });
 });

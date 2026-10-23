@@ -50,14 +50,24 @@ import { createAutoLogitSource, type AutoLogitSource, type LogprobCapabilities }
 import { createStepEvaluator, type JitStepEvaluator } from './step-evaluator';
 import { backfillFromTreePool, type BackfillResult, type BackfillTreeSource } from './backfill';
 import {
+  createEffectivePolicyConfigProvider,
+  freshPolicySupport,
+  baseEffectivePolicyConfig,
+  learningFacingFilterOptions,
+  projectNeighborsBySlotKind,
+  runDecisionKernel,
+  type EffectivePolicyConfig,
+  type EffectivePolicyConfigProvider
+} from './decision-kernel';
+import { policyPriorLogit } from './logit-sources';
+import { abstractMetaState } from './state-abstraction';
+import {
   createJitActivePolicy,
   type JitActivePolicy,
   type JitActivePolicyOptions
 } from './jit-active-policy';
 import { createMemoryExperienceStore, type MemoryExperienceStore } from './stores/memory.store';
 import type { ExperienceStoreFs, JsonlExperienceStore } from './stores/jsonl.store';
-import { driftFactorFor } from './retriever';
-import { normalizeAdvantages } from './value-estimator';
 import { slotKindOfActionKey } from './jit-active-policy';
 import { createHostAdvisor, type HostAdvisor } from './host-advisor';
 import {
@@ -473,7 +483,14 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
 
 /**
  * Closed-form optimizer over an injected store. Shared by the L1 decorator and
- * any future L2 selector so there is exactly one acquisition path.
+ * the L2 proposal selector so there is exactly one acquisition path.
+ *
+ * P6 t28: this is the L2 *learning-facing* decision point - it picks one of K
+ * proposals to execute, so the evidence it reads trains the policy. It therefore
+ * queries with the strict learning filter (no legacy, no cancelled /
+ * infrastructure records), the same one L1 and replay use. Filtering here rather
+ * than in the caller is deliberate: it is the single place the L2 neighbourhood
+ * is built, so a future second caller cannot forget it.
  */
 export function createStoreOptimizer(options: {
   readonly store: Pick<IExperienceStore, 'query'>;
@@ -496,7 +513,8 @@ export function createStoreOptimizer(options: {
         similarityThreshold: options.config.similarityThreshold,
         ...(decideOptions.guidanceFilter === undefined
           ? {}
-          : { guidanceFilter: decideOptions.guidanceFilter })
+          : { guidanceFilter: decideOptions.guidanceFilter }),
+        ...learningFacingFilterOptions()
       });
       return decide(level, state, candidates, {
         neighbors,
@@ -558,20 +576,6 @@ function clampUnit(value: number): number {
   return value < 0 ? 0 : value > 1 ? 1 : value;
 }
 
-/** Weighted mean of finite values; 0 when nothing has positive weight. */
-function weightedMeanOf(pairs: readonly { readonly value: number; readonly weight: number }[]): number {
-  let weighted = 0;
-  let total = 0;
-  for (const pair of pairs) {
-    if (!finiteNumber(pair.value) || !finiteNumber(pair.weight) || pair.weight <= 0) {
-      continue;
-    }
-    weighted += pair.value * pair.weight;
-    total += pair.weight;
-  }
-  return total > 0 ? weighted / total : 0;
-}
-
 /** Slot probabilities of a policy, normalized across all four slot kinds. */
 function normalizedSlotShares(
   slotWeights: Readonly<Record<BatchSlotKind, number>>
@@ -619,234 +623,257 @@ function klDivergenceOf(
   return Number.isFinite(kl) && kl > 0 ? kl : 0;
 }
 
+/**
+ * The config slice the replay hook actually reads.
+ *
+ * Narrower than `JitRlConfig` on purpose: a frozen config object (`levels` is a
+ * readonly array on DEFAULT_EVO_HARNESS_CONFIG.jitrl) is not assignable to the
+ * mutable config type, and the hook must be usable from a parity test that holds
+ * the frozen defaults. Listing the fields also documents what replay consumes.
+ */
+export interface JitReplayHookKernelConfig {
+  readonly k: number;
+  readonly similarityThreshold: number;
+  readonly dream: { readonly driftRho: number };
+}
+
 /** Options for {@link createJitReplayHook}. */
 export interface JitReplayHookFactoryOptions {
   /** Kernel configuration; supplies k, similarityThreshold and driftRho. */
-  readonly config: JitRlConfig;
+  readonly config: JitReplayHookKernelConfig;
   /** Per-hook drift override; defaults to config.jitrl.dream.driftRho. */
   readonly driftRho?: number;
+  /**
+   * P6 PR5 (plan section 7.1): the abstract state of the replayed decision.
+   *
+   * A `JitReplayHookInput` carries only the frontier view, whose task identity
+   * is unknown to replay, so deriving a state from it would silently bucket the
+   * decision differently from the online path and destroy the very parity this
+   * round is about. The caller therefore supplies the state it wants replayed;
+   * absent keeps the frontier-derived fallback so an old caller still works.
+   *
+   * The state is the *only* thing the caller injects for parity: snapshot
+   * truncation stays replay's job and the algorithm below is the shared kernel.
+   */
+  readonly stateOf?: (input: JitReplayHookInput) => AbstractState;
+  /**
+   * Deterministic seed for the exploration draw (plan section 7.1). Replay is a
+   * pure function, so it must not reach for Math.random; absent means an
+   * exploration-free draw (rng always 1, i.e. no unsupported action is explored),
+   * which is the deterministic-policy comparison mode.
+   */
+  readonly seed?: number;
+  /** Injected clock for the half-life decay; absent disables the decay. */
+  readonly now?: () => number;
+  /**
+   * P6 PR5 (plan section 7.1): prior logit z(s, a) of one slot candidate.
+   *
+   * The online decorator derives it from the policy's slot shares *plus* the
+   * request's memory confidence and exploration temperature; replay has neither
+   * of those inputs (a `JitReplayHookInput` only carries the frontier view), so
+   * by default replay uses the memory-free, unit-temperature prior. A parity
+   * caller that knows the online context injects the same function here, which
+   * is what makes the two candidate sets identical and the adjusted logits
+   * comparable term by term.
+   */
+  readonly priorLogitOf?: (slotKind: BatchSlotKind, slotWeights: Readonly<Record<BatchSlotKind, number>>) => number;
 }
 
 /**
- * Build the synchronous Dream replay simulator (plan section 7.3-2).
+ * Fallback state for a replay hook without an injected `stateOf`.
  *
- * Replay hands the hook a snapshot already truncated to the replay tree's own
- * past, so this implementation is a pure function over `input.experiences`:
+ * Everything the frontier view actually exposes goes in; the task identity is
+ * unknowable here, which is exactly why parity callers inject their own state.
+ */
+function replayStateFromFrontier(input: JitReplayHookInput): AbstractState {
+  return abstractMetaState({
+    task: { id: input.treeId, prompt: '' },
+    round: input.frontier.depth,
+    parentDepth: input.frontier.depth,
+    ...(input.frontier.slot === undefined ? {} : { parentSlot: input.frontier.slot }),
+    memoryConfidence: 0,
+    referenceStatus: 'missing'
+  });
+}
+
+/** Slot candidates of one replay correction: one per slot kind (plan section 7.1). */
+function replayCandidates(
+  slotWeights: Readonly<Record<BatchSlotKind, number>>,
+  priorLogitOf?: (kind: BatchSlotKind, weights: Readonly<Record<BatchSlotKind, number>>) => number
+): readonly JitCandidate<{ readonly slotKind: BatchSlotKind }>[] {
+  return BATCH_SLOT_KINDS.map((kind) => ({
+    actionKey: 'slot:' + kind,
+    // Policy prior exactly as the online decorator derives it when replay has no
+    // extra context: same shares, no memory modulation, unit temperature. A
+    // parity caller injects `priorLogitOf` to reproduce the online context.
+    baseLogit:
+      priorLogitOf === undefined
+        ? policyPriorLogit(slotWeights, kind)
+        : priorLogitOf(kind, slotWeights),
+    source: 'policy_prior' as const,
+    payload: { slotKind: kind }
+  }));
+}
+
+/**
+ * Build the synchronous Dream replay simulator (plan section 7.3-2 / P6 PR5).
  *
- *  1. keep the level-'meta' records (the L1 portfolio level) and, for a
- *     `guidance_free` frontier node, only `guidance_free` evidence, mirroring the
- *     invariant isolation L1 enforces at decision time;
- *  2. down-weight records written by a superseded policy through
- *     retriever.driftFactorFor() (plan section 7.3-4), exactly once per record -
- *     the store never applies drift on its own;
- *  3. estimate Q(slot) as the weighted mean return of that slot's records and
- *     V(s) over the whole snapshot, then re-apportion the three search shares
- *     with the closed form pi'(slot) ~ pi(slot) * exp(beta * A-tilde(slot)). The
- *     recovery share is held fixed. beta comes from the policy under replay,
- *     which is what makes the perturbed candidate hyperparameters meaningful;
- *  4. report the same diagnostics shape L1 reports, so replay evidence and the
- *     live decorator can be compared field by field.
+ * This is a *shell*: the entire algorithm - filtering, bucket/Jaccard/decay
+ * top-k retrieval, Q/V/advantage, the closed-form logit correction and the slot
+ * allocation - is `runDecisionKernel()`, the same pure function the online L1
+ * decorator calls (plan section 7.1). Before P6 this hook re-implemented the
+ * correction (weighted means over the whole level, its own exp(beta * A)
+ * re-apportioning, no nearest-neighbour retrieval and no top-k truncation), so
+ * offline replay evaluated a different policy than the one that ran online.
  *
- * Cold start (empty snapshot) is a normal path: the prior weights are returned
- * unchanged with `adjustments: []`. The hook never throws and never mutates its
- * input, so callers can treat any failure as "prior weights".
+ * Replay's only two jobs are (a) hand the kernel the snapshot the caller
+ * truncated to the replayed tree's own past and (b) project the kernel result
+ * back onto the JitReplayHookResult shape. The recovery share is held at its
+ * prior, which is what makes a replay correction comparable to L1's, where the
+ * recovery cap is structural.
+ *
+ * Cold start (empty snapshot) is a normal path: the prior weights come back
+ * unchanged. The hook never throws and never mutates its input, so a caller can
+ * treat any failure as "prior weights".
  */
 export function createJitReplayHook(options: JitReplayHookFactoryOptions): JitReplayHook {
   const config = options.config;
   const configuredDrift = clampUnit(
     finiteNumber(options.driftRho) ? options.driftRho : config.dream.driftRho
   );
-  const neighbourBudget = Math.max(1, Math.trunc(finiteNumber(config.k) ? config.k : 10));
+  const fallbackState = (input: JitReplayHookInput): AbstractState =>
+    options.stateOf === undefined
+      ? replayStateFromFrontier(input)
+      : options.stateOf(input);
 
   return (input: JitReplayHookInput): JitReplayHookResult => {
     const priorShares = normalizedSlotShares(input.slotWeights);
     try {
-      const snapshot = Array.isArray(input.experiences) ? input.experiences : [];
-      const levelRecords: ExperienceRecord[] = [];
-      for (const record of snapshot) {
-        if (record === null || typeof record !== 'object') {
-          continue;
-        }
-        if (record.level !== 'meta' || !finiteNumber(record.return)) {
-          continue;
-        }
-        if (input.frontier.guidance === 'guidance_free' && record.guidance !== 'guidance_free') {
-          continue;
-        }
-        levelRecords.push(record);
-      }
-      if (levelRecords.length === 0) {
-        return {
-          slotWeights: input.slotWeights,
-          diagnostics: {
-            level: 'meta',
-            stateValue: 0,
-            neighborCount: 0,
-            klToPrior: 0,
-            adjustments: [],
-            notes: ['no causal neighbours inside the replay window']
-          }
-        };
-      }
-
       const driftRho = clampUnit(
         finiteNumber(input.driftRho) ? input.driftRho : configuredDrift
       );
-      const currentPolicyCount = levelRecords.filter(
-        (record) => record.policyId === input.policyId
-      ).length;
-      const driftContext = {
-        policyId: input.policyId,
-        driftRho,
-        currentBucketCount: currentPolicyCount,
-        k: neighbourBudget
-      };
-      const weighted: { readonly record: ExperienceRecord; readonly weight: number }[] = [];
-      for (const record of levelRecords) {
-        const weight =
-          input.policyId.length > 0 && driftRho < 1
-            ? driftFactorFor(record.policyId, driftContext)
-            : 1;
-        if (!finiteNumber(weight) || weight <= 0) {
-          continue;
-        }
-        weighted.push({ record, weight });
-      }
-      if (weighted.length === 0) {
-        return {
-          slotWeights: input.slotWeights,
-          diagnostics: {
-            level: 'meta',
-            stateValue: 0,
-            neighborCount: 0,
-            klToPrior: 0,
-            adjustments: [],
-            notes: ['every causal neighbour was dropped by the drift down-weight']
-          }
-        };
-      }
-
-      const stateValue = weightedMeanOf(
-        weighted.map((entry) => ({ value: entry.record.return, weight: entry.weight }))
-      );
-
-      const slotStats = new Map<
-        BatchSlotKind,
-        { readonly returns: number[]; readonly weights: number[] }
-      >();
-      for (const kind of BATCH_SLOT_KINDS) {
-        slotStats.set(kind, { returns: [], weights: [] });
-      }
-      for (const entry of weighted) {
-        const kind = slotKindOfActionKey(entry.record.actionKey);
-        if (kind === undefined) {
-          continue;
-        }
-        const bucket = slotStats.get(kind);
-        if (bucket === undefined) {
-          continue;
-        }
-        bucket.returns.push(entry.record.return);
-        bucket.weights.push(entry.weight);
-      }
-
-      const slotQ = new Map<BatchSlotKind, number>();
-      const slotSupport = new Map<BatchSlotKind, number>();
-      for (const kind of REPLAY_SEARCH_SLOTS) {
-        const bucket = slotStats.get(kind);
-        const support = bucket === undefined ? 0 : bucket.weights.length;
-        slotSupport.set(kind, support);
-        slotQ.set(
-          kind,
-          support === 0 || bucket === undefined
-            ? Number.NaN
-            : weightedMeanOf(
-                bucket.returns.map((value, index) => ({
-                  value,
-                  weight: bucket.weights[index] ?? 0
-                }))
-              )
-        );
-      }
-
-      const rawAdvantages = REPLAY_SEARCH_SLOTS.map((kind) => {
-        const q = slotQ.get(kind);
-        return q === undefined || !finiteNumber(q) ? 0 : q - stateValue;
+      const state = fallbackState(input);
+      const candidates =
+        options.priorLogitOf === undefined
+          ? replayCandidates(priorShares)
+          : replayCandidates(priorShares, options.priorLogitOf);
+      const jit = input.jit;
+      // Policy hyperparameters of the candidate under replay. k and beta come
+      // from the perturbed grid, which is what makes a candidate meaningful now
+      // that replay runs the same retrieval and correction as online.
+      const kernel = runDecisionKernel({
+        level: 'meta',
+        state,
+        candidates,
+        records: Array.isArray(input.experiences) ? input.experiences : [],
+        config: {
+          beta: finiteNumber(jit.beta) && jit.beta >= 0 ? jit.beta : 0,
+          k: Math.max(1, Math.trunc(finiteNumber(jit.k) ? jit.k : config.k)),
+          similarityThreshold: clampUnit(
+            finiteNumber(jit.similarityThreshold)
+              ? jit.similarityThreshold
+              : config.similarityThreshold
+          ),
+          selection: 'argmax',
+          // Exploration is disabled in replay by default: comparing candidate
+          // policies must not depend on an exploration draw (plan section 7.2
+          // keeps lambda/alpha out of the search grid for the same reason).
+          lambda: 0,
+          alpha: 0,
+          unseenFallback: 'baseline',
+          halfLifeMs: 0,
+          ...(input.policyId.length === 0
+            ? {}
+            : { policyId: input.policyId, driftRho })
+        },
+        guidance: input.frontier.guidance === 'guidance_free' ? 'guidance_free' : undefined,
+        // Learning-facing decision (plan sections 6.5 and 7.5): replay's
+        // neighbourhood must be the same evidence set the online decision may
+        // learn from, so legacy and learning-ineligible records are excluded on
+        // both sides. Without this, replay would "replay" a policy that consumed
+        // evidence the live path never sees.
+        ...learningFacingFilterOptions(),
+        ...(options.seed === undefined ? {} : { seed: options.seed }),
+        // No exploration draw: the deterministic-policy comparison mode.
+        rng: () => 1,
+        ...(options.now === undefined ? { } : { now: options.now() }),
+        projectNeighbors: projectNeighborsBySlotKind
       });
-      const normalizedAdvantages = normalizeAdvantages(rawAdvantages);
 
-      const beta = finiteNumber(input.jit.beta) && input.jit.beta >= 0 ? input.jit.beta : 0;
-      const rawShares: Record<BatchSlotKind, number> = {
-        exploit: 0,
-        explore_domain: 0,
-        explore_invariant: 0,
-        recover: priorShares.recover
-      };
-      for (let index = 0; index < REPLAY_SEARCH_SLOTS.length; index += 1) {
-        const kind = REPLAY_SEARCH_SLOTS[index] as BatchSlotKind;
-        const advantage = normalizedAdvantages[index] ?? 0;
-        rawShares[kind] = priorShares[kind] * Math.exp(beta * advantage);
-      }
-      let total = 0;
-      for (const kind of BATCH_SLOT_KINDS) {
-        const value = rawShares[kind];
-        if (finiteNumber(value) && value > 0) {
-          total += value;
-        }
-      }
-      const corrected: Record<BatchSlotKind, number> = {
-        exploit: 0,
-        explore_domain: 0,
-        explore_invariant: 0,
-        recover: 0
-      };
-      if (total > 0) {
-        for (const kind of BATCH_SLOT_KINDS) {
-          corrected[kind] = rawShares[kind] / total;
-        }
-      } else {
-        for (const kind of BATCH_SLOT_KINDS) {
-          corrected[kind] = priorShares[kind];
-        }
-      }
-
-      const adjustments: JitReplayAdjustment[] = REPLAY_SEARCH_SLOTS.map(
-        (kind, index) => {
-          const q = slotQ.get(kind);
-          const supported = q !== undefined && finiteNumber(q);
-          return {
-            actionKey: kind,
-            slot: kind,
-            baseWeight: priorShares[kind],
-            adjustedWeight: corrected[kind],
-            q: supported ? (q as number) : null,
-            advantage: rawAdvantages[index] ?? 0,
-            normalizedAdvantage: normalizedAdvantages[index] ?? 0,
-            support: slotSupport.get(kind) ?? 0,
-            explored: false
-          };
-        }
-      );
+      const corrected = replayedShares(kernel, priorShares);
+      // P6 PR5 parity: every slot kind the kernel decided on is reported, so a
+      // reviewer can compare replay's adjustments with the online diagnostics
+      // entry by entry instead of guessing which ones were omitted.
+      const adjustments: JitReplayAdjustment[] = BATCH_SLOT_KINDS.map((kind) => {
+        const entry = kernel.decision.adjustments.find(
+          (adjustment) => adjustment.candidate.actionKey === 'slot:' + kind
+        );
+        const supported = entry !== undefined && entry.q !== null;
+        return {
+          actionKey: kind,
+          slot: kind,
+          baseWeight: priorShares[kind],
+          adjustedWeight: corrected[kind],
+          q: supported ? (entry?.q ?? null) : null,
+          advantage: entry?.advantage ?? 0,
+          normalizedAdvantage: entry?.normalizedAdvantage ?? 0,
+          support: entry?.support ?? 0,
+          explored: entry?.explored ?? false
+        };
+      });
 
       const notes: string[] = [];
-      if (driftRho < 1 && currentPolicyCount < neighbourBudget) {
-        notes.push(
-          'drift rho=' +
-            String(driftRho) +
-            ' down-weighted superseded-policy evidence (' +
-            String(weighted.length - currentPolicyCount) +
-            ' of ' +
-            String(weighted.length) +
-            ' neighbours)'
-        );
+      if (driftRho < 1 && kernel.neighbors.length > 0) {
+        const drifted = kernel.neighbors.filter((entry) => entry.driftWeight !== undefined);
+        if (drifted.length > 0) {
+          notes.push(
+            'drift rho=' +
+              String(driftRho) +
+              ' down-weighted ' +
+              String(drifted.length) +
+              ' of ' +
+              String(kernel.neighbors.length) +
+              ' (level,bucket) neighbours'
+          );
+        }
       }
-      if (neighbourBudget > 0 && levelRecords.length > neighbourBudget) {
+      const support = freshPolicySupport(
+        Array.isArray(input.experiences) ? input.experiences : [],
+        {
+          level: 'meta',
+          bucket: state.bucket,
+          policyId: input.policyId,
+          k: Math.max(1, Math.trunc(finiteNumber(jit.k) ? jit.k : config.k)),
+          // M3 is a learning-facing count (plan sections 6.5 and 7.4): the
+          // freshness denominator decides when the drift penalty stops, so it
+          // must only ever be satisfied by evidence the new policy may learn
+          // from. Legacy and learning-ineligible records are counted as neither
+          // fresh nor usable.
+          ...learningFacingFilterOptions(),
+          ...(input.frontier.guidance === 'guidance_free'
+            ? { guidance: 'guidance_free' as const }
+            : {})
+        }
+      );
+      notes.push(
+        'fresh support (meta,' +
+          state.bucket +
+          ')=' +
+          String(support.fresh) +
+          '/' +
+          String(support.k) +
+          ' (usable ' +
+          String(support.usable) +
+          ')' +
+          (support.saturated ? '; drift penalty inactive' : '')
+      );
+      if (kernel.filters.kept !== kernel.filters.records) {
         notes.push(
-          'replay simulated ' +
-            String(levelRecords.length) +
-            ' causal neighbours beyond the k=' +
-            String(neighbourBudget) +
-            ' budget'
+          'filtered ' +
+            String(kernel.filters.records - kernel.filters.kept) +
+            ' of ' +
+            String(kernel.filters.records) +
+            ' causal records before retrieval'
         );
       }
 
@@ -854,8 +881,8 @@ export function createJitReplayHook(options: JitReplayHookFactoryOptions): JitRe
         slotWeights: corrected,
         diagnostics: {
           level: 'meta',
-          stateValue,
-          neighborCount: levelRecords.length,
+          stateValue: kernel.stateValue,
+          neighborCount: kernel.neighborCount,
           klToPrior: klDivergenceOf(corrected, priorShares),
           adjustments,
           ...(notes.length === 0 ? {} : { notes: notes.slice(0, REPLAY_NOTE_LIMIT) })
@@ -880,6 +907,44 @@ export function createJitReplayHook(options: JitReplayHookFactoryOptions): JitRe
     }
   };
 }
+
+/**
+ * Project a kernel slot allocation back onto the replay weight vector.
+ *
+ * The kernel allocates over all four kinds; replay holds the recovery share
+ * fixed at its prior (the recovery cap is structural in L1) and renormalizes the
+ * three search shares against it. When the kernel could not allocate (cold start
+ * or a non-slot action space) the prior shares come back unchanged.
+ */
+function replayedShares(
+  kernel: ReturnType<typeof runDecisionKernel<{ readonly slotKind: BatchSlotKind }>>,
+  priorShares: Readonly<Record<BatchSlotKind, number>>
+): Record<BatchSlotKind, number> {
+  const allocated = kernel.slotWeights;
+  const out: Record<BatchSlotKind, number> = {
+    exploit: priorShares.exploit,
+    explore_domain: priorShares.explore_domain,
+    explore_invariant: priorShares.explore_invariant,
+    recover: priorShares.recover
+  };
+  if (allocated === null) {
+    return out;
+  }
+  const searchTotal =
+    allocated.exploit + allocated.explore_domain + allocated.explore_invariant;
+  const searchBudget = Math.max(
+    0,
+    1 - priorShares.recover
+  );
+  if (!(searchTotal > 0) || !(searchBudget > 0)) {
+    return out;
+  }
+  for (const kind of REPLAY_SEARCH_SLOTS) {
+    out[kind] = (allocated[kind] / searchTotal) * searchBudget;
+  }
+  return out;
+}
+
 
 /**
  * Aggregate a raw experience snapshot into the mirror's outbound rows (plan

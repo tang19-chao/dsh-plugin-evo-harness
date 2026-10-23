@@ -12,7 +12,10 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   DEFAULT_JIT_BETAS,
+  DEFAULT_JIT_KS,
   DEFAULT_JIT_LAMBDAS,
+  DEFAULT_JIT_SIMILARITY_THRESHOLDS,
+  JIT_IGNORED_DIMENSIONS,
   causalCutoffFor,
   causalExperienceSnapshot,
   createModelPolicyGenerator,
@@ -345,22 +348,36 @@ function dreamRequest(overrides: Partial<OfflineDreamRequest> = {}): OfflineDrea
 // ---------------------------------------------------------------------------
 
 describe('jit hyperparameter perturbation', () => {
-  it('pairs one beta with one lambda per candidate and keeps the grid deterministic', () => {
+  it('sweeps only beta/k/similarityThreshold and inherits the ignored dimensions', () => {
     const baseline = policy();
     const first = generateCandidatePolicies(baseline, 6, { now: () => 11 });
     const second = generateCandidatePolicies(baseline, 6, { now: () => 11 });
     expect(first).toHaveLength(6);
     expect(second.map((entry) => entry.jit)).toEqual(first.map((entry) => entry.jit));
-    // index i takes betas[i % 3] together with lambdas[i % 3], never a merge.
+    // P6 PR5 (plan section 7.2): index i takes betas[i % 3], ks[i % 3] and
+    // similarityThresholds[i % 3]; the three swept dimensions move together and
+    // are never merged element-wise with the baseline record.
     expect(first.map((entry) => entry.jit?.beta)).toEqual([0.5, 1, 2, 0.5, 1, 2]);
-    expect(first.map((entry) => entry.jit?.lambda)).toEqual([0.02, 0.05, 0.1, 0.02, 0.05, 0.1]);
+    expect(first.map((entry) => entry.jit?.k)).toEqual([5, 10, 20, 5, 10, 20]);
+    expect(first.map((entry) => entry.jit?.similarityThreshold)).toEqual([
+      0.2, 0.3, 0.5, 0.2, 0.3, 0.5
+    ]);
+    // The ignored dimensions are inherited verbatim, and saying so is auditable
+    // through metadata.jitIgnored rather than being an implicit no-op.
     for (const candidate of first) {
+      expect(candidate.jit?.lambda).toBe(baseline.jit?.lambda);
       expect(candidate.jit?.alpha).toBe(baseline.jit?.alpha);
-      expect(candidate.jit?.k).toBe(baseline.jit?.k);
       expect(candidate.jit?.gamma).toBe(baseline.jit?.gamma);
-      expect(candidate.jit?.similarityThreshold).toBe(baseline.jit?.similarityThreshold);
+      expect(candidate.metadata?.jitIgnored).toEqual(['lambda', 'alpha', 'gamma']);
     }
+    // A changed dimension must be reported explicitly, not left implicit.
+    expect(first[0]?.metadata?.jitK).toBe(5);
+    expect(first[0]?.metadata?.jitSimilarityThreshold).toBe(0.2);
     expect(DEFAULT_JIT_BETAS).toEqual([0.5, 1, 2]);
+    expect(DEFAULT_JIT_KS).toEqual([5, 10, 20]);
+    expect(DEFAULT_JIT_SIMILARITY_THRESHOLDS).toEqual([0.2, 0.3, 0.5]);
+    // The lambda grid still exists for backwards compatibility, but it is not
+    // what produced the candidates above.
     expect(DEFAULT_JIT_LAMBDAS).toEqual([0.02, 0.05, 0.1]);
   });
 
@@ -384,12 +401,17 @@ describe('jit hyperparameter perturbation', () => {
     expect(bare.jit).toBeUndefined();
     const candidates = generateCandidatePolicies(bare, 3, { now: () => 1 });
     const defaults = defaultJitHyperparams();
-    expect(candidates[0]?.jit?.beta).toBe(0.5);
-    expect(candidates[0]?.jit?.lambda).toBe(0.02);
+    // Index 0 lands on the first grid point of every swept dimension; the
+    // inherited dimensions keep the kernel default verbatim.
+    expect(candidates[0]?.jit?.beta).toBe(DEFAULT_JIT_BETAS[0]);
+    expect(candidates[0]?.jit?.k).toBe(DEFAULT_JIT_KS[0]);
+    expect(candidates[0]?.jit?.similarityThreshold).toBe(
+      DEFAULT_JIT_SIMILARITY_THRESHOLDS[0]
+    );
+    expect(candidates[0]?.jit?.lambda).toBe(defaults.lambda);
     expect(candidates[0]?.jit?.alpha).toBe(defaults.alpha);
-    expect(candidates[0]?.jit?.k).toBe(defaults.k);
     expect(candidates[0]?.jit?.gamma).toBe(defaults.gamma);
-    expect(candidates[0]?.jit?.similarityThreshold).toBe(defaults.similarityThreshold);
+    expect(candidates[0]?.metadata?.jitIgnored).toEqual(['lambda', 'alpha', 'gamma']);
   });
 
   it('keeps the baseline jit untouched when perturbation is switched off', () => {
@@ -414,15 +436,32 @@ describe('jit hyperparameter perturbation', () => {
   it('drops invalid grid entries and falls back to the built-in grids when empty', () => {
     const grid = resolveJitPerturbationGrid({
       candidateJitBetas: [1, Number.NaN, -2, 2, 2],
+      candidateJitKs: [0, 3.5, 7],
+      candidateJitSimilarityThresholds: [-0.5, 0.4, 2],
       candidateJitLambdas: []
     });
     expect(grid.enabled).toBe(true);
     expect(grid.betas).toEqual([1, 2]);
+    // k must stay a positive integer and a threshold must stay inside [0, 1]:
+    // both are retriever preconditions, so an illegal grid point is dropped
+    // rather than silently clamped into the search space.
+    expect(grid.ks).toEqual([7]);
+    expect(grid.similarityThresholds).toEqual([0.4]);
+    // The legacy lambda grid is still resolved (backwards compatibility) but is
+    // reported as ignored, which is what makes "not searched" auditable.
     expect(grid.lambdas).toEqual([...DEFAULT_JIT_LAMBDAS]);
+    expect(grid.ignored.map((entry) => entry.dimension)).toEqual([
+      'lambda',
+      'alpha',
+      'gamma'
+    ]);
     expect(resolveJitPerturbationGrid({ hyperparamPerturbation: false })).toEqual({
       enabled: false,
       betas: [],
-      lambdas: []
+      ks: [],
+      similarityThresholds: [],
+      lambdas: [],
+      ignored: grid.ignored
     });
   });
 });
@@ -982,9 +1021,10 @@ describe('dual-loop hot-swap', () => {
   });
 
   it('drives candidate generation from the jit grid by default', async () => {
-    // The deterministic generator varies width/depth/profile and the jit grid
-    // together, so this test proves the default path perturbs beta/lambda by grid
-    // index; the fixed-dimension beta acceptance lives in the section above.
+    // The deterministic generator varies width/depth/profile and the swept jit
+    // dimensions together, so this test proves the default path perturbs beta/k/
+    // similarityThreshold by grid index and leaves the ignored ones alone; the
+    // fixed-dimension beta acceptance lives in the section above.
     const generated = generateCandidatePolicies(policy(), 3, { now: () => 100 });
     expect(generated.map((entry) => entry.id)).toEqual([
       'pi-0::dream-1',
@@ -992,7 +1032,14 @@ describe('dual-loop hot-swap', () => {
       'pi-0::dream-3'
     ]);
     expect(generated.map((entry) => entry.jit?.beta)).toEqual([0.5, 1, 2]);
-    expect(generated.map((entry) => entry.jit?.lambda)).toEqual([0.02, 0.05, 0.1]);
+    expect(generated.map((entry) => entry.jit?.k)).toEqual([5, 10, 20]);
+    expect(generated.map((entry) => entry.jit?.similarityThreshold)).toEqual([0.2, 0.3, 0.5]);
+    // Not one candidate was ranked by the ignored dimensions.
+    for (const entry of generated) {
+      expect(entry.jit?.lambda).toBe(policy().jit?.lambda);
+      expect(entry.jit?.alpha).toBe(policy().jit?.alpha);
+      expect(entry.jit?.gamma).toBe(policy().jit?.gamma);
+    }
 
     const dreamer = createOfflineDreamer({
       now: () => 100,
@@ -1010,5 +1057,11 @@ describe('dual-loop hot-swap', () => {
     expect(winner).toBeDefined();
     // The winner's hyperparameters are a point of the perturbed grid, not the baseline.
     expect([0.5, 1, 2]).toContain(winner?.jit?.beta);
+    // The report restates which dimensions were not searched, so a reader does
+    // not have to infer it from the grid.
+    const withShadow = report as unknown as { readonly ignoredDimensions?: readonly { readonly dimension: string }[] };
+    expect((withShadow.ignoredDimensions ?? []).map((entry) => entry.dimension)).toEqual(
+      JIT_IGNORED_DIMENSIONS.map((entry) => entry.dimension)
+    );
   });
 });

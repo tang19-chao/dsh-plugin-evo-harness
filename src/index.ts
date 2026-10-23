@@ -100,6 +100,10 @@ import {
   type JitRlDiagnostic
 } from './jitrl';
 import {
+  createScopeRegistry,
+  type ScopeRegistry
+} from './jitrl/scope-registry';
+import {
   createHostToolExperienceCollector,
   type HostToolExperienceCollector
 } from './jitrl/host-tool-experience';
@@ -111,6 +115,13 @@ import {
   type JitRecentDecision,
   type JitResetDrop
 } from './jitrl/commands';
+import {
+  createJitRuntimeControl,
+  type JitRuntimeControl,
+  type JitRuntimeSnapshot,
+  type JitSurface,
+  type MutableJitRuntimeControl
+} from './jitrl/runtime-control';
 import type {
   DerivedCacheStats,
   JitBatchDiagnostics
@@ -310,9 +321,18 @@ export interface EvoHarnessPluginOptions {
    * `config.jitrl.hostAdvisor.enabled` is true, so the default stays silent.   */
   readonly hostAdvisor?: HostAdvisor;
   /**
+   * Injected ScopeRegistry for trusted scope resolution and invariant branch
+   * isolation (PR3 / R2+R3, plan section 5.2). When omitted, createEvoHarnessPlugin
+   * creates a singleton registry and wires it to both the hook adapter and the
+   * host-tool experience collector.
+   */
+  readonly scopeRegistry?: ScopeRegistry;
+  /**
    * Probe branch/session an attached L3 advisor is scoped to. A dispatch that
-   * names a different branch or session is left untouched. Empty means the
-   * advisor is host-local (every dispatch in this host).   */
+   * names a different branch or session is left untouched. Unspecified means
+   * fail-closed: advice is only injected into dispatches whose scope is proven
+   * and authorized by the ScopeRegistry (never host-local across all dispatches).
+   */
   readonly hostAdvisorScope?: {
     readonly branchId?: string;
     readonly sessionId?: string;
@@ -410,6 +430,14 @@ export interface EvoHarnessJitRlStatus {
   /** Memory-bridge statistics mirror visibility (additive, Phase 5). */
   readonly mirror?: EvoHarnessMirrorStatus;
   /**
+   * Live runtime-control snapshot (additive, P6 PR2).
+   *
+   * `enabled` above is the CONFIGURED availability; this is the volatile state
+   * every surface reads. A status page must use `runtime.runtimeEnabled` for
+   * `/evo jit off` and `runtime.configured` for "is JitRL configured at all".
+   */
+  readonly runtime?: JitRuntimeSnapshot;
+  /**
    * Host-tool experience records currently held (additive, H2 repair). This is
    * the evidence the L3 advisor retrieves; before the repair it was always 0 in
    * a real plugin.
@@ -434,6 +462,10 @@ export interface EvoHarnessPlugin {
   /** Resolves once ctx.llm / ctx.tools / runBranch detection settles. */
   readonly collaborators: Promise<DshCollaborators | undefined>;
 
+  /**
+   * The ScopeRegistry instance managing trusted scope resolution and invariant isolation.
+   */
+  readonly scopeRegistry?: ScopeRegistry;
   /**
    * JitRL status. When the feature is off this reports { enabled: false } and
    * the plugin behaves exactly as it did before JitRL existed.   */
@@ -801,6 +833,10 @@ export function resolveHostAdapter(ctx: unknown,
           fallback: structured
         } : {
         }),
+        ... (options.scopeRegistry !== undefined ? {
+          scopeRegistry: options.scopeRegistry
+        } : {
+        }),
         onDiagnostic: (message) => diagnostics.push(message)
       });
     return {
@@ -829,7 +865,23 @@ export interface JitRlWiring {
   readonly status: EvoHarnessJitRlStatus;
   /** The mounted L1 decorator when creation succeeded (P3-E diagnostics). */
   readonly policy?: JitActivePolicy;
-  /** Mutable runtime switch shared with the decorator (/evo jit off|on). */
+  /**
+   * The single runtime control every JitRL surface shares (P6 PR2).
+   *
+   * Always present: an unconfigured plugin still exposes it so commands, the
+   * status page and the orchestrator can read `configured`/`runtimeEnabled`
+   * without probing for a kernel. It is created even when the kernel could not
+   * be built, and then reports `configured: false`.
+   */
+  readonly runtimeControl: MutableJitRuntimeControl;
+  /**
+   * Legacy mutable switch handed to the L1 decorator.
+   *
+   * Kept because `JitActivePolicyOptions.isRuntimeEnabled` takes a callback
+   * that reads a plain object; `setEnabled` writes BOTH this object and the
+   * runtime control so there is never a second source of truth. Consumers that
+   * are not the decorator must read `runtimeControl` instead.
+   */
   readonly runtimeEnabled?: {
     enabled: boolean
   };
@@ -843,6 +895,8 @@ export interface JitRlWiring {
   readonly mirrorState?: MirrorCounterState;
   /** P5-a/H2: host-tool experience producer wired to the hook adapter. */
   readonly hostTool?: HostToolExperienceCollector;
+  /** Injected ScopeRegistry instance (PR3 / F1). */
+  readonly scopeRegistry?: ScopeRegistry;
 }
 /** Mutable last-replay record written by the wired dreamer (Phase 4). */
 export interface DreamReplayRecorder {
@@ -923,12 +977,38 @@ function pickMirrorClient(clients: readonly unknown[] | undefined): JitMirrorMcp
 }
 /** Dreamer surface plus the P4 diagnostic accessor the orchestrator reads. */
 export interface WiredOfflineDreamer extends IOfflineDreamer {
-  /** True when a JitReplayHook is injected on every replay (Phase 4). */
+  /**
+   * True while a JitReplayHook is actually injected on replay.
+   *
+   * Dynamic on purpose (P6 PR2 repair F1): with `/evo jit off` the wrapper stops
+   * injecting the hook, so a status page must not keep reporting `true` from the
+   * mount-time wiring. Reads the live runtime surface, not a cached boolean.
+   */
   readonly hookAttached: boolean;
   /** Human-readable summary of the last replay's JitRL hook activity. */
   lastDreamDiagnostics?(): readonly string[];
 } function finiteOrZero(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+/**
+ * Copy a policy with its JitRL hyperparameters pinned to the incumbent's block.
+ *
+ * P6 PR2 repair F1: while JitRL is switched off, the dream may still replay and
+ * still hot-swap the BASIC Dream-RSI policy (pi/gamma/width/depth), but it must
+ * not smuggle the Jit perturbation grid (beta/lambda/alpha/k/threshold) into the
+ * live online policy. When the incumbent carries no explicit `jit` block the
+ * field is dropped entirely, which is exactly the pre-JitRL shape.
+ */
+function withoutJitPerturbation(
+  policy: MetaSearchPolicy,
+  incumbentJit: MetaSearchPolicy['jit']
+): MetaSearchPolicy {
+  if (incumbentJit !== undefined) {
+    return { ...policy, jit: incumbentJit };
+  }
+  const { jit: _dropped, ...rest } = policy;
+  void _dropped;
+  return rest;
 }
 /**
  * P4: wrap the offline dreamer so every replay simulates JitRL against the LIVE
@@ -950,9 +1030,33 @@ export function createJitWiredDreamer(input: {
   readonly config: EvoHarnessConfig;
   readonly base: OfflineDreamerOptions;
   readonly recorder: DreamReplayRecorder;
+  /**
+   * P6 PR2 repair F1: the `dreamJit` surface. Re-read at the START of every
+   * replay so `/evo jit off` takes effect on the next dream without recreating
+   * the dreamer. Absent keeps the pre-repair behaviour (hook always injected)
+   * for hosts that build this wrapper by hand.
+   */
+  readonly isJitRuntimeEnabled?: () => boolean;
 }): WiredOfflineDreamer {
   let lastDiagnostics: readonly string[] = [];
   const now = input.base.now ?? ((): number => Date.now());
+  /**
+   * Re-read the switch, fail closed.
+   *
+   * A throwing predicate disables the Jit surfaces: an error must never be the
+   * reason a switched-off simulation keeps running.
+   */
+  const jitRuntimeOn = (): boolean => {
+    const check = input.isJitRuntimeEnabled;
+    if (check === undefined) {
+      return true;
+    }
+    try {
+      return check() === true;
+    } catch {
+      return false;
+    }
+  };
   // P4-b: the configured perturbation grid must reach candidate generation; a
   // model-backed generator keeps its own call and falls back to the grid.
   const grid = input.config.jitrl.dream;
@@ -975,12 +1079,21 @@ export function createJitWiredDreamer(input: {
     return typeof store.snapshot === 'function' ? store.snapshot() : [];
   };
   return {
-    hookAttached: true,
+    // Dynamic (P6 PR2 repair F1): `/evo jit off` stops injecting the hook, so a
+    // status page must not keep reporting the mount-time `true`.
+    get hookAttached(): boolean {
+      return jitRuntimeOn();
+    },
     lastDreamDiagnostics(): readonly string[] {
       return lastDiagnostics;
     },
     async replay(request): Promise<DreamReplayReport> {
       const driftRho = input.config.jitrl.dream.driftRho;
+      // F1: read the `dreamJit` surface at the START of every replay. Off means
+      // the basic Dream-RSI replay still runs (it must - plan section 4 R1), but
+      // the Jit simulation does not: no hook, no Jit-guided frontier ordering and
+      // no perturbed Jit hyperparameters hot-swapped into the online policy.
+      const jitOn = jitRuntimeOn();
       const seen = new Map<string,
         {
           readonly policyId: string;
@@ -1003,20 +1116,50 @@ export function createJitWiredDreamer(input: {
           });
         return innerHook(hookInput);
       };
-      const dreamer = createOfflineDreamer({
+      const baseOptions: OfflineDreamerOptions = {
         ...input.base,
         generatePolicies,
-        experiences: snapshot(),
-        jitHook: recordingHook,
-        driftRho
-      });
+        experiences: snapshot()
+      };
+      const dreamer = createOfflineDreamer(
+        jitOn
+          ? {
+              ...baseOptions,
+              jitHook: recordingHook,
+              driftRho
+            }
+          : {
+              // No `jitHook`: replayTree() takes its documented legacy branch
+              // (orderFrontier without Jit weighting) because `hook === undefined`.
+              ...baseOptions,
+              // The basic Dream-RSI hot swap still happens - off must not disable
+              // the base loop - but the winner's Jit hyperparameters are pinned to
+              // the incumbent's block, so a perturbation grid can never leak into
+              // the live online policy while the switch is off.
+              applyPolicy: (policy: MetaSearchPolicy): void | Promise<void> => {
+                const holder = input.base.activePolicy as
+                  | {
+                      readonly policy?: MetaSearchPolicy;
+                      update(policy: MetaSearchPolicy): void;
+                    }
+                  | undefined;
+                const pinned = withoutJitPerturbation(policy, holder?.policy?.jit);
+                if (input.base.applyPolicy !== undefined) {
+                  return input.base.applyPolicy(pinned);
+                }
+                holder?.update(pinned);
+              }
+            }
+      );
       const report = await dreamer.replay(request);
       const candidates = [...seen.values()].sort((left,
         right) => left.policyId < right.policyId ? - 1 : left.policyId > right.policyId ? 1 : 0);
       const holder = input.base.activePolicy as | {
         readonly policy?: MetaSearchPolicy
       } | undefined;
-      const appliedJit = report.improved ? holder?.policy?.jit : undefined;
+      // With the switch off there is no Jit hot swap to report, even when the
+      // basic replay improved: `appliedJit` describes a Jit swap, not replay gain.
+      const appliedJit = jitOn && report.improved ? holder?.policy?.jit : undefined;
       input.recorder.lastReplay = {
         ranAt: report.ranAt,
         hookCalls,
@@ -1033,7 +1176,9 @@ export function createJitWiredDreamer(input: {
       };
       const betas = [... new Set(candidates.map((candidate) => candidate.beta))].sort((left,
         right) => left - right);
-      lastDiagnostics = ['offline dream jit: ' + String(hookCalls) + ' replay hook call(s) across ' + String(candidates.length) + ' polic' + (candidates.length === 1 ? 'y' : 'ies') + ' (beta ' + (betas.length === 0 ? 'n/a' : betas.join('/')) + ', driftRho ' + String(driftRho) + ')'];
+      lastDiagnostics = [jitOn
+        ? 'offline dream jit: ' + String(hookCalls) + ' replay hook call(s) across ' + String(candidates.length) + ' polic' + (candidates.length === 1 ? 'y' : 'ies') + ' (beta ' + (betas.length === 0 ? 'n/a' : betas.join('/')) + ', driftRho ' + String(driftRho) + ')'
+        : 'offline dream jit: the dreamJit runtime surface is off; the basic Dream-RSI replay ran without the Jit hook (Jit hyperparameters were not hot-swapped)'];
       return report;
     }
   };
@@ -1053,6 +1198,7 @@ export function buildJitRlWiring(input: {
   readonly config: EvoHarnessConfig;
   readonly policy: IActivePolicy;
   readonly options: EvoHarnessPluginOptions;
+  readonly scopeRegistry?: ScopeRegistry;
   readonly persistence: PersistenceRuntime | undefined;
   readonly diagnostics: string[];
   readonly now: () => number;
@@ -1084,7 +1230,10 @@ export function buildJitRlWiring(input: {
       policy: input.policy,
       wiring: {
         kernel: undefined,
-        status: disabledStatus
+        status: disabledStatus,
+        // Unconfigured, not merely switched off: `configured` stays false so no
+        // caller can mistake the absent kernel for a volatile `off`.
+        runtimeControl: createJitRuntimeControl({ configured: false })
       }
     };
   } try {
@@ -1099,10 +1248,16 @@ export function buildJitRlWiring(input: {
         input.diagnostics.push('jitrl: ' + diagnostic.message);
       }
     });
+    // The one runtime switch every JitRL surface reads (P6 PR2). L1, L3, the
+    // mirror, host-tool collection, the online recorder and the L2 selector all
+    // consult this object; `/evo jit off` flips it and nothing else.
+    const runtimeControl = createJitRuntimeControl({ configured: true });
     // Runtime switch shared with the command surface; /evo jit off flips this
     // and the decorator returns the baseline plan until it is flipped back.
+    // `setEnabled` writes this object and the control together, so the
+    // decorator cannot drift from the control.
     const runtimeEnabled = {
-      enabled: true
+      enabled: runtimeControl.snapshot().runtimeEnabled
     };
     const wrapped = kernel.createJitActivePolicy({
       inner: input.policy,
@@ -1117,9 +1272,13 @@ export function buildJitRlWiring(input: {
     }
     // P4/P5 wiring state. The recorder and counters are shared by reference with
     // the dreamer wrapper and the post-run mirror sync, so the status getter
-    // always reads live values (never a stale snapshot).
+    // always reads live values (never a stale snapshot). `hookAttached` is a
+    // getter because the `dreamJit` runtime surface can turn the hook off later
+    // (P6 PR2 repair F1): a status page must see the live answer.
     const dreamRecorder: DreamReplayRecorder = {
-      hookAttached: true
+      get hookAttached(): boolean {
+        return runtimeControl.isEnabled('dreamJit');
+      }
     };
     const mirrorState: MirrorCounterState = {
       calls: 0,
@@ -1137,12 +1296,14 @@ export function buildJitRlWiring(input: {
     // createEvoHarnessPlugin once the adapter exists. Collection follows the L3
     // switch: with hostAdvisor.enabled=false the default stays exactly as silent
     // as before (no extra records, no extra store writes).
+    const effectiveScopeRegistry = input.options.scopeRegistry ?? input.scopeRegistry;
     const hostTool = jitrl.hostAdvisor.enabled
       ? createHostToolExperienceCollector({
           config: input.config,
           store: kernel.store,
           now: input.now,
           policyId: () => wrapped.policy.id,
+          scopeRegistry: effectiveScopeRegistry,
           onDiagnostic: (message) => input.diagnostics.push('jitrl host-tool: ' + message)
         })
       : undefined;
@@ -1173,11 +1334,13 @@ export function buildJitRlWiring(input: {
         kernel,
         status,
         policy: wrapped,
+        runtimeControl,
         runtimeEnabled,
         dream: dreamRecorder,
         mirror,
         mirrorState,
         hostTool,
+        scopeRegistry: effectiveScopeRegistry,
         ... (advisor === undefined ? {
         } : {
           advisor
@@ -1190,7 +1353,10 @@ export function buildJitRlWiring(input: {
       policy: input.policy,
       wiring: {
         kernel: undefined,
-        status: disabledStatus
+        status: disabledStatus,
+        // The kernel exists no more, so no surface may act: report an
+        // unconfigured control instead of a half-wired one.
+        runtimeControl: createJitRuntimeControl({ configured: false })
       }
     };
   }
@@ -1231,11 +1397,21 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     sequence += 1;
     return 'evo-' + String(sequence);
   });
+  const scopeRegistry =
+    options.scopeRegistry ??
+    createScopeRegistry({
+      now,
+      onDiagnostic: (msg) => diagnostics.push('scope-registry: ' + msg)
+    });
+  const effectiveOptions: EvoHarnessPluginOptions = {
+    ...options,
+    scopeRegistry
+  };
   const {
     hostAdapter,
     hostAdapterSource
   } = resolveHostAdapter(ctx,
-    options,
+    effectiveOptions,
     diagnostics);
   if (hostAdapterSource === 'in-memory') {
     diagnostics.push('no Cordis capability seams were discoverable on the host context; an in-process in-memory host adapter is mounted so the lifecycle still runs (inject options.host for real sandboxed probes)');
@@ -1290,7 +1466,8 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
   const jitWiring = buildJitRlWiring({
     config,
     policy,
-    options,
+    options: effectiveOptions,
+    scopeRegistry,
     persistence,
     diagnostics,
     now
@@ -1334,7 +1511,12 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
       kernel: jitWiring.wiring.kernel,
       config,
       base: dreamBase,
-      recorder: jitWiring.wiring.dream
+      recorder: jitWiring.wiring.dream,
+      // P6 PR2 repair F1: the `dreamJit` surface, read at every replay. This is
+      // the consumer the plan requires ("离线 Jit 重放和热替换也必须明确受哪个
+      // 开关管理"), and it is the ONLY thing `/evo jit off` changes about dreaming:
+      // the base Dream-RSI cadence and reports stay untouched.
+      isJitRuntimeEnabled: () => jitWiring.wiring.runtimeControl.isEnabled('dreamJit')
     }) : createOfflineDreamer(dreamBase));
   // Branch executor order: an explicit host runner wins (a test or integrator
   // override), then the multi-step agent probe executor, then the loud-failure
@@ -1364,6 +1546,11 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     } : {
       jitrl: jitWiring.wiring.kernel
     }),
+    // P6 PR2: the orchestrator reads the SAME runtime control as the command
+    // surface. Without it, `selectProposal`/`recordOnlineExperience` could only
+    // see the static `kernel.config.enabled` and `/evo jit off` would not stop
+    // the K-candidate path or the experience append (plan R1).
+    jitRuntime: jitWiring.wiring.runtimeControl,
     ... (persistence === undefined ? {
     } : {
       taskCounter: persistence.policyStore
@@ -1607,13 +1794,14 @@ export function createEvoHarnessPlugin(
     }
     diagnostics.push(message);
   };
-  // Single runtime switch for every JitRL surface (repair F1): L1 already reads
-  // it through jitWiring.runtimeEnabled; L3 and the mirror read this object so
-  // `/evo jit off` really stops advice, gate asks, mirror calls and evidence
-  // collection, and `/evo jit on` restores all of them.
-  const runtimeGate = {
-    enabled: jitWiring.status.enabled
-  };
+  // Single runtime control for every JitRL surface (repair F1, unified by P6
+  // PR2). L1 reads it through jitWiring.runtimeEnabled (written in lockstep by
+  // the command controller), the orchestrator reads it through deps.jitRuntime,
+  // and L3, the mirror, host-tool collection and the status page read it here.
+  // `/evo jit off` therefore stops decisions, collection, mirroring and the K
+  // candidate path, and `/evo jit on` restores all of them.
+  const runtimeControl = jitWiring.runtimeControl;
+  const isRuntimeOn = (surface: JitSurface): boolean => runtimeControl.isEnabled(surface);
   // The hook adapter owns host listeners the plugin installed itself; an
   // injected adapter stays owned by its injector.
   if (hostAdapterSource === 'dsh-hooks') {
@@ -1626,13 +1814,18 @@ export function createEvoHarnessPlugin(
     // host-tool experience producer. Evidence collection pauses while JitRL is
     // switched off at runtime.
     const hookWiring = hostAdapter as DshHookHostAdapter;
+    if (typeof hookWiring.setScopeRegistry === 'function' && jitWiring.scopeRegistry !== undefined) {
+      hookWiring.setScopeRegistry(jitWiring.scopeRegistry);
+    }
     const hostTool = jitWiring.hostTool;
     if (hostTool !== undefined && typeof hookWiring.setHostToolExperienceSink === 'function') {
       hookWiring.setHostToolExperienceSink({
+        // hostRecord: evidence collection pauses while JitRL is switched off at
+        // runtime, and resumes on the next observation after `/evo jit on`.
         observeToolCall: (observation) =>
-          runtimeGate.enabled ? hostTool.observeToolCall(observation) : Promise.resolve(),
+          isRuntimeOn('hostRecord') ? hostTool.observeToolCall(observation) : Promise.resolve(),
         observeTurnEnd: (observation) =>
-          runtimeGate.enabled ? hostTool.observeTurnEnd(observation) : Promise.resolve()
+          isRuntimeOn('hostRecord') ? hostTool.observeTurnEnd(observation) : Promise.resolve()
       });
       diagnostics.push('jitrl: host-tool experience producer attached to the DSH hook adapter');
     }
@@ -1643,7 +1836,7 @@ export function createEvoHarnessPlugin(
       hookWiring.attachHostAdvisor(jitWiring.advisor,
         {
           mode: resolved.jitrl.hostAdvisor.mode,
-          isRuntimeEnabled: () => runtimeGate.enabled,
+          isRuntimeEnabled: () => isRuntimeOn('advisor'),
           ... (options.hostAdvisorScope === undefined ? {
           } : {
             scope: options.hostAdvisorScope
@@ -1685,7 +1878,10 @@ export function createEvoHarnessPlugin(
         }),
         mirror: mirrorJitStatus(resolved,
           jitWiring.mirrorState),
-        hostToolExperiences: 0
+        hostToolExperiences: 0,
+        // Unconfigured: configured=false and every surface is off. Reported from
+        // the control itself so a status page never has to infer it.
+        runtime: runtimeControl.snapshot()
       };
     } const decorator = jitWiring.policy;
     const advisorAttached = jitWiring.advisor !== undefined && hostAdapterSource === 'dsh-hooks';
@@ -1708,7 +1904,7 @@ export function createEvoHarnessPlugin(
       hostAdvisor: hostAdvisorJitStatus({
         config: resolved,
         attached: advisorAttached,
-        runtimeEnabled: runtimeGate.enabled,
+        runtimeEnabled: runtimeControl.snapshot().runtimeEnabled,
         ... (jitWiring.advisor === undefined ? {
         } : {
           advisor: jitWiring.advisor
@@ -1717,7 +1913,9 @@ export function createEvoHarnessPlugin(
       }),
       mirror: mirrorJitStatus(resolved,
         jitWiring.mirrorState),
-      hostToolExperiences: jitExperienceSnapshot().filter((record) => record.level === 'host_tool').length
+      hostToolExperiences: jitExperienceSnapshot().filter((record) => record.level === 'host_tool').length,
+      // The volatile view of the SAME control the orchestrator and hooks read.
+      runtime: runtimeControl.snapshot()
     };
   };
   /** Adapter-side L3 counters; zero when the adapter has no advisor support. */
@@ -1750,12 +1948,17 @@ export function createEvoHarnessPlugin(
     if (mirror === undefined || state === undefined || !resolved.jitrl.store.mirrorToMemoryBridge) {
       return;
     }
-    // Repair F1: `/evo jit off` also stops the mirror, so switching the feature
-    // off really means zero backend calls from that moment on.
-    if (!runtimeGate.enabled) {
+    // Repair F1, unified by P6 PR2: `/evo jit off` also stops the mirror, so
+    // switching the feature off really means zero backend calls from that
+    // moment on. Re-read immediately before the backend call: the rows are
+    // computed synchronously, but a switch flipped while this sync was pending
+    // must still win.
+    if (!isRuntimeOn('mirror')) {
       return;
     } const rows = aggregateExperienceStats(jitExperienceSnapshot());
     if (rows.length === 0) {
+      return;
+    } if (!isRuntimeOn('mirror')) {
       return;
     } try {
       const result = await mirror.mirror(rows);
@@ -1772,7 +1975,6 @@ export function createEvoHarnessPlugin(
       diagnostics.push('jitrl mirror: aggregate mirror failed (' + (error instanceof Error ? error.message : String(error)) + ')');
     }
   };
-  let volatileJitEnabled = jitWiring.status.enabled;
   const jitExperienceSnapshot = (): readonly ExperienceRecord[] => {
     const kernel = jitWiring.kernel;
     if (kernel === undefined) {
@@ -1817,17 +2019,19 @@ export function createEvoHarnessPlugin(
     };
   };
   const jitCommandController: JitCommandController = {
-    isEnabled: () => jitWiring.kernel !== undefined && volatileJitEnabled,
+    // The command surface reports the VOLATILE state, never `plugin.jitrl.enabled`
+    // (that field is `configured`; plan appendix A explicitly warns against
+    // asserting it reflects `/evo jit off`).
+    isEnabled: () => runtimeControl.snapshot().runtimeEnabled,
     setEnabled: (enabled) => {
-      volatileJitEnabled = jitWiring.kernel !== undefined && enabled;
-      // Flip the decorator's runtime switch too, so off really stops adjustments.
+      // One write path for every surface: the control is the source of truth,
+      // and the decorator's legacy switch is updated in lockstep so L1 cannot
+      // drift from the other six surfaces.
+      const snapshot = runtimeControl.setEnabled(enabled);
       if (jitWiring.runtimeEnabled !== undefined) {
-        jitWiring.runtimeEnabled.enabled = volatileJitEnabled;
+        jitWiring.runtimeEnabled.enabled = snapshot.runtimeEnabled;
       }
-      // Repair F1: the same toggle gates L3 (advice/gate), the mirror and the
-      // host-tool evidence producer.
-      runtimeGate.enabled = volatileJitEnabled;
-      return volatileJitEnabled;
+      return snapshot.runtimeEnabled;
     },
     levels: () => jitWiring.kernel === undefined ? [...resolved.jitrl.levels] : [...jitWiring.kernel.config.levels],
     storeSize: (level) => (jitWiring.kernel === undefined ? 0 : jitWiring.kernel.count(level)),
@@ -1936,6 +2140,46 @@ export function createEvoHarnessPlugin(
   /** Build the recovery prompt from a verified failure observation. */
   const failurePrompt = (failure: DshFailureEvent): string => failure.summary;
 
+  /**
+   * Unified run execution and teardown helper (L4 governance repair).
+   *
+   * Shared by plugin.run, plugin.runFromCommand, runFallback, and runCompletedTurn.
+   * Ensures:
+   * 1. Cold-start backfill is awaited (jitReady).
+   * 2. Orchestrator executes the run.
+   * 3. On successful execution: syncJitMirror() is called (subject to runtimeControl mirror policy).
+   * 4. On run failure (orchestrator threw an error): syncJitMirror() is NOT called.
+   *    Mirror sync MUST NOT be placed in an unconditional finally that runs on failure
+   *    or circumvents the off/failure policy.
+   * 5. Session inFlight guard is cleanly cleared in finally.
+   */
+  const executeRun = async (
+    request: EvoHarnessRunRequest,
+    runOpts?: { readonly trackInFlight?: boolean }
+  ): Promise<EvoHarnessRunResult> => {
+    const sessionId = request.sessionId;
+    if (runOpts?.trackInFlight && inFlight.has(sessionId)) {
+      report('a run is already in flight for ' + sessionId + '; run ignored');
+      throw new Error('run in flight for ' + sessionId);
+    }
+    if (runOpts?.trackInFlight) {
+      inFlight.add(sessionId);
+    }
+    try {
+      await jitReady;
+      const runResult = await orchestrator.run(request);
+      // Synchronize mirror only after a successful run.
+      // Mirror sync is conditioned on isRuntimeOn('mirror') inside syncJitMirror().
+      // It is NEVER executed unconditionally in finally so failure/off policy is respected.
+      await syncJitMirror();
+      return runResult;
+    } finally {
+      if (runOpts?.trackInFlight) {
+        inFlight.delete(sessionId);
+      }
+    }
+  };
+
   /** One auto_fallback run keyed by session, with an in-flight guard. */
   const runFallback = async (
     failure: DshFailureEvent
@@ -1952,28 +2196,28 @@ export function createEvoHarnessPlugin(
       report('auto_fallback: a run is already in flight for ' + sessionId + '; event ignored');
       return null;
     }
-    inFlight.add(sessionId);
     try {
-      return await orchestrator.run({
-        sessionId,
-        task: plugin.makeTask({ prompt: failurePrompt(failure) }),
-        trigger: 'auto_fallback',
-        metadata: {
-          autoFallback: true,
-          dshEvent: failure.dshEvent,
-          dshFailureKind: failure.kind,
-          failureSignals: failure.failureSignals,
-          evidence: failure.evidence
-        }
-      });
+      return await executeRun(
+        {
+          sessionId,
+          task: plugin.makeTask({ prompt: failurePrompt(failure) }),
+          trigger: 'auto_fallback',
+          metadata: {
+            autoFallback: true,
+            dshEvent: failure.dshEvent,
+            dshFailureKind: failure.kind,
+            failureSignals: failure.failureSignals,
+            evidence: failure.evidence
+          }
+        },
+        { trackInFlight: true }
+      );
     } catch (error) {
       report(
         'auto_fallback run failed: '
           + (error instanceof Error ? error.name + ': ' + error.message : String(error))
       );
       return null;
-    } finally {
-      inFlight.delete(sessionId);
     }
   };
 
@@ -1989,27 +2233,27 @@ export function createEvoHarnessPlugin(
       report('always: a run is already in flight for ' + sessionId + '; turn ignored');
       return null;
     }
-    inFlight.add(sessionId);
     try {
-      return await orchestrator.run({
-        sessionId,
-        task: plugin.makeTask({
-          prompt: 'improve the completed turn' + (turn.turn === undefined ? '' : ' #' + String(turn.turn))
-        }),
-        trigger: 'always',
-        metadata: {
-          dshEvent: turn.dshEvent,
-          completedTurn: turn.evidence
-        }
-      });
+      return await executeRun(
+        {
+          sessionId,
+          task: plugin.makeTask({
+            prompt: 'improve the completed turn' + (turn.turn === undefined ? '' : ' #' + String(turn.turn))
+          }),
+          trigger: 'always',
+          metadata: {
+            dshEvent: turn.dshEvent,
+            completedTurn: turn.evidence
+          }
+        },
+        { trackInFlight: true }
+      );
     } catch (error) {
       report(
         'always run failed: '
           + (error instanceof Error ? error.name + ': ' + error.message : String(error))
       );
       return null;
-    } finally {
-      inFlight.delete(sessionId);
     }
   };
 
@@ -2023,18 +2267,14 @@ export function createEvoHarnessPlugin(
     hostAdapterSource,
     modelRoute,
     collaborators,
+    get scopeRegistry(): ScopeRegistry | undefined {
+      return jitWiring.scopeRegistry;
+    },
     get jitrl(): EvoHarnessJitRlStatus {
       return currentJitRlStatus();
     },
     async run(request: EvoHarnessRunRequest): Promise<EvoHarnessRunResult> {
-      // The very first run may start before the cold-start backfill finished;
-      // waiting here (not at construction) keeps the plugin synchronous to mount.
-      await jitReady;
-      const runResult = await orchestrator.run(request);
-      // P5-b: mirror the aggregate statistics this run just wrote. A disabled
-      // mirror returns before the first backend call, so it costs nothing.
-      await syncJitMirror();
-      return runResult;
+      return executeRun(request);
     },
     async runFromCommand(args: unknown,
       context?: unknown): Promise<EvoHarnessCommandRunResult> {
@@ -2078,12 +2318,11 @@ export function createEvoHarnessPlugin(
         } : {
         })
       });
-      const runResult = await orchestrator.run({
+      const runResult = await executeRun({
         sessionId,
         task,
         trigger: 'slash_command'
       });
-      await syncJitMirror();
       return runResult;
     },
     /**
@@ -2190,6 +2429,13 @@ export function createEvoHarnessPlugin(
           // ignore
         }
       } disposers.length = 0;
+      // P6 PR2: teardown is a permanent `off`. Disposing the control before the
+      // orchestrator means a run still settling in the same tick can no longer
+      // publish a decision, append experience or mirror anything.
+      runtimeControl.dispose();
+      if (jitWiring.runtimeEnabled !== undefined) {
+        jitWiring.runtimeEnabled.enabled = false;
+      }
       await orchestrator.dispose();
     }
   };
@@ -2496,6 +2742,24 @@ export {
   type BridgeMirrorStore,
   type JitMirrorMcpClient
 } from './jitrl';
+/**
+ * P6 PR2: the unified runtime control, re-exported so a host (or a status page
+ * built outside this package) can read the SAME object the plugin uses instead
+ * of re-deriving a boolean from `plugin.jitrl.enabled` (which is `configured`).
+ */
+export {
+  createScopeRegistry,
+  type ScopeRegistry,
+  type RegisteredScope,
+  type ScopeRegistrationSpec
+} from './jitrl/scope-registry';
+export {
+  createJitRuntimeControl,
+  JIT_SURFACES,
+  type JitRuntimeControl,
+  type JitRuntimeSnapshot,
+  type JitSurface
+} from './jitrl/runtime-control';
 export {
   createAgentLoopExecutor,
   asAgentLoopModel,

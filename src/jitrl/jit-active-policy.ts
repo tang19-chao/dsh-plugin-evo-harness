@@ -59,9 +59,15 @@ import {
   type ActivePolicy
 } from '../dream-rsi/active-policy';
 import { normalizeMetaAction } from './action-normalizer';
-import { composeDecision, softmax } from './logit-adjuster';
 import { policyPriorLogit } from './logit-sources';
-import { retrieveNeighbors } from './retriever';
+import {
+  learningFacingFilterOptions,
+  projectNeighborsBySlotKind,
+  runDecisionKernel,
+  slotWeightsFromDecision,
+  type EffectivePolicyConfigProvider,
+  type LayerDecisionConfig
+} from './decision-kernel';
 import {
   abstractMetaState,
   type JitReferenceStatus,
@@ -129,6 +135,25 @@ export interface JitBatchDiagnostics {
   readonly rationale: string;
   readonly degraded?: boolean;
   readonly degradedReason?: string;
+  /**
+   * P6 PR5 (plan section 7.3): version tag of the EffectivePolicyConfig this
+   * decision actually consumed (`<policyId>@v<version>`). Present on every
+   * decision the decorator takes, so a log line can be traced to the exact
+   * configuration that produced it; absent only on legacy degraded paths that
+   * never got as far as resolving a configuration.
+   */
+  readonly policyVersion?: string;
+  /** Dimensions deliberately left out of this round's search grid (§7.2). */
+  readonly ignoredDimensions?: readonly string[];
+  /** Server-side filter trace: how many records survived and why. */
+  readonly filter?: {
+    readonly records: number;
+    readonly kept: number;
+    /** True when legacy evidence was excluded from the neighbourhood (§6.5). */
+    readonly excludeLegacy?: boolean;
+    /** True when non-learning evidence was excluded (§6.2). */
+    readonly learningEligibleOnly?: boolean;
+  };
 }
 
 /** One per-slot diagnostic line; mirrors JitAdjustment with the action key inlined. */
@@ -252,6 +277,13 @@ export interface JitActivePolicyOptions {
   readonly defaultFocusSurfaces?: readonly HarnessComponentKey[];
   /** Diagnostic sink; the same notices are also kept in diagnostics(). */
   readonly onDiagnostic?: (message: string) => void;
+  /**
+   * P6 PR5 (plan section 7.3): versioned effective-configuration provider. When
+   * supplied it is read once per decision, so the decorator always consumes the
+   * currently published L1 configuration and records its version tag. Absent
+   * keeps the pre-PR5 behaviour (construction config merged with policy.jit).
+   */
+  readonly policyConfigProvider?: EffectivePolicyConfigProvider;
 }
 
 function resolveSnapshot(source: ExperienceSnapshotSource | undefined): readonly ExperienceRecord[] {
@@ -364,6 +396,21 @@ interface ResolvedConfig {
   readonly before: number | undefined;
   readonly useSurfaces: boolean;
   readonly surfaceActions: boolean;
+}
+
+/** Project the layer config the kernel consumes back onto the decorator knobs. */
+function layerFromResolved(config: ResolvedConfig): LayerDecisionConfig {
+  return {
+    beta: config.beta,
+    k: config.k,
+    similarityThreshold: config.similarityThreshold,
+    selection: config.selection,
+    lambda: config.lambda,
+    alpha: config.alpha,
+    unseenFallback: config.unseenFallback,
+    halfLifeMs: config.halfLifeMs,
+    ...(config.before === undefined ? {} : { before: config.before })
+  };
 }
 
 function resolveConfig(config: JitActivePolicyConfig): ResolvedConfig {
@@ -534,37 +581,62 @@ class JitActivePolicyImpl implements JitActivePolicy {
   }
 
   /**
-   * Merge the current policy's JitRL hyperparameters over the construction-time
-   * config (repair H1).
+   * Resolve the L1 configuration this decision consumes (repair H1 + P6 PR5).
    *
-   * `update()` swaps the base policy, and a dream hot swap replaces the policy
-   * together with its `jit` block (plan section 7.3-3), so beta/lambda/alpha/k
-   * and the similarity threshold must be read *per decision* instead of being
-   * frozen in the constructor. Reading `this.base.policy` on every call is what
-   * makes an `update()` take effect immediately without a second cache to keep
-   * in sync.
+   * Two sources, in order of authority:
    *
-   * A field is taken from `policy.jit` only when it is a usable finite value;
-   * anything missing (policy never hot swapped, older policy, or a malformed
-   * block) falls back to the resolved construction config field by field, which
-   * preserves the pre-repair behaviour exactly.
+   * 1. P6 PR5: when a `policyConfigProvider` is injected, it is read once per
+   *    decision. The provider holds the currently published configuration and its
+   *    version tag, so an `update()`-driven hot swap is visible on this very
+   *    decision *and* the decision records which version it consumed. That is
+   *    the plan section 7.3 contract; the provider is the single authority.
+   * 2. Without a provider (pre-PR5 wiring, hand-built decorators, unit tests),
+   *    fall back to merging the live policy's `jit` block over the construction
+   *    config field by field. This preserves repair H1 exactly.
    *
    * `gamma` is deliberately not mapped: it scales the return discount used by
    * the offline dreamer and the step evaluator, neither of which this decorator
-   * calls, so it has no online counterpart here.
+   * calls, so it has no online counterpart here (plan section 7.2 keeps gamma
+   * frozen this round; see POLICY_IGNORED_DIMENSIONS).
    */
-  private effectiveConfig(policy: MetaSearchPolicy): ResolvedConfig {
+  private effectiveConfig(policy: MetaSearchPolicy): {
+    readonly config: ResolvedConfig;
+    readonly policyVersion: string | undefined;
+  } {
+    const provider = this.options.policyConfigProvider;
+    if (provider !== undefined) {
+      const effective = provider.current('level1');
+      const layer = effective.level1;
+      return {
+        config: {
+          ...this.config,
+          beta: layer.beta,
+          k: layer.k,
+          similarityThreshold: layer.similarityThreshold,
+          selection: layer.selection,
+          lambda: layer.lambda,
+          alpha: layer.alpha,
+          unseenFallback: layer.unseenFallback,
+          halfLifeMs: layer.halfLifeMs,
+          before: layer.before ?? this.config.before
+        },
+        policyVersion: effective.versionTag
+      };
+    }
     const jit = policy.jit;
     if (jit === undefined) {
-      return this.config;
+      return { config: this.config, policyVersion: undefined };
     }
     return {
-      ...this.config,
-      beta: finiteOr(jit.beta, this.config.beta),
-      k: Math.max(1, Math.floor(finiteOr(jit.k, this.config.k))),
-      similarityThreshold: finiteOr(jit.similarityThreshold, this.config.similarityThreshold),
-      lambda: finiteOr(jit.lambda, this.config.lambda),
-      alpha: finiteOr(jit.alpha, this.config.alpha)
+      config: {
+        ...this.config,
+        beta: finiteOr(jit.beta, this.config.beta),
+        k: Math.max(1, Math.floor(finiteOr(jit.k, this.config.k))),
+        similarityThreshold: finiteOr(jit.similarityThreshold, this.config.similarityThreshold),
+        lambda: finiteOr(jit.lambda, this.config.lambda),
+        alpha: finiteOr(jit.alpha, this.config.alpha)
+      },
+      policyVersion: undefined
     };
   }
 
@@ -604,21 +676,51 @@ class JitActivePolicyImpl implements JitActivePolicy {
   /** One L1 correction: abstract, decide, re-apportion, attach diagnostics. */
   private adjust(request: SelectBatchRequest, baseline: BatchPlan): BatchPlan {
     const policy = this.base.policy;
-    // Repair H1: resolve the hyperparameters from the *current* policy so a hot
-    // swap (update() with a new jit block) takes effect on this very decision.
-    const config = this.effectiveConfig(policy);
+    // Repair H1 + P6 PR5: resolve the configuration from the *current* published
+    // version so a hot swap takes effect on this very decision, and keep the
+    // version tag so the diagnostics can record what was actually consumed.
+    const resolved = this.effectiveConfig(policy);
+    const config = resolved.config;
     const state = buildMetaState(request);
     const candidates = this.candidates(baseline, request, policy, config);
-    const neighbors = this.alignNeighbors(this.retrieve(state, config), candidates);
-    const decision = composeDecision('meta', state, neighbors, candidates, {
-      beta: config.beta,
-      selection: config.selection,
-      lambda: config.lambda,
-      alpha: config.alpha,
-      unseenFallback: config.unseenFallback,
-      rng: this.rng
+    // P6 PR5 / plan section 7.1: the SAME pure kernel Dream replay calls. Online
+    // supplies the current snapshot; replay supplies a causally truncated one.
+    // The neighbour projection (exact action key first, then slot kind) is the
+    // only L1-specific step, and it is passed in as a documented extension
+    // point instead of being a second retrieval algorithm.
+    const kernel = runDecisionKernel({
+      level: 'meta',
+      state,
+      candidates,
+      records: resolveSnapshot(this.options.experiences),
+      config: layerFromResolved(config),
+      ...(resolved.policyVersion === undefined
+        ? {}
+        : { policyVersion: resolved.policyVersion }),
+      now: this.now(),
+      rng: this.rng,
+      // Learning-facing decision (plan sections 6.2, 6.5 and 7.5): the L1
+      // neighbourhood must not contain legacy evidence (written under an older
+      // reward/provenance model) or records that were never a quality signal
+      // (user cancellation, infrastructure failure). Dream replay applies the
+      // same filter, which is what keeps offline and online on one evidence set.
+      ...learningFacingFilterOptions(),
+      projectNeighbors: (neighbors, projected) =>
+        this.alignNeighbors(neighbors, projected)
     });
-    const diagnostics = toDiagnostics(decision, candidates, config.surfaceActions);
+    const decision = kernel.decision;
+    const diagnostics = toDiagnostics(decision, candidates, config.surfaceActions, {
+      ...(resolved.policyVersion === undefined
+        ? {}
+        : { policyVersion: resolved.policyVersion }),
+      ignoredDimensions: kernel.ignored.map((entry) => entry.dimension),
+      filter: {
+        records: kernel.filters.records,
+        kept: kernel.filters.kept,
+        excludeLegacy: kernel.filters.excludeLegacy,
+        learningEligibleOnly: kernel.filters.learningEligibleOnly
+      }
+    });
 
     // A no-op correction must leave the plan byte-identical: with every
     // advantage zero the softmax of z' is the prior itself, so KL is exactly 0.
@@ -628,7 +730,7 @@ class JitActivePolicyImpl implements JitActivePolicy {
     }
 
     const weights = weightsFromDecision(decision, candidates);
-    const plan = this.reapportion(request, weights);
+    const plan = this.reapportion(request, weights, resolved.policyVersion);
     if (plan === undefined) {
       const reason =
         'the adjusted slot weights failed validation; kept the unadjusted plan';
@@ -706,68 +808,40 @@ class JitActivePolicyImpl implements JitActivePolicy {
     return out;
   }
 
-  /** Weighted neighbourhood for the abstract state, from the injected snapshot. */
-  private retrieve(
-    state: AbstractState,
-    config: ResolvedConfig
-  ): readonly ScoredExperience[] {
-    return retrieveNeighbors(resolveSnapshot(this.options.experiences), state, {
-      k: config.k,
-      similarityThreshold: config.similarityThreshold,
-      level: 'meta',
-      now: this.now(),
-      halfLifeMs: config.halfLifeMs,
-      ...(config.before === undefined ? {} : { before: config.before })
-    });
-  }
-
   /**
    * Map every retrieved L1 record onto the candidate that represents it.
    *
-   * Exact action key first: with the surface action space enabled a kind owns
-   * several candidates, and folding them all onto one key would hand every
-   * surface the whole kind's support and destroy the very discrimination the
-   * surface dimension exists for. Only when no candidate carries the exact key
-   * does the record fall back to its slot-kind representative, which is what
-   * keeps a backfilled 'slot:<kind>/surf:<...>' record attributable to the live
-   * candidate of that kind (support semantics documented in the verifier report
-   * A2: support is per action, never per exact spelling).
+   * Delegates to the kernel's shared projection so online and replay fold the
+   * neighbourhood identically (plan section 7.1); the semantics are documented
+   * on `projectNeighborsBySlotKind`.
    */
   private alignNeighbors(
     neighbors: readonly ScoredExperience[],
     candidates: readonly JitCandidate<MetaActionPayload>[]
   ): readonly ScoredExperience[] {
-    const keys = new Set(candidates.map((candidate) => candidate.actionKey));
-    const byKind = new Map<BatchSlotKind, string>();
-    for (const candidate of candidates) {
-      if (!byKind.has(candidate.payload.slotKind)) {
-        byKind.set(candidate.payload.slotKind, candidate.actionKey);
-      }
-    }
-    const out: ScoredExperience[] = [];
-    for (const neighbor of neighbors) {
-      if (keys.has(neighbor.record.actionKey)) {
-        out.push(neighbor);
-        continue;
-      }
-      const kind = slotKindOfActionKey(neighbor.record.actionKey);
-      const actionKey = kind === undefined ? undefined : byKind.get(kind);
-      if (actionKey === undefined) {
-        continue;
-      }
-      out.push({ ...neighbor, record: { ...neighbor.record, actionKey } });
-    }
-    return out;
+    return projectNeighborsBySlotKind(neighbors, candidates);
   }
 
-  /** Re-apportion through a validated, throw-away derived policy. */
+  /**
+   * Re-apportion through a validated, throw-away derived policy.
+   *
+   * P6 PR5 (plan section 7.3): the cache key carries the effective-configuration
+   * version, so a hot swap cannot be served a derived policy built from the
+   * previous version's weights even when the weight vector happens to repeat.
+   */
   private reapportion(
     request: SelectBatchRequest,
-    weights: Readonly<Record<BatchSlotKind, number>>
+    weights: Readonly<Record<BatchSlotKind, number>>,
+    policyVersion: string | undefined
   ): BatchPlan | undefined {
     const policy = this.base.policy;
     const key =
-      policy.id + '@' + String(policy.version) + '#' + weightSignature(weights);
+      policy.id +
+      '@' +
+      String(policy.version) +
+      (policyVersion === undefined ? '' : '~' + policyVersion) +
+      '#' +
+      weightSignature(weights);
     const derived = this.derivedFor(key, weights);
     if (derived === undefined) {
       return undefined;
@@ -864,11 +938,24 @@ function withJitMetadata(plan: BatchPlan, diagnostics: JitBatchDiagnostics): Bat
   };
 }
 
+/** Extra audit fields attached to one decision's diagnostics. */
+interface DiagnosticsAudit {
+  readonly policyVersion?: string;
+  readonly ignoredDimensions?: readonly string[];
+  readonly filter?: {
+    readonly records: number;
+    readonly kept: number;
+    readonly excludeLegacy?: boolean;
+    readonly learningEligibleOnly?: boolean;
+  };
+}
+
 /** Per-candidate diagnostics, in candidate (BATCH_SLOT_KINDS) order. */
 function toDiagnostics(
   decision: JitDecision<MetaActionPayload>,
   candidates: readonly JitCandidate<MetaActionPayload>[],
-  includeSurfaces = false
+  includeSurfaces = false,
+  audit: DiagnosticsAudit = {}
 ): JitBatchDiagnostics {
   const adjustments: JitBatchAdjustment[] = [];
   for (let index = 0; index < candidates.length; index += 1) {
@@ -899,35 +986,30 @@ function toDiagnostics(
     neighborCount: decision.neighborCount,
     klToPrior: decision.klToPrior,
     adjustments,
-    rationale: decision.rationale
+    rationale: decision.rationale,
+    ...(audit.policyVersion === undefined ? {} : { policyVersion: audit.policyVersion }),
+    ...(audit.ignoredDimensions === undefined
+      ? {}
+      : { ignoredDimensions: audit.ignoredDimensions }),
+    ...(audit.filter === undefined ? {} : { filter: audit.filter })
   };
 }
 
 /**
- * softmax(z') aggregated per slot kind. Candidates are one-per-kind, so the
- * aggregation is a direct copy; the sum over kinds is 1 by construction of
- * softmax, which keeps apportionSearchSlots scale-free.
+ * softmax(z') aggregated per slot kind (plan section 7.1: same allocation as
+ * replay). Delegates to the kernel's allocator so the two paths cannot drift;
+ * the kernel returns null only for a non-slot action space, which cannot happen
+ * here (every L1 candidate is a `slot:<kind>` key).
  */
 function weightsFromDecision(
   decision: JitDecision<MetaActionPayload>,
   candidates: readonly JitCandidate<MetaActionPayload>[]
 ): Readonly<Record<BatchSlotKind, number>> {
-  const probabilities = softmax(decision.adjustments.map((entry) => entry.adjustedLogit));
-  const weights: Record<BatchSlotKind, number> = {
-    exploit: 0,
-    explore_domain: 0,
-    explore_invariant: 0,
-    recover: 0
-  };
-  for (let index = 0; index < candidates.length; index += 1) {
-    const kind = (candidates[index] as JitCandidate<MetaActionPayload>).payload.slotKind;
-    const probability = probabilities[index];
-    if (probability === undefined || !Number.isFinite(probability)) {
-      continue;
-    }
-    weights[kind] += probability;
+  const weights = slotWeightsFromDecision(decision, candidates);
+  if (weights !== null) {
+    return weights;
   }
-  return weights;
+  return { exploit: 0, explore_domain: 0, explore_invariant: 0, recover: 0 };
 }
 
 /**

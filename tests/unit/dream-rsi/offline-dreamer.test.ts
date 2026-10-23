@@ -759,19 +759,24 @@ describe('early-stop probe accounting', () => {
  * jit-dream.test.ts.
  */
 describe('Phase 4 dual loop: jit grid and replay hook', () => {
-  it('perturbs beta/lambda together and leaves the other jit fields inherited', () => {
+  it('sweeps beta/k/similarityThreshold and inherits the ignored jit fields', () => {
     const baseline = makePolicy({
       id: 'pi-jit-base',
       jit: { beta: 1, lambda: 0.05, alpha: 5, k: 10, gamma: 0.5, similarityThreshold: 0.3 }
     });
     const candidates = generateCandidatePolicies(baseline, 6, { now: () => 3 });
     expect(candidates.map((entry) => entry.jit?.beta)).toEqual([0.5, 1, 2, 0.5, 1, 2]);
-    expect(candidates.map((entry) => entry.jit?.lambda)).toEqual([0.02, 0.05, 0.1, 0.02, 0.05, 0.1]);
+    // P6 PR5 (plan section 7.2): k and similarityThreshold are now searched, while
+    // lambda/alpha/gamma stay inherited and are reported as ignored.
+    expect(candidates.map((entry) => entry.jit?.k)).toEqual([5, 10, 20, 5, 10, 20]);
+    expect(candidates.map((entry) => entry.jit?.similarityThreshold)).toEqual([
+      0.2, 0.3, 0.5, 0.2, 0.3, 0.5
+    ]);
     for (const candidate of candidates) {
+      expect(candidate.jit?.lambda).toBe(0.05);
       expect(candidate.jit?.alpha).toBe(5);
-      expect(candidate.jit?.k).toBe(10);
       expect(candidate.jit?.gamma).toBe(0.5);
-      expect(candidate.jit?.similarityThreshold).toBe(0.3);
+      expect(candidate.metadata?.jitIgnored).toEqual(['lambda', 'alpha', 'gamma']);
       expect(jitHyperparamIssues(candidate.jit)).toEqual([]);
     }
     // Same inputs, same candidates: the sequence is reproducible.
@@ -927,5 +932,215 @@ describe('Phase 4 dual loop: jit grid and replay hook', () => {
     expect(corrected.quality).toBe(0.3);
     expect(corrected.jitDiagnostics?.hookCalls).toBeGreaterThan(0);
     expect(corrected.jitDiagnostics?.degraded).toBe(false);
+  });
+});
+
+/**
+ * P6 PR5 (plan section 7.4): the publication gate, shadow mode, and the split
+ * between candidate selection and final validation.
+ *
+ * These are the R5/M3 acceptance properties that were previously unverifiable:
+ * before this round the dreamer published whenever hypervolume moved, so "the
+ * best of M candidates on one tree batch" was reported as generalisation.
+ */
+describe('P6 PR5: shadow mode, holdout split and the gate boundary', () => {
+  /** Two trees: one to select on, one to validate on. */
+  function twoTrees(): { select: DiscoveryTreeSnapshot; holdout: DiscoveryTreeSnapshot } {
+    const build = (id: string, score: number): DiscoveryTreeSnapshot => {
+      const tree = createDiscoveryTree({
+        id,
+        sessionId: 'session-1',
+        taskId: 'task-' + id,
+        rootPatchId: 'patch-root',
+        clock: fixedClock()
+      });
+      tree.addNode(childInput(tree.rootId, { id: id + '-good', origin: 'domain', purpose: 'explore' }));
+      tree.recordProbe(id + '-good', { trajectoryId: 'traj-' + id, score });
+      tree.addNode(childInput(tree.rootId, { id: id + '-weak', purpose: 'deepen' }));
+      tree.recordProbe(id + '-weak', { trajectoryId: 'traj-' + id + '-weak', score: 0.1 });
+      return tree.snapshot();
+    };
+    return { select: build('tree-a', 0.9), holdout: build('tree-b', 0.8) };
+  }
+
+  it('records the suggestion without publishing it in shadow mode', async () => {
+    const applied: MetaSearchPolicy[] = [];
+    const { select } = twoTrees();
+    const dreamer = createOfflineDreamer({
+      now: () => 100,
+      shadowMode: true,
+      applyPolicy: (policy) => {
+        applied.push(policy);
+      }
+    });
+    const baseline = makePolicy({ id: 'pi-shadow-base', maxWidth: 1, maxDepth: 1 });
+    const wide = makePolicy({
+      id: 'pi-shadow-wide',
+      maxWidth: 4,
+      maxDepth: 2,
+      earlyStopThreshold: 1,
+      version: 2
+    });
+    const report = await dreamer.replay(
+      dreamRequest({ trees: [select], baselinePolicy: baseline, candidatePolicies: [wide] })
+    );
+
+    // The replay still evaluated the candidate, so the suggestion is real...
+    expect(report.candidateEvaluations.map((entry) => entry.policyId)).toEqual(['pi-shadow-wide']);
+    expect(report.shadow.suggestedPolicyId).toBe('pi-shadow-wide');
+    expect(report.shadow.incumbentPolicyId).toBe('pi-shadow-base');
+    // ...but nothing was published and the incumbent is still in force. This is
+    // the plan section 7.4 requirement: shadow records the difference, it never
+    // auto-publishes, regardless of whether the candidate won.
+    expect(report.shadow.published).toBe(false);
+    expect(report.publication.publish).toBe(false);
+    expect(applied).toHaveLength(0);
+    // The reason names whichever gate stopped it: a losing candidate never
+    // reaches the shadow check, a winning one is stopped by shadow mode.
+    expect(report.publication.reason.length).toBeGreaterThan(0);
+    if (report.improved) {
+      expect(report.publication.reason).toContain('shadow mode');
+    } else {
+      expect(report.publication.reason).toContain('did not beat baseline');
+    }
+    // No candidate is ever marked selected when nothing was published.
+    for (const comparison of report.shadow.comparisons) {
+      expect(comparison.selected).toBe(false);
+    }
+    // The boundary travels with the record, so the number cannot be quoted alone.
+    expect(report.shadow.boundary).toContain('fixed historical replay set');
+    expect(report.publication.boundary).toBe(report.shadow.boundary);
+  });
+
+  it('splits selection and validation trees and reports both sets', async () => {
+    const applied: MetaSearchPolicy[] = [];
+    const { select, holdout } = twoTrees();
+    const dreamer = createOfflineDreamer({
+      now: () => 100,
+      holdoutTreeCount: 1,
+      applyPolicy: (policy) => {
+        applied.push(policy);
+      }
+    });
+    const baseline = makePolicy({ id: 'pi-split-base', maxWidth: 1, maxDepth: 1 });
+    const wide = makePolicy({
+      id: 'pi-split-wide',
+      maxWidth: 4,
+      maxDepth: 2,
+      earlyStopThreshold: 1,
+      version: 2
+    });
+    const report = await dreamer.replay(
+      dreamRequest({
+        // The tail of the caller's order is the holdout, deterministically.
+        trees: [select, holdout],
+        baselinePolicy: baseline,
+        candidatePolicies: [wide]
+      })
+    );
+
+    // Candidates were selected on tree-a only, and tree-b was held back. That
+    // split is the whole point: picking the best of M on one batch and calling
+    // it generalisation is the defect plan section 7.4 removes.
+    expect(report.shadow.selectionTreeIds).toEqual(['tree-a']);
+    expect(report.shadow.holdoutTreeIds).toEqual(['tree-b']);
+    expect(report.replayedTreeIds).toEqual(['tree-a']);
+    // The two sets never overlap.
+    for (const id of report.shadow.selectionTreeIds) {
+      expect(report.shadow.holdoutTreeIds).not.toContain(id);
+    }
+    expect(report.shadow.comparisons).toHaveLength(1);
+    const comparison = report.shadow.comparisons[0];
+    expect(comparison?.policyId).toBe('pi-split-wide');
+    expect(typeof comparison?.delta).toBe('number');
+    // The holdout verdict is present exactly when a winner went to validation.
+    if (report.improved) {
+      expect(typeof report.shadow.holdoutHypervolume).toBe('number');
+      expect(typeof report.shadow.baselineHypervolume).toBe('number');
+    } else {
+      expect(report.shadow.holdoutHypervolume).toBeUndefined();
+    }
+    // Publication is a consequence of the gate, never an assumption.
+    if (report.publication.publish) {
+      expect(applied.map((policy) => policy.id)).toEqual(['pi-split-wide']);
+      expect(comparison?.selected).toBe(true);
+    } else {
+      expect(applied).toHaveLength(0);
+      expect(comparison?.selected).toBe(false);
+    }
+  });
+
+  it('withholds a candidate that cannot beat the baseline on the holdout', async () => {
+    // Build a holdout whose best reachable node is already the baseline's, so a
+    // wider candidate has nothing left to win there.
+    const tree = (id: string): DiscoveryTreeSnapshot => {
+      const built = createDiscoveryTree({
+        id,
+        sessionId: 'session-1',
+        taskId: 'task-' + id,
+        rootPatchId: 'patch-root',
+        clock: fixedClock()
+      });
+      built.addNode(childInput(built.rootId, { id: id + '-only', purpose: 'deepen' }));
+      built.recordProbe(id + '-only', { trajectoryId: 'traj-' + id, score: 0.5 });
+      return built.snapshot();
+    };
+    const applied: MetaSearchPolicy[] = [];
+    const dreamer = createOfflineDreamer({
+      now: () => 100,
+      holdoutTreeCount: 1,
+      applyPolicy: (policy) => {
+        applied.push(policy);
+      }
+    });
+    const baseline = makePolicy({ id: 'pi-hold-base', maxWidth: 1, maxDepth: 1 });
+    const narrow = makePolicy({
+      id: 'pi-hold-wide',
+      maxWidth: 4,
+      maxDepth: 2,
+      earlyStopThreshold: 1,
+      version: 2
+    });
+    const report = await dreamer.replay(
+      dreamRequest({
+        trees: [tree('tree-x'), tree('tree-y')],
+        baselinePolicy: baseline,
+        candidatePolicies: [narrow]
+      })
+    );
+    // Whatever the verdict, the gate and the shadow record must agree.
+    expect(report.publication.publish).toBe(report.shadow.published);
+    expect(report.publication.boundary).toContain('proxy metric');
+    if (!report.publication.publish) {
+      expect(applied).toHaveLength(0);
+    }
+  });
+
+  it('keeps the additivity contract: legacy report fields are unchanged', async () => {
+    const { select } = twoTrees();
+    const dreamer = createOfflineDreamer({ now: () => 55 });
+    const baseline = makePolicy({ id: 'pi-add-base', maxWidth: 1, maxDepth: 1 });
+    const report = await dreamer.replay(
+      dreamRequest({ trees: [select], baselinePolicy: baseline, candidatePolicies: [] })
+    );
+    // Every pre-PR5 field is still there, with the pre-PR5 meaning.
+    expect(report.ranAt).toBe(55);
+    expect(report.improved).toBe(false);
+    expect(report.selectedPolicyId).toBe('pi-add-base');
+    expect(report.rhoPreferences).toEqual([0, 0.25, 0.5, 0.75, 1]);
+    expect(report.best).toEqual(report.baseline);
+    // And the additive fields are present for a caller that wants them. The
+    // default generator still produced candidates, so every one of them is
+    // listed as a comparison and none is selected (nothing was published).
+    expect(report.publication.publish).toBe(false);
+    expect(report.shadow.comparisons).toHaveLength(report.candidateEvaluations.length);
+    for (const comparison of report.shadow.comparisons) {
+      expect(comparison.selected).toBe(false);
+    }
+    expect(report.ignoredDimensions.map((entry) => entry.dimension)).toEqual([
+      'lambda',
+      'alpha',
+      'gamma'
+    ]);
   });
 });

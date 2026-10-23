@@ -13,12 +13,17 @@ import type {
   ExperienceRecord
 } from '../../../src/types/contracts';
 import {
+  BACKFILL_PROVENANCE_VERSION,
   BACKFILL_RECORD_PREFIX,
+  BACKFILL_REWARD_VERSION,
   backfillFromTreePool,
   backfillRecordId,
   mapScoreToReward,
+  migrateExperienceRecords,
+  partitionExperienceRecords,
   type ExperienceAppendSink
 } from '../../../src/jitrl/backfill';
+import { EXPERIENCE_SCHEMA_VERSION } from '../../../src/jitrl/experience-store';
 import { createDiscoveryTreePool } from '../../../src/dream-rsi';
 import { createMemoryExperienceStore } from '../../../src/jitrl/stores/memory.store';
 
@@ -507,5 +512,139 @@ describe('G2-5: the walk is linear, not quadratic', () => {
     expect(result.unscored).toBe(2);
     expect(result.records.some((entry) => entry.nodeId === 'hub')).toBe(false);
     expect(result.records.some((entry) => entry.nodeId === 'root')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P6 PR4 / plan section 6.5: versioned rebuild + reversible legacy migration
+// ---------------------------------------------------------------------------
+
+describe('P6 PR4: rebuild provenance and legacy isolation', () => {
+  it('stamps rebuilt cold-start records with the current schema and the rebuild versions', async () => {
+    const sink = recordingSink();
+    const result = await backfillFromTreePool({ pool: [fixtureTree()], store: sink });
+    expect(result.records.length).toBeGreaterThan(0);
+    for (const record of result.records) {
+      expect(record.experienceSchemaVersion).toBe(EXPERIENCE_SCHEMA_VERSION);
+      expect(record.rewardVersion).toBe(BACKFILL_REWARD_VERSION);
+      expect(record.provenanceVersion).toBe(BACKFILL_PROVENANCE_VERSION);
+      expect(record.learningEligible).toBe(true);
+      // The tree can prove the node/parent pair, so it is recorded; the round
+      // and trajectory are recorded only when the node carries them.
+      expect(record.nodeId).toBeTypeOf('string');
+      expect(record.parentNodeId).toBeTypeOf('string');
+      expect(record.observedReturn).toBe(record.return);
+      expect(record.attributionBaseline).toBeTypeOf('number');
+      expect(record.learningTarget).toBeTypeOf('number');
+      expect(record.outcome).toBeTypeOf('string');
+    }
+  });
+
+  it('makes rebuilt records visible to a legacy-filtered query', async () => {
+    // The point of stamping: a rebuilt record must survive excludeLegacy, unlike
+    // a pre-PR4 line that carries no schema version at all.
+    const store = createMemoryExperienceStore({ now: () => T0 });
+    const result = await backfillFromTreePool({ pool: [fixtureTree()], store });
+    expect(result.records.length).toBeGreaterThan(0);
+    const first = result.records[0];
+    expect(first).toBeDefined();
+    if (first === undefined) {
+      return;
+    }
+    const learning = await store.query({
+      level: 'meta',
+      state: first.state,
+      k: 10,
+      similarityThreshold: 0,
+      excludeLegacy: true
+    });
+    expect(learning.length).toBeGreaterThan(0);
+  });
+
+  it('counts new vs legacy samples and marks legacy copies without touching the source', async () => {
+    const rebuilt = (
+      await backfillFromTreePool({ pool: [fixtureTree()], store: recordingSink() })
+    ).records;
+    // A pre-PR4 line: no schema version, no association.
+    const legacy: ExperienceRecord = {
+      ...(rebuilt[0] as ExperienceRecord),
+      id: 'legacy-online-1',
+      experienceSchemaVersion: undefined,
+      rewardVersion: undefined,
+      provenanceVersion: undefined,
+      trajectoryId: undefined,
+      round: undefined,
+      slotIndex: undefined
+    };
+    const source = [legacy, ...rebuilt];
+    const before = JSON.stringify(source);
+
+    const result = await migrateExperienceRecords({ records: source });
+    expect(result.current).toBe(rebuilt.length);
+    expect(result.legacy).toBe(1);
+    expect(result.excludedFromLearning).toBe(1);
+    expect(result.marked).toHaveLength(1);
+    expect(result.marked[0]?.id).toBe('legacy-online-1');
+    expect(result.marked[0]?.rewardVersion).toBe('legacy');
+    expect(result.marked[0]?.learningEligible).toBe(false);
+    // No in-place rewrite of the original snapshot.
+    expect(JSON.stringify(source)).toBe(before);
+
+    const partition = partitionExperienceRecords(source);
+    expect(partition.learning).toHaveLength(rebuilt.length);
+    expect(partition.auditOnly.map((record) => record.id)).toEqual(['legacy-online-1']);
+  });
+
+  it('writes the marked copies only to the injected audit sink (rollback = drop it)', async () => {
+    const legacy: ExperienceRecord = {
+      id: 'legacy-only',
+      level: 'meta',
+      state: { level: 'meta', bucket: 'b', tokens: ['t'], summary: '' },
+      actionKey: 'slot:exploit',
+      reward: 2,
+      return: 2,
+      rewardSources: { surrogate: 2 },
+      guidance: 'memory',
+      policyId: 'p',
+      sessionId: 's',
+      createdAt: T0,
+      redacted: true
+    };
+    const appended: ExperienceRecord[] = [];
+    const applied = await migrateExperienceRecords({
+      records: [legacy],
+      apply: true,
+      auditSink: { append: async (batch) => void appended.push(...batch) }
+    });
+    expect(applied.marked).toHaveLength(1);
+    expect(appended).toHaveLength(1);
+    expect(appended[0]?.id).toBe('legacy-only');
+    // The source object itself was never mutated.
+    expect(legacy.rewardVersion).toBeUndefined();
+    expect(legacy.learningEligible).toBeUndefined();
+  });
+
+  it('reports a dry run without an audit sink instead of writing', async () => {
+    const applied = await migrateExperienceRecords({
+      records: [
+        {
+          id: 'legacy-x',
+          level: 'meta',
+          state: { level: 'meta', bucket: 'b', tokens: ['t'], summary: '' },
+          actionKey: 'slot:exploit',
+          reward: 1,
+          return: 1,
+          rewardSources: {},
+          guidance: 'memory',
+          policyId: 'p',
+          sessionId: 's',
+          createdAt: T0,
+          redacted: true
+        }
+      ],
+      apply: true
+    });
+    expect(applied.marked).toHaveLength(1);
+    expect(applied.diagnostics.some((line) => line.includes('without an audit sink'))).toBe(true);
   });
 });

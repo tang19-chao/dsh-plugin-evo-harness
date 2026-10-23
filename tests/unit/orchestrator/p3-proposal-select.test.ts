@@ -31,6 +31,7 @@ import {
 } from '../../../src/jitrl';
 import { abstractProposalState } from '../../../src/jitrl/state-abstraction';
 import { createJitActivePolicy, slotKindOfActionKey } from '../../../src/jitrl/jit-active-policy';
+import { EXPERIENCE_SCHEMA_VERSION } from '../../../src/jitrl/experience-store';
 import type { LessonPatchSource } from '../../../src/jitrl/candidate-augmenter';
 import type {
   BatchPlan,
@@ -729,6 +730,7 @@ describe('jit_proposal_select (K proposals, one probe)', () => {
     await harness.store.append([
       {
         id: 'seed-proposal-1-negative',
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
         level: 'proposal',
         state,
         actionKey: normalizePatchSignature(harness.patches[0] as EightSurfacePatch),
@@ -744,6 +746,7 @@ describe('jit_proposal_select (K proposals, one probe)', () => {
       },
       {
         id: 'seed-proposal-2-positive',
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
         level: 'proposal',
         state,
         actionKey: normalizePatchSignature(favored as EightSurfacePatch),
@@ -806,6 +809,7 @@ describe('jit_proposal_select (K proposals, one probe)', () => {
     await harness.store.append([
       {
         id: 'seed-proposal-1-negative',
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
         level: 'proposal',
         state,
         actionKey: normalizePatchSignature(harness.patches[0] as EightSurfacePatch),
@@ -821,6 +825,7 @@ describe('jit_proposal_select (K proposals, one probe)', () => {
       },
       {
         id: 'seed-proposal-2-positive',
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
         level: 'proposal',
         state,
         actionKey: normalizePatchSignature(favored as EightSurfacePatch),
@@ -1189,6 +1194,7 @@ async function seedAugmentableNeighbour(
   await harness.store.append([
     {
       id: 'seed-augmentable',
+      experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
       level: 'proposal',
       state: augmentState(slot, guidance),
       actionKey,

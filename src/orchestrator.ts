@@ -93,7 +93,18 @@ import {
   type LessonPatchSource,
   type RehydratedAction
 } from './jitrl/candidate-augmenter';
-import { discountedReturn } from './jitrl/step-evaluator';
+import {
+  classifyTrajectoryOutcome,
+  discountedReturn,
+  isLearningOutcome,
+  scoreTrajectorySignals
+} from './jitrl/step-evaluator';
+import {
+  CURRENT_PROVENANCE_VERSION,
+  CURRENT_REWARD_VERSION,
+  EXPERIENCE_SCHEMA_VERSION
+} from './jitrl/experience-store';
+import type { JitRuntimeControl, JitSurface } from './jitrl/runtime-control';
 import { createDiscoveryTree } from './dream-rsi';
 import type {
   DiscoveryTree,
@@ -189,6 +200,20 @@ export interface EvoHarnessOrchestratorDeps {
    * lifecycle.
    */
   readonly jitrl?: OrchestratorJitRl;
+  /**
+   * The single JitRL runtime control the plugin entrypoint owns (P6 PR2).
+   *
+   * Injected rather than imported so the orchestrator stays free of the entry
+   * module and a host can still drive the orchestrator directly. Absent means
+   * "no volatile switch is wired": the orchestrator then falls back to the
+   * static `jitrl.config.enabled`/`levels`, which is exactly the pre-PR2
+   * behaviour for hosts that construct it by hand.
+   *
+   * When present it is authoritative for every surface: `/evo jit off` flips it
+   * and `selectProposal`/`recordOnlineExperience` must stop, even though
+   * `kernel.config.enabled` (configured) is still true.
+   */
+  readonly jitRuntime?: JitRuntimeControl;
   readonly onStage?: (event: EvoHarnessStageEvent) => void;
 }
 
@@ -530,10 +555,32 @@ function nodeStatusFor(status: ProbeTrajectory['status']): 'succeeded' | 'failed
   return status === 'succeeded' ? 'succeeded' : 'failed';
 }
 
+/**
+ * Deduplication key for one appended experience record (plan section 6.2:
+ * "记录去重"). It combines the identity of the action with the identity of the
+ * execution, so re-entering the recorder cannot double-count a probe while two
+ * genuinely different executions of the same action still both count.
+ */
+function experienceDedupKey(record: ExperienceRecord): string {
+  return [
+    record.level,
+    record.actionKey,
+    record.treeId ?? '',
+    record.nodeId ?? '',
+    record.trajectoryId ?? '',
+    String(record.round ?? '')
+  ].join('\u0000');
+}
+
 /** One L2 selection made for an admitted candidate (online experience sample). */
 interface PreparedSelection {
   readonly state: AbstractState;
   readonly actionKey: string;
+  /** Stable id of the L2 decision that chose this action (plan section 6.1). */
+  readonly decisionId: string;
+  /** Index the decision chose, and how many candidates it was offered. */
+  readonly chosenIndex: number;
+  readonly offered: number;
 }
 
 /** One proposal admitted into a round's concurrent probe wave. */
@@ -543,6 +590,32 @@ interface PreparedProbe {
   readonly proposed: ProposedPatch;
   readonly executionPatch: EightSurfacePatch;
   /** Present only when L2 chose this candidate out of K (see PreparedSelection). */
+  readonly selection?: PreparedSelection;
+}
+
+/**
+ * One probe that ACTUALLY EXECUTED and whose execution status was committed to
+ * the discovery tree (plan section 6.2).
+ *
+ * This is the unit of credit attribution: it carries its own trajectory, its own
+ * node/branch and the exact slot it ran for, so nothing is shared between
+ * siblings. A candidate that never ran has no entry here and therefore can never
+ * receive a measured reward.
+ */
+interface ExecutedProbe {
+  readonly round: number;
+  readonly slotIndex: number;
+  readonly slot: BatchSlotPlan;
+  /** The L1 abstract state of the round that scheduled this slot. */
+  readonly l1State: AbstractState;
+  readonly nodeId: string;
+  readonly parentNodeId: string;
+  readonly branchId: string;
+  /** L1 action key in the L1 candidate vocabulary (normalizeMetaAction). */
+  readonly actionKey: string;
+  /** True guidance provenance of the slot (never the claimed one). */
+  readonly guidance: GuidanceMode;
+  readonly trajectory: ProbeTrajectory;
   readonly selection?: PreparedSelection;
 }
 
@@ -685,6 +758,13 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
   private plan: SearchGridPlan | null = null;
   private count = 0;
   private disposed = false;
+  /**
+   * Dedup ledger for online experience (plan section 6.2). Scoped to this
+   * orchestrator instance: it prevents re-entering the recorder from appending
+   * the same execution twice, and it is bounded by the number of probes the
+   * process actually ran.
+   */
+  private readonly appendedExperienceKeys: Set<string> = new Set();
 
   constructor(deps: EvoHarnessOrchestratorDeps) {
     if (deps === undefined || deps === null || deps.config === undefined) {
@@ -926,24 +1006,15 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       let stagnantRounds = 0;
       let composition: CompositionResult | null = null;
       const maxRounds = Math.max(1, Math.min(grid.maxDepth, budget.maxDepth));
-      // Online experience bookkeeping (plan Phase 3): the L1 batch state of the
-      // round that produced the winning candidate, plus the L2 selections made
-      // for the candidates that actually reached the composer.
-      const l1Samples: {
-        readonly state: AbstractState;
-        readonly round: number;
-        /** One entry per scheduled slot, keyed exactly like an L1 candidate. */
-        readonly slots: readonly {
-          readonly nodeId: string;
-          readonly actionKey: string;
-          readonly guidance: GuidanceMode;
-        }[];
-      }[] = [];
-      const l2Samples: {
-        readonly state: AbstractState;
-        readonly actionKey: string;
-        readonly slot: BatchSlotPlan;
-      }[] = [];
+      // Online experience bookkeeping (plan Phase 3 / P6 PR4). The wave below is
+      // the commit barrier: a probe enters `executed` only after its execution
+      // status was committed to the tree, and every entry carries its OWN
+      // trajectory, node, slot index and L1 state. Nothing is shared between
+      // siblings, so completion order cannot leak one action's outcome into
+      // another (plan sections 6.2 and 6.4).
+      const executed: ExecutedProbe[] = [];
+      /** L1 state of the round currently being planned (per-round, not global). */
+      const l1StateByRound = new Map<number, AbstractState>();
       let stop = false;
 
       while (!stop && rounds < maxRounds) {
@@ -1108,7 +1179,8 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
             cumulativePatches.set(node.id, executionPatch);
           }
           // L2 sample: the abstract proposal state plus the signature of the patch
-          // actually chosen, so the store can grow a proposal neighbourhood.
+          // actually chosen, so the store can grow a proposal neighbourhood. The
+          // decisionId identifies THIS decision, not the run's final winner.
           const selectionState: PreparedSelection | undefined =
             selection === undefined
               ? undefined
@@ -1126,25 +1198,21 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
                       ? {}
                       : { parentPatchSignature: normalizePatchSignature(parentCandidate.patch) })
                   }),
-                  actionKey: normalizePatchSignature(proposed.patch)
+                  actionKey: normalizePatchSignature(proposed.patch),
+                  decisionId: 'jit-decision-' + runId + '-r' + String(rounds) + '-s' + String(slot.slotIndex),
+                  chosenIndex: selection.chosen,
+                  offered: selection.offered
                 };
           prepared.push({ slot, node, proposed, executionPatch, ...(selectionState === undefined ? {} : { selection: selectionState }) });
         }
 
-        // The L1 sample for this round is the state that produced this batch (not a
-        // later round's), with ONE entry per action that actually ran, so the
-        // return is attributed to the action it belongs to and each record is
-        // matchable by the L1 candidate contract.
+        // The L1 state of THIS round, captured once and reused by every probe of
+        // the wave. It is the state that produced this batch (not a later round's)
+        // and it is keyed by round, so an earlier round's slots keep their own
+        // state when the run reaches a later round (plan section 6.2: never
+        // `l1Samples.at(-1)`).
         if (prepared.length > 0) {
-          l1Samples.push({
-            state: buildL1State(batchRequest),
-            round: rounds,
-            slots: prepared.map((entry) => ({
-              nodeId: entry.node.id,
-              actionKey: slotActionKey(entry.slot),
-              guidance: slotProvenance(entry.slot)
-            }))
-          });
+          l1StateByRound.set(rounds, buildL1State(batchRequest));
         }
 
         if (prepared.length > 0) {
@@ -1208,7 +1276,6 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
             probesRun += 1;
             candidateProbes += 1;
             trajectories.push(trajectory);
-
             stage('classify', { round: rounds, detail: { nodeId: node.id } });
             // Lineage comes from the node's ancestor chain, not from the previous
             // sibling, so repeated-failure counting accumulates across depths and
@@ -1252,6 +1319,27 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
               // exploit/recover slots on the surfaces that actually moved.
               metadata: { slot: slot.slot, surfaceKeys: [...trajectory.surfaceKeys] }
             });
+            // The execution status is now COMMITTED, so this probe becomes a
+            // credit-attribution unit (plan section 6.2: never record a "success
+            // sample" before the probe is known to have finished). It carries its
+            // own trajectory/node/slot, so a sibling's outcome can never be
+            // copied onto it - including when it failed and the run has no winner.
+            const l1State = l1StateByRound.get(rounds);
+            if (l1State !== undefined) {
+              executed.push({
+                round: rounds,
+                slotIndex: slot.slotIndex,
+                slot,
+                l1State,
+                nodeId: node.id,
+                parentNodeId: node.parentId ?? tree.rootId,
+                branchId: trajectory.branchId,
+                actionKey: slotActionKey(slot),
+                guidance: slotProvenance(slot),
+                trajectory,
+                ...(entry.selection === undefined ? {} : { selection: entry.selection })
+              });
+            }
             candidates.push({
               nodeId: node.id,
               branchId: trajectory.branchId,
@@ -1274,11 +1362,6 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           }
         }
 
-        for (const entry of prepared) {
-          if (entry.selection !== undefined) {
-            l2Samples.push({ ...entry.selection, slot: entry.slot });
-          }
-        }
         if (candidates.length === 0) {
           diagnostics.push('no candidate probe completed; probing stops');
           break;
@@ -1396,19 +1479,19 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         });
         this.lessons = reflection.lessons;
 
-        // Phase 3 online learning: score the winning candidate's trajectory step by
-        // step, then append the L1 and L2 samples so the in-process neighbourhood
-        // grows during the run instead of only through the cold-start backfill.
+        // Phase 3 online learning, rewritten by P6 PR4: every probe that actually
+        // executed gets its own record (see recordOnlineExperience). The write is
+        // a CROSS-RUN barrier (plan section 6.4): it happens once, after reflect,
+        // and the next run sees it - never a sibling within the same wave.
         const recorded = await this.recordOnlineExperience({
           kernel: this.deps.jitrl,
           task,
           sessionId,
-          candidates,
+          executed,
           reference,
           selectedNodeId: composition.selectedNodeId,
-          l1Samples,
-          l2Samples,
           policyId: runPolicy.id,
+          runId,
           treeId: tree.id,
           round: rounds,
           stage,
@@ -1549,6 +1632,48 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     return scope ?? { kind: 'session', sessionId };
   }
 
+  /**
+   * True when the injected runtime control permits `surface` right now.
+   *
+   * Without a wired control the caller falls back to its own static checks (the
+   * pre-PR2 behaviour for hosts that build the orchestrator by hand). With one,
+   * the VOLATILE state wins: `configured`/`kernel.config.enabled` staying true
+   * never implies the surface may act, because `/evo jit off` only flips the
+   * control. A throwing control fails closed - an error must never re-enable an
+   * external effect.
+   */
+  private surfaceEnabled(surface: JitSurface): boolean {
+    const control = this.deps.jitRuntime;
+    if (control === undefined) {
+      return true;
+    }
+    try {
+      return control.isEnabled(surface);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Current control generation (0 when no control is wired).
+   *
+   * Captured before an external effect and re-read afterwards: a change means
+   * the switch moved while the effect was in flight. The effect itself is never
+   * withdrawn (a sent model call cannot be unsent), but its result must not be
+   * published as a decision, appended as experience or mirrored.
+   */
+  private runtimeGeneration(): number {
+    const control = this.deps.jitRuntime;
+    if (control === undefined) {
+      return 0;
+    }
+    try {
+      return control.snapshot().generation;
+    } catch {
+      return 0;
+    }
+  }
+
   private referencePatch(sessionId: string, runId: string): {
     id: string;
     sessionId: string;
@@ -1599,28 +1724,62 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
    *
    * Returns the number of records appended (0 when nothing was written).
    */
+  /**
+   * evaluate_steps + record_experience (plan Phase 3 / gap G2-3; rewritten by
+   * P6 PR4 / plan sections 6.1-6.5).
+   *
+   * WHAT CHANGED AND WHY
+   * --------------------
+   * The pre-PR4 implementation evaluated ONE trajectory (the composer's final
+   * winner) and then copied its discounted return onto every action of the LAST
+   * L1 batch and onto every L2 selection the run had accumulated. That is the
+   * "copy the winner's return" defect of plan section R4:
+   *   - `l1Samples.at(-1)` dropped every earlier round;
+   *   - a failed slot in the same batch received the winner's positive return;
+   *   - a run with no winner recorded nothing at all (no negative sample);
+   *   - every L2 record was stamped with the winner's nodeId instead of the node
+   *     that actually executed the selection.
+   *
+   * The rewrite attributes credit PER EXECUTED PROBE. `input.executed` holds one
+   * entry per probe whose execution status was committed to the tree, each with
+   * its own trajectory, node, slot index, L1 state and (when L2 chose it) its own
+   * selection. Consequences:
+   *   - every executed action gets its own reward, return and learning target;
+   *   - a candidate that never ran has no entry, so it can never receive a
+   *     measured reward;
+   *   - a run without a winner still records its executed failures;
+   *   - L2 actionKey/nodeId/trajectoryId all come from the same executed probe.
+   *
+   * WHEN LEARNING HAPPENS (plan section 6.4)
+   * ----------------------------------------
+   * The commit barrier is the WAVE: `input.executed` is only populated after a
+   * round's parallel probes have all settled and their statuses were committed in
+   * slotIndex order, so completion order cannot influence the record set. The
+   * write itself happens once, after `reflect`, which makes this explicitly
+   * CROSS-RUN learning (the plan's documented fallback): the store grows between
+   * runs, never inside one. Every round's records are written, not just the last
+   * round's, so "cross-run" loses nothing.
+   *
+   * COST (plan section 6.3)
+   * -----------------------
+   * The (possibly model-backed) step evaluator is called at most ONCE per run, for
+   * the composer's winner, exactly as before. Every other executed probe is scored
+   * from verifiable signals already present in its trajectory (tool status,
+   * repeated errors, completion, step count, failure type), so per-slot scoring
+   * never multiplies the model bill. No LLM judge is introduced by this round.
+   *
+   * Silent no-op when the kernel is absent or JitRL is disabled/off.
+   * Returns the number of records appended (0 when nothing was written).
+   */
   private async recordOnlineExperience(input: {
     readonly kernel: OrchestratorJitRl | undefined;
     readonly task: ProbeTask;
     readonly sessionId: string;
-    readonly candidates: readonly ProbeCandidate[];
+    readonly executed: readonly ExecutedProbe[];
     readonly reference: ProbeTrajectory;
     readonly selectedNodeId: string | null;
-    readonly l1Samples: readonly {
-      readonly state: AbstractState;
-      readonly round: number;
-      readonly slots: readonly {
-        readonly nodeId: string;
-        readonly actionKey: string;
-        readonly guidance: GuidanceMode;
-      }[];
-    }[];
-    readonly l2Samples: readonly {
-      readonly state: AbstractState;
-      readonly actionKey: string;
-      readonly slot: BatchSlotPlan;
-    }[];
     readonly policyId: string;
+    readonly runId: string;
     readonly treeId: string;
     readonly round: number;
     readonly stage: (name: EvoHarnessStage, detail?: Readonly<Record<string, unknown>>) => void;
@@ -1631,101 +1790,230 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     if (kernel === undefined || !kernel.config.enabled || evaluator === undefined) {
       return 0;
     }
-    // The composer's winner is the trajectory that carries the evidence; without
-    // one there is nothing to evaluate and nothing to record.
-    const selected = input.candidates.find(
-      (candidate) => candidate.nodeId === input.selectedNodeId
-    );
-    if (selected === undefined) {
-      input.diagnostics.push('jitrl: no selected candidate, nothing to evaluate');
+    // P6 PR2: `kernel.config.enabled` is CONFIGURED. The volatile control is
+    // authoritative, so `/evo jit off` stops scoring and appending even though
+    // the kernel stays configured (plan R1: the experience store kept growing).
+    if (!this.surfaceEnabled('onlineRecord')) {
+      return 0;
+    }
+    if (input.executed.length === 0) {
+      input.diagnostics.push('jitrl: no executed probe, nothing to attribute');
       return 0;
     }
 
-    input.stage('evaluate_steps', { round: input.round, detail: { nodeId: selected.nodeId } });
-    let rewards: readonly StepReward[];
-    try {
-      rewards = await evaluator.evaluate(selected.trajectory, {
-        task: input.task,
-        reference: input.reference
-      });
-    } catch (error) {
-      input.diagnostics.push('evaluate_steps failed: ' + errorMessage(error));
-      return 0;
-    }
-    if (rewards.length === 0) {
-      input.diagnostics.push('evaluate_steps produced no steps; nothing recorded');
-      return 0;
+    // Deterministic attribution order: round, then slotIndex, then nodeId. This
+    // is the wave-commit order, so a probe that finished first can never reorder
+    // the experience set (plan section 6.4).
+    const ordered = [...input.executed].sort((left, right) => {
+      if (left.round !== right.round) {
+        return left.round - right.round;
+      }
+      if (left.slotIndex !== right.slotIndex) {
+        return left.slotIndex - right.slotIndex;
+      }
+      return left.nodeId < right.nodeId ? -1 : left.nodeId > right.nodeId ? 1 : 0;
+    });
+
+    // The composer's winner is the only trajectory that justifies the (possibly
+    // model-backed) step evaluation. A run without a winner evaluates nothing and
+    // still records every executed probe from verifiable signals.
+    const winner = ordered.find((probe) => probe.nodeId === input.selectedNodeId);
+    let winnerRewards: readonly StepReward[] | undefined;
+    if (winner !== undefined) {
+      input.stage('evaluate_steps', { round: input.round, detail: { nodeId: winner.nodeId } });
+      // Snapshot the switch before the (external) model-backed evaluation. The
+      // evaluator may spend a real model call; if `/evo jit off` lands while it is
+      // in flight, that call is not withdrawn, but its result must not become
+      // training data (plan P6 section 5.1 "执行中关闭").
+      const generationBeforeEvaluate = this.runtimeGeneration();
+      try {
+        const rewards = await evaluator.evaluate(winner.trajectory, {
+          task: input.task,
+          reference: input.reference
+        });
+        if (rewards.length > 0) {
+          winnerRewards = rewards;
+        } else {
+          input.diagnostics.push(
+            'evaluate_steps produced no steps for the winner; its verifiable signals are used instead'
+          );
+        }
+      } catch (error) {
+        // A failed evaluation must not delete the run's negative samples: the
+        // winner falls back to the same verifiable signals as its siblings.
+        input.diagnostics.push(
+          'evaluate_steps failed: ' + errorMessage(error) + '; verifiable signals are used instead'
+        );
+      }
+      if (
+        !this.surfaceEnabled('onlineRecord') ||
+        this.runtimeGeneration() !== generationBeforeEvaluate
+      ) {
+        input.diagnostics.push(
+          'jitrl: JitRL was switched while evaluate_steps was in flight; the step rewards were discarded and no experience was recorded'
+        );
+        return 0;
+      }
+    } else {
+      input.diagnostics.push(
+        'jitrl: the run has no winning candidate; ' +
+          String(ordered.length) +
+          ' executed probe(s) are recorded from their own verifiable signals'
+      );
     }
 
-    const perStep = rewards.map((reward) => reward.reward);
-    const returnG = discountedReturn(perStep, kernel.config.gamma, 0);
+    // Baseline: the reference run is the comparable context every candidate is
+    // contrasted with (plan section 6.3 attributionBaseline). It is scored the
+    // same way, from verifiable signals only, so the comparison is consistent.
+    const baseline = scoreTrajectorySignals(input.reference).reward;
     const createdAt = this.now();
-    const scores = rewards.map((reward) => reward.reward);
-    const meanReward = scores.reduce((total, value) => total + value, 0) / scores.length;
     const records: ExperienceRecord[] = [];
+    const outcomes: string[] = [];
+    let ineligible = 0;
 
-    // L1: one record per action that ran this round, in the L1 candidate key
-    // vocabulary, carrying that action's own guidance provenance. Support for an
-    // action therefore grows only from runs that actually took it.
-    const l1 = input.l1Samples.at(-1);
-    if (l1 !== undefined) {
-      for (const action of l1.slots) {
+    for (const probe of ordered) {
+      const outcome = classifyTrajectoryOutcome(probe.trajectory);
+      const eligible = isLearningOutcome(outcome);
+      outcomes.push(outcome);
+      if (!eligible) {
+        ineligible += 1;
+      }
+      const isWinner = winnerRewards !== undefined && probe.nodeId === input.selectedNodeId;
+      let reward: number;
+      let observedReturn: number;
+      let rewardSources: Readonly<Record<string, number>>;
+      if (!eligible) {
+        // A user cancellation / abort / infrastructure failure says nothing about
+        // action quality (plan section 6.2), so it is audit-only: neutral reward,
+        // zero learning target, `learningEligible: false`.
+        reward = 0;
+        observedReturn = 0;
+        rewardSources = { outcome: 1 };
+      } else if (isWinner && winnerRewards !== undefined) {
+        const perStep = winnerRewards.map((entry) => entry.reward);
+        const mean =
+          perStep.reduce((total, value) => total + value, 0) / Math.max(1, perStep.length);
+        reward = clamp(mean, -3, 3);
+        observedReturn = discountedReturn(perStep, kernel.config.gamma, 0);
+        rewardSources = rewardSourcesOf(winnerRewards);
+      } else {
+        const signal = scoreTrajectorySignals(probe.trajectory);
+        reward = clamp(signal.reward, -3, 3);
+        observedReturn = clamp(signal.reward, -3, 3);
+        rewardSources = signal.sources;
+      }
+      const learningTarget = eligible ? clamp(observedReturn - baseline, -3, 3) : 0;
+      const decisionId = probe.selection?.decisionId ?? 'jit-meta-decision-' + input.runId + '-r' + String(probe.round);
+      const association = {
+        round: probe.round,
+        slotIndex: probe.slotIndex,
+        nodeId: probe.nodeId,
+        parentNodeId: probe.parentNodeId,
+        branchId: probe.branchId,
+        trajectoryId: probe.trajectory.id,
+        decisionId,
+        runId: input.runId,
+        policyVersion: input.policyId + '@v' + String(finiteOr(this.deps.policy.policy?.version, 1)),
+        rewardVersion: CURRENT_REWARD_VERSION,
+        provenanceVersion: CURRENT_PROVENANCE_VERSION,
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        observedReturn,
+        attributionBaseline: baseline,
+        learningTarget,
+        outcome,
+        learningEligible: eligible
+      } as const;
+
+      // L1: this executed action's own record, in the L1 candidate key vocabulary
+      // and with the guidance provenance of the slot that actually ran it.
+      records.push({
+        id: 'online-' + this.newId(),
+        level: 'meta',
+        state: probe.l1State,
+        actionKey: probe.actionKey,
+        reward,
+        return: observedReturn,
+        rewardSources,
+        guidance: probe.guidance,
+        policyId: input.policyId,
+        sessionId: input.sessionId,
+        treeId: input.treeId,
+        ...association,
+        createdAt,
+        redacted: true
+      });
+
+      // L2: ONLY when this exact proposal was chosen by the L2 decision AND
+      // actually executed. The node/trajectory pair is the one that ran, never
+      // the run's final winner (plan section 6.2).
+      if (probe.selection !== undefined) {
         records.push({
           id: 'online-' + this.newId(),
-          level: 'meta',
-          state: l1.state,
-          actionKey: action.actionKey,
-          reward: clamp(meanReward, -3, 3),
-          return: returnG,
-          rewardSources: rewardSourcesOf(rewards),
-          guidance: action.guidance,
+          level: 'proposal',
+          state: probe.selection.state,
+          actionKey: probe.selection.actionKey,
+          reward,
+          return: observedReturn,
+          rewardSources,
+          guidance: probe.guidance,
           policyId: input.policyId,
           sessionId: input.sessionId,
           treeId: input.treeId,
-          nodeId: action.nodeId,
+          ...association,
           createdAt,
           redacted: true
         });
       }
     }
 
-    for (const selection of input.l2Samples) {
-      if (selection === undefined) {
+    // Record deduplication (plan section 6.2): the same (level, actionKey, node,
+    // trajectory, round) must never be appended twice, even if the recorder is
+    // re-entered. Node ids are unique per tree, so this cannot suppress a
+    // legitimate repeat across runs.
+    const deduped: ExperienceRecord[] = [];
+    for (const record of records) {
+      const key = experienceDedupKey(record);
+      if (this.appendedExperienceKeys.has(key)) {
         continue;
       }
-      records.push({
-        id: 'online-' + this.newId(),
-        level: 'proposal',
-        state: selection.state,
-        actionKey: selection.actionKey,
-        reward: clamp(meanReward, -3, 3),
-        return: returnG,
-        rewardSources: rewardSourcesOf(rewards),
-        // The L2 sample inherits the provenance of the slot/proposal that ran it.
-        guidance: slotProvenance(selection.slot),
-        policyId: input.policyId,
-        sessionId: input.sessionId,
-        treeId: input.treeId,
-        ...(input.selectedNodeId === null ? {} : { nodeId: input.selectedNodeId }),
-        createdAt,
-        redacted: true
-      });
+      this.appendedExperienceKeys.add(key);
+      deduped.push(record);
     }
-    if (records.length === 0) {
+    if (deduped.length === 0) {
+      input.diagnostics.push('jitrl: every candidate record was already appended; nothing written');
+      return 0;
+    }
+
+    // Last re-read immediately before the write: everything above was pure
+    // computation, so re-checking here is what makes "no append after off"
+    // independent of how long the evaluation took.
+    if (!this.surfaceEnabled('onlineRecord')) {
+      input.diagnostics.push(
+        'jitrl: JitRL is off; ' +
+          String(deduped.length) +
+          ' scored record(s) were discarded instead of appended'
+      );
       return 0;
     }
 
     input.stage('record_experience', {
       round: input.round,
-      detail: { records: records.length, return: returnG, steps: perStep.length }
+      detail: {
+        records: deduped.length,
+        executed: ordered.length,
+        rounds: new Set(ordered.map((probe) => probe.round)).size,
+        outcomes,
+        notLearningEligible: ineligible,
+        attributionBaseline: baseline
+      }
     });
     try {
-      await kernel.store.append(records);
+      await kernel.store.append(deduped);
     } catch (error) {
       input.diagnostics.push('record_experience failed: ' + errorMessage(error));
       return 0;
     }
-    return records.length;
+    return deduped.length;
   }
 
   /**
@@ -1822,6 +2110,12 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     if (kernel === undefined || !kernel.config.enabled || !kernel.config.levels.includes('proposal')) {
       return undefined;
     }
+    // P6 PR2: `kernel.config.enabled` is CONFIGURED, not live. The volatile
+    // control is authoritative, so `/evo jit off` stops the K-candidate path even
+    // though the kernel stays configured (plan R1 root cause).
+    if (!this.surfaceEnabled('proposal')) {
+      return undefined;
+    }
     // K == 1 means there is nothing to choose between: stay on the single-call
     // propose() path so the model is never invoked twice for one proposal.
     if (!Number.isFinite(kernel.config.candidateCount) || kernel.config.candidateCount <= 1) {
@@ -1845,6 +2139,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       candidateCount: kernel.config.candidateCount
     };
     let set: ProposedPatchSet;
+    // Snapshot before the K-candidate model call: `/evo jit off` may land while
+    // it is in flight. The call is not withdrawn, but the resulting choice must
+    // not be published as a Jit decision (plan P6 section 5.1).
+    const generationBeforePropose = this.runtimeGeneration();
     try {
       set = await proposer.proposeCandidates(request);
     } catch (error) {
@@ -1854,8 +2152,21 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       );
       return undefined;
     }
+    const switchMoved =
+      this.runtimeGeneration() !== generationBeforePropose || !this.surfaceEnabled('proposal');
     const offered = Array.isArray(set?.candidates) ? set.candidates : [];
     if (offered.length === 0) {
+      return undefined;
+    }
+    // The proposer already returned; nothing above produced an external effect.
+    // Dropping the set here is what keeps a mid-flight `jit off` from turning a
+    // finished model call into a published decision.
+    if (switchMoved) {
+      input.diagnostics.push(
+        'jit_proposal_select: JitRL was switched while the multi-candidate proposer was in flight; ' +
+          String(offered.length) +
+          ' candidate(s) were discarded and the single propose() path is used instead'
+      );
       return undefined;
     }
 

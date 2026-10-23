@@ -168,6 +168,29 @@ export function isSurfaceKey(value: unknown): value is HarnessComponentKey {
   return typeof value === 'string' && (HARNESS_COMPONENT_KEYS as readonly string[]).includes(value);
 }
 
+/**
+ * Pattern matching structured JitRL advice blocks injected into host tools or observations.
+ * Matches both standard <jitrl_advice>...</jitrl_advice> and <anti_patterns_to_avoid> tags.
+ */
+const STRUCTURED_ADVICE_PATTERN =
+  /<(?:jitrl_advice|anti_patterns_to_avoid)(?:\s+[^>]*)?>[\s\S]*?<\/(?:jitrl_advice|anti_patterns_to_avoid)>|<(?:jitrl_advice|anti_patterns_to_avoid)(?:\s+[^>]*)?\/>/gi;
+
+/**
+ * Strip structured JitRL advisory markup from text before entering judge/composer prompts.
+ *
+ * GOVERNANCE & RISK NOTICE (L2 repair):
+ * Stripping XML tags removes explicit structured advice markup. However, if a model
+ * restates or paraphrases advisory statistics (e.g. mean return, neighbor counts, anti-patterns)
+ * in free-form prose, XML tag stripping alone CANNOT eliminate those semantic restatements.
+ * This residual risk is explicitly audited and recorded rather than claimed eliminated.
+ */
+export function stripStructuredAdvice(text: string): string {
+  if (typeof text !== 'string' || text.length === 0) {
+    return text;
+  }
+  return text.replace(STRUCTURED_ADVICE_PATTERN, '').trim();
+}
+
 /** Deterministic per-step summary used by the anonymous judge dossier. */
 export function summarizeTrajectorySteps(
   steps: readonly TrajectoryStep[],
@@ -181,9 +204,13 @@ export function summarizeTrajectorySteps(
       parts.push(step.toolName);
     }
     if (step.error !== undefined) {
-      parts.push('error=' + truncate(oneLine(step.error.message), 80));
+      const cleanedError = stripStructuredAdvice(step.error.message);
+      parts.push('error=' + truncate(oneLine(cleanedError), 80));
     } else if (step.text !== undefined) {
-      parts.push(truncate(oneLine(step.text), 80));
+      const cleanedText = stripStructuredAdvice(step.text);
+      if (cleanedText.length > 0) {
+        parts.push(truncate(oneLine(cleanedText), 80));
+      }
     }
     out.push(parts.join(' '));
   }

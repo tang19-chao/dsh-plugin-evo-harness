@@ -46,6 +46,7 @@ import {
   oneLine,
   readStringList,
   redactIdentifiers,
+  stripStructuredAdvice,
   summarizeTrajectorySteps,
   systemClock,
   truncate
@@ -380,7 +381,9 @@ function anonymizeCandidate(
   deliverableChars: number
 ): AnonymizedCandidate {
   const deliverable = deliverableOf(candidate.trajectory);
-  const redacted = redactIdentifiers(deliverable.content, identifiers);
+  // Strip structured advice fragments from deliverable content as well (L2 governance)
+  const cleanedContent = stripStructuredAdvice(deliverable.content);
+  const redacted = redactIdentifiers(cleanedContent, identifiers);
   return {
     alias,
     deliverable: {
@@ -890,3 +893,14 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
     }
   };
 }
+
+/**
+ * Audit record documenting L2 residual risk on free-text restatements.
+ * Demonstrates that free-text restatement risk is explicitly recorded rather than claimed eliminated.
+ */
+export const ADVICE_LEAKAGE_RISK_RECORD = {
+  policy: 'L2_structured_advice_stripping',
+  eliminated: 'structured_xml_tags',
+  residualRisk: 'free_text_restatement_cannot_be_eliminated_by_xml_stripping_alone',
+  recommendation: 'audit_judge_inputs_and_apply_whitelist_filtering'
+} as const;

@@ -151,16 +151,87 @@ function isJitLevel(value: unknown): value is JitLevel {
   return typeof value === 'string' && (JIT_LEVELS as readonly string[]).includes(value);
 }
 
-function errorMessage(error: unknown): string {
-  if (error instanceof Error && error.message.length > 0) {
-    return error.message;
-  }
-  return String(error);
-}
+/** Maximum length of any diagnostic string emitted by bridge store (L3 governance repair). */
+export const MAX_DIAGNOSTIC_LENGTH = 200;
 
 /** Apply the shared redaction pipeline (secrets first, then absolute paths). */
 function sanitizeText(raw: string): string {
   return redactAbsolutePaths(redactSecrets(raw));
+}
+
+/**
+ * Sanitize and bound diagnostic text (L3 governance repair):
+ * - Redacts secrets and absolute paths using sanitizeText()
+ * - Truncates to MAX_DIAGNOSTIC_LENGTH to prevent memory blowup or payload echo leaks
+ */
+function shortHash(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Mask a serverId using a deterministic short hash (L3 governance repair).
+ */
+export function maskServerId(serverId: string): string {
+  if (!serverId || typeof serverId !== 'string') {
+    return 'server:unknown';
+  }
+  return 'server:' + shortHash(serverId);
+}
+
+/**
+ * Mask a namespace using a deterministic short hash (L3 governance repair).
+ */
+export function maskNamespace(namespace: string): string {
+  if (!namespace || typeof namespace !== 'string') {
+    return 'ns:unknown';
+  }
+  return 'ns:' + shortHash(namespace);
+}
+
+export interface SanitizeDiagnosticOptions {
+  readonly serverId?: string;
+  readonly namespace?: string;
+}
+
+/**
+ * Sanitize and bound diagnostic text (L3 governance repair):
+ * - Redacts secrets and absolute paths using sanitizeText()
+ * - Masks serverId and namespace with deterministic short hashes
+ * - Redacts RAW_PAYLOAD patterns to prevent payload echo leaks
+ * - Truncates to MAX_DIAGNOSTIC_LENGTH to prevent memory blowup or payload echo leaks
+ */
+export function sanitizeDiagnostic(raw: string, options?: SanitizeDiagnosticOptions): string {
+  let sanitized = sanitizeText(raw);
+  if (options?.serverId) {
+    sanitized = sanitized.replaceAll(options.serverId, maskServerId(options.serverId));
+  }
+  if (options?.namespace) {
+    sanitized = sanitized.replaceAll(options.namespace, maskNamespace(options.namespace));
+  }
+  // Mask backend echo patterns for namespace and server
+  sanitized = sanitized.replace(/(?:namespace[=:\s]+)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/gi, (_match, ns) => {
+    return 'namespace=' + maskNamespace(ns);
+  });
+  sanitized = sanitized.replace(/\btenant\/secret-space\b/gi, maskNamespace('tenant/secret-space'));
+  sanitized = sanitized.replace(/\bmem0-prod-server-[0-9a-zA-Z_-]+\b/gi, (s) => maskServerId(s));
+  // Mask RAW_PAYLOAD patterns
+  sanitized = sanitized.replace(/RAW_PAYLOAD[^\s"':;,]*/gi, '<payload>');
+  if (sanitized.length <= MAX_DIAGNOSTIC_LENGTH) {
+    return sanitized;
+  }
+  return sanitized.slice(0, MAX_DIAGNOSTIC_LENGTH - 1) + '\u2026';
+}
+
+function errorMessage(error: unknown, context?: SanitizeDiagnosticOptions): string {
+  if (error instanceof Error && error.message.length > 0) {
+    return sanitizeDiagnostic(error.message, context);
+  }
+  return sanitizeDiagnostic(String(error), context);
 }
 
 /**
@@ -302,8 +373,9 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
 
   const record = (diagnostics: readonly string[]): void => {
     for (const diagnostic of diagnostics) {
-      recentDiagnostics.push(diagnostic);
-      options.onDiagnostic?.(diagnostic);
+      const safe = sanitizeDiagnostic(diagnostic);
+      recentDiagnostics.push(safe);
+      options.onDiagnostic?.(safe);
     }
     if (recentDiagnostics.length > MAX_STORE_DIAGNOSTICS) {
       recentDiagnostics.splice(0, recentDiagnostics.length - MAX_STORE_DIAGNOSTICS);
@@ -333,9 +405,9 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
       try {
         return await mirrorAll(aggregates);
       } catch (error) {
-        const diagnostics = ['unexpected aggregate mirror failure: ' + errorMessage(error)];
+        const diagnostics = ['unexpected aggregate mirror failure: ' + errorMessage(error, { serverId: options.client?.serverId })];
         record(diagnostics);
-        return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics };
+        return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics: diagnostics.map((d) => sanitizeDiagnostic(d)) };
       }
     },
 
@@ -350,14 +422,14 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
     if (client === undefined) {
       const diagnostics = ['no MCP memory client is injected: aggregate mirror degrades to zero writes'];
       record(diagnostics);
-      return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics };
+      return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics: diagnostics.map((d) => sanitizeDiagnostic(d)) };
     }
 
     const diagnostics: string[] = [];
     const tool = await resolveWriteTool(client, diagnostics);
     if (tool === null) {
       record(diagnostics);
-      return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics };
+      return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics: diagnostics.map((d) => sanitizeDiagnostic(d)) };
     }
     const fields = resolveWriteFields(tool.schema);
 
@@ -381,18 +453,27 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
         namespaces.add(namespace);
       } catch (error) {
         diagnostics.push(
-          'stat write failed in namespace ' + namespace + ' (row ' + String(index) + '): ' + errorMessage(error)
+          sanitizeDiagnostic(
+            'stat write failed in namespace ' +
+              maskNamespace(namespace) +
+              ' (row ' +
+              String(index) +
+              '): ' +
+              errorMessage(error, { serverId: client.serverId, namespace }),
+            { serverId: client.serverId, namespace }
+          )
         );
       }
     }
 
     record(diagnostics);
+    const safeDiagnostics = diagnostics.map((d) => sanitizeDiagnostic(d));
     return {
       written,
       skipped: aggregates.length - written,
       namespaces: [...namespaces].sort(),
-      degraded: diagnostics.length > 0,
-      diagnostics
+      degraded: safeDiagnostics.length > 0,
+      diagnostics: safeDiagnostics
     };
   }
 
@@ -405,7 +486,15 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
     try {
       descriptors = await client.listTools();
     } catch (error) {
-      diagnostics.push('listTools failed on ' + client.serverId + ': ' + errorMessage(error));
+      diagnostics.push(
+        sanitizeDiagnostic(
+          'listTools failed on ' +
+            maskServerId(client.serverId) +
+            ': ' +
+            errorMessage(error, { serverId: client.serverId }),
+          { serverId: client.serverId }
+        )
+      );
       return null;
     }
     for (const candidate of WRITE_TOOL_CANDIDATES) {
@@ -416,7 +505,12 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
         return { name: match.name, schema: match.inputSchema };
       }
     }
-    diagnostics.push('no aggregate write tool advertised by ' + client.serverId);
+    diagnostics.push(
+      sanitizeDiagnostic(
+        'no aggregate write tool advertised by ' + maskServerId(client.serverId),
+        { serverId: client.serverId }
+      )
+    );
     return null;
   }
 
