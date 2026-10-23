@@ -340,3 +340,14 @@ export async function resolveDshCollaborators(
     diagnostics
   };
 }
+
+// ---------------------------------------------------------------------------
+// Multi-step agent probe executor (plan Phase 0, P0-2)
+//
+// Kept alongside the DSH collaborator bridge above. Both this executor and the
+// DSH branch executor satisfy BranchExecutor: the DSH one resolves its model and
+// tools from the live context, while this one drives a bounded
+// model -> tool -> result loop inside a probe branch.
+// ---------------------------------------------------------------------------
+
+export * from './agent-loop-executor';

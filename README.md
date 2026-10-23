@@ -94,9 +94,10 @@ transpiles on the fly.
 | `pnpm run test` | `vitest run` | Every unit and end-to-end suite |
 | `pnpm run test:unit` | `vitest run tests/unit` | Unit suites only |
 | `pnpm run test:e2e` | `vitest run tests/e2e` | End-to-end suites only |
+| `pnpm run check:docs` | `node scripts/verify-readme-counts.mjs` | Mechanically validates README test counts against test results and repo hygiene |
 | `pnpm run verify` | `pnpm run typecheck && pnpm run test` | The full gate: typecheck, then every suite |
 
-A green checkout currently reports `23` test files and `390` passing tests for `pnpm run test`
+A green checkout currently reports `64` test files and `1154` passing tests for `pnpm run test`
 (see [Testing](#testing) for the breakdown). This package is `private` and is not published to
 any registry, so there are no publication steps.
 
@@ -327,8 +328,12 @@ LLM.
 ```text
 dsh-plugin-evo-harness/
 ├── ARCHITECTURE.md          # the design document (sections 1-7)
+├── CHANGELOG.md             # version history and hardening notes
+├── LICENSE                  # Apache-2.0 license (pending author confirmation)
 ├── package.json             # engines, packageManager, scripts, devDependencies
 ├── tsconfig.json            # strict ES2022 / Bundler typecheck, noEmit
+├── scripts/
+│   └── verify-readme-counts.mjs # mechanical verification of README metrics in CI
 ├── src/
 │   ├── index.ts             # Cordis entrypoint: apply(ctx), /evo command, auto_fallback hook, evoHarness service
 │   ├── config.ts            # schema, frozen defaults, deterministic validation
@@ -361,26 +366,33 @@ cross-session promotion, and the offline dream trigger and model wiring.
 
 | Command | Scope | Suites at the time of writing |
 | :--- | :--- | :--- |
-| `pnpm run test:unit` | `tests/unit` | 18 files, 292 tests |
-| `pnpm run test:e2e` | `tests/e2e` | 5 files, 42 tests |
-| `pnpm run test` | everything | 23 files, 334 tests |
+| `pnpm run test:unit` | `tests/unit` | 57 files, 1076 tests |
+| `pnpm run test:e2e` | `tests/e2e` | 7 files, 78 tests |
+| `pnpm run test` | everything | 64 files, 1154 tests |
 | `pnpm run verify` | typecheck + everything | the gate to run before a change lands |
 
 Individual files can be run the usual Vitest way, for example
 `pnpm exec vitest run tests/unit/harness2`.
 
+Because `check:docs` compares the counts above against the live suite, it must be re-run as the
+release gate whenever tests are added, removed or renamed.
+
 ## Limitations and status
 
 Stated plainly, because they matter when you evaluate this plugin:
 
-- **No live host has been exercised.** `apply(ctx, ...)` discovers Cordis capabilities structurally
+- **Host adapter capabilities and real Hook constraints.** `apply(ctx, ...)` discovers Cordis capabilities structurally
   (`ctx.prompt`, `ctx.permissions`, `ctx.tools`, `ctx.skills`, `ctx.sandbox`, `ctx.subagents`, `ctx.middleware`, `ctx.evoMemory`,
-  `ctx.fork`) and is a best-effort adapter over that surface, not a verified integration. When no
-  seam is discoverable the plugin mounts an in-process in-memory host adapter so the lifecycle
-  still runs deterministically; `plugin.hostAdapterSource` reports `'injected'`, `'context'` or
-  `'in-memory'`, and the fallback is recorded in `plugin.diagnostics`. That in-memory host is **not**
-  a sandbox, and the repository's own tests never talk to a real Cordis host or a real MCP
-  server.
+  `ctx.fork`) and real DSH hook events; `plugin.hostAdapterSource` reports `'injected'`, `'dsh-hooks'`, `'context'` or
+  `'in-memory'`, and the fallback is recorded in `plugin.diagnostics`.
+  When real DSH hook events are available (`hostAdapterSource='dsh-hooks'`), the adapter mounts listeners on
+  `system-prompt/assemble`, `tools/pre-execute`, `tools/post-execute`, and `agent/pre-step` with branch/session scope isolation.
+  However, this real Hook adapter enforces only a **deterministic subset**:
+  - It does **not** execute or evaluate generated middleware code (middleware execution belongs to a host-managed sandbox).
+  - On `tools/pre-execute`, it deterministically enforces explicit deny rules (`toolPreconditions` starting with `deny`, `forbiddenActions` matching `tool:<name>` or `deny:<name>`, and host-supplied `options.denyTools`).
+  - All non-deny natural-language rules and permissive constraints are treated as **advisory** observations rather than hard security boundaries.
+  When no seam or hook is discoverable the plugin mounts an in-process in-memory host adapter so the lifecycle
+  still runs deterministically; that in-memory host is **not** a sandbox, and the repository's own tests never talk to a real Cordis host or a real MCP server.
 - **Branch isolation is delegated to the host.** `runInIsolatedBranch` disposes everything it
   mounted on success, failure, timeout and abort, and the memory side gets a deterministic
   branch namespace, but real filesystem/process isolation only exists if the injected host
@@ -396,9 +408,9 @@ Stated plainly, because they matter when you evaluate this plugin:
   surrogate score are documented heuristics; the offline dreamer is the only component with a
   monotonic non-regression guarantee (a candidate policy must strictly beat `pi^0`).
 - **Packaging status.** The package is `private`, version `0.1.0`, and is not published to a
-  registry. CI runs `tsc --noEmit` and the full Vitest suite on push and pull requests to
-  `main` (`.github/workflows/ci.yml`); no status badge is shown. There is **no
-  LICENSE file**, so the licensing terms are unspecified.
+  registry. CI runs `tsc --noEmit`, the full Vitest suite, and mechanical docs hygiene verification on push and pull requests to
+  `main` (`.github/workflows/ci.yml`); no status badge is shown. The package is licensed under the
+  [Apache-2.0 License](LICENSE) (with copyright attribution pending author confirmation). See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## Design document
 
@@ -407,3 +419,4 @@ onto Cordis seams, section 4 defines the Canonical Lesson Envelope and the gover
 polyfill, section 5 covers the online/offline Dream-RSI loop, section 6 the directory layout,
 the interfaces and the example `cordis.yml`, and section 7 the end-to-end sequence.
 `src/types/contracts.ts` is the frozen contract surface shared by the implementation modules.
+

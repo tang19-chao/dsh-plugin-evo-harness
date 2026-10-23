@@ -2,6 +2,7 @@
   "name": "dsh-plugin-evo-harness",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "description": "DeepSeek Harness (Cordis) plugin: reversible eight-surface Harness² editing, Dream-RSI online search / offline replay, and a governed Universal MCP memory bridge.",
   "type": "module",
   "main": "lib/index.js",
@@ -35,6 +36,9 @@
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "test:e2e": "vitest run tests/e2e",
+    "check:docs": "node scripts/verify-readme-counts.mjs",
+    "bench:jitrl": "node scripts/bench-jitrl-query.mjs",
+    "eval:jitrl": "node scripts/eval-jitrl.mjs",
     "verify": "pnpm run typecheck && pnpm run test"
   },
   "devDependencies": {

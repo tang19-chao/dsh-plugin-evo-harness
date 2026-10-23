@@ -38,12 +38,22 @@
  *    lessons and must never be injected as recommendations. The memory bridge
  *    separates them into anti-pattern warnings after recall.
  *
- * CONTRACT VERSION: 1. A breaking change requires a new Wave 0 contract round;
+ * CONTRACT VERSION: 2. Version 2 is a purely additive round for JitRL (Phase 1):
+ * it adds the experience / adjustment / step-evaluation contracts, two new
+ * ModelPurpose values, optional logprob and candidateCount request fields, and
+ * the optional MetaSearchPolicy.jit hyperparameters. No version 1 export was
+ * renamed, removed or widened. A breaking change requires a new contract round;
  * do not silently widen or rename exported fields.
+ *
+ * Version 2 stays the current version for the Phase 4/5 additive round: the
+ * Dream-RSI x JitRL replay hook, the L3 host-advisor tri-state decision, and the
+ * JitRL statistics mirror contracts append new exports and optional fields only
+ * (see the "JitRL Phase 4/5" section below). Nothing already exported was
+ * renamed, removed, widened or made required.
  */
 
 /** Version of the frozen contract surface. */
-export const CONTRACT_SCHEMA_VERSION = 1 as const;
+export const CONTRACT_SCHEMA_VERSION = 2 as const;
 
 /**
  * The eight editable Harness² surfaces, mapped 1:1 onto Cordis capability seams
@@ -741,8 +751,23 @@ export interface ICordisSeamManager {
 // Injected model adapter (host-neutral LLM boundary)
 // ---------------------------------------------------------------------------
 
-/** Why a model call is being made; useful for deterministic fakes. */
-export type ModelPurpose = 'propose' | 'compose' | 'reflect' | 'dream_policy';
+/**
+ * Why a model call is being made; useful for deterministic fakes.
+ *
+ * 'probe' marks model calls made inside an isolated probe branch (the branch
+ * execution / multi-step agent probe loop). Probe traffic must stay
+ * distinguishable from 'compose' judging in routing and usage statistics: a
+ * probe runs the candidate scaffold itself, while 'compose' only ranks
+ * anonymized probe results afterwards.
+ */
+export type ModelPurpose =
+  | 'propose'
+  | 'compose'
+  | 'reflect'
+  | 'dream_policy'
+  | 'probe'
+  | 'evaluate_steps'
+  | 'abstract_state';
 
 /** One chat-style model message. */
 export interface ModelMessage {
@@ -758,6 +783,8 @@ export interface ModelRequest {
   readonly maxTokens?: number;
   readonly responseFormat?: 'text' | 'json';
   readonly metadata?: ContractMetadata;
+  /** Optional top-K token logprob request; providers without support ignore it. */
+  readonly logprobs?: { readonly topK: number };
 }
 
 /** A model response with optional usage accounting. */
@@ -767,6 +794,12 @@ export interface ModelResponse {
   readonly usage?: TokenUsage;
   readonly model?: string;
   readonly metadata?: ContractMetadata;
+  /** Per-token logprobs when requested and reported by the provider. */
+  readonly tokenLogprobs?: readonly {
+    readonly token: string;
+    readonly logprob: number;
+    readonly top?: readonly { readonly token: string; readonly logprob: number }[];
+  }[];
 }
 
 /** Injectable LLM adapter used by Harness² and Dream-RSI policy generation. */
@@ -810,6 +843,8 @@ export interface ProposeRequest {
   readonly attemptIndex: number;
   readonly totalBudget: number;
   readonly metadata?: ContractMetadata;
+  /** Number of candidates to propose (K); defaults to 1 for backward compatibility. */
+  readonly candidateCount?: number;
 }
 
 /** A candidate patch plus its rationale and focus. */
@@ -821,9 +856,25 @@ export interface ProposedPatch {
   readonly expectedStepsDelta?: number;
 }
 
+/**
+ * K-candidate proposal payload returned by the optional multi-candidate
+ * proposer path (plan section 8 Phase 3, L2). Each candidate keeps its own
+ * confidence and patch; the list is readonly so downstream selection cannot
+ * mutate the proposer's output.
+ */
+export interface ProposedPatchSet {
+  readonly candidates: readonly ProposedPatch[];
+}
+
 /** Dual-track proposer (Domain vs Invariant). */
 export interface IHarnessProposer {
   propose(request: ProposeRequest): Promise<ProposedPatch>;
+  /**
+   * Optional multi-candidate path: return K candidates in one proposer call
+   * (K = request.candidateCount, default 1). Implementations that omit this
+   * method keep the single-candidate behaviour of propose().
+   */
+  proposeCandidates?(request: ProposeRequest): Promise<ProposedPatchSet>;
 }
 
 /** A probed candidate ready for contrastive composition. */
@@ -1121,6 +1172,15 @@ export interface MetaSearchPolicy {
   readonly minMemoryConfidenceForSkip: number;
   readonly explorationTemperature?: number;
   readonly metadata?: ContractMetadata;
+  /** JitRL meta-level hyperparameters; tuned by offline dreaming (plan section 7.3). */
+  readonly jit?: Readonly<{
+    readonly beta: number;
+    readonly lambda: number;
+    readonly alpha: number;
+    readonly k: number;
+    readonly gamma: number;
+    readonly similarityThreshold: number;
+  }>;
 }
 
 /** Multi-budget preference set rho used by Pareto replay. */
@@ -1201,6 +1261,441 @@ export interface DreamReplayReport {
 /** Zero-execution offline replay engine. */
 export interface IOfflineDreamer {
   replay(request: OfflineDreamRequest): Promise<DreamReplayReport>;
+}
+
+// ---------------------------------------------------------------------------
+// JitRL: experience, adjustment and step-evaluation contracts (Phase 1, v2)
+// ---------------------------------------------------------------------------
+
+/** The three JitRL layers a state, record or decision can belong to. */
+export type JitLevel = 'meta' | 'proposal' | 'host_tool';
+
+/**
+ * Abstraction of one decision point, shared by the experience store and the
+ * policy optimizer. `bucket` is the exact-match key, `tokens` feeds the
+ * Jaccard similarity used by nearest-neighbour retrieval, and `summary` is
+ * diagnostics/audit only.
+ */
+export interface AbstractState {
+  readonly level: JitLevel;
+  /** Exact-match bucket, e.g. `${taskSignature}|${complexity}|${slotKind?}`. */
+  readonly bucket: string;
+  /** Normalized token set used for Jaccard similarity. */
+  readonly tokens: readonly string[];
+  /** Human-readable summary; never used for matching. */
+  readonly summary: string;
+}
+
+/** One stored JitRL experience sample observed at a JitLevel. */
+export interface ExperienceRecord {
+  readonly id: string;
+  readonly level: JitLevel;
+  readonly state: AbstractState;
+  /** MetaAction id, patch signature or tool action key, depending on level. */
+  readonly actionKey: string;
+  /** Fused, clipped per-step reward r_t. */
+  readonly reward: number;
+  /** Discounted return G_t from this step onwards. */
+  readonly return: number;
+  /** Per-source reward breakdown (llm / surrogate / tool / turn / user). */
+  readonly rewardSources: Readonly<Record<string, number>>;
+  /** Guidance mode in force; keeps invariant slots isolated. */
+  readonly guidance: GuidanceMode;
+  /** Prior policy that produced this sample (non-stationarity handling). */
+  readonly policyId: string;
+  readonly sessionId: string;
+  readonly treeId?: string;
+  readonly nodeId?: string;
+  /** Creation timestamp in ms since epoch (injected clock). */
+  readonly createdAt: number;
+  /** True once secrets have been redacted from this record. */
+  readonly redacted: boolean;
+}
+
+/**
+ * Nearest-neighbour query against the experience store.
+ *
+ * Phase 4 (additive): `policyId` and `driftRho` carry the drift down-weighting
+ * input from plan section 7.3-4. Both are optional, so every pre-existing
+ * construction site keeps compiling and behaving exactly as before. When
+ * `policyId` is absent no drift weighting is applied (factor 1); when it is
+ * present, records produced by a different policy are weighted by `driftRho`
+ * until the same bucket holds k records from the current policy.
+ */
+export interface ExperienceQuery {
+  readonly level: JitLevel;
+  readonly state: AbstractState;
+  readonly k: number;
+  /** Minimum Jaccard similarity for a neighbour to be returned. */
+  readonly similarityThreshold: number;
+  /** Restrict results to this guidance mode (invariant slots force 'guidance_free'). */
+  readonly guidanceFilter?: GuidanceMode;
+  /** Causal cutoff: only records with createdAt <= before are visible. */
+  readonly before?: number;
+  /** Current policy id; when set, stale-policy records are down-weighted. */
+  readonly policyId?: string;
+  /** Drift down-weight factor in [0, 1] applied to stale-policy records. */
+  readonly driftRho?: number;
+}
+
+/** Append-only experience store backing all JitRL levels. */
+export interface IExperienceStore {
+  append(records: readonly ExperienceRecord[]): Promise<void>;
+  query(query: ExperienceQuery): Promise<readonly ScoredExperience[]>;
+  size(level?: JitLevel): Promise<number>;
+  compact(options: { readonly maxPerBucket: number; readonly halfLifeMs?: number }): Promise<number>;
+  export(): AsyncIterable<ExperienceRecord>;
+}
+
+/** A neighbour returned by the store, with its similarity in [0, 1]. */
+export interface ScoredExperience {
+  readonly record: ExperienceRecord;
+  readonly similarity: number;
+  /** Store-derived retrieval weight; consumers may recompute it. */
+  readonly weight?: number;
+  /**
+   * Phase 4 (additive): the drift factor actually applied to this neighbour,
+   * 1 when no drift weighting was requested. Reported so replay diagnostics can
+   * prove the down-weighting happened instead of silently shrinking weights.
+   */
+  readonly driftWeight?: number;
+}
+
+/**
+ * One candidate action handed to the policy optimizer, with the prior logit
+ * z(s, a) of its source. The payload carries the level-specific action object
+ * (meta action, patch proposal or tool-call plan) unchanged.
+ */
+export interface JitCandidate<TPayload = unknown> {
+  readonly actionKey: string;
+  readonly baseLogit: number;
+  readonly source: 'llm' | 'policy_prior' | 'memory_augmented';
+  readonly payload: TPayload;
+}
+
+/** The optimizer's closed-form correction applied to one candidate. */
+export interface JitAdjustment<TPayload = unknown> {
+  readonly candidate: JitCandidate<TPayload>;
+  /** Q estimate; null when the action has no support and was not explored. */
+  readonly q: number | null;
+  /** Advantage A = Q - V. */
+  readonly advantage: number;
+  /** Normalized advantage A-tilde in [-1, 1]. */
+  readonly normalizedAdvantage: number;
+  /** Adjusted logit z' = z + beta * A-tilde. */
+  readonly adjustedLogit: number;
+  /** Softmax probability over all adjusted logits. */
+  readonly probability: number;
+  /** Neighbour support |N(s, a)| for this action. */
+  readonly support: number;
+  /** True when optimistic exploration produced this Q value. */
+  readonly explored: boolean;
+}
+
+/** Terminal result of one optimizer decision. */
+export interface JitDecision<TPayload = unknown> {
+  readonly level: JitLevel;
+  /** State value estimate V-hat from the neighbourhood. */
+  readonly stateValue: number;
+  /** Neighbour count |N(s)|. */
+  readonly neighborCount: number;
+  readonly adjustments: readonly JitAdjustment<TPayload>[];
+  readonly chosen: JitAdjustment<TPayload>;
+  /** Diagnostic KL(pi' || pi_prior). */
+  readonly klToPrior: number;
+  readonly rationale: string;
+}
+
+/** JitRL policy optimizer over experience-backed candidates. */
+export interface IJitPolicyOptimizer {
+  decide<T>(
+    level: JitLevel,
+    state: AbstractState,
+    candidates: readonly JitCandidate<T>[],
+    options?: { readonly guidanceFilter?: GuidanceMode; readonly rng?: () => number }
+  ): Promise<JitDecision<T>>;
+}
+
+/** One fused per-step reward (plan section 6.5). */
+export interface StepReward {
+  readonly stepIndex: number;
+  readonly reward: number;
+  readonly sources: Readonly<Record<string, number>>;
+  readonly rationale?: string;
+}
+
+/**
+ * Fuses multi-source per-step signals (llm / surrogate / tool / turn / user)
+ * into StepReward entries for one trajectory. The llm judge runs with purpose
+ * 'evaluate_steps' and sees anonymized candidates.
+ */
+export interface IStepEvaluator {
+  evaluate(
+    trajectory: ProbeTrajectory,
+    context: { readonly task: ProbeTask; readonly reference?: ProbeTrajectory }
+  ): Promise<readonly StepReward[]>;
+}
+
+// ---------------------------------------------------------------------------
+// JitRL Phase 4/5: Dream replay hook, L3 host advisor, statistics mirror (v2)
+// ---------------------------------------------------------------------------
+//
+// Every export below is additive to contract version 2. The Dream-RSI replay
+// loop is synchronous by construction (see replayTree), so the JitRL simulation
+// is expressed as a plain synchronous function type: no Promise, no I/O, no
+// timers. Callers budget the neighbour snapshot (already causally truncated)
+// before invoking the hook; the hook never queries a store itself.
+
+/**
+ * Frontier-node view handed to a replay hook. It carries only the fields replay
+ * already exposes, so the hook stays decoupled from DiscoveryNode identity and
+ * from the mutable tree.
+ */
+export interface JitReplayFrontierNode {
+  readonly nodeId: string;
+  readonly depth: number;
+  readonly patchOrigin: PatchOrigin;
+  readonly purpose: PatchPurpose;
+  readonly guidance: GuidanceMode;
+  readonly slot?: BatchSlotKind;
+  readonly score?: number;
+  readonly createdAt: number;
+}
+
+/**
+ * Input of one replay-time JitRL simulation step.
+ *
+ * `experiences` is the caller-budgeted neighbour snapshot: replay must fill it
+ * with an ExperienceQuery whose `before` is the replayed tree's createdAt
+ * (causal cutoff, plan section 7.3-2). The hook must not widen that window.
+ */
+export interface JitReplayHookInput {
+  readonly treeId: string;
+  readonly policyId: string;
+  /** Budget preference of the replay point currently being evaluated. */
+  readonly rho: number;
+  /** Slot weights of the policy under replay, before the Jit correction. */
+  readonly slotWeights: Readonly<Record<BatchSlotKind, number>>;
+  readonly frontier: JitReplayFrontierNode;
+  /** Causally truncated neighbours; the hook is a pure function over them. */
+  readonly experiences: readonly ExperienceRecord[];
+  /** Hyperparameters of the policy under replay (reuses MetaSearchPolicy.jit). */
+  readonly jit: NonNullable<MetaSearchPolicy['jit']>;
+  /** Current policy id used for drift down-weighting (plan section 7.3-4). */
+  readonly driftRho?: number;
+}
+
+/** One slot/action correction produced by a replay hook. */
+export interface JitReplayAdjustment {
+  readonly actionKey: string;
+  /** Slot this correction applies to, when the action maps to one slot. */
+  readonly slot?: BatchSlotKind;
+  /** Prior weight/probability before the correction. */
+  readonly baseWeight: number;
+  /** Weight/probability after the correction. */
+  readonly adjustedWeight: number;
+  /** Q estimate; null when the action had no support and was not explored. */
+  readonly q: number | null;
+  readonly advantage: number;
+  readonly normalizedAdvantage: number;
+  /** Neighbour support |N(s, a)|. */
+  readonly support: number;
+  /** True when optimistic exploration produced this Q value. */
+  readonly explored: boolean;
+}
+
+/** Diagnostics of one replay-time JitRL simulation step. */
+export interface JitReplayHookDiagnostics {
+  readonly level: JitLevel;
+  /** State value estimate V-hat from the neighbour snapshot. */
+  readonly stateValue: number;
+  /** Neighbour count |N(s)| within the causal window. */
+  readonly neighborCount: number;
+  /** KL(pi' || pi_prior) of the corrected portfolio against the prior. */
+  readonly klToPrior: number;
+  readonly adjustments: readonly JitReplayAdjustment[];
+  /** True when the hook could not apply a correction and kept the prior. */
+  readonly degraded?: boolean;
+  readonly notes?: readonly string[];
+}
+
+/**
+ * Result of one replay-time JitRL simulation step. `slotWeights` is the
+ * corrected portfolio and must stay normalized over all four slot kinds; a
+ * hook that cannot correct anything returns the prior weights unchanged.
+ */
+export interface JitReplayHookResult {
+  readonly slotWeights: Readonly<Record<BatchSlotKind, number>>;
+  readonly diagnostics: JitReplayHookDiagnostics;
+}
+
+/**
+ * Synchronous, side-effect-free JitRL simulation injected into Dream replay.
+ *
+ * Implementations must be pure and synchronous: replay is a synchronous
+ * function over recorded data, so the hook may not await, read files, hit the
+ * network or mutate its input. Any neighbour lookup happens in the caller.
+ */
+export type JitReplayHook = (input: JitReplayHookInput) => JitReplayHookResult;
+
+/**
+ * Per-tree, per-rho JitRL diagnostics attached by Dream replay. This is the
+ * Dream-layer aggregation the replay report exposes; it is additive, so a
+ * replay outcome without a hook simply omits it.
+ */
+export interface DreamJitDiagnostics {
+  readonly treeId: string;
+  readonly policyId: string;
+  /** Number of frontier nodes the hook actually consulted. */
+  readonly hookCalls: number;
+  /** Total neighbours the hook saw after the causal cutoff. */
+  readonly neighborsUsed: number;
+  /** Mean KL(pi' || pi_prior) across hook calls; 0 when no call happened. */
+  readonly meanKlToPrior: number;
+  /** Mean state value estimate across hook calls. */
+  readonly meanStateValue: number;
+  /** Drift down-weight factor in force during this replay. */
+  readonly driftRho: number;
+  /** Causal cutoff used for the neighbour snapshot (normally tree.createdAt). */
+  readonly causalCutoff?: number;
+  /** True when at least one hook call degraded to the unchanged prior. */
+  readonly degraded: boolean;
+  /** Human-readable evidence lines; safe to append to ReplayTreeOutcome.evidence. */
+  readonly evidence: readonly string[];
+}
+
+/**
+ * L3 host-advisor decision kinds. 'deny' is deliberately absent: the advisor may
+ * annotate a decision or ask the user, but it must never block a tool call on
+ * its own (plan section 3.3, gate mode is user-approval only).
+ */
+export const HOST_ADVISOR_DECISION_KINDS = ['advisory', 'ask', 'noop'] as const;
+export type HostAdvisorDecisionKind = (typeof HOST_ADVISOR_DECISION_KINDS)[number];
+
+/** One observed host tool call, used to build the L3 abstract state. */
+export interface HostToolCallObservation {
+  readonly toolName: string;
+  readonly actionKey?: string;
+  readonly at?: number;
+  readonly isError?: boolean;
+  readonly exitCode?: number;
+  readonly summary?: string;
+}
+
+/** Coarse working-directory digest; never the raw file contents. */
+export interface WorkingDirectorySummary {
+  readonly path: string;
+  readonly fileCount?: number;
+  readonly topExtensions?: readonly string[];
+  readonly truncated?: boolean;
+}
+
+/**
+ * Input of one L3 host-advisor evaluation. `state` is always a 'host_tool'
+ * AbstractState, so the advisor can reuse the shared experience retriever.
+ */
+export interface HostAdvisorRequest {
+  readonly level: 'host_tool';
+  readonly state: AbstractState;
+  /** Most recent host tool calls, newest last. */
+  readonly recentTools: readonly HostToolCallObservation[];
+  readonly errors: readonly ToolErrorRecord[];
+  readonly workingDirectory?: WorkingDirectorySummary;
+  /** Advisor mode in force; 'gate' may ask the user but never denies. */
+  readonly mode: 'advisory' | 'gate';
+  readonly adviseThreshold: number;
+  readonly gateThreshold: number;
+  readonly minSupport: number;
+  readonly policyId?: string;
+  /** Drift down-weight factor in [0, 1] for stale-policy experience. */
+  readonly driftRho?: number;
+  /** Injected wall clock (ms since epoch). */
+  readonly now?: number;
+  readonly metadata?: ContractMetadata;
+}
+
+/** Evidence behind one advisor decision; diagnostics only, never injected. */
+export interface HostAdvisorDiagnostics {
+  readonly actionKey: string;
+  readonly meanReturn: number | null;
+  readonly support: number;
+  readonly stateValue: number;
+  readonly advantage: number;
+  readonly threshold: number;
+  readonly mode: 'advisory' | 'gate';
+}
+
+/**
+ * Advisory decision: annotate the turn with a short suggestion. The rendered
+ * text is capped by the implementation (<= 300 tokens, plan section 8 Phase 5).
+ */
+export interface HostAdvisorAdvisoryDecision {
+  readonly kind: 'advisory';
+  readonly text: string;
+  /** Anti-patterns rendered separately; never phrased as recommendations. */
+  readonly antiPatterns?: readonly string[];
+  readonly diagnostics?: HostAdvisorDiagnostics;
+}
+
+/** Gate decision: hand the call to the user for approval. Never an automatic deny. */
+export interface HostAdvisorAskDecision {
+  readonly kind: 'ask';
+  readonly reason: string;
+  readonly suggestedActionKey?: string;
+  readonly diagnostics?: HostAdvisorDiagnostics;
+}
+
+/** Do-nothing decision: no neighbours, low support or advantage above threshold. */
+export interface HostAdvisorNoopDecision {
+  readonly kind: 'noop';
+  readonly reason?: string;
+  readonly diagnostics?: HostAdvisorDiagnostics;
+}
+
+/** Tri-state L3 decision discriminated by 'kind'. */
+export type HostAdvisorDecision =
+  | HostAdvisorAdvisoryDecision
+  | HostAdvisorAskDecision
+  | HostAdvisorNoopDecision;
+
+/**
+ * One aggregated JitRL statistic row mirrored to the memory bridge: per
+ * (bucket, actionKey, level) sample count, mean return and variance. Raw
+ * records are never mirrored; the aggregate is the only outbound shape.
+ */
+export interface JitStatsAggregate {
+  readonly bucket: string;
+  readonly actionKey: string;
+  readonly level: JitLevel;
+  readonly n: number;
+  readonly meanReturn: number;
+  readonly variance: number;
+  /** Namespace the aggregate belongs to; filled by namespaceFor(level). */
+  readonly namespace?: string;
+  readonly policyId?: string;
+  /** Drift factor applied to the contributing records, 1 when none. */
+  readonly driftRhoApplied?: number;
+  readonly updatedAt?: number;
+}
+
+/** Outcome of one mirror write. */
+export interface JitMirrorResult {
+  readonly written: number;
+  readonly skipped: number;
+  readonly namespaces: readonly string[];
+  readonly degraded: boolean;
+  readonly diagnostics: readonly string[];
+}
+
+/**
+ * Optional mirror of JitRL statistics into the governed memory bridge. Writes
+ * are aggregate-only (plan section 7.2) and namespace-isolated per level, so a
+ * disabled mirror costs zero backend calls instead of a degraded write.
+ */
+export interface IJitMirrorStore {
+  mirror(aggregates: readonly JitStatsAggregate[]): Promise<JitMirrorResult>;
+  /** Stable namespace for one level, e.g. `${prefix}/jitrl/${level}`. */
+  namespaceFor(level: JitLevel): string;
 }
 
 // ---------------------------------------------------------------------------

@@ -41,4 +41,7 @@ jobs:
         run: pnpm exec tsc --noEmit
 
       - name: Run tests
-        run: pnpm exec vitest run
+        run: pnpm exec vitest run --reporter=default --reporter=json --outputFile=test-results.json
+
+      - name: Verify README test counts and docs hygiene
+        run: pnpm run check:docs

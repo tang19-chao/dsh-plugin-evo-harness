@@ -132,10 +132,12 @@ export interface ScriptedModelOptions {
 }
 
 /**
- * Routes on ModelPurpose so one adapter serves propose/compose/reflect:
+ * Routes on ModelPurpose so one adapter serves propose/compose/reflect/probe:
  *  - propose -> the next cycled proposal payload
  *  - compose -> ranking of every candidate alias found in the prompt
  *  - reflect -> no headers, so the reflector keeps its deterministic titles
+ *  - probe   -> a distinct scripted probe reply, so model calls made inside an
+ *    isolated probe branch stay distinguishable from 'compose' judging
  */
 export function createScriptedModel(options: ScriptedModelOptions = {}): ScriptedModel {
   const requests: ModelRequest[] = [];
@@ -172,6 +174,9 @@ export function createScriptedModel(options: ScriptedModelOptions = {}): Scripte
       }
       if (request.purpose === 'reflect') {
         return { text: JSON.stringify({ lessons: [] }), finishReason: 'stop', model: 'scripted' };
+      }
+      if (request.purpose === 'probe') {
+        return { text: 'probe-loop-reply', finishReason: 'stop', model: 'scripted' };
       }
       return { text: JSON.stringify({ policies: [] }), finishReason: 'stop', model: 'scripted' };
     }
