@@ -9,6 +9,12 @@ work/
 outputs/
 %SystemDrive%/
 
+# extracted upstream probe copies and one-off asar/verification scripts
+dsh-probe/
+bridge-verify/
+f1-repro/
+asar-*.cjs
+
 # build and test output
 dist/
 coverage/

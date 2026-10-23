@@ -10,6 +10,7 @@
  *   - DisposableRegistry : LIFO reversible-effect unwinding
  */
 export * from './disposable-registry';
+export * from './dsh-hook-host-adapter';
 export * from './eight-surfaces';
 export * from './errors';
 export * from './context-forker';

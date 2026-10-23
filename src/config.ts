@@ -19,6 +19,7 @@ import {
   MEMORY_DRIVER_KINDS,
   TRIGGER_MODES,
   type HarnessComponentKey,
+  type JitLevel,
   type MemoryDriverKind,
   type SurrogateScoreWeights,
   type TriggerMode
@@ -87,6 +88,130 @@ export interface LoggingConfig {
   includeTrajectorySummaries: boolean;
 }
 
+/** JitRL exploration schedule (plan section 6.4). */
+export interface JitRlExplorationConfig {
+  /** Probability of optimistic exploration for an action without support. */
+  lambda: number;
+  /** Optimism bonus added on top of the state value when exploring. */
+  alpha: number;
+}
+
+/** Local JitRL experience store persistence settings. */
+export interface JitRlStoreConfig {
+  /** Storage driver; only the append-only JSONL store ships in Phase 1. */
+  driver: 'jsonl';
+  /** Also mirror appended experience records into the host memory bridge. */
+  mirrorToMemoryBridge: boolean;
+  /** Per-bucket record cap enforced by compaction. */
+  maxPerBucket: number;
+  /** Half-life in days used by compaction; 0 disables half-life decay. */
+  halfLifeDays: number;
+}
+
+/** Per-source step-reward weights; must sum to 1. */
+export interface JitRlRewardWeightsConfig {
+  llm: number;
+  surrogate: number;
+  tool: number;
+  turn: number;
+  user: number;
+}
+
+/** Multi-source step reward fusion settings (plan section 6.5). */
+export interface JitRlRewardConfig {
+  /** Enable the LLM step judge (purpose 'evaluate_steps'). */
+  llmEvaluator: boolean;
+  weights: JitRlRewardWeightsConfig;
+  /** [min, max] clip applied to fused rewards; clip[0] must be < clip[1]. */
+  clip: readonly [number, number];
+}
+
+/** L3 host tool-call advisor settings (experimental, default off). */
+export interface JitRlHostAdvisorConfig {
+  enabled: boolean;
+  /** 'advisory' annotates decisions; 'gate' may block host tool calls. */
+  mode: 'advisory' | 'gate';
+  /** Mean neighbour return below which the advisor suggests an alternative. */
+  adviseThreshold: number;
+  /** Mean neighbour return below which 'gate' mode blocks the call. */
+  gateThreshold: number;
+  /** Minimum neighbour support before the advisor acts. */
+  minSupport: number;
+}
+
+/** Privacy controls applied before experience is persisted. */
+export interface JitRlPrivacyConfig {
+  /** Redact secrets from persisted states and summaries. */
+  redactSecrets: boolean;
+  /** Store raw task/observation text alongside abstract states. */
+  storeRawText: boolean;
+}
+
+/**
+ * Dream-RSI x JitRL dual-loop settings (plan section 7.3, Phase 4).
+ *
+ * candidateJitBetas / candidateJitLambdas are the hyperparameter perturbation
+ * grids generateCandidatePolicies draws from; driftRho down-weights experience
+ * written by a superseded policy after a hot swap.
+ */
+export interface JitRlDreamConfig {
+  /** Down-weight factor for stale-policy experience, in [0, 1]. */
+  driftRho: number;
+  /** Perturb the JitRL hyperparameters when generating candidate policies. */
+  hyperparamPerturbation: boolean;
+  /** Candidate beta grid; non-empty, every entry finite and >= 0. */
+  candidateJitBetas: number[];
+  /** Candidate lambda grid; non-empty, every entry in [0, 1]. */
+  candidateJitLambdas: number[];
+}
+
+/**
+ * JitRL configuration (plan section 5.2). Deliberate deviations: the config
+ * schema version stays at 1 because persisted records use numeric
+ * schemaVersion 1, and the plan's .volatile() hot-reload markers have no
+ * counterpart in this schema yet - changed values take effect on the next
+ * plugin construction.
+ */
+export interface JitRlConfig {
+  enabled: boolean;
+  /** Active layers; 'host_tool' is experimental. */
+  levels: JitLevel[];
+  /** Candidate logit source: 'auto' | 'verbalized' | 'token'. */
+  logitSource: 'auto' | 'verbalized' | 'token';
+  /** Candidate selection rule: 'argmax' | 'sample'. */
+  selection: 'argmax' | 'sample';
+  /** KL temperature multiplying the normalized advantage. */
+  beta: number;
+  /** Nearest-neighbour count (paper robust range 8-14). */
+  k: number;
+  /** Minimum Jaccard similarity for a neighbour. */
+  similarityThreshold: number;
+  /** Return discount along step/tree paths. */
+  gamma: number;
+  exploration: JitRlExplorationConfig;
+  /** K candidates requested from proposers (proposal level). */
+  candidateCount: number;
+  /** Augment the candidate set with memory-only actions. */
+  augmentFromMemory: boolean;
+  /**
+   * Opt-in for the plan section 3.1 L1 action space: when true the meta-level
+   * decorator emits one candidate per slotKind x focusSurface (up to 4 x 8 = 32)
+   * and writes the chosen action's surfaces back onto BatchSlotPlan.focusSurfaces.
+   * Default false keeps the pre-G2-1 single-candidate-per-kind behaviour.
+   */
+  surfaceActions: boolean;
+  /** Minimum neighbour support before the prior dominates. */
+  minSupportForStrongPrior: number;
+  /** Value of unseen actions: 'baseline' (Q = V) or 'zero' (paper). */
+  unseenFallback: 'zero' | 'baseline';
+  store: JitRlStoreConfig;
+  reward: JitRlRewardConfig;
+  hostAdvisor: JitRlHostAdvisorConfig;
+  /** Dream-RSI x JitRL dual loop (plan section 7.3). */
+  dream: JitRlDreamConfig;
+  privacy: JitRlPrivacyConfig;
+}
+
 /** Fully resolved plugin configuration. */
 export interface EvoHarnessConfig {
   schemaVersion: typeof CONFIG_SCHEMA_VERSION;
@@ -96,6 +221,7 @@ export interface EvoHarnessConfig {
   probe: ProbeConfig;
   memoryBridge: MemoryBridgeConfig;
   dreamRsi: DreamRsiConfig;
+  jitrl: JitRlConfig;
   logging: LoggingConfig;
 }
 
@@ -201,6 +327,47 @@ const DEFAULT_CONFIG_VALUES: EvoHarnessConfig = {
     earlyStopThreshold: 0.8,
     minMemoryConfidenceForSkip: 0.75
   },
+  jitrl: {
+    enabled: true,
+    levels: ['meta', 'proposal'],
+    logitSource: 'auto',
+    selection: 'argmax',
+    beta: 1.0,
+    k: 10,
+    similarityThreshold: 0.3,
+    gamma: 0.5,
+    exploration: { lambda: 0.05, alpha: 5 },
+    candidateCount: 3,
+    augmentFromMemory: true,
+    surfaceActions: false,
+    minSupportForStrongPrior: 3,
+    unseenFallback: 'baseline',
+    store: {
+      driver: 'jsonl',
+      mirrorToMemoryBridge: false,
+      maxPerBucket: 200,
+      halfLifeDays: 30
+    },
+    reward: {
+      llmEvaluator: true,
+      weights: { llm: 0.4, surrogate: 0.3, tool: 0.2, turn: 0.1, user: 0.0 },
+      clip: [-3, 3]
+    },
+    hostAdvisor: {
+      enabled: false,
+      mode: 'advisory',
+      adviseThreshold: -0.5,
+      gateThreshold: -0.8,
+      minSupport: 5
+    },
+    dream: {
+      driftRho: 0.7,
+      hyperparamPerturbation: true,
+      candidateJitBetas: [0.5, 1, 2],
+      candidateJitLambdas: [0.02, 0.05, 0.1]
+    },
+    privacy: { redactSecrets: true, storeRawText: false }
+  },
   logging: {
     level: 'info',
     includeTrajectorySummaries: false
@@ -250,6 +417,7 @@ const ROOT_KEYS = new Set<string>([
   'probe',
   'memoryBridge',
   'dreamRsi',
+  'jitrl',
   'logging'
 ]);
 const PROBE_KEYS = new Set<string>(['maxConcurrentProbes', 'probeTimeoutMs']);
@@ -288,6 +456,58 @@ const DREAM_KEYS = new Set<string>([
 const WEIGHT_KEYS = ['selection', 'adoption', 'efficiency', 'toolErrorPenalty'] as const;
 const SURROGATE_WEIGHT_KEYS = new Set<string>([...WEIGHT_KEYS]);
 const LOGGING_KEYS = new Set<string>(['level', 'includeTrajectorySummaries']);
+const JITRL_KEYS = new Set<string>([
+  'enabled',
+  'levels',
+  'logitSource',
+  'selection',
+  'beta',
+  'k',
+  'similarityThreshold',
+  'gamma',
+  'exploration',
+  'candidateCount',
+  'augmentFromMemory',
+  'surfaceActions',
+  'minSupportForStrongPrior',
+  'unseenFallback',
+  'store',
+  'reward',
+  'hostAdvisor',
+  'dream',
+  'privacy'
+]);
+const JITRL_EXPLORATION_KEYS = new Set<string>(['lambda', 'alpha']);
+const JITRL_STORE_KEYS = new Set<string>([
+  'driver',
+  'mirrorToMemoryBridge',
+  'maxPerBucket',
+  'halfLifeDays'
+]);
+const JITRL_REWARD_KEYS = new Set<string>(['llmEvaluator', 'weights', 'clip']);
+const JITRL_HOST_ADVISOR_KEYS = new Set<string>([
+  'enabled',
+  'mode',
+  'adviseThreshold',
+  'gateThreshold',
+  'minSupport'
+]);
+const JITRL_PRIVACY_KEYS = new Set<string>(['redactSecrets', 'storeRawText']);
+const JITRL_DREAM_KEYS = new Set<string>([
+  'driftRho',
+  'hyperparamPerturbation',
+  'candidateJitBetas',
+  'candidateJitLambdas'
+]);
+const JITRL_LEVELS: readonly JitLevel[] = ['meta', 'proposal', 'host_tool'];
+const JITRL_LOGIT_SOURCES: readonly string[] = ['auto', 'verbalized', 'token'];
+const JITRL_SELECTIONS: readonly string[] = ['argmax', 'sample'];
+const JITRL_UNSEEN_FALLBACKS: readonly string[] = ['zero', 'baseline'];
+const JITRL_STORE_DRIVERS: readonly string[] = ['jsonl'];
+const JITRL_HOST_ADVISOR_MODES: readonly string[] = ['advisory', 'gate'];
+const JITRL_REWARD_WEIGHT_KEYS = ['llm', 'surrogate', 'tool', 'turn', 'user'] as const;
+const JITRL_REWARD_WEIGHT_KEYS_SET = new Set<string>([...JITRL_REWARD_WEIGHT_KEYS]);
+const JITRL_WEIGHT_SUM_EPSILON = 1e-9;
 const DRIVER_HINTS: readonly string[] = ['auto', ...MEMORY_DRIVER_KINDS];
 const FORBIDDEN_KEYS = new Set<string>(['__proto__', 'prototype', 'constructor']);
 const NAMESPACE_PREFIX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -423,6 +643,53 @@ function validateEnum(
       'Expected one of: ' + allowed.join(', ') + '.',
       value
     );
+  }
+}
+
+/**
+ * Validate a non-empty array of finite numbers, each inside [min, max] and
+ * unique. Used by the perturbation grids of jitrl.dream: a duplicated or
+ * non-finite entry would silently collapse the candidate space, so it is
+ * rejected instead of quietly de-duplicated.
+ */
+function validateNumberArray(
+  value: unknown,
+  path: string,
+  min: number,
+  max: number,
+  issues: ConfigValidationIssue[]
+): void {
+  if (!Array.isArray(value)) {
+    pushIssue(issues, path, 'invalid_type', 'Expected an array of numbers.', value);
+    return;
+  }
+  if (value.length === 0) {
+    pushIssue(issues, path, 'invalid_value', 'Expected at least 1 item(s).', value);
+    return;
+  }
+  const seen = new Set<number>();
+  for (let index = 0; index < value.length; index += 1) {
+    const item: unknown = value[index];
+    const itemPath = path + '[' + index + ']';
+    if (typeof item !== 'number' || !Number.isFinite(item)) {
+      pushIssue(issues, itemPath, 'invalid_type', 'Expected a finite number.', item);
+      continue;
+    }
+    if (item < min || item > max) {
+      pushIssue(
+        issues,
+        itemPath,
+        'out_of_range',
+        'Expected a number in [' + min + ', ' + max + '].',
+        item
+      );
+      continue;
+    }
+    if (seen.has(item)) {
+      pushIssue(issues, itemPath, 'duplicate_value', 'Duplicate value ' + item + '.', item);
+      continue;
+    }
+    seen.add(item);
   }
 }
 
@@ -739,6 +1006,186 @@ function validateLoggingGroup(root: Record<string, unknown>, issues: ConfigValid
   );
 }
 
+function validateJitRlLevels(value: unknown, issues: ConfigValidationIssue[]): void {
+  validateStringArray(value, 'jitrl.levels', 1, issues);
+  if (!Array.isArray(value)) {
+    return;
+  }
+  const seen = new Set<string>();
+  for (let index = 0; index < value.length; index += 1) {
+    const item: unknown = value[index];
+    if (typeof item !== 'string') {
+      continue;
+    }
+    validateEnum(item, 'jitrl.levels[' + index + ']', JITRL_LEVELS, issues);
+    if (seen.has(item)) {
+      pushIssue(
+        issues,
+        'jitrl.levels[' + index + ']',
+        'duplicate_value',
+        'Duplicate JitRL level ' + item + '.',
+        item
+      );
+    }
+    seen.add(item);
+  }
+}
+
+function validateJitRlRewardWeights(value: unknown, issues: ConfigValidationIssue[]): void {
+  if (!isPlainObject(value)) {
+    pushIssue(
+      issues,
+      'jitrl.reward.weights',
+      'invalid_type',
+      'Expected an object with five numeric weights.',
+      value
+    );
+    return;
+  }
+  collectUnknownKeys(value, JITRL_REWARD_WEIGHT_KEYS_SET, 'jitrl.reward.weights', issues);
+  const numeric: number[] = [];
+  let allNumeric = true;
+  for (const key of JITRL_REWARD_WEIGHT_KEYS) {
+    const entry: unknown = value[key];
+    validateNumberInRange(entry, 'jitrl.reward.weights.' + key, 0, 1, issues);
+    if (typeof entry === 'number' && Number.isFinite(entry)) {
+      numeric.push(entry);
+    } else {
+      allNumeric = false;
+    }
+  }
+  if (allNumeric) {
+    const sum = numeric.reduce((total, entry) => total + entry, 0);
+    if (Math.abs(sum - 1) > JITRL_WEIGHT_SUM_EPSILON) {
+      pushIssue(
+        issues,
+        'jitrl.reward.weights',
+        'weights_not_normalized',
+        'JitRL reward weights must sum to 1 (received ' + sum + ').',
+        sum
+      );
+    }
+  }
+}
+
+function validateJitRlRewardClip(value: unknown, issues: ConfigValidationIssue[]): void {
+  if (!Array.isArray(value) || value.length !== 2) {
+    pushIssue(
+      issues,
+      'jitrl.reward.clip',
+      'invalid_type',
+      'Expected a [min, max] pair of numbers.',
+      value
+    );
+    return;
+  }
+  const min: unknown = value[0];
+  const max: unknown = value[1];
+  validateNumberInRange(min, 'jitrl.reward.clip[0]', -1000, 1000, issues);
+  validateNumberInRange(max, 'jitrl.reward.clip[1]', -1000, 1000, issues);
+  if (
+    typeof min === 'number' &&
+    Number.isFinite(min) &&
+    typeof max === 'number' &&
+    Number.isFinite(max) &&
+    min >= max
+  ) {
+    pushIssue(
+      issues,
+      'jitrl.reward.clip',
+      'invalid_value',
+      'Expected clip[0] to be strictly smaller than clip[1].',
+      value
+    );
+  }
+}
+
+function validateJitRlGroup(root: Record<string, unknown>, issues: ConfigValidationIssue[]): void {
+  const jitrl = asGroup(root.jitrl, 'jitrl', issues);
+  if (jitrl === null) {
+    return;
+  }
+  validateBoolean(jitrl.enabled, 'jitrl.enabled', issues);
+  validateJitRlLevels(jitrl.levels, issues);
+  validateEnum(jitrl.logitSource, 'jitrl.logitSource', JITRL_LOGIT_SOURCES, issues);
+  validateEnum(jitrl.selection, 'jitrl.selection', JITRL_SELECTIONS, issues);
+  validateNumberInRange(jitrl.beta, 'jitrl.beta', 0, 100, issues);
+  validateInteger(jitrl.k, 'jitrl.k', 1, 1000, issues);
+  validateNumberInRange(jitrl.similarityThreshold, 'jitrl.similarityThreshold', 0, 1, issues);
+  validateNumberInRange(jitrl.gamma, 'jitrl.gamma', 0, 1, issues);
+  const exploration = asGroup(jitrl.exploration, 'jitrl.exploration', issues);
+  if (exploration !== null) {
+    validateNumberInRange(exploration.lambda, 'jitrl.exploration.lambda', 0, 1, issues);
+    validateNumberInRange(exploration.alpha, 'jitrl.exploration.alpha', 0, 100, issues);
+  }
+  validateInteger(jitrl.candidateCount, 'jitrl.candidateCount', 1, 64, issues);
+  validateBoolean(jitrl.augmentFromMemory, 'jitrl.augmentFromMemory', issues);
+  validateBoolean(jitrl.surfaceActions, 'jitrl.surfaceActions', issues);
+  validateInteger(
+    jitrl.minSupportForStrongPrior,
+    'jitrl.minSupportForStrongPrior',
+    0,
+    1000,
+    issues
+  );
+  validateEnum(jitrl.unseenFallback, 'jitrl.unseenFallback', JITRL_UNSEEN_FALLBACKS, issues);
+  const store = asGroup(jitrl.store, 'jitrl.store', issues);
+  if (store !== null) {
+    validateEnum(store.driver, 'jitrl.store.driver', JITRL_STORE_DRIVERS, issues);
+    validateBoolean(store.mirrorToMemoryBridge, 'jitrl.store.mirrorToMemoryBridge', issues);
+    validateInteger(store.maxPerBucket, 'jitrl.store.maxPerBucket', 1, 1_000_000, issues);
+    validateInteger(store.halfLifeDays, 'jitrl.store.halfLifeDays', 0, 36_500, issues);
+  }
+  const reward = asGroup(jitrl.reward, 'jitrl.reward', issues);
+  if (reward !== null) {
+    validateBoolean(reward.llmEvaluator, 'jitrl.reward.llmEvaluator', issues);
+    validateJitRlRewardWeights(reward.weights, issues);
+    validateJitRlRewardClip(reward.clip, issues);
+  }
+  const hostAdvisor = asGroup(jitrl.hostAdvisor, 'jitrl.hostAdvisor', issues);
+  if (hostAdvisor !== null) {
+    validateBoolean(hostAdvisor.enabled, 'jitrl.hostAdvisor.enabled', issues);
+    validateEnum(hostAdvisor.mode, 'jitrl.hostAdvisor.mode', JITRL_HOST_ADVISOR_MODES, issues);
+    validateNumberInRange(
+      hostAdvisor.adviseThreshold,
+      'jitrl.hostAdvisor.adviseThreshold',
+      -100,
+      100,
+      issues
+    );
+    validateNumberInRange(
+      hostAdvisor.gateThreshold,
+      'jitrl.hostAdvisor.gateThreshold',
+      -100,
+      100,
+      issues
+    );
+    validateInteger(hostAdvisor.minSupport, 'jitrl.hostAdvisor.minSupport', 0, 1000, issues);
+  }
+  const dream = asGroup(jitrl.dream, 'jitrl.dream', issues);
+  if (dream !== null) {
+    validateNumberInRange(dream.driftRho, 'jitrl.dream.driftRho', 0, 1, issues);
+    validateBoolean(
+      dream.hyperparamPerturbation,
+      'jitrl.dream.hyperparamPerturbation',
+      issues
+    );
+    validateNumberArray(dream.candidateJitBetas, 'jitrl.dream.candidateJitBetas', 0, 100, issues);
+    validateNumberArray(
+      dream.candidateJitLambdas,
+      'jitrl.dream.candidateJitLambdas',
+      0,
+      1,
+      issues
+    );
+  }
+  const privacy = asGroup(jitrl.privacy, 'jitrl.privacy', issues);
+  if (privacy !== null) {
+    validateBoolean(privacy.redactSecrets, 'jitrl.privacy.redactSecrets', issues);
+    validateBoolean(privacy.storeRawText, 'jitrl.privacy.storeRawText', issues);
+  }
+}
+
 function buildConfig(rawInput: unknown): ConfigBuildResult {
   const issues: ConfigValidationIssue[] = [];
   const raw = rawInput === undefined ? {} : rawInput;
@@ -767,6 +1214,28 @@ function buildConfig(rawInput: unknown): ConfigBuildResult {
       issues
     );
   }
+  collectUnknownKeys(raw.jitrl, JITRL_KEYS, 'jitrl', issues);
+  if (isPlainObject(raw.jitrl)) {
+    collectUnknownKeys(raw.jitrl.exploration, JITRL_EXPLORATION_KEYS, 'jitrl.exploration', issues);
+    collectUnknownKeys(raw.jitrl.store, JITRL_STORE_KEYS, 'jitrl.store', issues);
+    collectUnknownKeys(raw.jitrl.reward, JITRL_REWARD_KEYS, 'jitrl.reward', issues);
+    if (isPlainObject(raw.jitrl.reward)) {
+      collectUnknownKeys(
+        raw.jitrl.reward.weights,
+        JITRL_REWARD_WEIGHT_KEYS_SET,
+        'jitrl.reward.weights',
+        issues
+      );
+    }
+    collectUnknownKeys(
+      raw.jitrl.hostAdvisor,
+      JITRL_HOST_ADVISOR_KEYS,
+      'jitrl.hostAdvisor',
+      issues
+    );
+    collectUnknownKeys(raw.jitrl.privacy, JITRL_PRIVACY_KEYS, 'jitrl.privacy', issues);
+    collectUnknownKeys(raw.jitrl.dream, JITRL_DREAM_KEYS, 'jitrl.dream', issues);
+  }
   collectUnknownKeys(raw.logging, LOGGING_KEYS, 'logging', issues);
 
   const merged = deepMerge(createDefaultConfig(), raw);
@@ -791,6 +1260,7 @@ function buildConfig(rawInput: unknown): ConfigBuildResult {
   validateProbeGroup(merged, issues);
   validateMemoryGroup(merged, issues);
   validateDreamGroup(merged, issues);
+  validateJitRlGroup(merged, issues);
   validateLoggingGroup(merged, issues);
 
   return { config: merged as unknown as EvoHarnessConfig, issues };

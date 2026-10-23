@@ -226,3 +226,125 @@ describe('Harness² proposer / deterministic parsing', () => {
     expect(request.metadata?.guidance).toBe('memory');
   });
 });
+
+describe('Harness² proposer / multi-candidate path (P3-B)', () => {
+  const payload = (overrides: Record<string, unknown> = {}): Record<string, unknown> =>
+    JSON.parse(proposalJson(overrides)) as Record<string, unknown>;
+
+  it('returns K candidates in order from exactly one model call', async () => {
+    const set = JSON.stringify([
+      payload({ rationale: 'First.', confidence: 0.9, edits: { guardrails: { kind: 'guardrails', formatContract: 'A' } } }),
+      payload({ rationale: 'Second.', confidence: 0.5, edits: { system_prompt: { kind: 'system_prompt', mode: 'append', content: 'B' } } }),
+      payload({ rationale: 'Third.', confidence: 0.1, edits: { memory: { kind: 'memory', workingNotes: ['C'] } } })
+    ]);
+    const { model, proposer } = makeProposer([set]);
+    const request = makeProposeRequest({ candidateCount: 3 });
+
+    const result = await proposer.proposeCandidates!(request);
+
+    expect(model.requests).toHaveLength(1);
+    expect(model.requests[0]?.metadata?.candidateCount).toBe(3);
+    expect(promptText(model, 0)).toContain('JSON ARRAY of exactly 3');
+    expect(result.candidates).toHaveLength(3);
+    expect(result.candidates.map((candidate) => candidate.rationale)).toEqual(['First.', 'Second.', 'Third.']);
+    expect(result.candidates.map((candidate) => candidate.confidence)).toEqual([0.9, 0.5, 0.1]);
+    expect(result.candidates.map((candidate) => candidate.patch.guidance)).toEqual(['memory', 'memory', 'memory']);
+  });
+
+  it('keeps K=1 and K undefined on the unchanged single-candidate path', async () => {
+    const { model, proposer } = makeProposer([proposalJson(), proposalJson()]);
+    const one = await proposer.proposeCandidates!(makeProposeRequest({ candidateCount: 1 }));
+    expect(model.requests).toHaveLength(1);
+    expect(one.candidates).toHaveLength(1);
+    expect(one.candidates[0]?.confidence).toBeCloseTo(0.7, 5);
+    expect(model.requests[0]?.metadata?.candidateCount).toBeUndefined();
+    const undef = await proposer.proposeCandidates!(makeProposeRequest({}));
+    expect(model.requests).toHaveLength(2);
+    expect(undef.candidates).toHaveLength(1);
+    expect(promptText(model, 1)).not.toContain('JSON ARRAY');
+    expect(promptText(model, 1)).toContain('Return exactly ONE JSON object');
+  });
+
+  it('drops invalid candidates and records diagnostics without failing the call', async () => {
+    const set = JSON.stringify([
+      payload({ rationale: 'Good.', edits: { guardrails: { kind: 'guardrails', formatContract: 'A' } } }),
+      'not an object',
+      payload({ rationale: 'Empty edits.', edits: {} }),
+      payload({ rationale: 'Bad payload.', edits: { guardrails: { kind: 'nope' } } })
+    ]);
+    const { model, proposer } = makeProposer([set]);
+
+    const result = await proposer.proposeCandidates!(makeProposeRequest({ candidateCount: 4 }));
+
+    expect(model.requests).toHaveLength(1);
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0]?.rationale).toBe('Good.');
+    const diagnostics = result.candidates[0]?.patch.metadata?.diagnostics as string[];
+    const joined = diagnostics.join(' | ');
+    expect(joined).toContain('candidate 2: dropped, not a JSON object');
+    expect(joined).toContain('candidate 3: dropped, no valid surface edit');
+    expect(joined).toContain('multi-candidate proposal: requested 4, accepted 1');
+  });
+
+  it('falls back to the single-candidate path when every candidate is invalid', async () => {
+    const { model, proposer } = makeProposer([
+      JSON.stringify([{ rationale: 'Empty.', edits: {} }]),
+      proposalJson()
+    ]);
+
+    const result = await proposer.proposeCandidates!(makeProposeRequest({ candidateCount: 3 }));
+
+    expect(model.requests).toHaveLength(2);
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0]?.confidence).toBeCloseTo(0.7, 5);
+    const diagnostics = result.candidates[0]?.patch.metadata?.diagnostics as string[];
+    expect(diagnostics.join(' | ')).toContain('0 valid); fell back to the single-candidate path');
+  });
+
+  it('clamps out-of-range confidences and defaults missing ones to 0.5', async () => {
+    const set = JSON.stringify([
+      payload({ rationale: 'High.', confidence: 7, edits: { guardrails: { kind: 'guardrails', formatContract: 'A' } } }),
+      payload({ rationale: 'Negative.', confidence: -2, edits: { guardrails: { kind: 'guardrails', formatContract: 'B' } } }),
+      // confidence: undefined is dropped by JSON.stringify, so the payload
+      // genuinely lacks the key and the 0.5 default must apply.
+      payload({ rationale: 'Missing.', confidence: undefined, edits: { guardrails: { kind: 'guardrails', formatContract: 'C' } } })
+    ]);
+    const { model, proposer } = makeProposer([set]);
+
+    const result = await proposer.proposeCandidates!(makeProposeRequest({ candidateCount: 3 }));
+
+    expect(model.requests).toHaveLength(1);
+    expect(result.candidates.map((candidate) => candidate.confidence)).toEqual([1, 0, 0.5]);
+  });
+
+  it('keeps guidance_free slots free of memory recall even when K > 1', async () => {
+    const set = JSON.stringify([
+      payload({ rationale: 'One.', edits: { system_prompt: { kind: 'system_prompt', mode: 'append', content: 'A' } } }),
+      payload({ rationale: 'Two.', edits: { system_prompt: { kind: 'system_prompt', mode: 'append', content: 'B' } } }),
+      payload({ rationale: 'Three.', edits: { system_prompt: { kind: 'system_prompt', mode: 'append', content: 'C' } } })
+    ]);
+    const { model, proposer } = makeProposer([set]);
+    const request = makeProposeRequest({
+      candidateCount: 3,
+      slot: makeSlot({
+        slot: 'explore_invariant',
+        origin: 'invariant',
+        guidance: 'guidance_free',
+        focusSurfaces: ['system_prompt']
+      }),
+      guidance: { mode: 'invariant', memory: null }
+    });
+
+    const result = await proposer.proposeCandidates!(request);
+
+    const prompt = promptText(model, 0);
+    expect(prompt).not.toContain(POSITIVE_TITLE);
+    expect(prompt).not.toContain(NEGATIVE_TITLE);
+    expect(result.candidates).toHaveLength(3);
+    for (const candidate of result.candidates) {
+      expect(candidate.patch.guidance).toBe('guidance_free');
+      expect(candidate.patch.sourceLessonIds).toEqual([]);
+      expect(candidate.patch.metadata?.memoryRecallIds).toEqual([]);
+    }
+  });
+});

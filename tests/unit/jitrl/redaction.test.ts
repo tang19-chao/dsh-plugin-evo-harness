@@ -1,0 +1,200 @@
+/**
+ * Repair B2: shared secret redaction. Verifies every exported pattern
+ * class (GitHub tokens, AWS keys, hyphenated/underscored sk- keys, Bearer
+ * credentials, PEM blocks, keyword secrets with optional separators, long
+ * hex/base64 blobs), the stable placeholder that keeps bucketing identical
+ * when only the secret value changes, and idempotency.
+ */
+import { describe, expect, it } from 'vitest';
+import {
+  SECRET_PATTERNS,
+  SECRET_PLACEHOLDER,
+  redactAbsolutePaths,
+  redactSecrets
+} from '../../../src/jitrl/redaction';
+
+describe('secret pattern set', () => {
+  const cases: readonly (readonly [string, string])[] = [
+    ['github_token', 'ghp_0123456789abcdefghijklmnopqrstuv'],
+    ['github_token', 'gho_0123456789abcdefghijklmnopqrstuv'],
+    ['github_token', 'ghu_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456'],
+    ['github_token', 'ghs_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456'],
+    ['github_token', 'ghr_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456'],
+    ['aws_access_key', 'AKIAIOSFODNN7EXAMPLE'],
+    ['model_api_key', 'sk-proj-abc123XYZ_def-456'],
+    ['model_api_key', 'sk-abc_123defgh'],
+    ['model_api_key', 'sk-live-ABCDEF1234567890'],
+    ['bearer_token', 'Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6y'],
+    ['keyword_secret', 'password hunter2'],
+    ['keyword_secret', 'api_key = x'],
+    ['keyword_secret', 'token: y'],
+    ['keyword_secret', 'Password is y'],
+    ['keyword_secret', 'password: "s3cret value"'],
+    ['hex_blob', 'deadbeefdeadbeefdeadbeefdeadbeef'],
+    ['base64_blob', 'Abcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGhijk']
+  ];
+
+  it.each(cases)('%s matches its specimen', (name, specimen) => {
+    const entry = SECRET_PATTERNS.find((candidate) => candidate.name === name);
+    expect(entry, name).toBeDefined();
+    expect(entry?.pattern.test(specimen), name + ' vs ' + specimen).toBe(true);
+  });
+
+  it('matches a PEM private-key block including the body', () => {
+    const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\nlines\n-----END RSA PRIVATE KEY-----';
+    const entry = SECRET_PATTERNS.find((candidate) => candidate.name === 'pem_private_key');
+    expect(entry?.pattern.test(pem)).toBe(true);
+  });
+
+  it('does not match secret-free prose', () => {
+    const prose = 'deploy the api service to production';
+    for (const entry of SECRET_PATTERNS) {
+      expect(entry.pattern.test(prose), entry.name).toBe(false);
+    }
+  });
+});
+
+describe('redactSecrets', () => {
+  it('replaces a provider token with the stable placeholder', () => {
+    expect(redactSecrets('use ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 now')).toBe('use <secret> now');
+  });
+
+  it('keeps functionally equivalent inputs identical when only the value changes', () => {
+    const first = 'deploy with token ghp_AAAABBBBCCCCDDDDEEEEFFFF0000';
+    const second = 'deploy with token ghp_ZZZZYYYYXXXXWWWWVVVVUUUU9999';
+    expect(redactSecrets(first)).toBe(redactSecrets(second));
+    // 'token <value>' is itself a keyword secret, so the whole phrase folds
+    // into one stable placeholder.
+    expect(redactSecrets(first)).toBe('deploy with <secret>');
+  });
+
+  it('is idempotent, including over pre-redacted text', () => {
+    const adversarial = [
+      'echo password hunter2',
+      'sk-live-ABCDEF1234567890',
+      'Bearer abc.def.ghi',
+      'password <secret>',
+      SECRET_PLACEHOLDER,
+      'token is fine'
+    ].join(' | ');
+    const once = redactSecrets(adversarial);
+    expect(once).not.toContain('password');
+    expect(once).not.toContain('sk-live-');
+    expect(redactSecrets(once)).toBe(once);
+  });
+
+  it('leaves secret-free text untouched', () => {
+    const text = 'run the test suite and write a summary';
+    expect(redactSecrets(text)).toBe(text);
+  });
+
+  it('honours a custom placeholder', () => {
+    expect(redactSecrets('password hunter2', { placeholder: '<x>' })).toBe('<x>');
+  });
+});
+
+describe('redactAbsolutePaths', () => {
+  it('strips absolute windows and posix paths', () => {
+    expect(redactAbsolutePaths('see /usr/local/bin/x and C:\\Temp\\a')).toBe('see <path> and <path>');
+    expect(redactAbsolutePaths('plain relative/path.txt')).toBe('plain relative/path.txt');
+  });
+});
+
+describe('over-redaction narrowing (P3-F/G2-4)', () => {
+  const collisions: readonly (readonly [string, string])[] = [
+    ['token refresh bug', 'token expiry bug'],
+    ['secret manager config', 'secret rotation policy'],
+    ['bearer auth layer', 'bearer caching note']
+  ];
+
+  it('no longer redacts ordinary noun runs after a bare-whitespace keyword', () => {
+    for (const [first, second] of collisions) {
+      expect(redactSecrets(first), first).toBe(first);
+      expect(redactSecrets(second), second).toBe(second);
+    }
+  });
+
+  it('keeps the collision pairs distinguishable (no bucket folding)', () => {
+    for (const [first, second] of collisions) {
+      expect(redactSecrets(first)).not.toBe(redactSecrets(second));
+    }
+  });
+
+  it('still redacts every genuine credential shape', () => {
+    const genuine: readonly string[] = [
+      'password hunter2',
+      'api_key = x',
+      'token: y',
+      'Password is y',
+      'password: "s3cret value"',
+      'access_key=Abc123!@',
+      'token 0123456789abcdef0123456789abcdef',
+      'deploy with token ghp_AAAABBBBCCCCDDDDEEEEFFFF0000',
+      'AKIAIOSFODNN7EXAMPLE',
+      'sk-live-ABCDEF1234567890',
+      'Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6y',
+      '-----BEGIN RSA PRIVATE KEY-----\nMIIEpA\n-----END RSA PRIVATE KEY-----'
+    ];
+    for (const text of genuine) {
+      expect(redactSecrets(text), text).not.toBe(text);
+      expect(redactSecrets(text), text).toContain('<secret>');
+    }
+  });
+
+  it('still redacts a quoted short value after a bare-whitespace keyword', () => {
+    expect(redactSecrets('password "x"')).toBe('<secret>');
+  });
+
+  it('keeps idempotency and bucket stability after the narrowing', () => {
+    const adversarial = ['echo password hunter2', 'password <secret>', SECRET_PLACEHOLDER, 'token is fine'].join(' | ');
+    const once = redactSecrets(adversarial);
+    expect(redactSecrets(once)).toBe(once);
+    expect(redactSecrets('deploy with token ghp_AAAABBBBCCCCDDDDEEEEFFFF0000')).toBe(
+      redactSecrets('deploy with token ghp_ZZZZYYYYXXXXWWWWVVVVUUUU9999')
+    );
+  });
+});
+
+describe('structured keys and paths survive blobs (P3-FIX3)', () => {
+  const EIGHT_SURFACE_KEY =
+    'slot:exploit/surf:guardrails+memory+plugins+scripts+skills+subagents+system_prompt+tool_guidance';
+  const candidateKeys = [
+    EIGHT_SURFACE_KEY,
+    'slot:explore_domain/surf:guardrails+memory+plugins+scripts+skills+subagents+system_prompt+tool_guidance',
+    'slot:explore_invariant/surf:guardrails+memory+plugins+scripts+skills+subagents+system_prompt+tool_guidance',
+    'slot:recover/surf:guardrails+memory+plugins+scripts+skills+subagents+system_prompt+tool_guidance'
+  ];
+
+  it('round-trips the full eight-surface action key unchanged', () => {
+    expect(redactSecrets(EIGHT_SURFACE_KEY)).toBe(EIGHT_SURFACE_KEY);
+  });
+
+  it('keeps all four explain candidate keys intact and distinct', () => {
+    const scrubbed = candidateKeys.map((key) => redactSecrets(key));
+    expect(scrubbed).toEqual(candidateKeys);
+    expect(new Set(scrubbed).size).toBe(4);
+  });
+
+  it('keeps absolute paths intact under redactSecrets; the scrub layer turns them into <path>', () => {
+    const path = 'C:/Users/Admin/Documents/Codex/2026-10-19/https-github-com-google-research-harness2/jit-active-policy.ts';
+    expect(redactSecrets(path)).toBe(path);
+    expect(redactAbsolutePaths(path)).toBe('<path>');
+    expect(redactAbsolutePaths('C:\\Users\\Admin\\Documents\\jit-active-policy.ts')).toBe('<path>');
+    expect(
+      redactSecrets('see /usr/local/lib/node_modules/very-long-package-name-here/file.js')
+    ).toBe('see /usr/local/lib/node_modules/very-long-package-name-here/file.js');
+  });
+
+  it('keeps path-embedded and key-prefixed hex intact while folding bare hex', () => {
+    expect(redactSecrets('C:/Users/x/2026-10-19/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')).toBe(
+      'C:/Users/x/2026-10-19/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    );
+    expect(redactSecrets('node:deadbeefdeadbeefdeadbeefdeadbeef')).toBe('node:deadbeefdeadbeefdeadbeefdeadbeef');
+    expect(redactSecrets('deadbeefdeadbeefdeadbeefdeadbeef')).toBe('<secret>');
+  });
+
+  it('still folds realistic high-entropy blobs', () => {
+    expect(redactSecrets('Abcdefghijklmnopqrstuvwxyz0123456789AbCdEfGh')).toBe('<secret>');
+    expect(redactSecrets('Abcdefghijklmnopqrstuvwxyz0123456789+/AbCdEfGhIjKlMnOp')).toBe('<secret>');
+  });
+});

@@ -1,10 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  causalCutoffFor,
+  causalExperienceSnapshot,
   createModelPolicyGenerator,
   createOfflineDreamer,
   evaluatePolicy,
   generateCandidatePolicies,
+  jitHyperparamIssues,
   normalizeRhoPreferences,
   replayNodeScore,
   replayPolicy,
@@ -15,11 +18,36 @@ import {
 import { createDiscoveryTree, createDiscoveryTreePool, createReplayPrefixView } from '../../../src/dream-rsi/discovery-tree';
 import type {
   DiscoveryTreeSnapshot,
+  ExperienceRecord,
   IModelAdapter,
+  JitReplayHook,
   MetaSearchPolicy,
   OfflineDreamRequest
 } from '../../../src/types/contracts';
 import { childInput, fixedClock, makeDiagnosis, makePolicy } from './fixtures';
+
+/** Minimal L1 experience record for the causal-truncation cases. */
+function makeExperienceRecord(id: string, createdAt: number): ExperienceRecord {
+  return {
+    id,
+    level: 'meta',
+    state: {
+      level: 'meta',
+      bucket: 'meta|sig:search|cx:moderate',
+      tokens: ['sig:search', 'cx:moderate'],
+      summary: 'synthetic state'
+    },
+    actionKey: 'exploit|system_prompt',
+    reward: 0.5,
+    return: 0.5,
+    rewardSources: { surrogate: 0.5 },
+    guidance: 'memory',
+    policyId: 'pi-0',
+    sessionId: 'session-1',
+    createdAt,
+    redacted: true
+  };
+}
 
 function richTree(): DiscoveryTreeSnapshot {
   const tree = createDiscoveryTree({
@@ -721,5 +749,183 @@ describe('early-stop probe accounting', () => {
     expect(outcome.probes).toBe(1);
     expect(outcome.visitedNodeIds).toEqual([tree.rootId, 'hot']);
     expect(outcome.evidence.some((line) => line.startsWith('recovery probe charged'))).toBe(false);
+  });
+});
+
+/**
+ * Phase 4 addendum. These cases cover the dual-loop expansion of this module
+ * (jit hyperparameter perturbation and the injected JitReplayHook); they are
+ * additive and change no expectation above. The dedicated JitRL fixtures live in
+ * jit-dream.test.ts.
+ */
+describe('Phase 4 dual loop: jit grid and replay hook', () => {
+  it('perturbs beta/lambda together and leaves the other jit fields inherited', () => {
+    const baseline = makePolicy({
+      id: 'pi-jit-base',
+      jit: { beta: 1, lambda: 0.05, alpha: 5, k: 10, gamma: 0.5, similarityThreshold: 0.3 }
+    });
+    const candidates = generateCandidatePolicies(baseline, 6, { now: () => 3 });
+    expect(candidates.map((entry) => entry.jit?.beta)).toEqual([0.5, 1, 2, 0.5, 1, 2]);
+    expect(candidates.map((entry) => entry.jit?.lambda)).toEqual([0.02, 0.05, 0.1, 0.02, 0.05, 0.1]);
+    for (const candidate of candidates) {
+      expect(candidate.jit?.alpha).toBe(5);
+      expect(candidate.jit?.k).toBe(10);
+      expect(candidate.jit?.gamma).toBe(0.5);
+      expect(candidate.jit?.similarityThreshold).toBe(0.3);
+      expect(jitHyperparamIssues(candidate.jit)).toEqual([]);
+    }
+    // Same inputs, same candidates: the sequence is reproducible.
+    const again = generateCandidatePolicies(baseline, 6, { now: () => 3 });
+    expect(JSON.stringify(again)).toBe(JSON.stringify(candidates));
+    // Switching the perturbation off keeps the baseline jit verbatim.
+    const frozen = generateCandidatePolicies(baseline, 2, {
+      now: () => 3,
+      jitGrid: { hyperparamPerturbation: false }
+    });
+    for (const candidate of frozen) {
+      expect(candidate.jit).toEqual(baseline.jit);
+    }
+  });
+
+  it('keeps a model-proposed jit record and drops an illegal one', async () => {
+    const baseline = makePolicy({
+      id: 'pi-model-jit',
+      jit: { beta: 1, lambda: 0.05, alpha: 5, k: 10, gamma: 0.5, similarityThreshold: 0.3 }
+    });
+    const adapter: IModelAdapter = {
+      complete: async () => ({
+        text:
+          '[{"maxWidth": 2, "maxDepth": 2, "jit": {"beta": 2, "lambda": 0.1, "alpha": 5, "k": 10, "gamma": 0.5, "similarityThreshold": 0.3}}, {"maxWidth": 2, "maxDepth": 2, "jit": {"beta": 2, "lambda": 0.1, "alpha": 5, "k": -4, "gamma": 0.5, "similarityThreshold": 0.3}}]'
+      })
+    };
+    const policies = await createModelPolicyGenerator(adapter, { now: () => 21 })(
+      baseline,
+      3,
+      dreamRequest({ baselinePolicy: baseline })
+    );
+    // The first candidate keeps its proposed jit; the second is repaired by the
+    // field-wise fallback (k => baseline) rather than dropped.
+    expect(policies).toHaveLength(2);
+    expect(policies[0]?.jit?.beta).toBe(2);
+    expect(policies[0]?.metadata?.jitSource).toBe('model');
+    expect(policies[1]?.jit?.k).toBe(baseline.jit?.k);
+    expect(policies[1]?.metadata?.jitSource).toBe('baseline');
+    expect(policies[1]?.metadata?.jitDiagnostics).toEqual(
+      expect.arrayContaining([expect.stringContaining('jit.k')])
+    );
+    for (const entry of policies) {
+      expect(jitHyperparamIssues(entry.jit)).toEqual([]);
+    }
+  });
+
+  it('causally truncates the hook snapshot to the replayed tree', () => {
+    expect(
+      causalExperienceSnapshot(
+        [
+          makeExperienceRecord('past', 400),
+          makeExperienceRecord('boundary', 500),
+          makeExperienceRecord('future', 501)
+        ],
+        500
+      ).map((record) => record.id)
+    ).toEqual(['past', 'boundary']);
+
+    const tree = richTree();
+    const cutoff = causalCutoffFor(tree);
+    expect(cutoff).toBe(tree.createdAt);
+    const experiences = [
+      makeExperienceRecord('before-tree', cutoff - 1),
+      makeExperienceRecord('at-tree', cutoff),
+      makeExperienceRecord('after-tree', cutoff + 1)
+    ];
+
+    const seen: string[][] = [];
+    const hook: JitReplayHook = (input) => {
+      seen.push(input.experiences.map((record) => record.id));
+      return {
+        slotWeights: input.slotWeights,
+        diagnostics: {
+          level: 'meta',
+          stateValue: 0,
+          neighborCount: input.experiences.length,
+          klToPrior: 0,
+          adjustments: []
+        }
+      };
+    };
+    const outcome = replayTree(tree, narrowPolicy(), 1, { jitHook: hook, experiences });
+    expect(seen.length).toBeGreaterThan(0);
+    for (const snapshot of seen) {
+      expect(snapshot).toEqual(['before-tree', 'at-tree']);
+    }
+    expect(outcome.jitDiagnostics?.causalCutoff).toBe(cutoff);
+    expect(outcome.evidence.join(' ')).toContain('causalCutoff=');
+  });
+
+  it('degrades to the pre-hook replay when the injected hook throws', () => {
+    const tree = richTree();
+    const legacy = replayTree(tree, narrowPolicy(), 1);
+    const degraded = replayTree(tree, narrowPolicy(), 1, {
+      jitHook: () => {
+        throw new Error('no kernel');
+      }
+    });
+    const { jitDiagnostics, evidence, ...rest } = degraded;
+    const { evidence: legacyEvidence, ...legacyRest } = legacy;
+    expect(rest).toEqual(legacyRest);
+    expect(evidence.slice(0, legacyEvidence.length)).toEqual(legacyEvidence);
+    expect(evidence.join(' ')).toContain('degraded at layer 1');
+    expect(jitDiagnostics?.degraded).toBe(true);
+    expect(jitDiagnostics?.hookCalls).toBe(0);
+  });
+
+  it('feeds a corrected portfolio back into the replayed frontier', () => {
+    const tree = createDiscoveryTree({
+      id: 'tree-correction',
+      sessionId: 'session-1',
+      taskId: 'task-1',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    // 'hot' is a low-scoring domain sibling; 'deep-best' holds the best score but
+    // sits below a sibling the prior flushes last.
+    tree.addNode(childInput(tree.rootId, { id: 'hot', purpose: 'deepen' }));
+    tree.recordProbe('hot', { trajectoryId: 'traj-hot', score: 0.3 });
+    tree.addNode(childInput(tree.rootId, { id: 'best', purpose: 'deepen' }));
+    tree.recordProbe('best', { trajectoryId: 'traj-best', score: 0.6 });
+    tree.addNode(childInput('best', { id: 'deep-best', purpose: 'deepen' }));
+    tree.recordProbe('deep-best', { trajectoryId: 'traj-deep-best', score: 0.9 });
+
+    const base = makePolicy({
+      id: 'pi-correct',
+      maxWidth: 1,
+      maxDepth: 2,
+      earlyStopThreshold: 1,
+      slotWeights: { exploit: 0.4, explore_domain: 0.3, explore_invariant: 0.2, recover: 0.1 }
+    });
+    const legacy = replayTree(tree.snapshot(), base, 1);
+    // The default portfolio reaches 'best' and then its deep child.
+    expect(legacy.visitedNodeIds).toEqual([tree.rootId, 'best', 'deep-best']);
+    expect(legacy.quality).toBe(0.9);
+
+    // A hook that pins the frontier to 'hot' keeps the replayed policy shallow.
+    const exploitHot: JitReplayHook = (input) => ({
+      slotWeights:
+        input.frontier.nodeId === 'hot'
+          ? { exploit: 1, explore_domain: 0, explore_invariant: 0, recover: 0 }
+          : { exploit: 0, explore_domain: 1, explore_invariant: 0, recover: 0 },
+      diagnostics: {
+        level: 'meta',
+        stateValue: 0,
+        neighborCount: input.experiences.length,
+        klToPrior: 0.1,
+        adjustments: []
+      }
+    });
+    const corrected = replayTree(tree.snapshot(), base, 1, { jitHook: exploitHot });
+    expect(corrected.visitedNodeIds).toEqual([tree.rootId, 'hot']);
+    expect(corrected.quality).toBe(0.3);
+    expect(corrected.jitDiagnostics?.hookCalls).toBeGreaterThan(0);
+    expect(corrected.jitDiagnostics?.degraded).toBe(false);
   });
 });

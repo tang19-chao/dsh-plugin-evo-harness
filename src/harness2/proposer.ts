@@ -35,6 +35,7 @@ import {
   type ProbeTrajectory,
   type ProposeRequest,
   type ProposedPatch,
+  type ProposedPatchSet,
   type ScriptArtifactSpec,
   type ScriptsSurfaceEdit,
   type SkillsSurfaceEdit,
@@ -227,7 +228,7 @@ function memorySectionLines(recall: MemoryRecallResult, maxLessons: number): str
  */
 export function renderProposalPrompts(
   request: ProposeRequest,
-  options?: { readonly maxLessonsPerSection?: number }
+  options?: { readonly maxLessonsPerSection?: number; readonly candidateCount?: number }
 ): readonly ModelMessage[] {
   const decision = decideProposalGuidance(request);
   const maxLessons = options?.maxLessonsPerSection ?? 8;
@@ -240,10 +241,19 @@ export function renderProposalPrompts(
     'You edit the eight harness surfaces that wrap a frozen model. Model weights never change; only the scaffold around them changes.'
   );
   system.push('Surfaces (stable order): ' + HARNESS_COMPONENT_KEYS.join(', ') + '.');
-  system.push('Return exactly ONE JSON object, no prose, matching this shape:');
-  system.push(
-    '{ "rationale": string, "focusSurfaces": string[], "confidence": number in [0,1], "expectedStepsDelta": number, "edits": { <surface>: <payload> } }'
-  );
+  const shapeLine =
+    '{ "rationale": string, "focusSurfaces": string[], "confidence": number in [0,1], "expectedStepsDelta": number, "edits": { <surface>: <payload> } }';
+  const candidateCount = options?.candidateCount ?? 1;
+  if (candidateCount > 1) {
+    system.push(
+      'Return a JSON ARRAY of exactly ' + String(candidateCount) + ' candidate objects, no prose. Every array element matches this shape:'
+    );
+    system.push(shapeLine);
+    system.push('Diversify: every candidate must propose a materially different edit plan; never repeat an object.');
+  } else {
+    system.push('Return exactly ONE JSON object, no prose, matching this shape:');
+    system.push(shapeLine);
+  }
   system.push('Payload shapes (the "kind" field is mandatory):');
   for (const line of SURFACE_PAYLOAD_CONTRACT) {
     system.push(line);
@@ -742,7 +752,7 @@ export function createDualTrackProposer(options: HarnessProposerOptions): IHarne
   const newId = options.newId ?? createDeterministicIdFactory('propose');
   const maxLessons = options.maxLessonsPerSection ?? 8;
 
-  return {
+  const proposer: IHarnessProposer = {
     async propose(request: ProposeRequest): Promise<ProposedPatch> {
       const decision = decideProposalGuidance(request);
       const diagnostics: string[] = [];
@@ -843,4 +853,149 @@ export function createDualTrackProposer(options: HarnessProposerOptions): IHarne
       return { patch, rationale, focusSurfaces, confidence, expectedStepsDelta };
     }
   };
+
+  // P3-B (plan section 8): optional multi-candidate path. K>1 asks the model
+  // ONCE for a JSON array of candidate objects, validates every element with
+  // the same EightSurfacePatch checks as the single path, drops invalid
+  // entries (never failing the whole call) and falls back to the proven
+  // single-candidate path when nothing usable remains. K<=1 defers to
+  // propose() byte-for-byte.
+  proposer.proposeCandidates = async (request: ProposeRequest): Promise<ProposedPatchSet> => {
+    const requested = request.candidateCount;
+    if (!Number.isInteger(requested) || (requested ?? 1) <= 1) {
+      const single = await proposer.propose(request);
+      return { candidates: [single] };
+    }
+    const k = requested as number;
+    const decision = decideProposalGuidance(request);
+    const diagnostics: string[] = [];
+    if (decision.sanitized) {
+      diagnostics.push(decision.reason);
+    }
+    const recall: MemoryRecallResult | undefined =
+      decision.memoryAllowed && request.guidance.mode === 'domain' ? request.guidance.memory : undefined;
+    const modelRequest: ModelRequest = {
+      purpose: 'propose',
+      messages: renderProposalPrompts(request, { maxLessonsPerSection: maxLessons, candidateCount: k }),
+      temperature: options.temperature ?? 0.2,
+      maxTokens: options.maxTokens ?? 2048,
+      responseFormat: 'json',
+      metadata: {
+        sessionId: request.sessionId,
+        slot: request.slot.slot,
+        guidance: decision.memoryAllowed ? 'memory' : 'guidance_free',
+        attemptIndex: request.attemptIndex,
+        candidateCount: k
+      }
+    };
+    const response = await options.model.complete(modelRequest);
+    const parsed = extractJsonValue(response.text);
+    const rawCandidates: unknown[] = Array.isArray(parsed)
+      ? parsed.slice(0, k)
+      : isRecord(parsed)
+        ? [parsed]
+        : [];
+    const allowed = allowedSurfacesFor(request);
+    const candidates: ProposedPatch[] = [];
+    for (let index = 0; index < rawCandidates.length; index += 1) {
+      const entry: unknown = rawCandidates[index];
+      const label = 'candidate ' + String(index + 1);
+      if (!isRecord(entry)) {
+        diagnostics.push(label + ': dropped, not a JSON object');
+        continue;
+      }
+      const dropped: string[] = [];
+      const edits = parseEdits(entry.edits, allowed, dropped);
+      if (!decision.memoryAllowed) {
+        stripExternalMemoryChannels(edits, dropped);
+      }
+      const editedSurfaces = surfaceKeysInOrder(Object.keys(edits));
+      if (editedSurfaces.length === 0) {
+        diagnostics.push(
+          label + ': dropped, no valid surface edit' + (dropped.length > 0 ? ' (' + dropped.join(' | ') + ')' : '')
+        );
+        continue;
+      }
+      const rationale =
+        nonEmptyString(entry.rationale) ??
+        'Model proposal for slot ' + request.slot.slot + ' touching ' + editedSurfaces.join(', ') + '.';
+      const focusSurfaces = resolveFocusSurfaces(entry.focusSurfaces, editedSurfaces);
+      const confidence = clamp01(finiteNumber(entry.confidence) ?? 0.5);
+      const expectedStepsDelta = finiteNumber(entry.expectedStepsDelta);
+      const sourceLessonIds = decision.memoryAllowed ? lessonIds(recall) : [];
+      const parentPatchIds: string[] = [];
+      if (request.parentPatch !== undefined) {
+        parentPatchIds.push(request.parentPatch.id);
+      }
+      for (const seedId of request.slot.seedPatchIds ?? []) {
+        if (!parentPatchIds.includes(seedId)) {
+          parentPatchIds.push(seedId);
+        }
+      }
+      const metadata: ContractMetadata = {
+        slot: request.slot.slot,
+        slotIndex: request.slot.slotIndex,
+        origin: request.slot.origin,
+        attemptIndex: request.attemptIndex,
+        requestedGuidanceMode: request.guidance.mode,
+        effectiveGuidanceMode: decision.memoryAllowed ? 'memory' : 'guidance_free',
+        guidanceSanitized: decision.sanitized,
+        candidateIndex: index + 1,
+        candidateCountRequested: k,
+        droppedEdits: dropped,
+        memoryConfidence: recall?.confidence,
+        memoryRecallIds: sourceLessonIds,
+        diagnostics,
+        model: response.model
+      };
+      candidates.push({
+        patch: {
+          id: newId('patch'),
+          sessionId: request.sessionId,
+          branchId: request.slot.branchId,
+          origin: request.slot.origin,
+          purpose: purposeForSlot(request.slot.slot),
+          guidance: decision.memoryAllowed ? 'memory' : 'guidance_free',
+          label: request.slot.slot + ':' + editedSurfaces.join('+'),
+          rationale,
+          edits: edits as EightSurfaceEdits,
+          parentPatchIds: parentPatchIds.length > 0 ? parentPatchIds : undefined,
+          sourceLessonIds,
+          createdAt: now(),
+          metadata
+        },
+        rationale,
+        focusSurfaces,
+        confidence,
+        expectedStepsDelta
+      });
+    }
+    if (candidates.length === 0) {
+      const fallback = await proposer.propose(request);
+      const fallbackMeta: ContractMetadata = {
+        ...(fallback.patch.metadata ?? {}),
+        diagnostics: [
+          ...((fallback.patch.metadata?.diagnostics as readonly string[]) ?? []),
+          'multi-candidate response unusable (' + String(k) + ' requested, 0 valid); fell back to the single-candidate path'
+        ]
+      };
+      return {
+        candidates: [{ ...fallback, patch: { ...fallback.patch, metadata: fallbackMeta } }]
+      };
+    }
+    diagnostics.unshift(
+      'multi-candidate proposal: requested ' + String(k) + ', accepted ' + String(candidates.length)
+    );
+    return {
+      candidates: candidates.map((candidate) => ({
+        ...candidate,
+        patch: {
+          ...candidate.patch,
+          metadata: { ...(candidate.patch.metadata ?? {}), diagnostics: [...diagnostics] }
+        }
+      }))
+    };
+  };
+
+  return proposer;
 }
