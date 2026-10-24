@@ -37,6 +37,7 @@ import type {
   GuidanceMode
 } from '../types/contracts';
 import { EXPERIENCE_OUTCOMES } from '../types/contracts';
+import { isRewardVersionCompatible } from './reward-contract';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -69,8 +70,22 @@ export const EXPERIENCE_SCHEMA_VERSION = 2 as const;
 /** Schema version of a record written before per-execution attribution. */
 export const LEGACY_EXPERIENCE_SCHEMA_VERSION = 1 as const;
 
-/** Reward-model version stamped on every record written by this round. */
-export const CURRENT_REWARD_VERSION = 'r2/verifiable-v1' as const;
+/**
+ * Reward-model version stamped on every record written by this round.
+ *
+ * P6.1-D2 / R3 F1-a: this constant POINTS AT the RewardContract version so the
+ * persisted marker and the contract that defines its meaning cannot drift
+ * apart (previously it stayed on 'r2/verifiable-v1' while the orchestrator
+ * already wrote 'r3/unified-signals-v1'). The contract module
+ * (./reward-contract.ts) owns the version and its compatibility rule.
+ */
+export const CURRENT_REWARD_VERSION = 'r3/unified-signals-v1' as const;
+
+/**
+ * The reward version this store upgraded FROM; kept explicit so upgrade paths
+ * and tests can name the r2 lineage instead of hard-coding the string.
+ */
+export const PREVIOUS_REWARD_VERSION = 'r2/verifiable-v1' as const;
 
 /** Provenance-model version stamped on every record written by this round. */
 export const CURRENT_PROVENANCE_VERSION = 'p2/per-execution-v1' as const;
@@ -195,9 +210,23 @@ export function isLegacyStoredExperience(
   return version === undefined || !Number.isFinite(version) || version < minimum;
 }
 
-/** True when a record may train the policy (explicit false, or legacy). */
+/**
+ * True when a record may train the policy (explicit false, or legacy).
+ *
+ * P6.1-D2 / R3 F1-c: a record is also learning-INELIGIBLE when its
+ * rewardVersion is not compatible with the current RewardContract generation.
+ * Before this check the filter ignored rewardVersion entirely, so after the
+ * r2 -> r3 upgrade an old r2 record (schema already v2, never tagged legacy)
+ * would still be averaged into the same neighbourhood as fresh r3 records -
+ * exactly the cross-yardstick estimation P6.1-D exists to eliminate. The check
+ * fails closed: a missing or unknown rewardVersion proves nothing, so it does
+ * not train either.
+ */
 export function isLearningEligible(record: StoredExperience): boolean {
-  return record.learningEligible !== false && !isLegacyStoredExperience(record);
+  if (record.learningEligible === false || isLegacyStoredExperience(record)) {
+    return false;
+  }
+  return isRewardVersionCompatible(record.rewardVersion, CURRENT_REWARD_VERSION);
 }
 
 function normalizeRecord(value: unknown): StoredExperience {

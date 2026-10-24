@@ -5,8 +5,14 @@
  * State (recentTools, lastCredit, error history) is strictly bucketed by scope
  * (session + branch). Different sessions and different branches never share
  * recent tool history or action credits. Turn completion cleans up pending
- * credits, preventing duplicate turn-end attributions. Unknown scopes do not
- * inherit any global state.
+ * credits, preventing duplicate turn-end attributions.
+ *
+ * D1 strict default (ADR 0001 section 2): an observation whose identity cannot
+ * be proven - no branchId/sessionId, or an unregistered scope - is never
+ * learned from. It is counted via `scope_unknown_skipped` (payload free: no
+ * tool arguments, no bodies) instead of being written into a learnable
+ * 'unknown' bucket. Only a trusted ScopeRegistry registration re-enables the
+ * learning track for a scope.
  *
  * Invariant branch protection (R3, plan section 5.2):
  * Invariant probe branches (guidance_free) are never masqueraded as regular
@@ -125,6 +131,11 @@ export interface HostToolExperienceCollector extends HostToolExperienceSink {
   readonly scopeRegistry?: ScopeRegistry;
   /** Records this collector appended successfully in this process. */
   count(): number;
+  /**
+   * D1 status diagnostic: identity-free observations skipped without being
+   * learned from (`scope_unknown_skipped`). Counter only; no payload stored.
+   */
+  scopeUnknownSkipped(): number;
   /** Payload-free diagnostics (append failures, invalid observations). */
   diagnostics(): readonly string[];
   /** Prune inactive scope buckets older than TTL. Returns count of pruned scopes. */
@@ -233,6 +244,12 @@ export function createHostToolExperienceCollector(
   const scopeOrder: string[] = [];
   let sequence = 0;
   let appended = 0;
+  /**
+   * D1 status diagnostic: identity-free observations that were skipped instead
+   * of learned from. Counter only - tool arguments and bodies are never stored
+   * (ADR 0001 section 2.3).
+   */
+  let scopeUnknownSkipped = 0;
   let disposed = false;
 
   const enabled = (): boolean =>
@@ -448,53 +465,25 @@ export function createHostToolExperienceCollector(
         return;
       }
 
-      // Handle unknown scope: isolates to its own 'unknown' bucket, does NOT inherit any global state
-      // Option 2 (F9): Unproven branches (rawBranch.length > 0) fail-closed and write zero memory.
-      // Host-local ordinary tool executions without branchId accumulate host-level baseline experience.
+      // Handle unknown scope (D1 strict default / F9 Option 1):
+      // Unproven branches (rawBranch.length > 0) fail-closed and write zero
+      // memory. Observations without any provable identity are skipped the same
+      // way: they are counted via `scope_unknown_skipped` (payload free - no
+      // tool arguments, no bodies) and never become a learnable 'unknown'
+      // bucket. A scope only re-enters the learning track when the host
+      // completes a trusted registration that the ScopeRegistry can prove.
       if (!scopeInfo.isKnown) {
         const rawBranch = typeof observation.branchId === 'string' ? observation.branchId.trim() : '';
         if (rawBranch.length > 0) {
           note('host-tool observation skipped: unproven branch scope is prohibited from collection');
           return;
         }
-
-        const bucket = getOrCreateBucket(scopeInfo, currentTime);
-        const isError = observation.isError === true;
-        const errorClass = safeErrorClass(observation.errorClass, isError);
-        const toolSignal = isError
-          ? HOST_TOOL_REWARD_SIGNALS.toolError
-          : HOST_TOOL_REWARD_SIGNALS.toolSuccess;
-        const toolContribution = toolWeight * toolSignal;
-        const reward = clamp(toolContribution, clipMin, clipMax);
-        bucket.recentTools.push(toolName);
-        while (bucket.recentTools.length > RECENT_TOOL_WINDOW) {
-          bucket.recentTools.shift();
-        }
-        const state = abstractHostState({
-          recentToolNames: [...bucket.recentTools],
-          lastErrorClass: errorClass,
-          turnKind: 'unknown'
-        });
-        const actionKey = redactSecrets(normalizeToolActionKey(toolName));
-        bucket.lastCredit = {
-          actionKey,
-          toolName,
-          errorClass,
-          sessionId: 'unknown',
-          branchId: 'unknown',
-          toolCallId: observation.toolCallId,
-          at: currentTime
-        };
-        await append({
-          reward,
-          toolName,
-          state,
-          actionKey,
-          sessionId: 'unknown',
-          guidance: 'memory',
-          rewardSources: { tool: toolContribution, turn: 0 },
-          at: currentTime
-        });
+        scopeUnknownSkipped += 1;
+        note(
+          'scope_unknown_skipped: ' +
+            String(scopeUnknownSkipped) +
+            ' (identity-free host-tool observation not collected; no payload stored)'
+        );
         return;
       }
 
@@ -593,13 +582,21 @@ export function createHostToolExperienceCollector(
         return;
       }
 
-      let bucket = scopeBuckets.get(scopeInfo.scopeKey);
-      if (bucket === undefined && scopeInfo.scopeKey !== 'unknown') {
-        bucket = scopeBuckets.get('unknown');
-      }
-      if (!scopeInfo.isKnown && (bucket === undefined || bucket.lastCredit === undefined)) {
+      // D1 strict default: an identity-free turn can never attribute to a
+      // learnable action. There is no learnable 'unknown' bucket to borrow, so
+      // the turn end is dropped; nothing about the turn payload is stored.
+      // Unproven branches keep the quieter skip semantics of their tool calls;
+      // only a truly identity-free turn bumps `scope_unknown_skipped`.
+      if (!scopeInfo.isKnown) {
+        const rawBranch =
+          typeof observation.branchId === 'string' ? observation.branchId.trim() : '';
+        if (rawBranch.length === 0) {
+          scopeUnknownSkipped += 1;
+        }
         return;
       }
+
+      const bucket = scopeBuckets.get(scopeInfo.scopeKey);
       if (bucket === undefined) {
         // No preceding tool call in this scope bucket; nothing to attribute
         return;
@@ -667,6 +664,11 @@ export function createHostToolExperienceCollector(
 
     count(): number {
       return appended;
+    },
+
+    /** D1 diagnostic: identity-free observations skipped without learning. */
+    scopeUnknownSkipped(): number {
+      return scopeUnknownSkipped;
     },
 
     diagnostics(): readonly string[] {

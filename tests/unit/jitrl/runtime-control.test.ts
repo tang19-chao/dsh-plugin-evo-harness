@@ -502,6 +502,20 @@ describe('each surface is read by a production path (F2)', () => {
     ctx['systemPrompt'] = { assemble: () => ({ sections: [] }) };
     const harness = buildE2E({ ctx: ctx as never, config: JIT_CONFIG });
     const { plugin } = harness;
+    // D1 strict default: the dispatches below carry sessionId identities, so
+    // the test registers a trusted scope for them (the host-session registration
+    // path). An unprovable identity would be skipped by the advisor instead of
+    // reaching the evaluate() path this test pins.
+    const registry = plugin.scopeRegistry;
+    if (registry !== undefined) {
+      registry.register({
+        sessionId: 'sess-t21-adv',
+        branchId: 'br-t21-adv',
+        role: 'domain',
+        guidance: 'memory',
+        allowAdvice: true
+      });
+    }
     const postExecute = fixture.listener('tools/post-execute') as unknown as (
       ...args: unknown[]
     ) => Promise<unknown>;
@@ -518,7 +532,7 @@ describe('each surface is read by a production path (F2)', () => {
     // dispatches the runtime gate refused, so an on-run must leave it at 0 while
     // an off-run must raise it: that counter is the adapter-side proof the SAME
     // control object is read on the production path.
-    await preStep({ sessionId: 'sess-t21-adv-on' }, enter);
+    await preStep({ sessionId: 'sess-t21-adv', branchId: 'br-t21-adv' }, enter);
     expect(plugin.jitrl.hostAdvisor?.skipped ?? 0).toBe(0);
 
     const collectedOn = plugin.jitrl.hostToolExperiences ?? 0;
@@ -533,11 +547,11 @@ describe('each surface is read by a production path (F2)', () => {
     await plugin.runFromCommand('jit off');
     expect(plugin.jitrl.hostAdvisor?.runtimeEnabled).toBe(false);
 
-    await preStep({ sessionId: 'sess-t21-adv-off' }, enter);
+    await preStep({ sessionId: 'sess-t21-adv', branchId: 'br-t21-adv' }, enter);
     expect(plugin.jitrl.hostAdvisor?.skipped ?? 0).toBeGreaterThan(0);
     // No new advice may be produced while off.
     const advisoryCallsOff = plugin.jitrl.hostAdvisor?.advisory ?? 0;
-    await preStep({ sessionId: 'sess-t21-adv-off-2' }, enter);
+    await preStep({ sessionId: 'sess-t21-adv', branchId: 'br-t21-adv' }, enter);
     expect(plugin.jitrl.hostAdvisor?.advisory ?? 0).toBe(advisoryCallsOff);
 
     // hostRecord: the sink is not called at all while off. The observable

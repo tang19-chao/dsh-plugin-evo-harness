@@ -39,7 +39,12 @@ import { BATCH_SLOT_KINDS } from '../../../src/types/contracts';
 import { createActivePolicy } from '../../../src/dream-rsi/active-policy';
 import { DEFAULT_EVO_HARNESS_CONFIG } from '../../../src/config';
 import type { JitRlConfig } from '../../../src/config';
-import { EXPERIENCE_SCHEMA_VERSION } from '../../../src/jitrl/experience-store';
+import {
+  CURRENT_PROVENANCE_VERSION,
+  CURRENT_REWARD_VERSION,
+  EXPERIENCE_SCHEMA_VERSION
+} from '../../../src/jitrl/experience-store';
+import { createMemoryExperienceStore } from '../../../src/jitrl/stores/memory.store';
 import {
   LEARNING_CONSUMER_FILTER,
   learningFacingFilterOptions
@@ -559,6 +564,129 @@ describe('L2 proposal selection queries with the strict filter', () => {
     expect(queries[0]?.excludeLegacy).toBe(true);
     expect(queries[0]?.learningEligibleOnly).toBe(true);
   });
+
+  it('actually excludes legacy and ineligible records from L2 decision when connected to a real memory store', async () => {
+    const store = createMemoryExperienceStore({ now: () => NOW, halfLifeMs: HALF_LIFE });
+    const pState = proposalState();
+    await store.append([
+      {
+        id: 'clean-good',
+        level: 'proposal',
+        state: pState,
+        actionKey: 'patch:good',
+        reward: 2,
+        return: 2,
+        rewardSources: { surrogate: 2 },
+        guidance: 'memory',
+        policyId: 'pi-0',
+        sessionId: 'session-filter',
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        // P6.1-D2: a clean learning record carries the current reward contract
+        // version, exactly as the online recorder writes it.
+        rewardVersion: CURRENT_REWARD_VERSION,
+        learningEligible: true,
+        createdAt: T0,
+        redacted: true
+      },
+      {
+        id: 'clean-bad',
+        level: 'proposal',
+        state: pState,
+        actionKey: 'patch:bad',
+        reward: -5,
+        return: -5,
+        rewardSources: { surrogate: -5 },
+        guidance: 'memory',
+        policyId: 'pi-0',
+        sessionId: 'session-filter',
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        rewardVersion: CURRENT_REWARD_VERSION,
+        learningEligible: true,
+        createdAt: T0,
+        redacted: true
+      },
+      {
+        id: 'legacy-bad-inflator',
+        level: 'proposal',
+        state: pState,
+        actionKey: 'patch:bad',
+        reward: 99,
+        return: 99,
+        rewardSources: { surrogate: 99 },
+        guidance: 'memory',
+        policyId: 'pi-0',
+        sessionId: 'session-filter',
+        // omitted schemaVersion -> legacy
+        createdAt: T0,
+        redacted: true
+      },
+      {
+        id: 'ineligible-bad-inflator',
+        level: 'proposal',
+        state: pState,
+        actionKey: 'patch:bad',
+        reward: 99,
+        return: 99,
+        rewardSources: { surrogate: 99 },
+        guidance: 'memory',
+        policyId: 'pi-0',
+        sessionId: 'session-filter',
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        learningEligible: false,
+        createdAt: T0,
+        redacted: true
+      },
+      {
+        id: 'old-yardstick-bad-inflator',
+        level: 'proposal',
+        state: pState,
+        actionKey: 'patch:bad',
+        reward: 99,
+        return: 99,
+        rewardSources: { surrogate: 99 },
+        guidance: 'memory',
+        policyId: 'pi-0',
+        sessionId: 'session-filter',
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        // P6.1-D2 / R3 F1: schema is current, but the reward generation is r2 -
+        // an old-yardstick record must not join the r3 neighbourhood either.
+        rewardVersion: 'r2/verifiable-v1',
+        learningEligible: true,
+        createdAt: T0,
+        redacted: true
+      }
+    ]);
+
+    const optimizer = createStoreOptimizer({
+      store,
+      config: {
+        ...optimizerConfig,
+        selection: 'argmax'
+      },
+      halfLifeMs: HALF_LIFE,
+      now: () => NOW,
+      rng: () => 0.0
+    });
+
+    const candidates = [
+      { actionKey: 'patch:good', baseLogit: 0, source: 'policy_prior' as const, payload: undefined },
+      { actionKey: 'patch:bad', baseLogit: 0, source: 'policy_prior' as const, payload: undefined }
+    ];
+
+    const decision = await optimizer.decide('proposal', pState, candidates);
+    // Strict filtering keeps only the 2 clean r3 records.
+    expect(decision.neighborCount).toBe(2);
+    expect(decision.stateValue).toBeCloseTo((2 + -5) / 2, 4);
+
+    const goodAdj = decision.adjustments.find((a) => a.candidate.actionKey === 'patch:good');
+    const badAdj = decision.adjustments.find((a) => a.candidate.actionKey === 'patch:bad');
+    // patch:good has Q = 2, patch:bad has Q = -5 (clean record), NOT 99
+    // (legacy, ineligible, or written on the old r2 yardstick).
+    expect(goodAdj?.q).toBeCloseTo(2, 4);
+    expect(badAdj?.q).toBeCloseTo(-5, 4);
+    expect(badAdj?.q).toBeLessThan(0);
+    expect(decision.chosen.candidate.actionKey).toBe('patch:good');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -626,6 +754,121 @@ describe('online and replay exclude the same evidence', () => {
     // Each supported slot keeps its own clean support; no record is double-counted.
     expect(invariant?.support).toBe(1);
     expect(exploit?.support).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. Version incompatibility isolation (initial schema, reward, provenance)
+// ---------------------------------------------------------------------------
+
+describe('incompatible versions do not mix into estimation', () => {
+  it('excludes records with older schemaVersion, legacy rewardVersion, or legacy provenanceVersion from online L1 estimate', () => {
+    const versionedHistory: ExperienceRecord[] = [
+      {
+        ...record({ id: 'current-valid', slotKind: 'explore_invariant', value: 3 }),
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        rewardVersion: CURRENT_REWARD_VERSION,
+        provenanceVersion: CURRENT_PROVENANCE_VERSION,
+        learningEligible: true
+      },
+      {
+        ...record({ id: 'incompatible-schema-v1', slotKind: 'exploit', value: 80 }),
+        experienceSchemaVersion: 1, // older schema version (< 2)
+        rewardVersion: 'r1/legacy-vector',
+        provenanceVersion: 'p1/legacy',
+        learningEligible: true
+      },
+      {
+        ...record({ id: 'incompatible-legacy-reward', slotKind: 'exploit', value: 80 }),
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        rewardVersion: 'legacy',
+        provenanceVersion: CURRENT_PROVENANCE_VERSION,
+        learningEligible: false // marked copies from migration have learningEligible: false
+      },
+      {
+        ...record({ id: 'incompatible-legacy-provenance', slotKind: 'exploit', value: 80 }),
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        rewardVersion: CURRENT_REWARD_VERSION,
+        provenanceVersion: 'legacy',
+        learningEligible: false // marked copies from migration have learningEligible: false
+      },
+      {
+        ...record({ id: 'unversioned-initial', slotKind: 'exploit', value: 80, legacy: true })
+      }
+    ];
+
+    const jit = createJitActivePolicy({
+      inner: createActivePolicy({
+        policy: {
+          id: 'pi-0',
+          version: 3,
+          createdAt: T0,
+          maxWidth: 4,
+          maxDepth: 2,
+          slotWeights: { exploit: 0.4, explore_domain: 0.3, explore_invariant: 0.2, recover: 0.1 },
+          earlyStopThreshold: 0.8,
+          minMemoryConfidenceForSkip: 0.75
+        } as never,
+        now: () => T0,
+        maxRecoverySlots: 1
+      }),
+      experiences: versionedHistory,
+      config: { useSurfaces: false },
+      now: () => NOW,
+      rng: NO_EXPLORE
+    });
+
+    const diagnostics = readJitDiagnostics(jit.selectBatch(makeRequest()));
+    expect(diagnostics).toBeDefined();
+    // Only current-valid (1 record) is kept; all 4 incompatible version records are excluded
+    expect(diagnostics?.neighborCount).toBe(1);
+    expect(diagnostics?.stateValue).toBeCloseTo(3, 6);
+    expect(diagnostics?.filter?.records).toBe(5);
+    expect(diagnostics?.filter?.kept).toBe(1);
+  });
+
+  it('excludes incompatible versions from replay estimates and M3 count', () => {
+    const hook = createJitReplayHook({
+      config: DEFAULT_EVO_HARNESS_CONFIG.jitrl,
+      stateOf: () => parityState(),
+      now: () => NOW,
+      seed: 7
+    });
+
+    const versionedHistory: ExperienceRecord[] = [
+      {
+        ...record({ id: 'current-valid-1', slotKind: 'explore_invariant', value: 3 }),
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        rewardVersion: CURRENT_REWARD_VERSION,
+        provenanceVersion: CURRENT_PROVENANCE_VERSION,
+        learningEligible: true
+      },
+      {
+        ...record({ id: 'incompatible-schema-v0', slotKind: 'exploit', value: 50, legacy: true }),
+        rewardVersion: undefined,
+        provenanceVersion: undefined
+      },
+      {
+        ...record({ id: 'incompatible-schema-v1', slotKind: 'exploit', value: 50 }),
+        experienceSchemaVersion: 1,
+        rewardVersion: 'r1/legacy-vector',
+        provenanceVersion: 'p1/legacy'
+      },
+      {
+        ...record({ id: 'incompatible-audit-copy', slotKind: 'exploit', value: 50 }),
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        rewardVersion: 'legacy',
+        provenanceVersion: 'legacy',
+        learningEligible: false
+      }
+    ];
+
+    const replayed = hook(hookInput(versionedHistory));
+    expect(replayed.diagnostics.neighborCount).toBe(1);
+    expect(replayed.diagnostics.stateValue).toBeCloseTo(3, 6);
+    const notes = (replayed.diagnostics.notes ?? []).join(' ');
+    expect(notes).toContain('filtered 3 of 4');
+    expect(notes).toContain('usable 1');
   });
 });
 

@@ -8,7 +8,7 @@
  * asks, an empty neighbourhood and a throwing store both degrade to noop
  * without throwing, and the injected text is built from statistics only.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_EVO_HARNESS_CONFIG,
   createDefaultConfig,
@@ -38,6 +38,7 @@ import {
   type HostAdvisorEstimator,
   type HostAdvisorStore
 } from '../../../src/jitrl/host-advisor';
+import { estimateActionValues } from '../../../src/jitrl/value-estimator';
 import { retrieveNeighbors } from '../../../src/jitrl/retriever';
 
 const T0 = 1_700_000_000_000;
@@ -789,5 +790,295 @@ describe('host advisor: diagnostics surface', () => {
     const second = advisor.diagnostics();
     expect(first).toEqual(second);
     expect(first).not.toBe(second);
+  });
+
+  it('P6.1-B1: secret-shaped bodies stay redacted in advisor failure diagnostics', async () => {
+    // P6.1-B2 update: describeError() now emits a bounded class only
+    // (`class=error`), so the secret never enters the line at all. This test
+    // keeps the credential canary and additionally pins the zero-body form.
+    const canarySecret = 'ghp_CANARY_ADVISOR_7341abcdefghijklmnopqrstuv';
+    const advisor = createHostAdvisor({
+      config: enabledConfig(),
+      store: {
+        query: async () => {
+          throw new Error('store offline: ' + canarySecret);
+        }
+      }
+    });
+
+    const decision = await advisor.evaluate(makeRequest());
+
+    expect(decision.kind).toBe('noop');
+    if (decision.kind === 'noop') {
+      expect(decision.reason).toBe('retrieval_failed');
+    }
+    const lines = advisor.diagnostics().filter((line) => line.startsWith('retrieval_failed'));
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) {
+      expect(line).not.toContain(canarySecret);
+      expect(line).not.toContain('ghp_CANARY_ADVISOR');
+      // P6.1-B2: zero body - not even a redacted remnant of it.
+      expect(line).toBe('retrieval_failed: class=error');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P6.1-B2 acceptance: consumer-path canary matrix (zero error-body echo)
+// ---------------------------------------------------------------------------
+
+describe('P6.1-B2 canary matrix (consumer exits, zero body echo)', () => {
+  interface AdvisorCanaryCase {
+    readonly name: string;
+    readonly canary: string;
+    readonly extraForbiddens: readonly string[];
+    readonly throwValue: (canary: string) => unknown;
+  }
+
+  const cases: readonly AdvisorCanaryCase[] = [
+    {
+      name: 'chinese body',
+      canary: '金丝雀建议正文泄漏探针八四二一',
+      extraForbiddens: ['金丝雀', '八四二一'],
+      throwValue: (c) => new Error('检索失败：' + c)
+    },
+    {
+      name: 'english short sentence',
+      canary: 'ADVISOR_CANARY_EN_8421 leaked phrase',
+      extraForbiddens: ['ADVISOR_CANARY_EN_8421', 'leaked phrase'],
+      throwValue: (c) => new Error('store exploded: ' + c)
+    },
+    {
+      name: 'json body',
+      canary: JSON.stringify({ canary: 'ADVISOR_CANARY_JSON_8421', secret: 'leak' }),
+      extraForbiddens: ['ADVISOR_CANARY_JSON_8421', '"secret"'],
+      throwValue: (c) => new Error('bad payload ' + c)
+    },
+    {
+      name: 'newline body',
+      canary: 'ADVISOR_CANARY_L1_8421\nADVISOR_CANARY_L2_8421',
+      extraForbiddens: ['ADVISOR_CANARY_L1_8421', 'ADVISOR_CANARY_L2_8421'],
+      throwValue: (c) => new Error('multi\nline\n' + c)
+    },
+    {
+      name: 'nested cause',
+      canary: 'ADVISOR_CANARY_CAUSE_8421',
+      extraForbiddens: ['ADVISOR_CANARY_CAUSE_8421', 'root cause'],
+      throwValue: (c) => new Error('wrapped', { cause: new Error('root cause carries ' + c) })
+    },
+    {
+      name: 'string throw',
+      canary: 'ADVISOR_CANARY_STRING_8421',
+      extraForbiddens: ['ADVISOR_CANARY_STRING_8421'],
+      throwValue: (c) => 'plain string throw ' + c
+    },
+    {
+      name: 'object throw',
+      canary: 'ADVISOR_CANARY_OBJECT_8421',
+      extraForbiddens: ['ADVISOR_CANARY_OBJECT_8421'],
+      throwValue: (c) => ({ body: c })
+    },
+    {
+      name: 'extreme length',
+      canary: 'ADVISOR_CANARY_LONG_' + 'Q'.repeat(3000) + '_8421',
+      extraForbiddens: ['ADVISOR_CANARY_LONG_'],
+      throwValue: (c) => new Error('huge ' + c)
+    },
+    {
+      name: 'hostile Error.name',
+      canary: 'ADVISOR_CANARY_NAME_8421',
+      extraForbiddens: ['ADVISOR_CANARY_NAME_8421'],
+      throwValue: (c) => {
+        const hostile = new Error('message with ' + c);
+        hostile.name = 'CANARY_HOSTILE_NAME_8421<script>';
+        return hostile;
+      }
+    }
+  ];
+
+  /** Every model/user-visible advisor exit for one evaluate() call. */
+  function visibleSurfaces(
+    decision: HostAdvisorDecision,
+    diagnostics: readonly string[]
+  ): readonly string[] {
+    const surfaces = [...diagnostics];
+    if (decision.kind === 'advisory') {
+      surfaces.push(decision.text, ...(decision.antiPatterns ?? []));
+    }
+    if (decision.kind === 'ask') {
+      surfaces.push(decision.reason);
+    }
+    if (decision.kind === 'noop' && typeof decision.reason === 'string') {
+      surfaces.push(decision.reason);
+    }
+    if (decision.diagnostics !== undefined) {
+      surfaces.push(JSON.stringify(decision.diagnostics));
+    }
+    return surfaces;
+  }
+
+  for (const canaryCase of cases) {
+    it(`never echoes ${canaryCase.name} through any advisor-visible surface`, async () => {
+      // Route 1: throwing store -> retrieval_failed.
+      const storeAdvisor = createHostAdvisor({
+        config: enabledConfig(),
+        store: {
+          query: async () => {
+            throw canaryCase.throwValue(canaryCase.canary);
+          }
+        }
+      });
+      const storeDecision = await storeAdvisor.evaluate(makeRequest());
+      expect(storeDecision.kind).toBe('noop');
+      if (storeDecision.kind === 'noop') {
+        expect(storeDecision.reason).toBe('retrieval_failed');
+      }
+      const storeLines = storeAdvisor
+        .diagnostics()
+        .filter((line) => line.startsWith('retrieval_failed'));
+      expect(storeLines.length).toBeGreaterThan(0);
+      for (const line of storeLines) {
+        // Bounded whitelist form, identical caliber to mirror_diag: Error
+        // instances fold to class=error; non-Error throws to class=unknown.
+        const expected =
+          canaryCase.name === 'string throw' || canaryCase.name === 'object throw'
+            ? 'retrieval_failed: class=unknown'
+            : 'retrieval_failed: class=error';
+        expect(line).toBe(expected);
+      }
+      for (const surface of visibleSurfaces(storeDecision, storeAdvisor.diagnostics())) {
+        for (const forbidden of [canaryCase.canary, ...canaryCase.extraForbiddens]) {
+          expect(surface, canaryCase.name + ' leaked via ' + forbidden).not.toContain(forbidden);
+        }
+      }
+
+      // Route 2: throwing estimator (after successful retrieval) -> advisor_failed.
+      const estimatorAdvisor = createHostAdvisor({
+        config: enabledConfig(),
+        store: stubStore(scored(BALANCED_RECORDS), []),
+        estimator: () => {
+          throw canaryCase.throwValue(canaryCase.canary);
+        }
+      });
+      const estimatorDecision = await estimatorAdvisor.evaluate(makeRequest());
+      expect(estimatorDecision.kind).toBe('noop');
+      if (estimatorDecision.kind === 'noop') {
+        expect(estimatorDecision.reason).toBe('advisor_failed');
+      }
+      const estimatorLines = estimatorAdvisor
+        .diagnostics()
+        .filter((line) => line.startsWith('advisor_failed'));
+      expect(estimatorLines.length).toBeGreaterThan(0);
+      for (const line of estimatorLines) {
+        const expected =
+          canaryCase.name === 'string throw' || canaryCase.name === 'object throw'
+            ? 'advisor_failed: class=unknown'
+            : 'advisor_failed: class=error';
+        expect(line).toBe(expected);
+      }
+      for (const surface of visibleSurfaces(estimatorDecision, estimatorAdvisor.diagnostics())) {
+        for (const forbidden of [canaryCase.canary, ...canaryCase.extraForbiddens]) {
+          expect(surface, canaryCase.name + ' leaked via ' + forbidden).not.toContain(forbidden);
+        }
+      }
+    });
+  }
+
+  it('preserved behavior: error classes stay distinguishable (bounded enum, not all-unknown)', async () => {
+    const make = (throwValue: unknown): HostAdvisor => {
+      return createHostAdvisor({
+        config: enabledConfig(),
+        store: {
+          query: async () => {
+            throw throwValue;
+          }
+        }
+      });
+    };
+    const lineOf = async (advisor: HostAdvisor): Promise<string> => {
+      const decision = await advisor.evaluate(makeRequest());
+      expect(decision.kind).toBe('noop');
+      if (decision.kind === 'noop') {
+        expect(decision.reason).toBe('retrieval_failed');
+      }
+      const lines = advisor.diagnostics().filter((line) => line.startsWith('retrieval_failed'));
+      expect(lines).toHaveLength(1);
+      return lines[0] ?? '';
+    };
+    expect(await lineOf(make(new TypeError('t')))).toBe('retrieval_failed: class=type_error');
+    expect(await lineOf(make(new RangeError('r')))).toBe('retrieval_failed: class=range_error');
+    const abort = new Error('a');
+    abort.name = 'AbortError';
+    expect(await lineOf(make(abort))).toBe('retrieval_failed: class=aborted');
+    const timeout = new Error('t');
+    timeout.name = 'TimeoutError';
+    expect(await lineOf(make(timeout))).toBe('retrieval_failed: class=timeout');
+    expect(await lineOf(make('string'))).toBe('retrieval_failed: class=unknown');
+    expect(await lineOf(make({ arbitrary: true }))).toBe('retrieval_failed: class=unknown');
+  });
+
+  it('preserved behavior: token budget wiring and secret redaction in advisory text do not regress', async () => {
+    // Budget wiring: an over-long evidence set still truncates with the
+    // explicit heuristic note (no silent truncation, no token equivalence claim).
+    const estimatorSpy = vi.fn(estimateActionValues);
+    const oversized: ExperienceRecord[] = [];
+    for (let index = 0; index < 40; index += 1) {
+      oversized.push(
+        makeRecord({
+          id: 'oversize-' + String(index),
+          actionKey: 'oversized_action_key_' + String(index).padStart(2, '0') + '_' + 'x'.repeat(40),
+          value: 3 - (index * 6) / 39
+        })
+      );
+    }
+    const advisor = createHostAdvisor({
+      config: enabledConfig(),
+      store: stubStore(scored(oversized), []),
+      estimator: estimatorSpy
+    });
+    const decision = await advisor.evaluate(makeRequest({ mode: 'advisory', adviseThreshold: -0.5 }));
+    expect(estimatorSpy).toHaveBeenCalled();
+    expect(decision.kind).toBe('advisory');
+    if (decision.kind === 'advisory') {
+      expect(decision.text).toContain(ADVISORY_TAG.slice(0, 12));
+      expect(estimateTokens(decision.text)).toBeLessThanOrEqual(MAX_ADVISORY_TOKENS);
+      expect(advisor.diagnostics().some((line) => line.startsWith('advisory_truncated'))).toBe(true);
+      expect(
+        advisor.diagnostics().some((line) => line.includes('heuristic/not real tokens') || line.includes('tokenizer budget'))
+      ).toBe(true);
+    }
+
+    // Secret redaction in advisory text: a secret-shaped action key entering
+    // the rendered advice is still folded to <secret> by safeFragment.
+    // (Two action groups so the secret action becomes the negative-advantage
+    // target; a lone candidate would normalize its advantage to zero.)
+    const secretAdvisor = createHostAdvisor({
+      config: enabledConfig(),
+      store: stubStore(
+        scored(
+          BALANCED_RECORDS.concat([
+            makeRecord({
+              id: 'secret-1',
+              actionKey: 'deploy ghp_0123456789abcdefghijklmnopqrstuv',
+              value: -3
+            })
+          ])
+        ),
+        []
+      )
+    });
+    const secretDecision = await secretAdvisor.evaluate(
+      makeRequest({ mode: 'advisory', adviseThreshold: -0.5 })
+    );
+    expect(secretDecision.kind).toBe('advisory');
+    if (secretDecision.kind === 'advisory') {
+      const rendered = secretDecision.text + (secretDecision.antiPatterns ?? []).join('\n');
+      // The credential body never survives safeFragment: the raw ghp_ token
+      // is gone. (Baseline quirk, unchanged by t14: safeFragment's quote
+      // mangle rewrites the <secret> placeholder to 'secret'; fixing that
+      // mangling belongs to the redaction work line, not this closure.)
+      expect(rendered).not.toContain('ghp_0123456789');
+      expect(rendered).not.toContain('ghp_');
+    }
   });
 });

@@ -27,9 +27,11 @@
  * namespace) from the payload and applies only mounts owned by that identity.
  * A payload that names a branch matches on the branch alone, so a session shared
  * by sibling probe branches can never leak one branch's patch into another.
- * A dispatch that carries no identity at all is treated as host-local and sees
- * every mount; that is the only fail-open case and is documented in
- * {@link hookScopeMatches}.
+ * A dispatch that carries no identity at all is still treated as host-local for
+ * mount matching and sees every mount; that is the only fail-open case and is
+ * documented in {@link hookScopeMatches}. The advice/learning channels are the
+ * opposite (D1 strict default): an unprovable identity gets no advice, no ask
+ * and no experience record.
  *
  * Lifetime
  * --------
@@ -261,7 +263,9 @@ export interface HookMountScope {
  * Precedence matters for isolation: when the dispatch names a branch, only that
  * branch's mounts apply — a shared session id must never leak one probe branch's
  * patch into a sibling branch. Without a branch id the session (or namespace)
- * decides. A payload with no identity at all is host-local and fails open.
+ * decides. A payload with no identity at all is host-local for mounts and fails
+ * open here only; the advisor scope ({@link advisorInScope}) applies the D1
+ * strict default and never treats an unprovable identity as in scope.
  */
 export function hookScopeMatches(identity: HookScopeIdentity, mount: HookMountScope): boolean {
   const total = identity.branchIds.size + identity.sessionIds.size + identity.namespaces.size;
@@ -350,13 +354,24 @@ export interface DshHostAdvisorStats {
   readonly noop: number;
   /** Dispatches skipped because the advisor was off, busy or out of scope. */
   readonly skipped: number;
+  /**
+   * D1 strict default diagnostic: dispatches skipped because their identity
+   * could not be proven (no branchId/sessionId/namespace, or an identity the
+   * ScopeRegistry resolves to 'unknown'). Counter only: no tool arguments or
+   * payload bodies are stored (ADR 0001 section 2.3).
+   */
+  readonly scopeUnknownSkipped: number;
 }
 
 /** Wiring for {@link DshHookHostAdapter.attachHostAdvisor}. */
 export interface DshHostAdvisorAttachOptions {
   /** Which hook consumes the advisor; defaults to the adapter's current mode. */
   readonly mode?: 'advisory' | 'gate';
-  /** Branch/session scope; empty means host-local (every dispatch). */
+  /**
+   * Branch/session scope. An empty scope falls through to ScopeRegistry
+   * resolution and then to the D1 strict default (unprovable identities get no
+   * advice) instead of an implicit host-local exception.
+   */
   readonly scope?: Partial<HookMountScope>;
   /**
    * Runtime gate shared with `/evo jit off` (repair F1). When it returns false
@@ -450,7 +465,10 @@ export interface DshHookHostAdapterOptions {
   readonly hostAdvisor?: HostAdvisor;
   /** Which hook consumes the advisor; defaults to 'advisory'. */
   readonly hostAdvisorMode?: 'advisory' | 'gate';
-  /** Branch/session scope of the advisor; empty means host-local. */
+  /**
+   * Branch/session scope of the advisor. Empty means the ScopeRegistry decides;
+   * dispatches the registry cannot prove stay out of scope (D1 strict default).
+   */
   readonly hostAdvisorScope?: Partial<HookMountScope>;
   /** Runtime gate shared with `/evo jit off`; absent means always enabled. */
   readonly hostAdvisorRuntimeEnabled?: () => boolean;
@@ -676,6 +694,12 @@ export function createDshHookHostAdapter(
   let advisor: HostAdvisor | undefined = options.hostAdvisor;
   let advisorMode: 'advisory' | 'gate' = options.hostAdvisorMode ?? 'advisory';
   const advisorCounters = { advisory: 0, ask: 0, noop: 0, skipped: 0 };
+  /**
+   * D1 status diagnostic: dispatches whose identity could not be proven, so the
+   * advisor skipped them (no advice, no ask). Counter only - no tool arguments
+   * or payload bodies are ever recorded (ADR 0001 section 2.3).
+   */
+  let scopeUnknownSkipped = 0;
   let advisorScope: HookMountScope = normalizeAdvisorScope(options.hostAdvisorScope);
   let advisorRuntime: (() => boolean) | undefined = options.hostAdvisorRuntimeEnabled;
 
@@ -879,28 +903,20 @@ export function createDshHookHostAdapter(
       }
     }
 
-    // 4. Unscoped advisor / host-local execution (PR3 / F9 Option 2):
-    // If dispatch explicitly names a branch, but it is NOT registered in ScopeRegistry:
-    // Fail-closed! Unproven branch must never receive advice (PR3 / F2).
-    if (identity.branchIds.size > 0) {
-      return false;
-    }
-
-    // Anonymous dispatch without any scope identity (Option 2):
-    // Ordinary host-local tool executions (e.g. bash) are permitted when the advisor is unscoped.
-    // Gate 4 host premise: probe branch payloads must carry branchId to enable branch scoping.
-    const total =
-      identity.branchIds.size + identity.sessionIds.size + identity.namespaces.size;
-    if (total === 0) {
-      const rec = asRecord(payloads[0]);
-      if (rec !== undefined && typeof rec['name'] === 'string' && rec['name'].trim().length > 0) {
-        return true;
-      }
-      return false;
-    }
-
-    // Ordinary host session (has sessionId):
-    return true;
+    // 4. Fail-closed on unproven identity (D1 strict default / F9 Option 1):
+    // A dispatch that names a branch the registry cannot prove, or that carries
+    // no provable identity at all (an anonymous `{name:'bash'}`), must never
+    // receive advice and must never trigger an extra Jit ask. Ordinary tool
+    // execution still flows through untouched: the listener returns the host
+    // decision (no auto-deny, no auto-ask) - only the advice channel closes.
+    // Scope recovery is a host responsibility: complete a trusted host-session
+    // scope registration (ScopeRegistry) so the dispatch resolves to a trusted
+    // scope; there is deliberately no `allowAnonymous` escape hatch.
+    // Reaching this point means either no ScopeRegistry is installed or its
+    // resolve() returned 'unknown' for this dispatch: the identity is unproven.
+    // Count it for the status diagnostics (payload free, ADR 0001 section 2.3).
+    scopeUnknownSkipped += 1;
+    return false;
   };
 
   /** A deny/cancel decided below us is final; the advisor must not touch it. */
@@ -1337,12 +1353,15 @@ export function createDshHookHostAdapter(
           (advisorScope.branchId === '' &&
           advisorScope.sessionId === '' &&
           advisorScope.namespace === ''
-            ? ', host-local'
+            ? ', registry-resolved scope (D1 strict default for unprovable identities)'
             : ', scoped to ' + (advisorScope.branchId || advisorScope.sessionId || advisorScope.namespace)) +
           ')'
       );
     },
-    hostAdvisorStats: (): DshHostAdvisorStats => ({ ...advisorCounters }),
+    hostAdvisorStats: (): DshHostAdvisorStats => ({
+      ...advisorCounters,
+      scopeUnknownSkipped
+    }),
     setHostToolExperienceSink(sink: HostToolExperienceSink | undefined): void {
       if (disposed) {
         return;

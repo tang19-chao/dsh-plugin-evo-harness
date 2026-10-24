@@ -538,6 +538,69 @@ describe('advisor and scope boundary enforcement (Plan §4 R3 / §5.2)', () => {
     await adapter.dispose();
   });
 
+  it('D1 strict default: anonymous {name:bash} default dispatch gets no advice and no ask while execution stays allow', async () => {
+    // Advisory adapter with production-default wiring (no hostAdvisorScope).
+    const advFixture = createHookFixture();
+    const advEvaluate = vi.fn().mockResolvedValue({
+      kind: 'advisory',
+      text: 'ANON_ADVICE_MARKER_MUST_NOT_APPEAR'
+    });
+    const advAdapter = createDshHookHostAdapter(advFixture.ctx, {
+      hostAdvisor: createMockHostAdvisor(advEvaluate),
+      hostAdvisorMode: 'advisory'
+    });
+    advAdapter.install();
+
+    // Anonymous agent/pre-step: the advisor is never evaluated and no
+    // additionalContexts (advisor marker) may appear.
+    const step = await dispatchPreStep(advFixture, {});
+    expect(advEvaluate).not.toHaveBeenCalled();
+    expect(step['additionalContexts']).toBeUndefined();
+    expect(advAdapter.hostAdvisorStats().scopeUnknownSkipped).toBe(1);
+
+    // Gate adapter: an anonymous tool call triggers no extra ask either.
+    const gateFixture = createHookFixture();
+    const gateEvaluate = vi.fn().mockResolvedValue({ kind: 'ask', reason: 'gate must not run' });
+    const gateAdapter = createDshHookHostAdapter(gateFixture.ctx, {
+      hostAdvisor: createMockHostAdvisor(gateEvaluate),
+      hostAdvisorMode: 'gate'
+    });
+    gateAdapter.install();
+
+    const exec = await dispatchPreExecute(gateFixture, { name: 'bash' });
+    expect(exec).toEqual({ kind: 'allow' });
+    expect(gateEvaluate).not.toHaveBeenCalled();
+    expect(gateAdapter.hostAdvisorStats().scopeUnknownSkipped).toBe(1);
+    expect(gateAdapter.hostAdvisorStats().skipped).toBe(1);
+    expect(gateAdapter.stats().deniedToolCalls).toBe(0);
+
+    await advAdapter.dispose();
+    await gateAdapter.dispose();
+  });
+
+  it('D1 row 5: a bare sessionId dispatch degrades to pass-through with no advice until trusted host-session registration exists', async () => {
+    const fixture = createHookFixture();
+    const evaluate = vi.fn().mockResolvedValue({
+      kind: 'advisory',
+      text: 'SESSION_ONLY_ADVICE_MUST_NOT_APPEAR'
+    });
+    const registry = createScopeRegistry(); // empty: nothing registered, no host-session registration path yet
+    const adapter = createDshHookHostAdapter(fixture.ctx, {
+      hostAdvisor: createMockHostAdvisor(evaluate),
+      hostAdvisorMode: 'advisory',
+      scopeRegistry: registry
+    });
+    adapter.install();
+
+    const step = await dispatchPreStep(fixture, { sessionId: 'sess-only' });
+    expect(evaluate).not.toHaveBeenCalled();
+    expect(step['additionalContexts']).toBeUndefined();
+    expect(adapter.hostAdvisorStats().scopeUnknownSkipped).toBe(1);
+    expect(adapter.hostAdvisorStats().skipped).toBe(1);
+
+    await adapter.dispose();
+  });
+
   it('delivers advice and gate ask to authorized domain branches', async () => {
     const gateFixture = createHookFixture();
     const gateEvaluate = vi.fn().mockResolvedValue({
@@ -722,12 +785,48 @@ describe('advisor and scope boundary enforcement (Plan §4 R3 / §5.2)', () => {
     expect(preResult).toEqual({ kind: 'allow' });
     expect(evaluate).not.toHaveBeenCalled();
 
-    // 3) Anonymous dispatch: fail-closed (Option 1 / F9)
+    // 3) Anonymous dispatch: fail-closed (D1 strict default / F9)
     const anonResult = await dispatchPreStep(fixture, {});
     expect(evaluate).not.toHaveBeenCalled();
     expect(anonResult['additionalContexts']).toBeUndefined();
 
     // 4) Clean dispose
+    await adapter.dispose();
+  });
+
+  it('D1: anonymous tool observations reach no learning track while the adapter stays transparent', async () => {
+    const fixture = createHookFixture();
+    const records: unknown[] = [];
+    const mockSink = {
+      observeToolCall: vi.fn(async (obs: unknown) => {
+        records.push(obs);
+      }),
+      observeTurnEnd: vi.fn(async () => {})
+    };
+
+    // Production default wiring: no scopeRegistry option, no hostAdvisorScope.
+    const adapter = createDshHookHostAdapter(fixture.ctx, { hostToolExperience: mockSink });
+    adapter.install();
+
+    // Anonymous tool execution: host decision stays untouched (allow) and the
+    // observation is still forwarded (transparency), but the D1 collector
+    // contract keeps it out of every learnable track.
+    const result = await dispatchPreExecute(fixture, { name: 'bash' });
+    expect(result).toEqual({ kind: 'allow' });
+
+    const postListener = fixture.listener('tools/post-execute');
+    await Promise.resolve(
+      postListener({ name: 'bash' }, { isError: false, exitCode: 0 }, () =>
+        Promise.resolve({ kind: 'accept' })
+      )
+    );
+    expect(mockSink.observeToolCall).toHaveBeenCalledTimes(1);
+    const observation = records[0] as Record<string, unknown>;
+    expect(observation['toolName']).toBe('bash');
+    // No identity fields may be invented for an anonymous dispatch.
+    expect(observation['sessionId']).toBeUndefined();
+    expect(observation['branchId']).toBeUndefined();
+
     await adapter.dispose();
   });
 

@@ -22,8 +22,10 @@
  *   free-form string passes the shared redaction helpers (../redaction.ts,
  *   read-only reuse) before it enters a write.
  * - Failure isolation: one failed or invalid write is recorded as a
- *   payload-free diagnostic; the remaining aggregates are still written and
- *   mirror() never throws.
+ *   structured, payload-free diagnostic (P6.1-B1 whitelist: bounded codes,
+ *   phases, operations, error classes and hash correlation references only -
+ *   backend error text, tool names and payloads never render); the remaining
+ *   aggregates are still written and mirror() never throws.
  * - Host neutrality: the backend is the structural JitMirrorMcpClient
  *   boundary below, a compatible subset of the memory-bridge McpClient SPI.
  *   No concrete MCP implementation is imported and no network call is made
@@ -39,6 +41,28 @@ import type {
   JitStatsAggregate
 } from '../../types/contracts';
 import { redactAbsolutePaths, redactSecrets } from '../redaction';
+
+/**
+ * P6.1-B1: mirror diagnostics are structured and whitelist-rendered.
+ *
+ * Every visible diagnostic line is assembled from a FIXED field set
+ * (`mirror_diag code= phase= operation= retryable= errorClass= correlationId=
+ * [serverRef= namespaceRef=]`), never by echoing a backend error message.
+ * Backend error bodies, tool arguments and note text are dropped at the
+ * throw boundary: they are classified into one bounded `errorClass` enum and
+ * one bounded `code` enum instead. No per-example redaction regex is added;
+ * the only pattern-based rule left is the generic RAW_PAYLOAD shape rule
+ * kept from the earlier repair (it guards the sanitizer surface itself).
+ *
+ * Hash notes: the short FNV-1a hashes below are NOT cryptographic
+ * anonymization - they exist only to correlate repeated diagnostics for the
+ * same server/namespace across lines. serverRef/namespaceRef are emitted
+ * only where a masked correlation anchor is genuinely useful, and `hashOf`
+ * stays private to this module so it cannot be mistaken for a general
+ * de-identification helper. Raw-error debugging has no channel here: any
+ * future debug surface must be a separate, explicitly authorized, retention-
+ * bounded local log - never the model-visible or memory-mirror diagnostics.
+ */
 
 /** Tag carried by every mirrored aggregate (plan section 7.2: #jitrl-stat). */
 export const JITRL_STAT_TAG = 'jitrl-stat';
@@ -88,7 +112,13 @@ export interface BridgeMirrorStoreOptions {
 
 /** The mirror contract plus its bounded payload-free diagnostic surface. */
 export interface BridgeMirrorStore extends IJitMirrorStore {
-  /** Recent store-level diagnostics (counts and tool names only, no payloads). */
+  /**
+   * Recent store-level diagnostics (P6.1-B1 whitelist): every line is rendered
+   * from the fixed field set `mirror_diag code= phase= operation= retryable=
+   * errorClass= correlationId= [serverRef= namespaceRef=]` - bounded enums and
+   * masked hash references only. No counts, no tool names, no backend error
+   * text, no payloads (see the module header and renderDiagnostic()).
+   */
   diagnostics(): readonly string[];
 }
 
@@ -151,7 +181,7 @@ function isJitLevel(value: unknown): value is JitLevel {
   return typeof value === 'string' && (JIT_LEVELS as readonly string[]).includes(value);
 }
 
-/** Maximum length of any diagnostic string emitted by bridge store (L3 governance repair). */
+/** Maximum length of any diagnostic string emitted by bridge store (kept). */
 export const MAX_DIAGNOSTIC_LENGTH = 200;
 
 /** Apply the shared redaction pipeline (secrets first, then absolute paths). */
@@ -159,12 +189,82 @@ function sanitizeText(raw: string): string {
   return redactAbsolutePaths(redactSecrets(raw));
 }
 
+/** Bounded diagnostic phase enum (P6.1-B1 whitelist). */
+const DIAG_PHASES = ['discovery', 'write', 'unexpected'] as const;
+type DiagPhase = (typeof DIAG_PHASES)[number];
+
+/** Bounded diagnostic operation enum (P6.1-B1 whitelist). */
+const DIAG_OPERATIONS = ['listTools', 'statWrite', 'aggregate'] as const;
+type DiagOperation = (typeof DIAG_OPERATIONS)[number];
+
+/** Bounded diagnostic error-class enum (P6.1-B1 whitelist). */
+const DIAG_ERROR_CLASSES = [
+  'transport',
+  'backend_rejection',
+  'invalid_input',
+  'timeout',
+  'aborted',
+  'unknown'
+] as const;
+type DiagErrorClass = (typeof DIAG_ERROR_CLASSES)[number];
+
+/** Bounded diagnostic code enum (P6.1-B1 whitelist). */
+const DIAG_CODES = [
+  'list_tools_failed',
+  'no_write_tool',
+  'no_client',
+  'write_failed',
+  'invalid_row',
+  'aggregate_failed'
+] as const;
+type DiagCode = (typeof DIAG_CODES)[number];
+
+/** One structured, payload-free mirror diagnostic (P6.1-B1 whitelist). */
+export interface MirrorDiagnostic {
+  readonly code: DiagCode;
+  readonly phase: DiagPhase;
+  readonly operation: DiagOperation;
+  readonly retryable: boolean;
+  readonly errorClass: DiagErrorClass;
+  /** Correlation reference: bounded mirror-internal sequence + optional hashes. */
+  readonly correlationId: string;
+  /** Masked short-hash reference (`server:<8hex>`); only for correlation. */
+  readonly serverRef?: string;
+  /** Masked short-hash reference (`ns:<8hex>`); only for correlation. */
+  readonly namespaceRef?: string;
+}
+
 /**
- * Sanitize and bound diagnostic text (L3 governance repair):
- * - Redacts secrets and absolute paths using sanitizeText()
- * - Truncates to MAX_DIAGNOSTIC_LENGTH to prevent memory blowup or payload echo leaks
+ * Classify an unknown thrown value into one bounded error class (P6.1-B1).
+ * The error message itself is NEVER read or echoed; only structural facts
+ * (prototype name, DOMException-ish `name`, MCP `isError` markers) feed the
+ * classification, and everything unmapped folds into `unknown`.
  */
-function shortHash(text: string): string {
+function classifyError(error: unknown): DiagErrorClass {
+  if (error instanceof BackendRejectionError) {
+    return 'backend_rejection';
+  }
+  if (error instanceof Error) {
+    if (error.name === 'AbortError') {
+      return 'aborted';
+    }
+    if (error.name === 'TimeoutError') {
+      return 'timeout';
+    }
+    // Node/undici-style structural signals carried as typed names.
+    if (error.name === 'TypeError' || error.name === 'RangeError') {
+      return error.name === 'TypeError' ? 'transport' : 'invalid_input';
+    }
+    return 'unknown';
+  }
+  if (typeof error === 'string') {
+    return 'unknown';
+  }
+  return 'unknown';
+}
+
+/** Stable hash suffix used by the whitelisted correlation references. */
+function hashOf(text: string): string {
   let hash = 0x811c9dc5;
   for (let i = 0; i < text.length; i += 1) {
     hash ^= text.charCodeAt(i);
@@ -173,24 +273,55 @@ function shortHash(text: string): string {
   return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
-/**
- * Mask a serverId using a deterministic short hash (L3 governance repair).
- */
+/** Mask a serverId using a deterministic short hash (correlation ref only). */
 export function maskServerId(serverId: string): string {
   if (!serverId || typeof serverId !== 'string') {
     return 'server:unknown';
   }
-  return 'server:' + shortHash(serverId);
+  return 'server:' + hashOf(serverId);
 }
 
-/**
- * Mask a namespace using a deterministic short hash (L3 governance repair).
- */
+/** Mask a namespace using a deterministic short hash (correlation ref only). */
 export function maskNamespace(namespace: string): string {
   if (!namespace || typeof namespace !== 'string') {
     return 'ns:unknown';
   }
-  return 'ns:' + shortHash(namespace);
+  return 'ns:' + hashOf(namespace);
+}
+
+/** The masked correlation references for one diagnostic, when supplied. */
+function correlationRefs(
+  serverId?: string,
+  namespace?: string
+): Pick<MirrorDiagnostic, 'serverRef' | 'namespaceRef'> {
+  const refs: {
+    serverRef?: string;
+    namespaceRef?: string;
+  } = {};
+  if (typeof serverId === 'string' && serverId.length > 0) {
+    refs.serverRef = maskServerId(serverId);
+  }
+  if (typeof namespace === 'string' && namespace.length > 0) {
+    refs.namespaceRef = maskNamespace(namespace);
+  }
+  return refs;
+}
+
+/** The only diagnostic text field renderer; every field is a bounded enum. */
+function whitelistFields(diagnostic: MirrorDiagnostic): string {
+  const fields: readonly (readonly string[])[] = [
+    ['code', diagnostic.code],
+    ['phase', diagnostic.phase],
+    ['operation', diagnostic.operation],
+    ['retryable', String(diagnostic.retryable)],
+    ['errorClass', diagnostic.errorClass],
+    ['correlationId', diagnostic.correlationId],
+    ...(diagnostic.serverRef === undefined ? [] : [['serverRef', diagnostic.serverRef] as const]),
+    ...(diagnostic.namespaceRef === undefined
+      ? []
+      : [['namespaceRef', diagnostic.namespaceRef] as const])
+  ];
+  return fields.map(([key, value]) => key + '=' + value).join(' ');
 }
 
 export interface SanitizeDiagnosticOptions {
@@ -199,11 +330,13 @@ export interface SanitizeDiagnosticOptions {
 }
 
 /**
- * Sanitize and bound diagnostic text (L3 governance repair):
- * - Redacts secrets and absolute paths using sanitizeText()
- * - Masks serverId and namespace with deterministic short hashes
- * - Redacts RAW_PAYLOAD patterns to prevent payload echo leaks
- * - Truncates to MAX_DIAGNOSTIC_LENGTH to prevent memory blowup or payload echo leaks
+ * Sanitize and bound diagnostic text (P6.1-B1 hardening):
+ * - Redacts secrets and absolute paths using sanitizeText() (kept from the
+ *   earlier repairs: keys must stay redacted even inside bounded fields).
+ * - Masks serverId/namespace supplied as explicit context with short hashes.
+ * - Keeps the generic RAW_PAYLOAD shape rule (no per-example regexes are
+ *   added; example-specific matching is removed entirely).
+ * - Truncates to MAX_DIAGNOSTIC_LENGTH.
  */
 export function sanitizeDiagnostic(raw: string, options?: SanitizeDiagnosticOptions): string {
   let sanitized = sanitizeText(raw);
@@ -213,25 +346,71 @@ export function sanitizeDiagnostic(raw: string, options?: SanitizeDiagnosticOpti
   if (options?.namespace) {
     sanitized = sanitized.replaceAll(options.namespace, maskNamespace(options.namespace));
   }
-  // Mask backend echo patterns for namespace and server
-  sanitized = sanitized.replace(/(?:namespace[=:\s]+)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/gi, (_match, ns) => {
-    return 'namespace=' + maskNamespace(ns);
-  });
-  sanitized = sanitized.replace(/\btenant\/secret-space\b/gi, maskNamespace('tenant/secret-space'));
-  sanitized = sanitized.replace(/\bmem0-prod-server-[0-9a-zA-Z_-]+\b/gi, (s) => maskServerId(s));
-  // Mask RAW_PAYLOAD patterns
+  // Mask RAW_PAYLOAD-shaped echo tokens (generic shape rule, not example-specific).
   sanitized = sanitized.replace(/RAW_PAYLOAD[^\s"':;,]*/gi, '<payload>');
-  if (sanitized.length <= MAX_DIAGNOSTIC_LENGTH) {
-    return sanitized;
+  if (sanitized.length > MAX_DIAGNOSTIC_LENGTH) {
+    sanitized = sanitized.slice(0, MAX_DIAGNOSTIC_LENGTH - 1) + '\u2026';
   }
-  return sanitized.slice(0, MAX_DIAGNOSTIC_LENGTH - 1) + '\u2026';
+  // Field-level defense in depth: the whitelist fields are bounded enums by
+  // construction, so this pass is a no-op for well-formed diagnostics and a
+  // bounds check for anything a future caller hands in directly.
+  return sanitizeText(sanitized);
 }
 
-function errorMessage(error: unknown, context?: SanitizeDiagnosticOptions): string {
-  if (error instanceof Error && error.message.length > 0) {
-    return sanitizeDiagnostic(error.message, context);
-  }
-  return sanitizeDiagnostic(String(error), context);
+/**
+ * Bounded-per-call counter that keeps correlationIds unique within one
+ * mirror() invocation without persisting anything across calls.
+ */
+function correlationIdFactory(): (code: DiagCode) => string {
+  let sequence = 0;
+  return (code: DiagCode): string => {
+    sequence += 1;
+    return 'mirror-' + code + '-' + String(sequence);
+  };
+}
+
+/**
+ * Render one structured diagnostic line through the whitelist. The result
+ * contains no free-form text by construction: every field is a bounded enum
+ * or a hash reference, so no backend message body can appear.
+ */
+function renderDiagnostic(
+  diagnostic: MirrorDiagnostic,
+  context?: SanitizeDiagnosticOptions
+): string {
+  const line = 'mirror_diag ' + whitelistFields(diagnostic);
+  // sanitizeText keeps the secret/path scrub as defense in depth; enums and
+  // hashes never match those patterns, so the line passes through unchanged.
+  return sanitizeDiagnostic(line, context);
+}
+
+/**
+ * Convert a failure at a known phase into its structured, payload-free
+ * diagnostic. This replaces the previous free-form errorMessage() echo: the
+ * thrown value is consumed only for classification, never for its text.
+ */
+function diagnosticFromError(
+  code: DiagCode,
+  phase: DiagPhase,
+  operation: DiagOperation,
+  error: unknown,
+  correlation: (code: DiagCode) => string,
+  refs?: Pick<MirrorDiagnostic, 'serverRef' | 'namespaceRef'>
+): string {
+  // Backend MCP rejections surface here as BackendRejectionError thrown by
+  // writeRow() from the structural isError answer; the classification reads
+  // the marker type only and never the backend message body.
+  const errorClass = classifyError(error);
+  const diagnostic: MirrorDiagnostic = {
+    code,
+    phase,
+    operation,
+    retryable: errorClass === 'transport' || errorClass === 'timeout' || errorClass === 'aborted',
+    errorClass,
+    correlationId: correlation(code),
+    ...refs
+  };
+  return renderDiagnostic(diagnostic);
 }
 
 /**
@@ -317,12 +496,21 @@ function isValidAggregate(aggregate: JitStatsAggregate): boolean {
   );
 }
 
-/** True when the backend answered with an MCP error result. */
-function backendRejection(result: unknown): string | null {
-  if (isRecord(result) && result.isError === true) {
-    return 'backend reported isError for the stat write';
+/**
+ * P6.1-B1 structural marker for an MCP isError answer. It carries NO backend
+ * text: the rejection is signaled by type, so downstream classification can
+ * never depend on (or echo) the backend message body.
+ */
+export class BackendRejectionError extends Error {
+  constructor() {
+    super('backend reported isError for the stat write');
+    this.name = 'BackendRejectionError';
   }
-  return null;
+}
+
+/** True when the backend answered with an MCP error result. */
+function backendRejection(result: unknown): boolean {
+  return isRecord(result) && result.isError === true;
 }
 
 function schemaPropertyNames(schema: unknown): Set<string> | null {
@@ -373,9 +561,15 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
 
   const record = (diagnostics: readonly string[]): void => {
     for (const diagnostic of diagnostics) {
+      // Defense in depth: every recorded line goes through the sanitizer,
+      // and a throwing onDiagnostic sink can never break mirror() itself.
       const safe = sanitizeDiagnostic(diagnostic);
       recentDiagnostics.push(safe);
-      options.onDiagnostic?.(safe);
+      try {
+        options.onDiagnostic?.(safe);
+      } catch {
+        // Diagnostic sink failures must not degrade mirroring.
+      }
     }
     if (recentDiagnostics.length > MAX_STORE_DIAGNOSTICS) {
       recentDiagnostics.splice(0, recentDiagnostics.length - MAX_STORE_DIAGNOSTICS);
@@ -402,12 +596,23 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
       if (aggregates.length === 0) {
         return { written: 0, skipped: 0, namespaces: [], degraded: false, diagnostics: [] };
       }
+      const correlation = correlationIdFactory();
       try {
-        return await mirrorAll(aggregates);
+        return await mirrorAll(aggregates, correlation);
       } catch (error) {
-        const diagnostics = ['unexpected aggregate mirror failure: ' + errorMessage(error, { serverId: options.client?.serverId })];
+        // P6.1-B1: the thrown value is classified structurally, never echoed.
+        const diagnostics = [
+          diagnosticFromError(
+            'aggregate_failed',
+            'unexpected',
+            'aggregate',
+            error,
+            correlation,
+            correlationRefs(options.client?.serverId)
+          )
+        ];
         record(diagnostics);
-        return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics: diagnostics.map((d) => sanitizeDiagnostic(d)) };
+        return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics };
       }
     },
 
@@ -417,19 +622,33 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
   };
   return store;
 
-  async function mirrorAll(aggregates: readonly JitStatsAggregate[]): Promise<JitMirrorResult> {
+  async function mirrorAll(
+    aggregates: readonly JitStatsAggregate[],
+    correlation: (code: DiagCode) => string
+  ): Promise<JitMirrorResult> {
     const client = options.client;
     if (client === undefined) {
-      const diagnostics = ['no MCP memory client is injected: aggregate mirror degrades to zero writes'];
+      const diagnostics = [
+        renderDiagnostic(
+          {
+            code: 'no_client',
+            phase: 'discovery',
+            operation: 'aggregate',
+            retryable: false,
+            errorClass: 'invalid_input',
+            correlationId: correlation('no_client')
+          }
+        )
+      ];
       record(diagnostics);
-      return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics: diagnostics.map((d) => sanitizeDiagnostic(d)) };
+      return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics };
     }
 
     const diagnostics: string[] = [];
-    const tool = await resolveWriteTool(client, diagnostics);
+    const tool = await resolveWriteTool(client, diagnostics, correlation);
     if (tool === null) {
       record(diagnostics);
-      return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics: diagnostics.map((d) => sanitizeDiagnostic(d)) };
+      return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics };
     }
     const fields = resolveWriteFields(tool.schema);
 
@@ -441,7 +660,16 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
         continue;
       }
       if (!isValidAggregate(aggregate)) {
-        diagnostics.push('skipped an invalid aggregate row at index ' + String(index));
+        diagnostics.push(
+          renderDiagnostic({
+            code: 'invalid_row',
+            phase: 'write',
+            operation: 'aggregate',
+            retryable: false,
+            errorClass: 'invalid_input',
+            correlationId: correlation('invalid_row')
+          })
+        );
         continue;
       }
       // The namespace is recomputed from the row's own level, so isolation
@@ -452,47 +680,50 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
         written += 1;
         namespaces.add(namespace);
       } catch (error) {
+        // P6.1-B1: no error text, tool args or namespace are echoed - only
+        // the bounded enum set plus masked hash references.
         diagnostics.push(
-          sanitizeDiagnostic(
-            'stat write failed in namespace ' +
-              maskNamespace(namespace) +
-              ' (row ' +
-              String(index) +
-              '): ' +
-              errorMessage(error, { serverId: client.serverId, namespace }),
-            { serverId: client.serverId, namespace }
+          diagnosticFromError(
+            'write_failed',
+            'write',
+            'statWrite',
+            error,
+            correlation,
+            correlationRefs(client.serverId, namespace)
           )
         );
       }
     }
 
     record(diagnostics);
-    const safeDiagnostics = diagnostics.map((d) => sanitizeDiagnostic(d));
     return {
       written,
       skipped: aggregates.length - written,
       namespaces: [...namespaces].sort(),
-      degraded: safeDiagnostics.length > 0,
-      diagnostics: safeDiagnostics
+      degraded: diagnostics.length > 0,
+      diagnostics
     };
   }
 
   /** One listTools round per mirror() call; the chosen tool and its schema. */
   async function resolveWriteTool(
     client: JitMirrorMcpClient,
-    diagnostics: string[]
+    diagnostics: string[],
+    correlation: (code: DiagCode) => string
   ): Promise<ResolvedWriteTool | null> {
     let descriptors: readonly JitMirrorToolDescriptor[];
     try {
       descriptors = await client.listTools();
     } catch (error) {
+      // P6.1-B1: the transport failure is classified; its text is dropped.
       diagnostics.push(
-        sanitizeDiagnostic(
-          'listTools failed on ' +
-            maskServerId(client.serverId) +
-            ': ' +
-            errorMessage(error, { serverId: client.serverId }),
-          { serverId: client.serverId }
+        diagnosticFromError(
+          'list_tools_failed',
+          'discovery',
+          'listTools',
+          error,
+          correlation,
+          correlationRefs(client.serverId)
         )
       );
       return null;
@@ -506,10 +737,15 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
       }
     }
     diagnostics.push(
-      sanitizeDiagnostic(
-        'no aggregate write tool advertised by ' + maskServerId(client.serverId),
-        { serverId: client.serverId }
-      )
+      renderDiagnostic({
+        code: 'no_write_tool',
+        phase: 'discovery',
+        operation: 'listTools',
+        retryable: false,
+        errorClass: 'backend_rejection',
+        correlationId: correlation('no_write_tool'),
+        serverRef: maskServerId(client.serverId)
+      })
     );
     return null;
   }
@@ -551,9 +787,8 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
     }
 
     const result = await client.callTool(tool, args);
-    const rejection = backendRejection(result);
-    if (rejection !== null) {
-      throw new Error(rejection);
+    if (backendRejection(result)) {
+      throw new BackendRejectionError();
     }
   }
 }

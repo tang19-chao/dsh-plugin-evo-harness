@@ -23,6 +23,13 @@
  * normalizeAdvantages() instead reject non-finite arguments with RangeError so
  * programmer errors are not silently clamped. The random draw is injectable and
  * must be finite.
+ *
+ * RewardContract (P6.1-D): the value averaged below is the CONTRACT's learning
+ * target - observedReturn first, `return` only as the legacy-record fallback -
+ * never the gain (learningTarget) field, which is the ablation arm. The
+ * consumed field and rewardVersion are observable through estimatorTargetLine()
+ * so a decision log can state what was actually read (P6.1 section 7.4-6),
+ * instead of that fact living only inside the persisted JSONL.
  */
 
 import type {
@@ -31,6 +38,23 @@ import type {
   JitCandidate,
   ScoredExperience
 } from '../types/contracts';
+import {
+  REWARD_CONTRACT,
+  consumedTargetFieldOf,
+  estimatorTargetLine,
+  readLearningTarget
+} from './reward-contract';
+
+export {
+  /** Contract answers "which field is consumed by default" (observedReturn). */
+  REWARD_CONTRACT,
+  /** Contract-default learning value of one record (observedReturn -> return). */
+  readLearningTarget,
+  /** Which of the contract target fields a concrete record was read from. */
+  consumedTargetFieldOf,
+  /** Payload-free estimator log line naming the consumed field + version. */
+  estimatorTargetLine
+};
 
 /** Fixed normalisation epsilon from plan section 6.4. */
 export const ADVANTAGE_EPSILON = 1e-6;
@@ -142,6 +166,9 @@ export function selectNeighbors(
  * Weighted state value V-hat over the supplied neighbours. Low-level helper:
  * callers that need level filtering should pass selectNeighbors() output.
  * Empty neighbours mean no evidence and yield 0 (all advantages then 0).
+ *
+ * The averaged quantity is the RewardContract learning target
+ * (readLearningTarget: observedReturn, `return` fallback) - NOT the gain field.
  */
 export function estimateStateValue(
   neighbors: readonly ScoredExperience[]
@@ -149,14 +176,15 @@ export function estimateStateValue(
   const returns: number[] = [];
   const weights: number[] = [];
   for (const neighbor of neighbors) {
-    if (!Number.isFinite(neighbor.record.return)) {
+    const target = readLearningTarget(neighbor.record);
+    if (!Number.isFinite(target)) {
       continue;
     }
     const weight = neighborWeight(neighbor);
     if (!Number.isFinite(weight) || weight < 0) {
       continue;
     }
-    returns.push(neighbor.record.return);
+    returns.push(target);
     weights.push(weight);
   }
   return weightedMean(returns, weights);
@@ -272,4 +300,34 @@ export function normalizeAdvantages(
     return values.map(() => 0);
   }
   return values.map((value) => value / denominator);
+}
+
+/**
+ * Estimate action values and return, alongside them, the RewardContract
+ * diagnostics a decision log must carry (P6.1 section 7.4-6): which target
+ * field the estimate actually consumed and under which rewardVersion. The
+ * line is derived from the SAME neighbours the estimate averaged, so it cannot
+ * drift from the arithmetic.
+ */
+export function estimateActionValuesWithContract<T>(
+  state: AbstractState,
+  neighbors: readonly ScoredExperience[],
+  candidates: readonly JitCandidate<T>[],
+  config: ValueEstimatorConfig,
+  rng: () => number = Math.random,
+  rewardVersion: string = REWARD_CONTRACT.version
+): {
+  readonly estimates: readonly ActionValueEstimate[];
+  /** Payload-free line naming the consumed target field and rewardVersion. */
+  readonly targetLine: string;
+  /** The rewardVersion the line was rendered with. */
+  readonly rewardVersion: string;
+} {
+  const estimates = estimateActionValues(state, neighbors, candidates, config, rng);
+  const sampled = selectNeighbors(state, neighbors).map((entry) => entry.record);
+  return {
+    estimates,
+    targetLine: estimatorTargetLine(sampled, rewardVersion),
+    rewardVersion
+  };
 }

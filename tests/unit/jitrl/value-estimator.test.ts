@@ -14,6 +14,7 @@ import type {
 import {
   ADVANTAGE_EPSILON,
   estimateActionValues,
+  estimateActionValuesWithContract,
   estimateStateValue,
   normalizeAdvantages,
   selectNeighbors,
@@ -21,6 +22,14 @@ import {
   type ActionValueEstimate,
   type ValueEstimatorConfig
 } from '../../../src/jitrl/value-estimator';
+import {
+  REWARD_CONTRACT,
+  consumedTargetFieldOf,
+  estimatorTargetLine,
+  isRewardVersionBump,
+  readLearningTarget,
+  requiresExperienceRebuild
+} from '../../../src/jitrl/reward-contract';
 
 const T0 = 1_700_000_000_000;
 const CONFIG: ValueEstimatorConfig = {
@@ -379,5 +388,110 @@ describe('normalizeAdvantages', () => {
     expect(() => normalizeAdvantages([Number.POSITIVE_INFINITY])).toThrow(RangeError);
     expect(() => normalizeAdvantages([1], -1)).toThrow(RangeError);
     expect(() => normalizeAdvantages([1], Number.NaN)).toThrow(RangeError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P6.1-D: the estimator consumes the RewardContract's target field
+// ---------------------------------------------------------------------------
+
+describe('P6.1-D: RewardContract target-field consumption', () => {
+  function versionedRecord(input: {
+    readonly id: string;
+    readonly value: number;
+    readonly observedReturn?: number;
+    readonly learningTarget?: number;
+  }): ExperienceRecord {
+    return {
+      ...makeRecord({ id: input.id, actionKey: 'a1', value: input.value }),
+      ...(input.observedReturn === undefined ? {} : { observedReturn: input.observedReturn }),
+      ...(input.learningTarget === undefined ? {} : { learningTarget: input.learningTarget })
+    };
+  }
+
+  it('reads observedReturn first, falls back to return only for legacy records', () => {
+    const current = versionedRecord({
+      id: 'cur',
+      value: 1,
+      observedReturn: 2,
+      learningTarget: 5
+    });
+    // The contract default is observedReturn - NOT the gain (learningTarget),
+    // which is the ablation arm.
+    expect(consumedTargetFieldOf(current)).toBe('observedReturn');
+    expect(readLearningTarget(current)).toBe(2);
+
+    const legacy = versionedRecord({ id: 'leg', value: 1 });
+    expect(consumedTargetFieldOf(legacy)).toBe('return');
+    expect(readLearningTarget(legacy)).toBe(1);
+
+    const broken = { ...versionedRecord({ id: 'nan', value: 1 }), observedReturn: Number.NaN };
+    expect(consumedTargetFieldOf(broken)).toBe('return');
+  });
+
+  it('estimateStateValue averages the contract target, not the gain field', () => {
+    // Two neighbours whose `return` differs from their observedReturn and whose
+    // learningTarget is deliberately extreme: the estimate must use
+    // observedReturn (contract default), proving which field was consumed.
+    const neighbors = [
+      scored({ id: 'n1', actionKey: 'a1', value: -10 }),
+      scored({ id: 'n2', actionKey: 'a1', value: -10 })
+    ].map((entry) => ({
+      ...entry,
+      record: {
+        ...entry.record,
+        observedReturn: 2,
+        learningTarget: 3,
+        return: -10
+      } as ExperienceRecord
+    }));
+    expect(estimateStateValue(neighbors)).toBeCloseTo(2, 12);
+  });
+
+  it('renders the estimator log line with the consumed field and rewardVersion', () => {
+    const records = [
+      versionedRecord({ id: 'a', value: 1, observedReturn: 2 }),
+      versionedRecord({ id: 'b', value: 1 })
+    ];
+    const line = estimatorTargetLine(records, REWARD_CONTRACT.version);
+    // The line names the contract default field...
+    expect(line).toContain('target field observedReturn');
+    // ...reports how many neighbours each concrete field contributed...
+    expect(line).toContain('observedReturn=1');
+    expect(line).toContain('return=1');
+    // ...and carries the rewardVersion, so the fact is not JSONL-only.
+    expect(line).toContain('rewardVersion=' + REWARD_CONTRACT.version);
+  });
+
+  it('estimateActionValuesWithContract returns the same estimates plus the line', () => {
+    const neighbors = figureNeighbors();
+    const candidates = figureCandidates();
+    const plain = estimateActionValues(STATE, neighbors, candidates, {
+      ...CONFIG,
+      unseenFallback: 'zero'
+    });
+    const withContract = estimateActionValuesWithContract(
+      STATE,
+      neighbors,
+      candidates,
+      { ...CONFIG, unseenFallback: 'zero' },
+      () => 0.99,
+      REWARD_CONTRACT.version
+    );
+    expect(withContract.estimates).toEqual(plain);
+    expect(withContract.rewardVersion).toBe(REWARD_CONTRACT.version);
+    expect(withContract.targetLine).toContain('rewardVersion=' + REWARD_CONTRACT.version);
+  });
+
+  it('bumps the rewardVersion and demands a rebuild when the scale changes', () => {
+    // A generation bump is a real version bump...
+    expect(isRewardVersionBump('r2/verifiable-v1', REWARD_CONTRACT.version)).toBe(true);
+    // ...and invalidates old-scale experience: rebuild, never rewrite in place.
+    expect(requiresExperienceRebuild('r2/verifiable-v1', REWARD_CONTRACT.version)).toBe(true);
+    // Same version means no change.
+    expect(requiresExperienceRebuild(REWARD_CONTRACT.version, REWARD_CONTRACT.version)).toBe(false);
+    // Downgrades and unknown shapes fail closed to rebuild.
+    expect(requiresExperienceRebuild('r3/x', 'r2/verifiable-v1')).toBe(true);
+    expect(requiresExperienceRebuild('legacy', 'r3/unified-signals-v1')).toBe(true);
   });
 });

@@ -95,15 +95,17 @@ import {
 } from './jitrl/candidate-augmenter';
 import {
   classifyTrajectoryOutcome,
-  discountedReturn,
-  isLearningOutcome,
-  scoreTrajectorySignals
+  isLearningOutcome
 } from './jitrl/step-evaluator';
 import {
   CURRENT_PROVENANCE_VERSION,
-  CURRENT_REWARD_VERSION,
   EXPERIENCE_SCHEMA_VERSION
 } from './jitrl/experience-store';
+import {
+  REWARD_CONTRACT,
+  estimatorTargetLine,
+  scoreUnderRewardContract
+} from './jitrl/reward-contract';
 import type { JitRuntimeControl, JitSurface } from './jitrl/runtime-control';
 import { createDiscoveryTree } from './dream-rsi';
 import type {
@@ -474,17 +476,20 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-/** Per-source reward totals for one round (plan section 6.5 source names). */
-function rewardSourcesOf(rewards: readonly StepReward[]): Readonly<Record<string, number>> {
-  const totals: Record<string, number> = {};
-  for (const reward of rewards) {
-    for (const [source, value] of Object.entries(reward.sources)) {
-      if (typeof value === 'number' && Number.isFinite(value)) {
-        totals[source] = (totals[source] ?? 0) + value;
-      }
-    }
+/**
+ * P6.1-D RewardContract: the winner's step-evaluator vector, kept as ONE
+ * auxiliary `stepJudge` entry (mean of the per-step rewards). It never defines
+ * the primary target, so a missing or failed evaluation cannot change what
+ * rewardVersion means. Clipped to the reward range so the auxiliary field stays
+ * comparable to the primary scale for calibration sampling.
+ */
+function winnerStepSummary(rewards: readonly StepReward[] | undefined): number {
+  if (rewards === undefined || rewards.length === 0) {
+    return 0;
   }
-  return totals;
+  const perStep = rewards.map((entry) => entry.reward);
+  const mean = perStep.reduce((total, value) => total + value, 0) / Math.max(1, perStep.length);
+  return clamp(mean, -3, 3);
 }
 
 /** Non-array object guard (ContractMetadata is a plain record). */
@@ -1814,9 +1819,11 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       return left.nodeId < right.nodeId ? -1 : left.nodeId > right.nodeId ? 1 : 0;
     });
 
-    // The composer's winner is the only trajectory that justifies the (possibly
-    // model-backed) step evaluation. A run without a winner evaluates nothing and
-    // still records every executed probe from verifiable signals.
+    // The composer's winner still justifies the (possibly model-backed) step
+    // evaluation: its per-step vector is an AUXILIARY signal under the
+    // RewardContract (judge-policy), it no longer defines the winner's primary
+    // target. A run without a winner evaluates nothing and still records every
+    // executed probe from verifiable signals.
     const winner = ordered.find((probe) => probe.nodeId === input.selectedNodeId);
     let winnerRewards: readonly StepReward[] | undefined;
     if (winner !== undefined) {
@@ -1862,10 +1869,11 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       );
     }
 
-    // Baseline: the reference run is the comparable context every candidate is
-    // contrasted with (plan section 6.3 attributionBaseline). It is scored the
-    // same way, from verifiable signals only, so the comparison is consistent.
-    const baseline = scoreTrajectorySignals(input.reference).reward;
+    // P6.1-D RewardContract: ONE yardstick per rewardVersion. The baseline (the
+    // reference run, the comparable same-task context of plan section 6.3) is
+    // scored by the SAME aggregation as every candidate below, so the
+    // learningTarget contrast compares like with like.
+    const baseline = clamp(scoreUnderRewardContract(input.reference).reward, -3, 3);
     const createdAt = this.now();
     const records: ExperienceRecord[] = [];
     const outcomes: string[] = [];
@@ -1889,18 +1897,22 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         reward = 0;
         observedReturn = 0;
         rewardSources = { outcome: 1 };
-      } else if (isWinner && winnerRewards !== undefined) {
-        const perStep = winnerRewards.map((entry) => entry.reward);
-        const mean =
-          perStep.reduce((total, value) => total + value, 0) / Math.max(1, perStep.length);
-        reward = clamp(mean, -3, 3);
-        observedReturn = discountedReturn(perStep, kernel.config.gamma, 0);
-        rewardSources = rewardSourcesOf(winnerRewards);
       } else {
-        const signal = scoreTrajectorySignals(probe.trajectory);
+        // P6.1-D RewardContract: ONE primary target for every executed probe -
+        // winner or not - under the same rewardVersion. The composer's winner
+        // no longer gets a private step-evaluator + discounted-return scale;
+        // its per-step vector survives only as an auxiliary rewardSources entry
+        // (judge-policy: auxiliary field, never the yardstick), so the same
+        // trajectory measures the same whether or not it won composition.
+        const signal = scoreUnderRewardContract(probe.trajectory);
         reward = clamp(signal.reward, -3, 3);
         observedReturn = clamp(signal.reward, -3, 3);
-        rewardSources = signal.sources;
+        rewardSources = isWinner
+          ? {
+              ...signal.sources,
+              stepJudge: winnerStepSummary(winnerRewards)
+            }
+          : signal.sources;
       }
       const learningTarget = eligible ? clamp(observedReturn - baseline, -3, 3) : 0;
       const decisionId = probe.selection?.decisionId ?? 'jit-meta-decision-' + input.runId + '-r' + String(probe.round);
@@ -1914,7 +1926,14 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         decisionId,
         runId: input.runId,
         policyVersion: input.policyId + '@v' + String(finiteOr(this.deps.policy.policy?.version, 1)),
-        rewardVersion: CURRENT_REWARD_VERSION,
+        // P6.1-D: the RewardContract version. The scoring rule changed in this
+        // round (the winner-only evaluator+discounted-return fork was removed),
+        // so the version was bumped from r2/verifiable-v1; the r2 experience
+        // stays readable for audit and is never rewritten in place. The scale
+        // and target-field meaning of this version live in
+        // src/jitrl/reward-contract.ts (REWARD_CONTRACT) and are echoed into the
+        // record_experience stage detail on every run.
+        rewardVersion: REWARD_CONTRACT.version,
         provenanceVersion: CURRENT_PROVENANCE_VERSION,
         experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
         observedReturn,
@@ -2004,7 +2023,14 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         rounds: new Set(ordered.map((probe) => probe.round)).size,
         outcomes,
         notLearningEligible: ineligible,
-        attributionBaseline: baseline
+        attributionBaseline: baseline,
+        // P6.1-D: the run's reward yardstick, visible in the stage detail (not
+        // only inside the JSONL records).
+        rewardVersion: REWARD_CONTRACT.version,
+        rewardScale: REWARD_CONTRACT.aggregation,
+        rewardTargetField: REWARD_CONTRACT.learningTargetField,
+        // What the value estimator will consume from these records.
+        estimatorTarget: estimatorTargetLine(deduped, REWARD_CONTRACT.version)
       }
     });
     try {

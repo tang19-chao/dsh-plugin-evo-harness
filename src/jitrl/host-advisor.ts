@@ -34,7 +34,9 @@
  *   - `hostAdvisor.enabled: false` returns noop('host_advisor_disabled') for
  *     every request and performs zero retrieval.
  *   - an injected store/retriever that throws, or a malformed retrieval result,
- *     degrades to noop with a diagnostic and never propagates to the host turn.
+ *     degrades to noop with a diagnostic and never propagates to the host turn;
+ *     the diagnostic carries only a bounded error class (P6.1-B2): no error
+ *     body, Error.name or external code is ever echoed to a visible surface.
  *   - the injected text is bounded by MAX_ADVISORY_TOKENS (300) using
  *     checkTokenBudget() from redaction.ts (supporting injected ModelTokenizer,
  *     or falling back to conservative character/byte/entropy-aware limits);
@@ -233,14 +235,38 @@ function noopDecision(
   };
 }
 
+/**
+ * P6.1-B2: describe a failure without echoing any error body.
+ *
+ * The thrown value is mapped onto a bounded class enum - never a raw
+ * Error.name, external code or message text - so no unvalidated content can
+ * reach any advisor-visible surface (diagnostics, advice text,
+ * additionalContexts). Same caliber as the mirror store's whitelist
+ * rendering (bridge.store.ts): classification only, zero payload. Secret
+ * redaction stays where it belongs: on free-form fragments that legitimately
+ * enter the advisory text (safeFragment), not on an echo channel.
+ */
 function describeError(error: unknown): string {
+  let errorClass: 'aborted' | 'timeout' | 'type_error' | 'range_error' | 'error' | 'unknown';
   if (error instanceof Error) {
-    return error.name + ': ' + redactSecrets(error.message);
+    if (error.name === 'AbortError') {
+      errorClass = 'aborted';
+    } else if (error.name === 'TimeoutError') {
+      errorClass = 'timeout';
+    } else if (error.name === 'TypeError') {
+      errorClass = 'type_error';
+    } else if (error.name === 'RangeError') {
+      errorClass = 'range_error';
+    } else {
+      // Any other Error.name - including hostile subclasses - folds into the
+      // single bounded 'error' class; the name itself is never rendered.
+      errorClass = 'error';
+    }
+  } else {
+    // String throws, objects, symbols, anything else: bounded unknown.
+    errorClass = 'unknown';
   }
-  if (typeof error === 'string') {
-    return redactSecrets(error);
-  }
-  return 'unknown';
+  return 'class=' + errorClass;
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -588,6 +614,9 @@ export function createHostAdvisor(options: HostAdvisorOptions): HostAdvisor {
           ? await source(state, query)
           : await (options.store as HostAdvisorStore).query(query);
     } catch (error) {
+      // Failure safety: a broken seam degrades to "do nothing", never a throw
+      // into the host turn and never a blocked tool call. P6.1-B2: the
+      // diagnostic carries only a bounded error class - no body, no name.
       diagnostics.push('retrieval_failed: ' + describeError(error));
       return noopDecision('retrieval_failed');
     }
@@ -737,7 +766,8 @@ export function createHostAdvisor(options: HostAdvisorOptions): HostAdvisor {
         return await evaluateEnabled(request);
       } catch (error) {
         // Failure safety: a broken seam degrades to "do nothing", never a throw
-        // into the host turn and never a blocked tool call.
+        // into the host turn and never a blocked tool call. P6.1-B2: bounded
+        // error class only - the thrown body never reaches this surface.
         diagnostics.push('advisor_failed: ' + describeError(error));
         return noopDecision('advisor_failed');
       }

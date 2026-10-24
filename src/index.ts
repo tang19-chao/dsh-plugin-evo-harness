@@ -541,7 +541,8 @@ function pickFunction(
     if (typeof candidate === 'function') {
       return candidate as (...args: unknown[]) => unknown;
     }
-  } return undefined;
+  }
+  return undefined;
 } function pickCapability(source: Record<string,
   unknown> | undefined,
   objectName: string,
@@ -556,13 +557,15 @@ function normalizeDisposer(result: unknown): HostDisposer {
     return {
       dispose: () => (result as () => void)()
     };
-  } const record = asRecord(result);
+  }
+  const record = asRecord(result);
   if (record !== undefined && typeof record.dispose === 'function') {
     const dispose = record.dispose as () => void | Promise<void>;
     return {
       dispose: () => dispose.call(result)
     };
-  } return {
+  }
+  return {
     dispose: () => undefined
   };
 }
@@ -611,7 +614,8 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
         }
       };
     };
-  } const promptSegment = pickCapability(root,
+  }
+  const promptSegment = pickCapability(root,
     'prompt',
     ['registerSegment']);
   if (promptSegment !== undefined) {
@@ -623,7 +627,8 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
         spec);
       return normalizeDisposer(result);
     };
-  } const permissions = pickCapability(root,
+  }
+  const permissions = pickCapability(root,
     'permissions',
     ['register',
       'addRule',
@@ -635,7 +640,8 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
         spec);
       return normalizeDisposer(result);
     };
-  } const memoryView = pickCapability(root,
+  }
+  const memoryView = pickCapability(root,
     'evoMemory',
     ['createScopedView',
       'scopedView']);
@@ -647,7 +653,8 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
         spec);
       return normalizeDisposer(result);
     };
-  } const patchDescriptions = pickCapability(root,
+  }
+  const patchDescriptions = pickCapability(root,
     'tools',
     ['patchDescriptions',
       'patchDescription']);
@@ -659,7 +666,8 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
         spec);
       return normalizeDisposer(result);
     };
-  } const mountSkill = pickCapability(root,
+  }
+  const mountSkill = pickCapability(root,
     'skills',
     ['mountDynamic',
       'mount']);
@@ -671,7 +679,8 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
         spec);
       return normalizeDisposer(result);
     };
-  } const mountScript = pickCapability(root,
+  }
+  const mountScript = pickCapability(root,
     'sandbox',
     ['mountScript',
       'writeFile']);
@@ -683,7 +692,8 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
         spec);
       return normalizeDisposer(result);
     };
-  } const registerSubagent = pickCapability(root,
+  }
+  const registerSubagent = pickCapability(root,
     'subagents',
     ['register',
       'registerSubagent']);
@@ -695,7 +705,8 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
         spec);
       return normalizeDisposer(result);
     };
-  } const useMiddleware = pickCapability(root,
+  }
+  const useMiddleware = pickCapability(root,
     'middleware',
     ['use',
       'register']);
@@ -707,7 +718,8 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
         spec);
       return normalizeDisposer(result);
     };
-  } const acquireSandbox = pickCapability(root,
+  }
+  const acquireSandbox = pickCapability(root,
     'sandbox',
     ['acquireWorkspace',
       'createWorkspace']);
@@ -743,7 +755,8 @@ export function createCordisHostFromContext(ctx: unknown): CordisHostAdapter {
         }
       };
     };
-  } return adapter as CordisHostAdapter;
+  }
+  return adapter as CordisHostAdapter;
 }
 /** True when an adapter exposes at least one mountable seam. */
 export function hostAdapterSeamCount(adapter: CordisHostAdapter): number {
@@ -763,8 +776,10 @@ export function hostAdapterSeamCount(adapter: CordisHostAdapter): number {
       unknown>)[key] === 'function') {
       count += 1;
     }
-  } return count;
-} const OPTION_KEYS = ['model',
+  }
+  return count;
+}
+const OPTION_KEYS = ['model',
   'host',
   'clients',
   'listClients',
@@ -788,10 +803,12 @@ export function normalizePluginOptions(second: unknown,
       config: ctxConfig
     } : {
     };
-  } const looksLikeOptions = OPTION_KEYS.some((key) => record[key] !== undefined);
+  }
+  const looksLikeOptions = OPTION_KEYS.some((key) => record[key] !== undefined);
   if (looksLikeOptions) {
     return record as EvoHarnessPluginOptions;
-  } return {
+  }
+  return {
     config: second
   };
 }
@@ -823,7 +840,8 @@ export function resolveHostAdapter(ctx: unknown,
       hostAdapter: options.host,
       hostAdapterSource: 'injected'
     };
-  } const structured = createCordisHostFromContext(ctx);
+  }
+  const structured = createCordisHostFromContext(ctx);
   const structuredSeams = hostAdapterSeamCount(structured);
   const detection = detectDshHookHost(ctx);
   if (detection.detected) {
@@ -844,14 +862,16 @@ export function resolveHostAdapter(ctx: unknown,
       hostAdapterSource: 'dsh-hooks',
       hookDetection: detection
     };
-  } if (structuredSeams > 0) {
+  }
+  if (structuredSeams > 0) {
     diagnostics.push('real DSH hook middleware is unavailable (' + detection.missing.join('; ') + '); using the structural Cordis capability seams instead');
     return {
       hostAdapter: structured,
       hostAdapterSource: 'context',
       hookDetection: detection
     };
-  } return {
+  }
+  return {
     hostAdapter: createInMemoryCordisHost(),
     hostAdapterSource: 'in-memory',
     hookDetection: detection
@@ -924,6 +944,34 @@ export function dreamJitStatus(config: EvoHarnessConfig,
     })
   };
 }
+/**
+ * Map an unexpected thrown value onto one bounded class enum (P6.1-A1b, same
+ * caliber as the advisor's describeError and the bridge store's classifyError):
+ * classification only, zero payload. The error message text is never read,
+ * rendered or echoed into any diagnostic surface.
+ */
+function describeThrownClass(error: unknown): string {
+  let errorClass: 'aborted' | 'timeout' | 'type_error' | 'range_error' | 'error' | 'unknown';
+  if (error instanceof Error) {
+    if (error.name === 'AbortError') {
+      errorClass = 'aborted';
+    } else if (error.name === 'TimeoutError') {
+      errorClass = 'timeout';
+    } else if (error.name === 'TypeError') {
+      errorClass = 'type_error';
+    } else if (error.name === 'RangeError') {
+      errorClass = 'range_error';
+    } else {
+      // Any other Error.name - including hostile subclasses - folds into the
+      // single bounded 'error' class; the name itself is never rendered.
+      errorClass = 'error';
+    }
+  } else {
+    // String throws, objects, symbols, anything else: bounded unknown.
+    errorClass = 'unknown';
+  }
+  return 'class=' + errorClass;
+}
 /** L3 status value; attached means an advisor reached the real hook adapter. */
 export function hostAdvisorJitStatus(input: {
   readonly config: EvoHarnessConfig;
@@ -973,7 +1021,8 @@ function pickMirrorClient(clients: readonly unknown[] | undefined): JitMirrorMcp
     if (record !== null && typeof record === 'object' && typeof record.serverId === 'string' && typeof record.listTools === 'function' && typeof record.callTool === 'function') {
       return record as JitMirrorMcpClient;
     }
-  } return undefined;
+  }
+  return undefined;
 }
 /** Dreamer surface plus the P4 diagnostic accessor the orchestrator reads. */
 export interface WiredOfflineDreamer extends IOfflineDreamer {
@@ -1236,7 +1285,8 @@ export function buildJitRlWiring(input: {
         runtimeControl: createJitRuntimeControl({ configured: false })
       }
     };
-  } try {
+  }
+  try {
     const kernel = createJitRl({
       config: input.config,
       now: input.now,
@@ -1369,10 +1419,12 @@ export function shouldHydrateJitRl(options: EvoHarnessPluginOptions): boolean {
 export function resolveExperienceFilePath(options: EvoHarnessPluginOptions): string | undefined {
   if (options.experienceFilePath !== undefined) {
     return options.experienceFilePath;
-  } const dataDir = options.persistence?.dataDir;
+  }
+  const dataDir = options.persistence?.dataDir;
   if (dataDir === undefined || dataDir.length === 0) {
     return undefined;
-  } return joinPath(dataDir,
+  }
+  return joinPath(dataDir,
     JITRL_EXPERIENCE_FILE);
 }
 /** Minimal POSIX/Windows join that does not pull node:path into the entry module. */
@@ -1415,7 +1467,8 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     diagnostics);
   if (hostAdapterSource === 'in-memory') {
     diagnostics.push('no Cordis capability seams were discoverable on the host context; an in-process in-memory host adapter is mounted so the lifecycle still runs (inject options.host for real sandboxed probes)');
-  } const persistence = options.persistence;
+  }
+  const persistence = options.persistence;
   const treePool = options.deps?.treePool ?? persistence?.treePool ?? createDiscoveryTreePool({
     maxTrees: config.dreamRsi.maxTreePoolSize
   });
@@ -1526,7 +1579,8 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     now) : undefined;
   if (agentExecutor !== undefined) {
     diagnostics.push('multi-step agent probe executor is active: ' + agentExecutor.describe().join('; '));
-  } const deps: EvoHarnessOrchestratorDeps = {
+  }
+  const deps: EvoHarnessOrchestratorDeps = {
     config,
     memory,
     seams,
@@ -1647,7 +1701,8 @@ export async function hydrateJitRl(input: {
   try {
     if (!shouldHydrateJitRl(input.options)) {
       return;
-    } const filePath = resolveExperienceFilePath(input.options);
+    }
+    const filePath = resolveExperienceFilePath(input.options);
     const pool = input.options.backfillFromTreePool === false ? undefined : input.persistence?.treePool;
     const result = await input.kernel.hydrate({
       ... (filePath === undefined ? {
@@ -1661,7 +1716,8 @@ export async function hydrateJitRl(input: {
     });
     if (result !== undefined) {
       input.diagnostics.push('jitrl: cold-start backfill converted ' + String(result.recordCount) + ' scored node(s) from ' + String(result.treeCount) + ' persisted tree(s) into L1 experience (' + String(result.appended) + ' appended)');
-    } if (filePath !== undefined) {
+    }
+    if (filePath !== undefined) {
       input.diagnostics.push('jitrl: experience log ' + filePath);
     }
   } catch (error) {
@@ -1700,7 +1756,8 @@ function recentJitDecisions(decisions: readonly JitBatchDiagnostics[],
     Math.floor(limit));
   if (bounded === 0) {
     return [];
-  } const start = Math.max(0,
+  }
+  const start = Math.max(0,
     decisions.length - bounded);
   const rows: JitRecentDecision[] = [];
   for (let index = start;
@@ -1712,7 +1769,8 @@ function recentJitDecisions(decisions: readonly JitBatchDiagnostics[],
         index,
         beta));
     }
-  } return rows.reverse();
+  }
+  return rows.reverse();
 }
 /** Construct the plugin without touching a host context. */
 export function createEvoHarnessPlugin(
@@ -1842,8 +1900,13 @@ export function createEvoHarnessPlugin(
             scope: options.hostAdvisorScope
           })
         });
-      diagnostics.push('jitrl: L3 host advisor attached to the DSH hook adapter (mode ' + resolved.jitrl.hostAdvisor.mode + (options.hostAdvisorScope === undefined ? ', host-local' : ', scoped') + ')');
-    } const disposeHooks = hookAdapter.dispose;
+      // D1 (ADR 0001): without an explicit hostAdvisorScope the ScopeRegistry
+      // decides, and dispatches whose identity cannot be proven get no advice
+      // and no learning. This diagnostic states that strict default instead of
+      // implying an implicit host-local exception.
+      diagnostics.push('jitrl: L3 host advisor attached to the DSH hook adapter (mode ' + resolved.jitrl.hostAdvisor.mode + (options.hostAdvisorScope === undefined ? ', registry-resolved scope (D1 strict default: unprovable identities get no advice or learning)' : ', scoped') + ')');
+    }
+    const disposeHooks = hookAdapter.dispose;
     if (disposeHooks !== undefined) {
       disposers.push(() => disposeHooks.call(hookAdapter));
     }
@@ -1883,7 +1946,8 @@ export function createEvoHarnessPlugin(
         // the control itself so a status page never has to infer it.
         runtime: runtimeControl.snapshot()
       };
-    } const decorator = jitWiring.policy;
+    }
+    const decorator = jitWiring.policy;
     const advisorAttached = jitWiring.advisor !== undefined && hostAdapterSource === 'dsh-hooks';
     return {
       enabled: true,
@@ -1933,7 +1997,8 @@ export function createEvoHarnessPlugin(
         noop: 0,
         skipped: 0
       };
-    } return adapter.hostAdvisorStats();
+    }
+    return adapter.hostAdvisorStats();
   };
   /**
    * P5-b: mirror the aggregate experience statistics after each completed run.
@@ -1955,31 +2020,41 @@ export function createEvoHarnessPlugin(
     // must still win.
     if (!isRuntimeOn('mirror')) {
       return;
-    } const rows = aggregateExperienceStats(jitExperienceSnapshot());
+    }
+    const rows = aggregateExperienceStats(jitExperienceSnapshot());
     if (rows.length === 0) {
       return;
-    } if (!isRuntimeOn('mirror')) {
+    }
+    if (!isRuntimeOn('mirror')) {
       return;
-    } try {
+    }
+    try {
       const result = await mirror.mirror(rows);
       state.calls += 1;
       state.writes += result.written;
       state.degraded = result.degraded;
       if (result.written > 0) {
         state.lastWritten = (options.now ?? ((): number => Date.now()))();
-      } for (const line of result.diagnostics) {
+      }
+      for (const line of result.diagnostics) {
         diagnostics.push('jitrl mirror: ' + line);
       }
     } catch (error) {
+      // The store classifies its own failures into whitelist diagnostics; this
+      // path only guards against an unexpected mirror() throw. Same caliber as
+      // the advisor's describeError and the bridge store's classifyError
+      // (P6.1-B1): classification only, zero payload - the thrown value's
+      // message text is never echoed into any diagnostic surface.
       state.degraded = true;
-      diagnostics.push('jitrl mirror: aggregate mirror failed (' + (error instanceof Error ? error.message : String(error)) + ')');
+      diagnostics.push('jitrl mirror: aggregate mirror failed unexpectedly (' + describeThrownClass(error) + ')');
     }
   };
   const jitExperienceSnapshot = (): readonly ExperienceRecord[] => {
     const kernel = jitWiring.kernel;
     if (kernel === undefined) {
       return [];
-    } const store = kernel.store as IExperienceStore & {
+    }
+    const store = kernel.store as IExperienceStore & {
       snapshot?: () => readonly ExperienceRecord[];
     };
     return typeof store.snapshot === 'function' ? store.snapshot() : [];
@@ -1997,7 +2072,8 @@ export function createEvoHarnessPlugin(
         supported: false,
         note: 'JitRL is not active in this process'
       };
-    } const facade = kernel.store as IExperienceStore & {
+    }
+    const facade = kernel.store as IExperienceStore & {
       purge?(options?: {
         readonly bucket?: string
       }): Promise<number>;
@@ -2008,7 +2084,8 @@ export function createEvoHarnessPlugin(
         supported: false,
         note: 'the experience store driver exposes no purge operation'
       };
-    } const dropped = await facade.purge(bucket === undefined ? {
+    }
+    const dropped = await facade.purge(bucket === undefined ? {
     } : {
       bucket
     });
@@ -2060,7 +2137,8 @@ export function createEvoHarnessPlugin(
               count: existing.count + 1
             });
         }
-      } return [...counts.values()];
+      }
+      return [...counts.values()];
     },
     cacheStats: () => jitWiring.policy?.cacheStats(),
     recentDecisions: (limit) => recentJitDecisions(jitDecoratorDecisions(),
@@ -2303,7 +2381,8 @@ export function createEvoHarnessPlugin(
           },
           jitCommand
         };
-      } const record = asRecord(args);
+      }
+      const record = asRecord(args);
       const prompt = typeof args === 'string' && args.trim().length > 0 ? args : typeof record?.prompt === 'string' ? (record.prompt as string) : typeof record?.text === 'string' ? (record.text as string) : 'evolve the current task';
       const sessionId = typeof record?.sessionId === 'string' ? (record.sessionId as string) : typeof asRecord(context)?.sessionId === 'string' ? String((asRecord(context) as Record<string,
         unknown>).sessionId) : 'session-unknown';

@@ -32,10 +32,10 @@ import { createMemoryExperienceStore } from '../../src/jitrl/stores/memory.store
 import { abstractMetaState, abstractProposalState } from '../../src/jitrl/state-abstraction';
 import { normalizePatchSignature } from '../../src/jitrl/action-normalizer';
 import { verbalizedLogit } from '../../src/jitrl/logit-sources';
-import { scoreTrajectorySignals } from '../../src/jitrl/step-evaluator';
+import { classifyTrajectoryOutcome, scoreTrajectorySignals, type TrajectorySignalScore } from '../../src/jitrl/step-evaluator';
+import { consumedTargetFieldOf, scoreUnderRewardContract } from '../../src/jitrl/reward-contract';
 import {
   CURRENT_PROVENANCE_VERSION,
-  CURRENT_REWARD_VERSION,
   EXPERIENCE_SCHEMA_VERSION
 } from '../../src/jitrl/experience-store';
 import {
@@ -58,6 +58,7 @@ import type {
   IHarnessProposer,
   IModelAdapter,
   IsolatedBranchContext,
+  JitDecision,
   ModelRequest,
   ModelResponse,
   PatchOrigin,
@@ -67,6 +68,7 @@ import type {
   ProposeRequest,
   ProposedPatch,
   ProposedPatchSet,
+  ScoredExperience,
   ToolErrorRecord,
   TrajectoryDeliverable,
   TrajectoryStatus,
@@ -76,6 +78,9 @@ import type {
 // ---------------------------------------------------------------------------
 // deterministic primitives
 // ---------------------------------------------------------------------------
+
+/** Local alias of {@link round} for scopes where `round` names the loop index. */
+const fixedRound = round;
 
 /** mulberry32: the one PRNG the whole harness uses. */
 export function createRng(seed: number): () => number {
@@ -2476,6 +2481,154 @@ interface FairEngineOptions {
   readonly experienceSource: 'self' | 'donor' | 'none';
   /** Collects the final snapshot (used to seed the cross-task donor library). */
   readonly collectRecords?: (records: readonly ExperienceRecord[]) => void;
+  /**
+   * P6.1-E diagnostic knobs (negative-result explanation). Every knob defaults
+   * to the historical behaviour, so a run WITHOUT this field is byte-identical
+   * to the pre-P6.1-E engine; the CI parity assertions only see the defaults.
+   * The knobs exist so the preregistered hypotheses can be probed ONE CHANGE AT
+   * A TIME on the same pool, seed and task set (plan section 8.2).
+   */
+  readonly diagnostics?: FairDiagKnobs;
+}
+
+/**
+ * One-change-at-a-time probe knobs. Each field maps to exactly one
+ * preregistered hypothesis; a probe run sets exactly ONE field (besides the
+ * ledger capture) and documents the minimal contrast in the report.
+ */
+export interface FairDiagKnobs {
+  /** Capture the decision-level ledger (payload-free structured fields). */
+  readonly ledger?: boolean;
+  /**
+   * H1 reward yardstick: 'r2-fair' (default) keeps the historical fair-engine
+   * scale (scoreTrajectorySignals with its default weights); 'r3-contract'
+   * scores every executed trajectory with the unified RewardContract yardstick
+   * (scoreUnderRewardContract). Same pool, same seed, only the scale changes.
+   */
+  readonly rewardScale?: 'r2-fair' | 'r3-contract';
+  /**
+   * H2 state coarseness: 'coarse' strips the run-indexed tokens (round:,
+   * depth:, pslot:, parent_patch_signature:) from the L2 state, so experience
+   * written in earlier runs stays retrievable at later runs of the same task.
+   * The bucket is unchanged; records persist the same transformed state they
+   * were decided with, so retrieval and write-back always agree.
+   */
+  readonly stateMode?: 'default' | 'coarse';
+  /**
+   * H3 action-space de-structuring: 'surfaces' canonicalizes the L2 action key
+   * to the candidate's surface set. The default 'signature' key carries the
+   * pool-slot edit shape, which can fragment support across semantically
+   * identical edits.
+   */
+  readonly actionKeyMode?: 'signature' | 'surfaces';
+  /**
+   * H4 minimum-support gate: when the kernel's raw choice deviates from the
+   * prior with chosen support below this floor, the decision falls back to the
+   * prior. Undefined (default) disables the gate.
+   */
+  readonly minSupportToDeviate?: number;
+  /**
+   * H5 fixed-pool schedule: 'fixed-lineage' (default) is the historical
+   * prefs.slice(0, round) stimulus; 'static' offers the round-0 pool at every
+   * decision, removing the schedule's alignment with the prior deepening order.
+   */
+  readonly poolSchedule?: 'fixed-lineage' | 'static';
+}
+
+/**
+ * Reward version stamped on records written under the r3 contract probe.
+ */
+const FAIR_R3_SCALE_VERSION = 'r3/unified-signals-v1';
+
+/**
+ * Reward version stamped on records written under the default 'r2-fair' arm
+ * (P6.1-E3 / gate-reviewer finding: the label must never decouple from the
+ * formula).
+ *
+ * This arm scores with the HISTORICAL fair-engine scale
+ * (`scoreTrajectorySignals` + its default weights), so its records are labelled
+ * with the historical version that scale belongs to. It deliberately does NOT
+ * inherit the production `CURRENT_REWARD_VERSION`: after P6.1-D2 that constant
+ * moved to r3, and inheriting it made this arm stamp r3 onto r2-scored
+ * records - a label/formula mismatch that falsified the neighbour-version
+ * evidence of the t8 H6 structural check. Both arm constants are now explicit
+ * and independent of the production constant.
+ */
+const FAIR_R2_SCALE_VERSION = 'r2/verifiable-v1';
+
+/** In-memory probe-space version tag; probes never persist a contract bump. */
+const FAIR_PROBE_POLICY_VERSION = 'fair-policy@v1-diag';
+
+/**
+ * One decision-level ledger entry (plan section 8.1-8.2, P6.1-E acceptance).
+ *
+ * Payload-free by construction: task/run/round coordinates, hashes and pool
+ * digests, kernel arithmetic (Q/V/A/z'/KL/support), neighbour IDs with their
+ * reward versions and retrieval weights, the consumed target field, and the
+ * OBSERVED outcome/return of the actually executed probe. No prompt text, no
+ * patch content, no raw deliverable text ever enters an entry. Unexecuted
+ * candidates get NO reward guess - only `candidateActionKeys` lists what was
+ * available.
+ */
+export interface FairDecisionLedgerEntry {
+  /** Task family (taskGroup). */
+  readonly taskGroup: string;
+  /** Task id within the family. */
+  readonly task: string;
+  /** Episode/run index. */
+  readonly run: number;
+  /** Deepening round within the run. */
+  readonly round: number;
+  /** Abstract state bucket the decision was made in. */
+  readonly stateBucket: string;
+  /** Fingerprint of the decision state's token set (payload-free). */
+  readonly stateFingerprint: string;
+  /** Digest of the candidate pool offered at this decision. */
+  readonly candidatePoolDigest: string;
+  /** Action key of the chosen candidate (after any probe key mapping). */
+  readonly actionKey: string;
+  /** Pool index the prior (highest confidence) would have chosen. */
+  readonly priorChoice: number;
+  /** Pool index actually chosen (after any support gate). */
+  readonly chosenChoice: number;
+  /** Whether the final choice deviated from the prior. */
+  readonly deviated: boolean;
+  /** True when the min-support gate redirected a deviation back to the prior. */
+  readonly minSupportGateFired: boolean;
+  /** Action keys of the whole offered pool (no rewards attached). */
+  readonly candidateActionKeys: readonly string[];
+  /** Neighbour record ids, in retrieval rank order. */
+  readonly neighborIds: readonly string[];
+  /** rewardVersion stamped on each neighbour (aligned with neighborIds). */
+  readonly neighborVersions: readonly string[];
+  /** Jaccard similarity of each neighbour (aligned with neighborIds). */
+  readonly similarity: readonly number[];
+  /** Retrieval weight of each neighbour (aligned with neighborIds). */
+  readonly weight: readonly number[];
+  /** Support (usable neighbour count) behind the chosen action's Q. */
+  readonly support: number;
+  /** Q estimate of the chosen action (null when unsupported and unexplored). */
+  readonly q: number | null;
+  /** Weighted state value V(s) of the decision. */
+  readonly v: number;
+  /** Advantage A = Q - V of the chosen action. */
+  readonly advantage: number;
+  /** Adjusted logit z' of the chosen action. */
+  readonly adjustedLogit: number;
+  /** KL(pi' || pi_prior) of the decision. */
+  readonly kl: number;
+  /** Reward model version of the scale the write-back used. */
+  readonly rewardModelVersion: string;
+  /** Which target field the chosen neighbours' estimates consumed. */
+  readonly targetField: string;
+  /** Observed outcome of the actually executed probe (no counterfactual). */
+  readonly observedOutcome: string;
+  /** Observed return of the actually executed probe on the arm's scale. */
+  readonly observedReturn: number;
+  /** Verifier-first observed coverage of the executed lineage (acceptance target). */
+  readonly observedCoverage: number;
+  /** Whether the executed lineage passed the verifier (coverage = 1). */
+  readonly observedVerified: boolean;
 }
 
 function probeTaskFor(taskSpec: EvalTask): ProbeTask {
@@ -2496,6 +2649,31 @@ function probeTaskFor(taskSpec: EvalTask): ProbeTask {
  */
 async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult> {
   const { spec } = options;
+  const diag = options.diagnostics ?? {};
+  const ledgerOn = diag.ledger === true;
+  const rewardScale = diag.rewardScale ?? 'r2-fair';
+  const stateMode = diag.stateMode ?? 'default';
+  const actionKeyMode = diag.actionKeyMode ?? 'signature';
+  const minSupportToDeviate = diag.minSupportToDeviate;
+  const poolSchedule = diag.poolSchedule ?? 'fixed-lineage';
+  // P6.1-E3: each arm stamps the version that matches ITS OWN aggregation -
+  // 'r3-contract' scores with scoreUnderRewardContract and stamps
+  // FAIR_R3_SCALE_VERSION; 'r2-fair' scores with the historical
+  // scoreTrajectorySignals weights and stamps FAIR_R2_SCALE_VERSION. Neither
+  // inherits CURRENT_REWARD_VERSION, so the label can never drift from the
+  // formula again.
+  const writeRewardVersion = rewardScale === 'r3-contract' ? FAIR_R3_SCALE_VERSION : FAIR_R2_SCALE_VERSION;
+  const writePolicyId = rewardScale === 'r3-contract' || stateMode !== 'default' || actionKeyMode !== 'signature'
+    ? FAIR_PROBE_POLICY_VERSION
+    : 'fair-policy@v1';
+  /** Score one executed trajectory on the arm's configured scale. */
+  const scaleScore = (trajectory: ProbeTrajectory): TrajectorySignalScore =>
+    rewardScale === 'r3-contract'
+      ? scoreUnderRewardContract(trajectory)
+      : scoreTrajectorySignals(trajectory);
+  if (ledgerOn) {
+    ledgerSink.length = 0;
+  }
   const wallStarted = performance.now();
   const clock = makeClock(1_700_000_000_000);
   const halfLifeMs = 30 * 24 * 60 * 60 * 1000;
@@ -2558,6 +2736,13 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
   const pendingKeys = new Set<string>();
   const taskResults: FairTaskResult[] = [];
   const perTaskRecords: ExperienceRecord[] = [];
+  /** P6.1-E: decision-level ledger (payload-free); empty unless requested. */
+  const decisionLedger: FairDecisionLedgerEntry[] = [];
+  /** Observed result of the most recent ACTUALLY EXECUTED probe this round. */
+  let lastExecutionOutcome: string = 'none';
+  let lastExecutionReturn = 0;
+  let lastExecutionCoverage = 0;
+  let lastExecutionVerified = false;
 
   for (const taskSpec of options.tasks) {
     const store = sharedStore ?? openStore();
@@ -2626,8 +2811,12 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
 
       for (let round = 0; round < options.rounds; round += 1) {
         // Fixed pool schedule: the stimulus is identical for every arm at this
-        // (task, run, round) - see fairFixedPoolParent.
-        const pool = fairPoolForDecision(taskSpec, round);
+        // (task, run, round) - see fairFixedPoolParent. H5 ('static') offers the
+        // round-0 pool at every decision instead, one change at a time.
+        const pool =
+          poolSchedule === 'static'
+            ? fairPoolForDecision(taskSpec, 0)
+            : fairPoolForDecision(taskSpec, round);
         totalRounds += 1;
         runPoolDigests.push(fairFixedPoolDigest(taskSpec, round));
         allPoolDigests.push(
@@ -2636,12 +2825,6 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
         runPoolTokens += estimateTokens(renderPoolPrompt(taskSpec, round, pool));
         poolGenerations += 1;
         candidateGenerationTokens += estimateTokens(renderPoolPrompt(taskSpec, round, pool));
-        const candidates = pool.map((entry) => ({
-          actionKey: entry.actionKey,
-          baseLogit: verbalizedLogit(entry.confidence),
-          source: 'llm' as const,
-          payload: entry
-        }));
 
         // One clock read per decision: the causal cutoff. Records written after
         // this point are invisible to this decision, so no round can read its own
@@ -2684,7 +2867,7 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
           l1KlValues.push(metaResult.decision.klToPrior);
         }
         const guidance: GuidanceMode = slotKind === 'explore_invariant' ? 'guidance_free' : 'memory';
-        const state = abstractProposalState({
+        const rawState = abstractProposalState({
           task: probeTaskFor(taskSpec),
           round,
           parentDepth: round,
@@ -2695,12 +2878,57 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
           guidance,
           ...(parentSignature === undefined ? {} : { parentPatchSignature: parentSignature })
         });
+        // H2 ('coarse'): drop run-indexed tokens (round/depth/pslot/parent patch
+        // signature) so records written in earlier runs stay retrievable at the
+        // same task later. The bucket keeps signature|complexity|slot|guidance;
+        // summary stays derived from the same (filtered) token set.
+        const state: AbstractState = {
+          ...(stateMode === 'coarse'
+            ? {
+                ...rawState,
+                tokens: rawState.tokens.filter(
+                  (token) =>
+                    !token.startsWith('round:') &&
+                    !token.startsWith('depth:') &&
+                    !token.startsWith('pslot:') &&
+                    !token.startsWith('parent_patch_signature:')
+                )
+              }
+            : rawState),
+          summary: ''
+        };
+        (state as { summary: string }).summary = state.tokens.join(' ');
+        // H3 ('surfaces'): canonical key = the candidate's surface set, so
+        // semantically identical edits share one action key. The kernel forbids
+        // duplicate keys, so a collision (narrow A == combined C at late rounds)
+        // keeps a '#<index>' suffix, mirroring fairCandidatePool's own
+        // duplicate-signature rule.
+        const seenSurfacesKeys = new Set<string>();
+        const candidates = pool.map((entry) => {
+          let actionKey = entry.actionKey;
+          if (actionKeyMode === 'surfaces') {
+            actionKey = 'surfaces:' + [...entry.surfaces].sort().join('+');
+            if (seenSurfacesKeys.has(actionKey)) {
+              actionKey = actionKey + '#' + String(entry.index);
+            }
+            seenSurfacesKeys.add(actionKey);
+          }
+          return {
+            actionKey,
+            baseLogit: verbalizedLogit(entry.confidence),
+            source: 'llm' as const,
+            payload: entry
+          };
+        });
 
         let chosenIndex = priorIndex;
         let decisionKl = 0;
         let decisionNeighbors = 0;
         let decisionSupport = 0;
         let usedAdvice = false;
+        let kernelNeighbors: readonly ScoredExperience[] = [];
+        let kernelDecision: JitDecision<FairPoolCandidate> | null = null;
+        let minSupportGateFired = false;
         if (spec.selection === 'random') {
           const rng = createRng(seedFromParts(options.seed, taskSpec.id, runIndex, round, 'c1'));
           chosenIndex = Math.min(pool.length - 1, Math.floor(rng() * pool.length));
@@ -2717,6 +2945,8 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
           decisionKl = kernelResult.decision.klToPrior;
           decisionNeighbors = kernelResult.decision.neighborCount;
           decisionSupport = kernelResult.decision.chosen.support;
+          kernelNeighbors = kernelResult.neighbors;
+          kernelDecision = kernelResult.decision;
           if (spec.selection === 'advice') {
             const advice = fairAdvice(kernelResult.neighbors, pool);
             usedAdvice = true;
@@ -2734,6 +2964,17 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
           } else {
             const picked = pool.find((entry) => entry.actionKey === kernelResult.decision.chosen.candidate.actionKey);
             chosenIndex = picked === undefined ? priorIndex : picked.index;
+          }
+          // H4: minimum-support gate - a deviation from the prior without
+          // enough supporting neighbours falls back to the prior. One knob,
+          // documented as the probe of hypothesis 4 (few-shot mis-switches).
+          if (
+            minSupportToDeviate !== undefined &&
+            chosenIndex !== priorIndex &&
+            kernelResult.decision.chosen.support < minSupportToDeviate
+          ) {
+            chosenIndex = priorIndex;
+            minSupportGateFired = true;
           }
           decisions += 1;
           klValues.push(decisionKl);
@@ -2823,12 +3064,20 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
           unverifiedProbes += 1;
         }
         score = Math.max(score, coverage);
+        // P6.1-E: observed result of the ACTUALLY executed probe, on the arm's
+        // configured scale (classifier shares the scale so ledger and records
+        // agree). Available to the ledger below; no unexecuted candidate is
+        // scored (no counterfactual in the fair-arm budget).
+        lastExecutionOutcome = classifyTrajectoryOutcome(trajectory);
+        lastExecutionReturn = clampScore(scaleScore(trajectory).reward);
+        lastExecutionCoverage = coverage;
+        lastExecutionVerified = verified;
         runEvaluationTokens += estimateTokens(renderEvaluationPrompt(taskSpec, { candidateIndex: chosenIndex, verified, coverage }));
         evaluationTokens += estimateTokens(renderEvaluationPrompt(taskSpec, { candidateIndex: chosenIndex, verified, coverage }));
         modelCalls += 1; // the evaluation call this arm would issue for the winner
 
         if (options.updates) {
-          const signal = scoreTrajectorySignals(trajectory);
+          const signal = scaleScore(trajectory);
           const observedReturn = clampScore(signal.reward);
           const learningTarget = signal.learningEligible ? clampScore(observedReturn - baseline) : 0;
           const association = {
@@ -2840,8 +3089,8 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
             branchId: 'fair-branch-' + taskSpec.id,
             trajectoryId: trajectory.id,
             decisionId: 'fair-decision-' + runId + '-r' + String(round) + '-s' + String(chosenIndex),
-            policyVersion: 'fair-policy@v1',
-            rewardVersion: CURRENT_REWARD_VERSION,
+            policyVersion: writePolicyId,
+            rewardVersion: writeRewardVersion,
             provenanceVersion: CURRENT_PROVENANCE_VERSION,
             experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
             observedReturn,
@@ -2872,7 +3121,7 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
                 return: observedReturn,
                 rewardSources: signal.sources,
                 guidance,
-                policyId: 'fair-policy',
+                policyId: writePolicyId,
                 sessionId: 'fair-' + taskSpec.id,
                 treeId: 'fair-tree-' + taskSpec.id,
                 ...association,
@@ -2881,19 +3130,19 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
               });
             }
           }
-          const proposalKey = 'proposal|' + (pool[chosenIndex]?.actionKey ?? 'unknown') + '|' + nodeId + '|r' + String(round);
+          const proposalKey = 'proposal|' + (candidates[chosenIndex]?.actionKey ?? 'unknown') + '|' + nodeId + '|r' + String(round);
           if (!pendingKeys.has(proposalKey)) {
             pendingKeys.add(proposalKey);
             appended.push({
               id: 'fair-exp-' + runId + '-r' + String(round) + '-l2',
               level: 'proposal',
               state,
-              actionKey: pool[chosenIndex]?.actionKey ?? 'unknown',
+              actionKey: candidates[chosenIndex]?.actionKey ?? 'unknown',
               reward: observedReturn,
               return: observedReturn,
               rewardSources: signal.sources,
               guidance,
-              policyId: 'fair-policy',
+              policyId: writePolicyId,
               sessionId: 'fair-' + taskSpec.id,
               treeId: 'fair-tree-' + taskSpec.id,
               ...association,
@@ -2905,6 +3154,54 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
             await store.append(appended);
             recordsAppended += appended.length;
           }
+        }
+
+        // P6.1-E decision-level ledger: payload-free structured fields only.
+        // Observed outcome/return come from the probe that ACTUALLY executed;
+        // the other pool candidates were never executed and get no reward
+        // (no counterfactual LLM-guessed rewards, per plan section 8.2).
+        if (ledgerOn && kernelDecision !== null) {
+          const chosenAdjustment = kernelDecision.adjustments[chosenIndex];
+          const chosenCand = candidates[chosenIndex];
+          const recordFieldCounts = new Map<string, number>();
+          for (const neighbor of kernelNeighbors) {
+            const field = consumedTargetFieldOf(neighbor.record);
+            const label = field ?? 'skipped(non-finite)';
+            recordFieldCounts.set(label, (recordFieldCounts.get(label) ?? 0) + 1);
+          }
+          decisionLedger.push({
+            taskGroup: taskSpec.family,
+            task: taskSpec.id,
+            run: runIndex,
+            round,
+            stateBucket: state.bucket,
+            stateFingerprint: hashString(state.tokens.join('|')).toString(16).padStart(8, '0'),
+            candidatePoolDigest: fairPoolDigest(pool),
+            actionKey: chosenCand?.actionKey ?? 'unknown',
+            priorChoice: priorIndex,
+            chosenChoice: chosenIndex,
+            deviated: chosenIndex !== priorIndex,
+            minSupportGateFired,
+            candidateActionKeys: candidates.map((entry) => entry.actionKey),
+            neighborIds: kernelNeighbors.map((entry) => entry.record.id),
+            neighborVersions: kernelNeighbors.map((entry) => entry.record.rewardVersion ?? 'unversioned'),
+            similarity: kernelNeighbors.map((entry) => fixedRound(entry.similarity, 6)),
+            weight: kernelNeighbors.map((entry) => fixedRound(entry.weight ?? entry.similarity, 6)),
+            support: chosenAdjustment?.support ?? 0,
+            q: chosenAdjustment?.q ?? null,
+            v: fixedRound(kernelDecision.stateValue, 6),
+            advantage: fixedRound(chosenAdjustment?.advantage ?? 0, 6),
+            adjustedLogit: fixedRound(chosenAdjustment?.adjustedLogit ?? 0, 6),
+            kl: fixedRound(kernelDecision.klToPrior, 6),
+            rewardModelVersion: writeRewardVersion,
+            targetField:
+              [...recordFieldCounts.entries()].map(([field, count]) => field + '=' + String(count)).sort().join(',') ||
+              'none',
+            observedOutcome: lastExecutionOutcome,
+            observedReturn: lastExecutionReturn,
+            observedCoverage: lastExecutionCoverage,
+            observedVerified: lastExecutionVerified
+          });
         }
 
         covered = total;
@@ -2987,6 +3284,12 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
   if (spec.adviceChannel) {
     notes.push('the logit correction is computed for contrast but NOT used for selection: the prompt advice rule is');
   }
+  if (ledgerOn) {
+    // Hand the captured ledger to the module sink (see runFairEngineWithLedger).
+    // Nested engine calls (donor building) only run without diagnostics knobs,
+    // so no cross-arm interleaving is possible in the probe paths.
+    ledgerSink.push(...decisionLedger);
+  }
   if (options.collectRecords !== undefined) {
     options.collectRecords(options.storeMode === 'shared' ? finalSnapshot : perTaskRecords);
   }
@@ -3061,6 +3364,54 @@ async function runFairEngine(options: FairEngineOptions): Promise<FairArmResult>
         : null,
     notes
   };
+}
+
+/** Engine result plus the P6.1-E decision-level ledger captured during the run. */
+export interface FairEngineRun {
+  readonly arm: FairArmResult;
+  /** Payload-free decision-level ledger; empty unless diagnostics.ledger. */
+  readonly decisionLedger: readonly FairDecisionLedgerEntry[];
+  /** The knobs this run actually applied (resolved defaults included). */
+  readonly knobs: {
+    readonly rewardScale: 'r2-fair' | 'r3-contract';
+    readonly stateMode: 'default' | 'coarse';
+    readonly actionKeyMode: 'signature' | 'surfaces';
+    readonly minSupportToDeviate: number | null;
+    readonly poolSchedule: 'fixed-lineage' | 'static';
+  };
+}
+
+/**
+ * Module-level handoff the engine writes into when diagnostics.ledger is set.
+ * The engine itself returns only FairArmResult (its public shape is asserted by
+ * the CI byte-parity test), so the ledger rides on a side channel that
+ * runFairEngineWithLedger drains. Single-threaded per process; the sink is
+ * emptied at the start of each ledger run and drained right after, so stale
+ * entries cannot leak into a later run.
+ */
+const ledgerSink: FairDecisionLedgerEntry[] = [];
+
+/** Run one fair arm and also return the decision-level ledger (P6.1-E). */
+export async function runFairEngineWithLedger(options: FairEngineOptions): Promise<FairEngineRun> {
+  const diag = options.diagnostics ?? {};
+  ledgerSink.length = 0;
+  const arm = await runFairEngine(options);
+  const decisionLedger = ledgerOnOf(diag) ? ledgerSink.splice(0, ledgerSink.length) : [];
+  return {
+    arm,
+    decisionLedger,
+    knobs: {
+      rewardScale: diag.rewardScale ?? 'r2-fair',
+      stateMode: diag.stateMode ?? 'default',
+      actionKeyMode: diag.actionKeyMode ?? 'signature',
+      minSupportToDeviate: diag.minSupportToDeviate ?? null,
+      poolSchedule: diag.poolSchedule ?? 'fixed-lineage'
+    }
+  };
+}
+
+function ledgerOnOf(diag: FairDiagKnobs): boolean {
+  return diag.ledger === true;
 }
 
 /** Mean coverage per run index across tasks (the full learning curve). */

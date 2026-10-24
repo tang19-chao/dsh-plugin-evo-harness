@@ -12,6 +12,12 @@ import {
   redactAbsolutePaths,
   redactSecrets, checkTokenBudget, countTokens, estimateConservativeTokens, DEFAULT_ADVISORY_TOKEN_BUDGET, CONSERVATIVE_FALLBACK_CHAR_LIMIT, CONSERVATIVE_FALLBACK_BYTE_LIMIT
 } from '../../../src/jitrl/redaction';
+import {
+  maskNamespace,
+  maskServerId,
+  sanitizeDiagnostic,
+  MAX_DIAGNOSTIC_LENGTH
+} from '../../../src/jitrl/stores/bridge.store';
 
 describe('secret pattern set', () => {
   const cases: readonly (readonly [string, string])[] = [
@@ -97,6 +103,48 @@ describe('redactAbsolutePaths', () => {
   it('strips absolute windows and posix paths', () => {
     expect(redactAbsolutePaths('see /usr/local/bin/x and C:\\Temp\\a')).toBe('see <path> and <path>');
     expect(redactAbsolutePaths('plain relative/path.txt')).toBe('plain relative/path.txt');
+  });
+});
+
+describe('P6.1-B1 mirror diagnostic sanitizer contract', () => {
+  it('masks RAW_PAYLOAD-shaped echo tokens generically and never keeps the original', () => {
+    // One arbitrary shape instance; there is no per-example branch behind it.
+    expect(sanitizeDiagnostic('echo RAW_PAYLOAD_AB_CD_7341')).toBe('echo <payload>');
+    expect(sanitizeDiagnostic('echo raw_payload_lower_7341 tail')).toContain('<payload>');
+  });
+
+  it('redacts secret-shaped and path-shaped text without any example-specific rule', () => {
+    const diag = sanitizeDiagnostic('secret=ghp_0123456789abcdefghijklmnopqrstuv path=/etc/vault/k.pem');
+    expect(diag).toContain('<secret>');
+    expect(diag).toContain('<path>');
+    expect(diag).not.toContain('ghp_0123456789');
+  });
+
+  it('masks explicit serverId/namespace context with short hashes; no example-string branches', () => {
+    const serverId = 'my-arbitrary-server-1';
+    const namespace = 'my/arbitrary-ns-1';
+    const diag = sanitizeDiagnostic(`server=${serverId} namespace=${namespace}`, { serverId, namespace });
+    expect(diag).not.toContain(serverId);
+    expect(diag).not.toContain(namespace);
+    expect(diag).toContain('server=' + maskServerId(serverId));
+    expect(diag).toContain('namespace=' + maskNamespace(namespace));
+    // The former review example strings get no dedicated branch anymore:
+    // they are handled by the same generic context masking.
+    expect(sanitizeDiagnostic('tenant/secret-space', { namespace: 'tenant/secret-space' })).toContain(
+      maskNamespace('tenant/secret-space')
+    );
+  });
+
+  it('bounds diagnostics to MAX_DIAGNOSTIC_LENGTH with an ellipsis', () => {
+    const long = 'x'.repeat(1000);
+    const diag = sanitizeDiagnostic(long);
+    expect(diag.length).toBeLessThanOrEqual(200);
+    expect(diag.endsWith('\u2026')).toBe(true);
+  });
+
+  it('is idempotent: already-sanitized diagnostics pass through unchanged', () => {
+    const once = sanitizeDiagnostic('secret=ghp_0123456789abcdefghijklmnopqrstuv RAW_PAYLOAD_XY_1');
+    expect(sanitizeDiagnostic(once)).toBe(once);
   });
 });
 

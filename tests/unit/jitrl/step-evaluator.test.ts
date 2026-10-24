@@ -7,9 +7,13 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  COMPLETION_SIGNAL,
+  MISSING_DELIVERABLE_SIGNAL,
   combineStepRewards,
   createStepEvaluator,
   discountedReturn,
+  isLearningOutcome,
+  scoreTrajectorySignals,
   surrogateSignal,
   turnSignalForStatus,
   redactAbsolutePaths,
@@ -19,6 +23,7 @@ import {
   type StepEvaluatorOptions,
   type UserFeedbackKind
 } from '../../../src/jitrl/step-evaluator';
+import { REWARD_CONTRACT, scoreUnderRewardContract } from '../../../src/jitrl/reward-contract';
 import {
   type IModelAdapter,
   type ModelRequest,
@@ -455,5 +460,83 @@ describe('judge prompt hardening (repair B2)', () => {
     const prompt = model.requests[0]?.messages[0]?.content ?? '';
     expect(prompt).toContain('build passed');
     expect(prompt).not.toContain('<secret>');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P6.1-D: scoreTrajectorySignals IS the one reward yardstick
+// ---------------------------------------------------------------------------
+
+describe('P6.1-D: the single trajectory-signal yardstick', () => {
+  it('is the aggregation the RewardContract names', () => {
+    // The contract's aggregation is exactly this deterministic, model-free
+    // function: winners, non-winners and the reference all measure with it.
+    expect(REWARD_CONTRACT.aggregation).toBe('trajectory-signals-v1');
+    expect(REWARD_CONTRACT.learningTargetField).toBe('observedReturn');
+    expect(REWARD_CONTRACT.judgePolicy).toBe('auxiliary-only');
+  });
+
+  it('③ separates a delivered run from a claim of success without a deliverable', () => {
+    const delivered = scoreUnderRewardContract(
+      makeTrajectory({ deliverable: { content: 'the patch', format: 'text' } })
+    );
+    const empty = scoreUnderRewardContract(makeTrajectory({ deliverable: undefined }));
+    // Both "succeeded", but the verifier-first signal keeps them apart.
+    expect(delivered.sources.completion).toBe(COMPLETION_SIGNAL);
+    expect(empty.sources.completion).toBe(MISSING_DELIVERABLE_SIGNAL);
+    expect(delivered.reward).toBeGreaterThan(empty.reward);
+  });
+
+  it('④ bounds padding: more meaningless successful calls cannot inflate the score', () => {
+    const scoreWith = (toolCalls: number, steps: number): number =>
+      scoreUnderRewardContract(
+        makeTrajectory({
+          deliverable: { content: 'done', format: 'text' },
+          metrics: { steps, toolCalls, toolErrors: 0, durationMs: 10 }
+        })
+      ).reward;
+    const few = scoreWith(2, 2);
+    const many = scoreWith(50, 2);
+    const absurd = scoreWith(5000, 2);
+    // The fusion is clipped at 3 and the step-budget term pushes DOWN as the
+    // step count grows, so padding saturates instead of growing without bound.
+    expect(few).toBeLessThanOrEqual(3);
+    expect(many).toBeLessThanOrEqual(few);
+    expect(absurd).toBeLessThanOrEqual(many);
+  });
+
+  it('⑤ keeps cancelled and infrastructure trajectories out of quality learning', () => {
+    const cancelled = scoreTrajectorySignals(
+      makeTrajectory({
+        status: 'failed',
+        failureSignals: [{ kind: 'unknown', message: 'cancelled by user' }],
+        error: { name: 'UserCancelledError', message: 'the user cancelled this run' }
+      })
+    );
+    expect(cancelled.outcome).toBe('cancelled');
+    expect(cancelled.learningEligible).toBe(false);
+    expect(cancelled.reward).toBe(0);
+    expect(isLearningOutcome(cancelled.outcome)).toBe(false);
+
+    const infra = scoreTrajectorySignals(
+      makeTrajectory({
+        status: 'failed',
+        failureSignals: [{ kind: 'unknown', message: 'ECONNREFUSED upstream' }],
+        error: { name: 'EvoHarnessPluginError', message: 'seam transport failed' }
+      })
+    );
+    expect(infra.outcome).toBe('infrastructure_error');
+    expect(infra.learningEligible).toBe(false);
+    expect(infra.reward).toBe(0);
+  });
+
+  it('scores the same trajectory identically on repeated calls (same yardstick)', () => {
+    const trajectory = makeTrajectory({
+      deliverable: { content: 'done', format: 'text' },
+      metrics: { steps: 3, toolCalls: 2, toolErrors: 1, durationMs: 5 }
+    });
+    const first = scoreTrajectorySignals(trajectory);
+    const second = scoreTrajectorySignals(trajectory);
+    expect(second).toEqual(first);
   });
 });

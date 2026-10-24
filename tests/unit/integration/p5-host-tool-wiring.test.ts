@@ -55,11 +55,39 @@ const enter = async () => ({ kind: 'enter', messages: [] });
 type Listener = (...args: unknown[]) => Promise<unknown>;
 
 /**
+ * Trusted host-session scope registration (ADR 0001 section 2.5): the D1 strict
+ * default keeps unprovable identities out of the advice and learning tracks, so
+ * the evidence flows below register the session scope the host is proving. Each
+ * session id used in this file maps to a domain branch with memory guidance.
+ */
+function registerTrustedScope(
+  plugin: ReturnType<typeof buildE2E>['plugin'],
+  sessionId: string
+): void {
+  const registry = plugin.scopeRegistry;
+  if (registry !== undefined) {
+    registry.register({
+      sessionId,
+      branchId: 'br-' + sessionId,
+      role: 'domain',
+      guidance: 'memory',
+      allowAdvice: true
+    });
+  }
+}
+
+/**
  * Feed the real post-execute listener: three failing `bash` calls (the 2nd/3rd
  * repeat the same error) and two successful `edit` calls. The canary in `input`
- * and in the raw error text must never reach experience.
+ * and in the raw error text must never reach experience. Every dispatch carries
+ * the trusted session identity, so the D1 strict default still lets the
+ * collector learn from them.
  */
-async function accumulateHostToolExperience(fixture: HookFixture): Promise<void> {
+async function accumulateHostToolExperience(
+  fixture: HookFixture,
+  sessionId: string,
+  branchId: string
+): Promise<void> {
   const postExecute = fixture.listener('tools/post-execute') as unknown as Listener;
   const failed = {
     isError: true,
@@ -71,14 +99,20 @@ async function accumulateHostToolExperience(fixture: HookFixture): Promise<void>
     await postExecute(
       {
         name: 'bash',
-        input: { command: 'curl -H "Authorization: Bearer CANARY-COMMAND-SECRET"' }
+        input: { command: 'curl -H "Authorization: Bearer CANARY-COMMAND-SECRET"' },
+        sessionId,
+        branchId
       },
       failed,
       accept
     );
   }
   for (let index = 0; index < 2; index += 1) {
-    await postExecute({ name: 'edit', input: { path: 'src/index.ts' } }, { isError: false }, accept);
+    await postExecute(
+      { name: 'edit', input: { path: 'src/index.ts' }, sessionId, branchId },
+      { isError: false },
+      accept
+    );
   }
 }
 
@@ -125,18 +159,23 @@ describe('H2: the default advisor gets real host_tool evidence', () => {
     expect(plugin.jitrl.hostAdvisor?.attached).toBe(true);
     expect(plugin.jitrl.hostToolExperiences).toBe(0);
 
-    await accumulateHostToolExperience(fixture);
+    // D1: the host proves the session scope; the collector then learns.
+    registerTrustedScope(plugin, 'sess-h2-gate');
+    await accumulateHostToolExperience(fixture, 'sess-h2-gate', 'br-sess-h2-gate');
 
     // Records really landed in the kernel store at level 'host_tool'.
     expect(plugin.jitrl.hostToolExperiences).toBeGreaterThanOrEqual(5);
 
     // The turn/end listener is optional but reachable on this fixture.
     const turnEnd = fixture.listener('turn/end') as unknown as Listener;
-    await turnEnd({ sessionId: 'sess-turn', reason: { kind: 'completed' } });
+    await turnEnd({ sessionId: 'sess-h2-gate', branchId: 'br-sess-h2-gate', reason: { kind: 'completed' } });
     expect(plugin.jitrl.hostToolExperiences).toBeGreaterThanOrEqual(6);
 
     const preExecute = fixture.listener('tools/pre-execute') as unknown as Listener;
-    const decision = (await preExecute({ name: 'bash' }, allow)) as {
+    const decision = (await preExecute(
+      { name: 'bash', sessionId: 'sess-h2-gate', branchId: 'br-sess-h2-gate' },
+      allow
+    )) as {
       kind: string;
       reason?: string;
     };
@@ -158,11 +197,12 @@ describe('H2: the default advisor gets real host_tool evidence', () => {
     const plugin = harness.plugin;
     expect(plugin.jitrl.hostAdvisor?.attached).toBe(true);
 
-    await accumulateHostToolExperience(fixture);
+    registerTrustedScope(plugin, 'sess-adv');
+    await accumulateHostToolExperience(fixture, 'sess-adv', 'br-sess-adv');
     expect(plugin.jitrl.hostToolExperiences).toBeGreaterThanOrEqual(5);
 
     const preStep = fixture.listener('agent/pre-step') as unknown as Listener;
-    const decision = (await preStep({ sessionId: 'sess-adv' }, enter)) as {
+    const decision = (await preStep({ sessionId: 'sess-adv', branchId: 'br-sess-adv' }, enter)) as {
       kind: string;
       additionalContexts?: string[];
     };
@@ -187,7 +227,8 @@ describe('H2: the default advisor gets real host_tool evidence', () => {
     });
     const plugin = harness.plugin;
 
-    await accumulateHostToolExperience(fixture);
+    registerTrustedScope(plugin, 'sess-privacy');
+    await accumulateHostToolExperience(fixture, 'sess-privacy', 'br-sess-privacy');
     await runOnce(plugin, 'task-privacy');
 
     expect(fake.calls.callTool).toBeGreaterThan(0);
@@ -215,7 +256,8 @@ describe('F1: /evo jit off gates L3 advice, gate asks, mirror and collection', (
       extra: { mirrorClient: fake.client }
     });
     const plugin = harness.plugin;
-    await accumulateHostToolExperience(fixture);
+    registerTrustedScope(plugin, 'sess-f1');
+    await accumulateHostToolExperience(fixture, 'sess-f1', 'br-sess-f1');
 
     // Baseline: a run mirrors, a gate dispatch asks.
     await runOnce(plugin, 'task-f1-before');
@@ -223,7 +265,12 @@ describe('F1: /evo jit off gates L3 advice, gate asks, mirror and collection', (
     expect(callsBefore).toBeGreaterThan(0);
     const preExecute = fixture.listener('tools/pre-execute') as unknown as Listener;
     const postExecute = fixture.listener('tools/post-execute') as unknown as Listener;
-    expect(((await preExecute({ name: 'bash' }, allow)) as { kind: string }).kind).toBe('ask');
+    expect(
+      ((await preExecute(
+        { name: 'bash', sessionId: 'sess-f1', branchId: 'br-sess-f1' },
+        allow
+      )) as { kind: string }).kind
+    ).toBe('ask');
     const askBefore = plugin.jitrl.hostAdvisor?.ask ?? 0;
 
     // OFF: runtime gate closes every L3 surface at once.
@@ -232,7 +279,12 @@ describe('F1: /evo jit off gates L3 advice, gate asks, mirror and collection', (
     expect((off.jitCommand?.json as Record<string, unknown>)['enabled']).toBe(false);
     expect(plugin.jitrl.hostAdvisor?.runtimeEnabled).toBe(false);
 
-    expect(((await preExecute({ name: 'bash' }, allow)) as { kind: string }).kind).toBe('allow');
+    expect(
+      ((await preExecute(
+        { name: 'bash', sessionId: 'sess-f1', branchId: 'br-sess-f1' },
+        allow
+      )) as { kind: string }).kind
+    ).toBe('allow');
     expect(plugin.jitrl.hostAdvisor?.ask).toBe(askBefore);
 
     const experiencesWhileOff = plugin.jitrl.hostToolExperiences ?? 0;
@@ -248,13 +300,22 @@ describe('F1: /evo jit off gates L3 advice, gate asks, mirror and collection', (
     expect((on.jitCommand?.json as Record<string, unknown>)['enabled']).toBe(true);
     expect(plugin.jitrl.hostAdvisor?.runtimeEnabled).toBe(true);
 
-    expect(((await preExecute({ name: 'bash' }, allow)) as { kind: string }).kind).toBe('ask');
+    expect(
+      ((await preExecute(
+        { name: 'bash', sessionId: 'sess-f1', branchId: 'br-sess-f1' },
+        allow
+      )) as { kind: string }).kind
+    ).toBe('ask');
     expect(plugin.jitrl.hostAdvisor?.ask).toBe(askBefore + 1);
 
     await runOnce(plugin, 'task-f1-on');
     expect(plugin.jitrl.mirror?.calls).toBeGreaterThan(callsBefore);
 
-    await postExecute({ name: 'bash' }, { isError: true, exitCode: 1 }, accept);
+    await postExecute(
+      { name: 'bash', sessionId: 'sess-f1', branchId: 'br-sess-f1' },
+      { isError: true, exitCode: 1 },
+      accept
+    );
     expect(plugin.jitrl.hostToolExperiences).toBeGreaterThan(experiencesWhileOff);
 
     await plugin.dispose();
@@ -267,23 +328,30 @@ describe('F1: /evo jit off gates L3 advice, gate asks, mirror and collection', (
       config: { jitrl: { hostAdvisor: ADVISORY_ADVISOR } }
     });
     const plugin = harness.plugin;
-    await accumulateHostToolExperience(fixture);
+    registerTrustedScope(plugin, 'sess-view');
+    await accumulateHostToolExperience(fixture, 'sess-view', 'br-sess-view');
     const preStep = fixture.listener('agent/pre-step') as unknown as Listener;
 
     // ON by default: advice appears.
-    const before = (await preStep({ sessionId: 'sess-view' }, enter)) as {
+    const before = (await preStep({ sessionId: 'sess-view', branchId: 'br-sess-view' }, enter)) as {
       additionalContexts?: string[];
     };
     expect(before.additionalContexts?.[0]).toContain('<jitrl_advice');
 
     await plugin.runFromCommand('jit off');
-    const whileOff = (await preStep({ sessionId: 'sess-view' }, enter)) as {
+    const whileOff = (await preStep(
+      { sessionId: 'sess-view', branchId: 'br-sess-view' },
+      enter
+    )) as {
       additionalContexts?: string[];
     };
     expect(whileOff.additionalContexts).toBeUndefined();
 
     await plugin.runFromCommand('jit on');
-    const restored = (await preStep({ sessionId: 'sess-view' }, enter)) as {
+    const restored = (await preStep(
+      { sessionId: 'sess-view', branchId: 'br-sess-view' },
+      enter
+    )) as {
       additionalContexts?: string[];
     };
     expect(restored.additionalContexts?.[0]).toContain('<jitrl_advice');

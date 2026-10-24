@@ -49,6 +49,7 @@ import {
   LEGACY_VERSION_TAG,
   isLegacyStoredExperience
 } from './experience-store';
+import { isRewardVersionCompatible } from './reward-contract';
 
 /** Prefix of every backfilled record id; keeps backfill ids recognisable. */
 export const BACKFILL_RECORD_PREFIX = 'jit-l1';
@@ -57,8 +58,15 @@ export const BACKFILL_RECORD_PREFIX = 'jit-l1';
  * Reward/provenance versions of a REBUILT record (plan section 6.5 item 3).
  * Distinct from the live online versions so a reader can tell "recomputed from
  * the persisted tree" apart from "attributed at execution time".
+ *
+ * P6.1-D2 / R3 F1: the reward generation was bumped r2 -> r3 together with the
+ * RewardContract. The suffix stays `backfill-tree-v1` (the producer and its
+ * surrogate-based rebuild scale are unchanged), and generation equality is what
+ * `isRewardVersionCompatible` checks, so a rebuilt cold-start record remains
+ * learning-eligible under the current contract while pre-upgrade
+ * `r2/backfill-tree-v1` lines are quarantined by the migration below.
  */
-export const BACKFILL_REWARD_VERSION = 'r2/backfill-tree-v1';
+export const BACKFILL_REWARD_VERSION = 'r3/backfill-tree-v1';
 export const BACKFILL_PROVENANCE_VERSION = 'p2/backfill-tree-v1';
 
 /** Default discount applied along a tree path (config `jitrl.gamma`). */
@@ -495,18 +503,28 @@ export async function backfillFromTreePool(
 
 /** Counts and marked copies produced by one migration pass. */
 export interface ExperienceMigrationResult {
-  /** Records already at or above the current schema version (untouched). */
+  /** Records already compatible with the current schema and reward contract. */
   readonly current: number;
-  /** Records that predate per-execution attribution. */
+  /**
+   * Records quarantined by the migration: pre-attribution legacy, or written
+   * under an incompatible reward-version generation (P6.1-D2 / R3 F1).
+   */
   readonly legacy: number;
-  /** Records excluded from the new neighbourhood because they are legacy. */
+  /** Records excluded from the new neighbourhood (same count as `legacy`). */
   readonly excludedFromLearning: number;
-  /** Legacy records that were also marked not learning eligible. */
+  /** Quarantined records that were also marked not learning eligible. */
   readonly excludedIneligible: number;
   /**
-   * MARKED COPIES of the legacy records: same ids, same payload, stamped with
-   * the legacy version tag and `learningEligible: false`. The originals in the
-   * source log are never modified (plan section 6.5 item 4).
+   * Quarantined records whose schema was current but whose rewardVersion
+   * generation is incompatible with the current RewardContract (P6.1-D2). The
+   * classic case after the r2 -> r3 upgrade: schema-v2 online records that
+   * were never tagged legacy but live on the old yardstick.
+   */
+  readonly rewardVersionIsolated: number;
+  /**
+   * MARKED COPIES of the quarantined records: same ids, same payload, stamped
+   * with the legacy version tag and `learningEligible: false`. The originals
+   * in the source log are never modified (plan section 6.5 item 4).
    */
   readonly marked: readonly ExperienceRecord[];
   readonly diagnostics: readonly string[];
@@ -516,38 +534,61 @@ export interface ExperienceMigrationResult {
  * Plan (and optionally perform) the migration of a historical experience
  * snapshot.
  *
- * Contract (plan section 6.5):
+ * Contract (plan section 6.5, extended by P6.1-D2 / R3 F1-c):
  *   - the ORIGINAL log is never rewritten in place: this function only reads
  *     `options.records` and produces copies;
- *   - the result counts new vs legacy samples, so an operator can see how much
- *     history is being quarantined;
- *   - `marked` holds legacy records stamped with `LEGACY_VERSION_TAG` for a
- *     separate audit sink. Dropping that sink IS the rollback: the source log
- *     was never touched, so re-reading it restores the pre-migration state;
+ *   - a record is QUARANTINED when it predates per-execution attribution
+ *     (schema below `minimumSchemaVersion`) OR when its rewardVersion is not
+ *     compatible with the current RewardContract generation - the upgrade
+ *     isolates old-yardstick records (r2 lines after the r3 bump) instead of
+ *     letting them mix into current estimates;
+ *   - the result counts compatible vs quarantined samples, so an operator can
+ *     see how much history is being quarantined and why;
+ *   - `marked` holds the quarantined records stamped with `LEGACY_VERSION_TAG`
+ *     for a separate audit sink. Dropping that sink IS the rollback: the source
+ *     log was never touched, so re-reading it restores the pre-migration state;
  *   - `apply` is the only side effect, and it appends the marked copies through
  *     the injected sink (a different log in production).
  */
 export async function migrateExperienceRecords(options: {
   readonly records: readonly ExperienceRecord[];
-  /** Audit sink for the marked legacy copies; omit for a dry run. */
+  /** Audit sink for the marked quarantined copies; omit for a dry run. */
   readonly auditSink?: ExperienceAppendSink;
   /** Append the marked copies to the audit sink (default false = dry run). */
   readonly apply?: boolean;
   readonly minimumSchemaVersion?: number;
+  /**
+   * Reward contract generation the migration targets; defaults to the current
+   * persisted version (CURRENT_REWARD_VERSION).
+   */
+  readonly currentRewardVersion?: string;
 }): Promise<ExperienceMigrationResult> {
   const minimum = options.minimumSchemaVersion ?? EXPERIENCE_SCHEMA_VERSION;
+  const currentRewardVersion = options.currentRewardVersion ?? CURRENT_REWARD_VERSION;
   const diagnostics: string[] = [];
   const marked: ExperienceRecord[] = [];
   let current = 0;
   let legacy = 0;
   let excludedIneligible = 0;
+  let rewardVersionIsolated = 0;
 
   for (const record of options.records) {
     const version = record.experienceSchemaVersion;
-    const isLegacy = version === undefined || !Number.isFinite(version) || version < minimum;
-    if (!isLegacy) {
+    const schemaLegacy =
+      version === undefined || !Number.isFinite(version) || version < minimum;
+    // P6.1-D2 / R3 F1-c: the reward generation is part of the isolation
+    // condition. A schema-current record on an old (or unknown) yardstick is
+    // just as quarantinable as a pre-attribution line.
+    const rewardIncompatible = !isRewardVersionCompatible(
+      record.rewardVersion,
+      currentRewardVersion
+    );
+    if (!schemaLegacy && !rewardIncompatible) {
       current += 1;
       continue;
+    }
+    if (!schemaLegacy && rewardIncompatible) {
+      rewardVersionIsolated += 1;
     }
     legacy += 1;
     if (record.learningEligible === false) {
@@ -578,11 +619,22 @@ export async function migrateExperienceRecords(options: {
     diagnostics.push('migration: apply requested without an audit sink; nothing was written');
   }
 
+  if (rewardVersionIsolated > 0) {
+    diagnostics.push(
+      'migration: ' +
+        String(rewardVersionIsolated) +
+        ' record(s) quarantined because their rewardVersion is incompatible with ' +
+        currentRewardVersion +
+        ' (P6.1-D2: the reward generation changed; rebuild experience instead of mixing scales)'
+    );
+  }
+
   return {
     current,
     legacy,
     excludedFromLearning: legacy,
     excludedIneligible,
+    rewardVersionIsolated,
     marked,
     diagnostics
   };
@@ -590,12 +642,15 @@ export async function migrateExperienceRecords(options: {
 
 /**
  * Split a snapshot into the records the NEW learning neighbourhood may use and
- * the ones it must ignore (plan section 6.5). Pure, so replay and the online
- * path can share exactly one rule.
+ * the ones it must ignore (plan section 6.5, extended by P6.1-D2 / R3 F1-c:
+ * an incompatible reward-version generation is an audit-only condition, same
+ * as a pre-attribution legacy line). Pure, so replay and the online path can
+ * share exactly one rule.
  */
 export function partitionExperienceRecords(
   records: readonly ExperienceRecord[],
-  minimumSchemaVersion: number = EXPERIENCE_SCHEMA_VERSION
+  minimumSchemaVersion: number = EXPERIENCE_SCHEMA_VERSION,
+  currentRewardVersion: string = CURRENT_REWARD_VERSION
 ): {
   readonly learning: readonly ExperienceRecord[];
   readonly auditOnly: readonly ExperienceRecord[];
@@ -606,7 +661,11 @@ export function partitionExperienceRecords(
     const version = record.experienceSchemaVersion;
     const legacy =
       version === undefined || !Number.isFinite(version) || version < minimumSchemaVersion;
-    if (legacy || record.learningEligible === false) {
+    const rewardIncompatible = !isRewardVersionCompatible(
+      record.rewardVersion,
+      currentRewardVersion
+    );
+    if (legacy || rewardIncompatible || record.learningEligible === false) {
       auditOnly.push(record);
     } else {
       learning.push(record);

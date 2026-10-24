@@ -47,10 +47,17 @@ import {
   CURRENT_REWARD_VERSION
 } from '../../../src/jitrl/experience-store';
 import {
+  COMPLETION_SIGNAL,
+  MISSING_DELIVERABLE_SIGNAL,
   classifyTrajectoryOutcome,
   isLearningOutcome,
   scoreTrajectorySignals
 } from '../../../src/jitrl/step-evaluator';
+import {
+  REWARD_CONTRACT,
+  estimatorTargetLine,
+  scoreUnderRewardContract
+} from '../../../src/jitrl/reward-contract';
 import { migrateExperienceRecords, partitionExperienceRecords } from '../../../src/jitrl/backfill';
 import type {
   AbstractState,
@@ -591,6 +598,10 @@ interface HarnessOptions {
   readonly candidateCount?: number;
   /** Delay a specific branch so completion order can be permuted. */
   readonly delay?: (branchId: string) => Promise<void> | undefined;
+  /** P6.1-D ②: replace the step evaluator with one that always rejects. */
+  readonly evaluatorThrows?: boolean;
+  /** P6.1-D ②: replace the step evaluator with one returning no steps. */
+  readonly evaluatorEmpty?: boolean;
 }
 
 interface Harness {
@@ -654,7 +665,20 @@ function makeHarness(options: HarnessOptions): Harness {
         };
       }
     },
-    stepEvaluator: makeStepEvaluator(options.stepRewards ?? [1, 2], evaluatorCalls),
+    stepEvaluator:
+      options.evaluatorThrows === true
+        ? ({
+            async evaluate(): Promise<readonly StepReward[]> {
+              throw new Error('judge provider down');
+            }
+          } as IStepEvaluator)
+        : options.evaluatorEmpty === true
+          ? ({
+              async evaluate(): Promise<readonly StepReward[]> {
+                return [];
+              }
+            } as IStepEvaluator)
+          : makeStepEvaluator(options.stepRewards ?? [1, 2], evaluatorCalls),
     config: {
       enabled: true,
       levels: ['meta', 'proposal'],
@@ -809,10 +833,13 @@ describe('6.6 (1): a batch never shares one winner return', () => {
     }
   });
 
-  it('does not give two succeeded slots the same return when only one was evaluated', async () => {
+  it('scores a succeeded sibling from its own verifiable signals, not the winner vector', async () => {
     // Two succeeding slots: the composer picks the first as winner, so only that
-    // one gets the (model-backed) step vector. The sibling must be scored from
-    // its own verifiable signals rather than inheriting the winner's vector.
+    // one gets the (model-backed) step vector. P6.1-D: the winner's step vector
+    // is AUXILIARY (rewardSources.stepJudge), so both records' primary targets
+    // come from the SAME verifiable-signal aggregation of each one's own
+    // trajectory - identical trajectories therefore measure identically, and a
+    // sibling can never inherit the winner's evaluator vector.
     const harness = makeHarness({
       rounds: {
         1: [
@@ -835,15 +862,25 @@ describe('6.6 (1): a batch never shares one winner return', () => {
     expect(meta).toHaveLength(2);
     // Exactly one evaluation happened (cost is not multiplied per slot).
     expect(harness.evaluatorCalls).toHaveLength(1);
-    // The evaluated trajectory is the composer's winner, and exactly one record
-    // carries its return; the sibling has its own verifiable-signal return.
     const winnerTrajectoryId = harness.evaluatorCalls[0]?.id;
     const winnerRecord = meta.find((record) => record.trajectoryId === winnerTrajectoryId);
     const siblingRecord = meta.find((record) => record.trajectoryId !== winnerTrajectoryId);
     expect(winnerRecord).toBeDefined();
     expect(siblingRecord).toBeDefined();
-    expect(siblingRecord?.return).not.toBeCloseTo(winnerRecord?.return ?? 0, 6);
+    // The sibling's primary target is its OWN verifiable-signal score...
     expect(siblingRecord?.observedReturn).toBe(siblingRecord?.return);
+    expect(siblingRecord?.rewardSources.stepJudge).toBeUndefined();
+    // ...identical to the winner's because the trajectories are identical and
+    // the yardstick is one (this is the P6.1-D fix: no winner-private scale).
+    expect(siblingRecord?.return).toBeCloseTo(winnerRecord?.return ?? Number.NaN, 12);
+    // The winner's evaluator vector survives ONLY as the auxiliary entry.
+    expect(winnerRecord?.rewardSources.stepJudge).toBeCloseTo(3, 12);
+    // And the primary scale is the RewardContract aggregation, not the
+    // evaluator mean.
+    const expected = scoreUnderRewardContract(
+      harness.seams.trajectories.get('r1-branch-0') as ProbeTrajectory
+    ).reward;
+    expect(winnerRecord?.return).toBeCloseTo(expected, 12);
   });
 });
 
@@ -1278,6 +1315,14 @@ describe('6.1: the association chain is persisted', () => {
       expect(record.actionKey.length).toBeGreaterThan(0);
       expect(record.guidance).toBeTypeOf('string');
       expect(record.policyVersion).toBe(POLICY.id + '@v7');
+      // P6.1-D: the RewardContract version (bumped from r2/verifiable-v1 when
+      // the winner-only scoring fork was removed; the bump rule lives in
+      // src/jitrl/reward-contract.ts).
+      expect(record.rewardVersion).toBe(REWARD_CONTRACT.version);
+      // P6.1-D2 / R3 F1-a: the store's persisted version constant now POINTS
+      // AT the contract, so the orchestrator's stamp and the store's marker are
+      // one source of truth (previously the store stayed on r2 while records
+      // were written r3 - that split is what this assertion used to pin).
       expect(record.rewardVersion).toBe(CURRENT_REWARD_VERSION);
       expect(record.provenanceVersion).toBe(CURRENT_PROVENANCE_VERSION);
       expect(record.experienceSchemaVersion).toBe(EXPERIENCE_SCHEMA_VERSION);
@@ -1640,5 +1685,251 @@ describe('6.6 (6): reverting to a shared winner return must fail', () => {
     expect(roundTwo?.outcome).toBe('succeeded');
     expect(roundOne?.return).toBeLessThan(0);
     expect(roundTwo?.return).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P6.1-D (plan section 7.4): the six discriminating RewardContract cases
+// ---------------------------------------------------------------------------
+
+describe('P6.1-D 7.4: one RewardContract, one yardstick', () => {
+  // ①相同轨迹不因是否 composer 赢家而得到不同主目标
+  it('① the same trajectory scores the same primary target whether or not it is the composer winner', async () => {
+    // Two IDENTICAL succeeded siblings: identical metrics, steps, deliverable
+    // and outcome. The composer picks the first as winner, so exactly one of
+    // them is "the winner". Under the RewardContract their primary targets
+    // (reward / observedReturn) must be EQUAL - the pre-P6.1-D fork gave the
+    // winner the step-evaluator mean and the sibling the signal score.
+    const harness = makeHarness({
+      rounds: {
+        1: [
+          { kind: 'explore_domain', guidance: 'memory' },
+          { kind: 'explore_domain', guidance: 'memory' }
+        ]
+      },
+      maxDepth: 1,
+      outcomes: { 'r1-branch-0': 'succeed', 'r1-branch-1': 'succeed' },
+      // A step vector deliberately different from the signal score so the old
+      // fork produced visibly different numbers.
+      stepRewards: [3, 3]
+    });
+    await harness.orchestrator.run({
+      sessionId: 'session-p61d',
+      task: TASK as never,
+      trigger: 'always'
+    });
+
+    const meta = metaRecords(harness.store);
+    expect(meta).toHaveLength(2);
+    // The winner was still evaluated exactly once (cost is unchanged)...
+    expect(harness.evaluatorCalls).toHaveLength(1);
+    const winnerTrajectoryId = harness.evaluatorCalls[0]?.id;
+    const winnerRecord = meta.find((record) => record.trajectoryId === winnerTrajectoryId);
+    const siblingRecord = meta.find((record) => record.trajectoryId !== winnerTrajectoryId);
+    expect(winnerRecord).toBeDefined();
+    expect(siblingRecord).toBeDefined();
+
+    // ...but the primary target is identical: same trajectory, same scale.
+    expect(winnerRecord?.reward).toBeCloseTo(siblingRecord?.reward ?? Number.NaN, 12);
+    expect(winnerRecord?.observedReturn).toBeCloseTo(siblingRecord?.observedReturn ?? Number.NaN, 12);
+    expect(winnerRecord?.return).toBeCloseTo(siblingRecord?.return ?? Number.NaN, 12);
+    // And that scale is the RewardContract aggregation, not the evaluator
+    // mean (stepRewards [3,3] would give 3 under the old winner path).
+    const expected = scoreUnderRewardContract(
+      harness.seams.trajectories.get('r1-branch-0') as ProbeTrajectory
+    ).reward;
+    expect(winnerRecord?.reward).toBeCloseTo(expected, 12);
+    // The winner's step vector survives ONLY as the auxiliary stepJudge source.
+    expect(winnerRecord?.rewardSources.stepJudge).toBeCloseTo(3, 12);
+    expect(siblingRecord?.rewardSources.stepJudge).toBeUndefined();
+    // Every record is stamped with the contract version and one scale.
+    for (const record of meta) {
+      expect(record.rewardVersion).toBe(REWARD_CONTRACT.version);
+    }
+  });
+
+  // ②judge 缺失或失败不改变 rewardVersion 隐含语义
+  it('② a missing or failed judge leaves the rewardVersion semantics unchanged', async () => {
+    const runOnce = async (
+      mode: 'healthy' | 'throws' | 'empty'
+    ): Promise<readonly ExperienceRecord[]> => {
+      const harness = makeHarness({
+        rounds: { 1: [{ kind: 'explore_domain', guidance: 'memory' }] },
+        maxDepth: 1,
+        outcomes: { 'r1-branch-0': 'succeed' },
+        stepRewards: [3, 3],
+        ...(mode === 'healthy' ? {} : mode === 'throws' ? { evaluatorThrows: true } : { evaluatorEmpty: true })
+      });
+      await harness.orchestrator.run({
+        sessionId: 'session-p61d',
+        task: TASK as never,
+        trigger: 'always'
+      });
+      return metaRecords(harness.store);
+    };
+
+    const healthy = await runOnce('healthy');
+    const throwing = await runOnce('throws');
+    const empty = await runOnce('empty');
+    expect(healthy).toHaveLength(1);
+    expect(throwing).toHaveLength(1);
+    expect(empty).toHaveLength(1);
+
+    // Same yardstick, same version, same primary target in all three cases:
+    // the judge is an auxiliary field; its failure (or absence) cannot change
+    // what the rewardVersion means.
+    const expected = healthy[0]?.reward;
+    for (const records of [throwing, empty]) {
+      const record = records[0];
+      expect(record?.rewardVersion).toBe(healthy[0]?.rewardVersion);
+      expect(record?.reward).toBeCloseTo(expected ?? Number.NaN, 12);
+      expect(record?.observedReturn).toBeCloseTo(healthy[0]?.observedReturn ?? Number.NaN, 12);
+      expect(record?.learningTarget).toBeCloseTo(healthy[0]?.learningTarget ?? Number.NaN, 12);
+      expect(record?.rewardSources.stepJudge).toBeUndefined();
+    }
+    // Only the healthy judge produced the auxiliary entry.
+    expect(healthy[0]?.rewardSources.stepJudge).toBeTypeOf('number');
+  });
+
+  // ③任务要求交付物时缺交付物不能与验证完成得相同目标
+  it('③ a succeeded run without the required deliverable cannot match the verified one', () => {
+    const request = {
+      sessionId: 'session-p61d',
+      task: TASK,
+      patch: patchVariant('p61d', 'guardrails-1', () => CLOCK_START),
+      executor: async () => ({}) as never
+    } as unknown as ProbeBranchRequest;
+    const make = (delivered: boolean): ProbeTrajectory =>
+      ({
+        ...makeTrajectory({
+          id: delivered ? 't-delivered' : 't-empty',
+          branchId: 'b',
+          request,
+          result: { status: 'succeeded' } as ProbeExecutionResult,
+          outcome: 'succeed',
+          startedAt: 0,
+          endedAt: 1
+        }),
+        ...(delivered ? {} : { deliverable: undefined })
+      }) as ProbeTrajectory;
+
+    const delivered = scoreUnderRewardContract(make(true));
+    const empty = scoreUnderRewardContract(make(false));
+    expect(delivered.reward).toBeGreaterThan(empty.reward);
+    expect(delivered.sources.completion).toBe(COMPLETION_SIGNAL);
+    expect(empty.sources.completion).toBe(MISSING_DELIVERABLE_SIGNAL);
+  });
+
+  // ④增加无意义成功工具调用不应无限提高任务质量目标
+  it('④ padding with meaningless successful tool calls cannot inflate the target', () => {
+    const request = {
+      sessionId: 'session-p61d',
+      task: TASK,
+      patch: patchVariant('p61d', 'guardrails-1', () => CLOCK_START),
+      executor: async () => ({}) as never
+    } as unknown as ProbeBranchRequest;
+    const make = (toolCalls: number, steps: number): ProbeTrajectory =>
+      makeTrajectory({
+        id: 't-pad-' + String(toolCalls),
+        branchId: 'b',
+        request,
+        result: { status: 'succeeded' } as ProbeExecutionResult,
+        outcome: 'succeed',
+        startedAt: 0,
+        endedAt: 1
+      }) as ProbeTrajectory & { metrics: { steps: number; toolCalls: number } };
+    // The signal scorer derives tool stats from trajectory.metrics; rebuild it.
+    const padded = (toolCalls: number, steps: number): ProbeTrajectory => {
+      const base = make(toolCalls, steps);
+      return {
+        ...base,
+        metrics: { ...base.metrics, toolCalls, toolErrors: 0, steps }
+      };
+    };
+
+    const scores = [1, 5, 20, 100].map((calls) => scoreUnderRewardContract(padded(calls, 2)).reward);
+    // Not monotonic in call count: the step-budget term and the clip bound the
+    // total, so padding cannot raise the objective without bound...
+    expect(Math.max(...scores)).toBeLessThanOrEqual(3);
+    // ...and beyond a handful of calls MORE padding does not help: the step
+    // efficiency penalty and the clip dominate.
+    expect(scores[3] ?? 0).toBeLessThanOrEqual(scores[1] ?? 3);
+  });
+
+  // ⑤cancelled/infra error 不进入质量学习
+  it('⑤ cancelled and infrastructure trajectories never enter quality learning', async () => {
+    const cancelled = makeHarness({
+      rounds: { 1: [{ kind: 'explore_domain', guidance: 'memory' }] },
+      maxDepth: 1,
+      outcomes: { 'r1-branch-0': 'cancel' },
+      stepRewards: [3, 3]
+    });
+    await cancelled.orchestrator.run({
+      sessionId: 'session-p61d',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    // candidateCount defaults to 1, so exactly the L1 record exists.
+    const cancelledRecords = onlineRecords(cancelled.store);
+    expect(cancelledRecords).toHaveLength(1);
+    for (const record of cancelledRecords) {
+      expect(record.outcome).toBe('cancelled');
+      expect(record.learningEligible).toBe(false);
+      expect(record.learningTarget).toBe(0);
+      expect(record.reward).toBe(0);
+    }
+
+    const infra = makeHarness({
+      rounds: { 1: [{ kind: 'explore_domain', guidance: 'memory' }] },
+      maxDepth: 1,
+      outcomes: { 'r1-branch-0': 'infra' },
+      stepRewards: [3, 3]
+    });
+    await infra.orchestrator.run({
+      sessionId: 'session-p61d',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    for (const record of onlineRecords(infra.store)) {
+      expect(record.outcome).toBe('infrastructure_error');
+      expect(record.learningEligible).toBe(false);
+      expect(record.learningTarget).toBe(0);
+    }
+  });
+
+  // ⑥estimator 日志写明实际读取的 target 字段及版本（不能只在 JSONL 展示）
+  it('⑥ the estimator log names the consumed target field and the reward version', async () => {
+    const harness = makeHarness({
+      rounds: { 1: [{ kind: 'explore_domain', guidance: 'memory' }] },
+      maxDepth: 1,
+      outcomes: { 'r1-branch-0': 'succeed' },
+      stepRewards: [2]
+    });
+    await harness.orchestrator.run({
+      sessionId: 'session-p61d',
+      task: TASK as never,
+      trigger: 'always'
+    });
+
+    // The record_experience stage detail carries the estimator's target line
+    // OUTSIDE the JSONL: field + version are visible without reading records.
+    const event = harness.events.find((entry) => entry.stage === 'record_experience');
+    expect(event).toBeDefined();
+    const payload = event?.detail as { readonly detail?: Record<string, unknown> } | undefined;
+    const detail = payload?.detail;
+    expect(detail?.rewardVersion).toBe(REWARD_CONTRACT.version);
+    expect(detail?.rewardScale).toBe(REWARD_CONTRACT.aggregation);
+    expect(detail?.rewardTargetField).toBe(REWARD_CONTRACT.learningTargetField);
+    const line = String(detail?.estimatorTarget);
+    expect(line).toContain('target field ' + REWARD_CONTRACT.learningTargetField);
+    expect(line).toContain('observedReturn=');
+    expect(line).toContain('rewardVersion=' + REWARD_CONTRACT.version);
+
+    // The same line can be derived for an arbitrary neighbour set (the value
+    // estimator's own view), proving the fact does not live only in JSONL.
+    const records = onlineRecords(harness.store);
+    const derived = estimatorTargetLine(records, REWARD_CONTRACT.version);
+    expect(derived).toContain('rewardVersion=' + REWARD_CONTRACT.version);
+    expect(derived).toContain('observedReturn=' + String(records.length));
   });
 });

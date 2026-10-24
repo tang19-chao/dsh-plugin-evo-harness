@@ -722,13 +722,15 @@ describe('ScopeRegistry integration and invariant isolation', () => {
     handle.dispose();
   });
 
-  it('enforces unproven branch fail-closed while supporting host-local ordinary calls (Option 2 / F9)', async () => {
+  it('D1 strict default: unproven branches and identity-free observations stay out of every learnable track', async () => {
+    const diagnostics: string[] = [];
     const { store, records } = memoryStore();
     const registry = createScopeRegistry();
     const collector = createHostToolExperienceCollector({
       config: baseConfig,
       store,
-      scopeRegistry: registry
+      scopeRegistry: registry,
+      onDiagnostic: (msg) => diagnostics.push(msg)
     });
 
     // 1) Unproven branch (names a branch but not in registry) -> strictly fail-closed!
@@ -746,12 +748,70 @@ describe('ScopeRegistry integration and invariant isolation', () => {
     });
     expect(records).toHaveLength(0);
 
-    // 2) Host-local ordinary tool execution without branchId accumulates host baseline
+    // 2) Identity-free host-local tool execution: no learnable record is written
+    //    and no trainable unknown bucket is created. The skip is only counted,
+    //    payload free (D1 section 2.3).
     await collector.observeToolCall({
       toolName: 'host_local_bash',
       isError: false
     });
+    expect(records).toHaveLength(0);
+    expect(collector.count()).toBe(0);
+    expect(collector.activeScopeKeys()).not.toContain('unknown');
+    expect(collector.scopeUnknownSkipped()).toBe(1);
+    expect(
+      diagnostics.some((message) => message.includes('scope_unknown_skipped'))
+    ).toBe(true);
+
+    // Turn end for an identity-free scope cannot attribute to anything either.
+    await collector.observeTurnEnd({ kind: 'completed' });
+    expect(records).toHaveLength(0);
+    expect(collector.scopeUnknownSkipped()).toBe(2);
+
+    // 3) Only-sessionId (no branchId, no registry): D1 contract table row 5
+    //    degrades the same way - no learnable record until the host completes a
+    //    trusted host-session scope registration.
+    await collector.observeToolCall({
+      toolName: 'session_only_tool',
+      isError: false,
+      sessionId: 'sess-only'
+    });
+    expect(records).toHaveLength(0);
+    expect(collector.scopeUnknownSkipped()).toBe(3);
+    expect(
+      collector.activeScopeKeys().every((key) => key !== 'unknown')
+    ).toBe(true);
+  });
+
+  it('D1: trusted registry registration is what re-enables learning for a scope', async () => {
+    const { store, records } = memoryStore();
+    const registry = createScopeRegistry();
+    const collector = createHostToolExperienceCollector({
+      config: baseConfig,
+      store,
+      scopeRegistry: registry
+    });
+
+    // Same identity: unknown while unregistered, learnable once trusted-registered.
+    const observation = {
+      toolName: 'bash',
+      isError: false,
+      sessionId: 'sess-d1',
+      branchId: 'br-d1'
+    } as const;
+    await collector.observeToolCall(observation);
+    expect(records).toHaveLength(0);
+
+    registry.register({
+      sessionId: 'sess-d1',
+      branchId: 'br-d1',
+      role: 'domain',
+      guidance: 'memory'
+    });
+    await collector.observeToolCall(observation);
     expect(records).toHaveLength(1);
     expect(records[0]?.guidance).toBe('memory');
+    expect(records[0]?.sessionId).toBe('sess-d1');
+    expect(records[0]?.branchId).toBe('br-d1');
   });
 });

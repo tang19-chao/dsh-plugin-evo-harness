@@ -7,8 +7,9 @@
  *  - K = 1 => no 'jit_proposal_select' stage and a single probe;
  *  - JitRL disabled => no stage is emitted and no record is written;
  *  - enabled => the store grows by 1 L1 + 1 L2 sample per round;
- *  - 'evaluate_steps' runs after 'reflect' and the recorded return equals the
- *    hand-computed discountedReturn() of the evaluator's own rewards;
+ *  - 'evaluate_steps' runs after 'reflect'; since P6.1-D every record's return
+ *    is the trajectory-signal score of the executed probe (the winner's step
+ *    vector rides along as the auxiliary rewardSources.stepJudge entry);
  *  - the 18-stage order is the documented one.
  */
 import { describe, expect, it } from 'vitest';
@@ -25,13 +26,16 @@ import { createDiscoveryTreePool } from '../../../src/dream-rsi';
 import {
   createMemoryExperienceStore,
   createStoreOptimizer,
-  discountedReturn,
   normalizePatchSignature,
   verbalizedLogit
 } from '../../../src/jitrl';
 import { abstractProposalState } from '../../../src/jitrl/state-abstraction';
 import { createJitActivePolicy, slotKindOfActionKey } from '../../../src/jitrl/jit-active-policy';
-import { EXPERIENCE_SCHEMA_VERSION } from '../../../src/jitrl/experience-store';
+import {
+  CURRENT_REWARD_VERSION,
+  EXPERIENCE_SCHEMA_VERSION
+} from '../../../src/jitrl/experience-store';
+import { scoreUnderRewardContract } from '../../../src/jitrl/reward-contract';
 import type { LessonPatchSource } from '../../../src/jitrl/candidate-augmenter';
 import type {
   BatchPlan,
@@ -222,6 +226,28 @@ function makeSeams(now: () => number, probes: string[]): ICordisSeamManager {
     listActiveBranches: () => [],
     dispose: async () => undefined
   } as unknown as ICordisSeamManager;
+}
+
+/** Minimal trajectory for scoreTrajectorySignals with the executed shape filled in. */
+function makeMinimalTrajectory(): ProbeTrajectory {
+  return {
+    id: 'traj-executed-shape',
+    sessionId: 'session-p3',
+    branchId: 'branch-0',
+    branchNamespace: 'mock',
+    role: 'candidate',
+    status: 'succeeded',
+    patchId: 'patch-k1',
+    patchOrigin: 'domain',
+    surfaceKeys: ['guardrails'],
+    startedAt: 0,
+    endedAt: 10,
+    metrics: { steps: 1, toolCalls: 0, toolErrors: 0, durationMs: 10 },
+    steps: [],
+    toolErrors: [],
+    failureSignals: [],
+    memoryRecallIds: []
+  } as ProbeTrajectory;
 }
 
 /** Slot the mock policy schedules; guidance decides the recorded provenance. */
@@ -731,6 +757,9 @@ describe('jit_proposal_select (K proposals, one probe)', () => {
       {
         id: 'seed-proposal-1-negative',
         experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        // P6.1-D2: a learning-facing seed carries the current reward contract
+        // version so it survives the strict learning filter.
+        rewardVersion: CURRENT_REWARD_VERSION,
         level: 'proposal',
         state,
         actionKey: normalizePatchSignature(harness.patches[0] as EightSurfacePatch),
@@ -747,6 +776,7 @@ describe('jit_proposal_select (K proposals, one probe)', () => {
       {
         id: 'seed-proposal-2-positive',
         experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        rewardVersion: CURRENT_REWARD_VERSION,
         level: 'proposal',
         state,
         actionKey: normalizePatchSignature(favored as EightSurfacePatch),
@@ -810,6 +840,9 @@ describe('jit_proposal_select (K proposals, one probe)', () => {
       {
         id: 'seed-proposal-1-negative',
         experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        // P6.1-D2: a learning-facing seed carries the current reward contract
+        // version so it survives the strict learning filter.
+        rewardVersion: CURRENT_REWARD_VERSION,
         level: 'proposal',
         state,
         actionKey: normalizePatchSignature(harness.patches[0] as EightSurfacePatch),
@@ -826,6 +859,7 @@ describe('jit_proposal_select (K proposals, one probe)', () => {
       {
         id: 'seed-proposal-2-positive',
         experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        rewardVersion: CURRENT_REWARD_VERSION,
         level: 'proposal',
         state,
         actionKey: normalizePatchSignature(favored as EightSurfacePatch),
@@ -940,16 +974,38 @@ describe('evaluate_steps and record_experience', () => {
     // The evaluator saw the composer's winning trajectory exactly once.
     expect(harness.evaluatorCalls).toHaveLength(1);
 
-    // Hand-computed return: gamma from the frozen defaults, from step 0.
-    const gamma = createDefaultConfig().jitrl.gamma;
-    const expected = discountedReturn(rewards, gamma, 0);
+    // P6.1-D RewardContract: every executed probe - winner included - is
+    // scored by the SAME trajectory-signal aggregation (the winner's step
+    // vector survives only as the auxiliary rewardSources.stepJudge entry), so
+    // the expected return is the verifiable-signal reward of the executed
+    // trajectory, not the discounted step-evaluator return.
+    //
+    // The runBranch fixture returns status 'succeeded' with one message step
+    // and zero tool calls, and makeSeams does not copy the executor's
+    // deliverable onto the trajectory, so the executed shape is a claimed
+    // success without a deliverable (completion = -1) - scored exactly as the
+    // contract says such a run must be scored.
+    const executedShape = {
+      ...makeMinimalTrajectory(),
+      status: 'succeeded' as const,
+      metrics: { steps: 1, toolCalls: 0, toolErrors: 0, durationMs: 10 },
+      steps: [{ index: 0, at: 1, kind: 'message' as const, text: 'recovered' }],
+      deliverable: undefined,
+      failureSignals: []
+    };
+    const expected = Math.min(3, Math.max(-3, scoreUnderRewardContract(executedShape).reward));
     const online = harness.store.snapshot().filter((record) => record.id.startsWith('online-'));
     expect(online.length).toBeGreaterThan(0);
     for (const record of online) {
       expect(record.return).toBeCloseTo(expected, 12);
-      // reward is the mean of the per-step rewards, clipped to [-3, 3].
-      expect(record.reward).toBeCloseTo((rewards[0] as number + (rewards[1] as number)) / 2, 12);
+      expect(record.reward).toBeCloseTo(expected, 12);
     }
+    // The judge's step vector is still visible, as the auxiliary entry only.
+    const winnerRecord = online.find((record) => record.rewardSources.stepJudge !== undefined);
+    expect(winnerRecord?.rewardSources.stepJudge).toBeCloseTo(
+      (rewards[0] as number + (rewards[1] as number)) / 2,
+      12
+    );
   });
 
   it('is silent when JitRL is disabled: no stages, no records', async () => {
