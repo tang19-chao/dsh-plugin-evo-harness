@@ -50,6 +50,11 @@ import { createAutoLogitSource, type AutoLogitSource, type LogprobCapabilities }
 import { createStepEvaluator, type JitStepEvaluator } from './step-evaluator';
 import { backfillFromTreePool, type BackfillResult, type BackfillTreeSource } from './backfill';
 import {
+  CURRENT_PROVENANCE_VERSION,
+  CURRENT_REWARD_VERSION,
+  EXPERIENCE_SCHEMA_VERSION
+} from './experience-store';
+import {
   createEffectivePolicyConfigProvider,
   freshPolicySupport,
   baseEffectivePolicyConfig,
@@ -233,7 +238,28 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
     purge(options?: { readonly bucket?: string }): Promise<number>;
   } = {
     async append(records: readonly ExperienceRecord[]): Promise<void> {
-      await drive.append(records);
+      // P6.2 PR-A / F1: stamp the CURRENT reward/provenance/schema versions on
+      // any record that reaches the kernel store without them. The online
+      // recorder (orchestrator) already stamps; this closes the remaining
+      // producers (e.g. the L3 host-tool collector) so the unified
+      // learning-eligibility predicate - which is EXACT-contract and
+      // fail-closed on a missing rewardVersion - never excludes a fresh
+      // record for lacking a stamp it should have carried. Records that
+      // already declare a version (any version, including surrogate/legacy)
+      // are passed through UNTOUCHED: re-stamping would relabel history.
+      const stamped = records.map((record) =>
+        record.rewardVersion === undefined &&
+        record.provenanceVersion === undefined &&
+        record.experienceSchemaVersion === undefined
+          ? {
+              ...record,
+              experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+              rewardVersion: CURRENT_REWARD_VERSION,
+              provenanceVersion: CURRENT_PROVENANCE_VERSION
+            }
+          : record
+      );
+      await drive.append(stamped);
     },
     async query(query: ExperienceQuery): Promise<readonly ScoredExperience[]> {
       return drive.query(query);
@@ -418,7 +444,19 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
     createHostAdvisor(advisorOptions = {}): HostAdvisor {
       return createHostAdvisor({
         config: jitrl,
-        store: { query: (query: ExperienceQuery) => store.query(query) },
+        // P6.2 PR-A / F1: the L3 advisor is a learning consumer - its advice
+        // and gate decisions shape host behaviour - so the kernel hands it a
+        // store seam that adds the SAME strict learning filter L1/L2/replay
+        // use (learningFacingFilterOptions: no legacy lines, no cancelled
+        // records, and - through the single eligibility predicate - no record
+        // on an incompatible reward contract: old r2, unversioned, future, or
+        // surrogate-only backfill). Applying it here (the kernel's one L3
+        // wiring point) keeps the advisor module pure and every L3 caller on
+        // one evidence set.
+        store: {
+          query: (query: ExperienceQuery) =>
+            store.query({ ...query, ...learningFacingFilterOptions() })
+        },
         now,
         ...(advisorOptions.rng === undefined ? {} : { rng: advisorOptions.rng })
       });

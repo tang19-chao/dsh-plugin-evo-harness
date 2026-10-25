@@ -1816,8 +1816,29 @@ describe('P6.1-D 7.4: one RewardContract, one yardstick', () => {
     const delivered = scoreUnderRewardContract(make(true));
     const empty = scoreUnderRewardContract(make(false));
     expect(delivered.reward).toBeGreaterThan(empty.reward);
-    expect(delivered.sources.completion).toBe(COMPLETION_SIGNAL);
+    // P6.2 PR-B / F3: without a trusted verification, a non-empty deliverable
+    // is a process observation (completion 0), never a claimed task success;
+    // the empty one is still refuted outright.
+    expect(delivered.sources.completion).toBe(0);
+    expect(delivered.taskSuccess).toBe(false);
     expect(empty.sources.completion).toBe(MISSING_DELIVERABLE_SIGNAL);
+    // With a PASSED trusted verification the delivered run earns the full
+    // completion signal and lands strictly above the unverified one.
+    const verified = scoreUnderRewardContract({
+      ...make(true),
+      metadata: {
+        verification: {
+          status: 'passed',
+          verifierId: 'ci-verifier',
+          verifierVersion: '1.0.0',
+          evidenceHash: 'abc123',
+          checks: [{ id: 'tests-pass', passed: true }]
+        }
+      }
+    } as ProbeTrajectory);
+    expect(verified.sources.completion).toBe(COMPLETION_SIGNAL);
+    expect(verified.taskSuccess).toBe(true);
+    expect(verified.reward).toBeGreaterThan(delivered.reward);
   });
 
   // ④增加无意义成功工具调用不应无限提高任务质量目标

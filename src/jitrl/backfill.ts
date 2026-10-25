@@ -49,7 +49,7 @@ import {
   LEGACY_VERSION_TAG,
   isLegacyStoredExperience
 } from './experience-store';
-import { isRewardVersionCompatible } from './reward-contract';
+import { isRewardVersionCompatible, isValidRescoreProvenance, RESCORE_REWARD_VERSION, type RescoreProvenance } from './reward-contract';
 
 /** Prefix of every backfilled record id; keeps backfill ids recognisable. */
 export const BACKFILL_RECORD_PREFIX = 'jit-l1';
@@ -59,15 +59,34 @@ export const BACKFILL_RECORD_PREFIX = 'jit-l1';
  * Distinct from the live online versions so a reader can tell "recomputed from
  * the persisted tree" apart from "attributed at execution time".
  *
- * P6.1-D2 / R3 F1: the reward generation was bumped r2 -> r3 together with the
- * RewardContract. The suffix stays `backfill-tree-v1` (the producer and its
- * surrogate-based rebuild scale are unchanged), and generation equality is what
- * `isRewardVersionCompatible` checks, so a rebuilt cold-start record remains
- * learning-eligible under the current contract while pre-upgrade
- * `r2/backfill-tree-v1` lines are quarantined by the migration below.
+ * P6.2 PR-A / F2: the version is deliberately NOT bumped to look compatible.
+ * The surrogate rebuild (node.score -> clip -> discounted best successor) and
+ * the online r3 single-trajectory aggregation are DIFFERENT targets - they
+ * share neither reward sources nor horizon - so `isRewardVersionCompatible`
+ * now uses exact contract ids and `r3/backfill-tree-v1` is NOT certified
+ * against `r3/unified-signals-v1`. A surrogate-only backfill record is
+ * therefore quarantined as SURROGATE PRIOR / AUDIT-ONLY: it stays in the log,
+ * it stays queryable for audit, and the learning-facing predicate excludes it
+ * from every online/replay/M3 neighbourhood (see backfillResurrogatePrior
+ * below and the eligibility contract tests).
  */
 export const BACKFILL_REWARD_VERSION = 'r3/backfill-tree-v1';
 export const BACKFILL_PROVENANCE_VERSION = 'p2/backfill-tree-v1';
+
+/**
+ * How a backfilled record may be used (P6.2 PR-A / F2).
+ *
+ *   surrogatePrior - rebuilt from tree scores WITHOUT original execution
+ *                    evidence: audit-only prior, never a training neighbour.
+ *   rescored       - original execution evidence was preserved and the record
+ *                    was re-scored under the CURRENT contract via
+ *                    scoreUnderRewardContract; carries the full rescore
+ *                    provenance chain (sourceTrajectoryHash, targetContractId,
+ *                    aggregation, horizon, weightsHash, verifierId) and is
+ *                    stamped with RESCORE_REWARD_VERSION, which IS certified
+ *                    compatible with the online contract.
+ */
+export type BackfillFidelity = 'surrogatePrior' | 'rescored';
 
 /** Default discount applied along a tree path (config `jitrl.gamma`). */
 export const DEFAULT_BACKFILL_GAMMA = 0.5;
@@ -466,7 +485,17 @@ export async function backfillFromTreePool(
           clip
         ),
         outcome: node.status === 'succeeded' ? 'succeeded' : 'failed',
-        learningEligible: true,
+        // P6.2 PR-A / F2: a surrogate-only rebuild (node.score -> clip ->
+        // discounted best successor) is NOT the online r3 target (single
+        // trajectory, tool/completion/steps/turn fusion), so the record is
+        // SURROGATE PRIOR / AUDIT-ONLY. It stays in the log and stays
+        // queryable without the learning filter, but `learningEligible: false`
+        // plus the exact-id compatibility rule keep it out of every online,
+        // replay and M3 neighbourhood. A record with original execution
+        // evidence must instead be rebuilt through
+        // buildRescoredBackfillRecord(), which re-scores under the current
+        // contract and keeps the full rescore provenance chain.
+        learningEligible: false,
         createdAt: finiteOr(node.updatedAt, finiteOr(node.createdAt, fallbackCreatedAt)),
         redacted: true
       });
@@ -500,6 +529,118 @@ export async function backfillFromTreePool(
 // ---------------------------------------------------------------------------
 // P6 PR4: legacy isolation and reversible migration (plan section 6.5)
 // ---------------------------------------------------------------------------
+
+/**
+ * True when a record is a SURROGATE-ONLY backfill rebuild (P6.2 PR-A / F2).
+ *
+ * Such a record carries `rewardVersion = 'r3/backfill-tree-v1'` and - for
+ * records written by this round of backfillFromTreePool - `learningEligible:
+ * false`. Historical surrogate lines written before the quarantine may still
+ * carry `learningEligible: true`; the rewardVersion tag plus the exact-id
+ * compatibility rule excludes them anyway, and migrateExperienceRecords
+ * quarantines them as marked copies rather than rewriting the log.
+ */
+export function isSurrogatePriorRecord(record: ExperienceRecord): boolean {
+  return record.rewardVersion === BACKFILL_REWARD_VERSION;
+}
+
+/**
+ * Build ONE rescored backfill record from preserved original execution
+ * evidence (P6.2 PR-A / F2 fix ③).
+ *
+ * Only records with original execution evidence may be re-scored into the
+ * current contract: the caller supplies the source trajectory's hash, the
+ * verifier identity that accepted it, and the trajectory-level signals the
+ * current contract's aggregation consumes. The result is stamped with
+ * {@link RESCORE_REWARD_VERSION} - the one id certified compatible with the
+ * online contract - and carries the FULL rescore provenance chain in the
+ * record's `provenanceVersion` string (sourceTrajectoryHash /
+ * targetContractId / aggregation / horizon / weightsHash / verifierId), so the
+ * rescore stays auditable on the record itself:
+ *
+ *   p2/rescore-v1#src=<hash>|contract=<id>|agg=<aggregation>|horizon=<h>|weights=<weightsHash>|verifier=<verifierId>
+ *
+ * The provenance MUST validate ({@link isValidRescoreProvenance}); otherwise
+ * this returns undefined and the caller must keep the record surrogate-prior /
+ * audit-only instead. "Rebuilding correctness" without original evidence is
+ * not possible; without evidence a record can only be isolated, or serve as a
+ * low-confidence prior after independent calibration (which would be a new,
+ * separately certified contract id).
+ */
+export const RESCORE_PROVENANCE_VERSION = 'p2/rescore-v1' as const;
+
+/** Parse a rescore provenanceVersion back into its provenance parts. */
+export function parseRescoreProvenanceVersion(
+  provenanceVersion: string | undefined
+): Partial<RescoreProvenance> | undefined {
+  if (
+    typeof provenanceVersion !== 'string' ||
+    !provenanceVersion.startsWith(RESCORE_PROVENANCE_VERSION + '#')
+  ) {
+    return undefined;
+  }
+  const parts: Record<string, string> = {};
+  for (const entry of provenanceVersion
+    .slice((RESCORE_PROVENANCE_VERSION + '#').length)
+    .split('|')) {
+    const separator = entry.indexOf('=');
+    if (separator <= 0) {
+      continue;
+    }
+    parts[entry.slice(0, separator)] = entry.slice(separator + 1);
+  }
+  return {
+    sourceTrajectoryHash: parts['src'],
+    targetContractId: parts['contract'],
+    aggregation: parts['agg'],
+    horizon: parts['horizon'],
+    weightsHash: parts['weights'],
+    verifierId: parts['verifier']
+  };
+}
+
+export function buildRescoredBackfillRecord(options: {
+  /** Base record (typically a surrogate-prior backfill line). */
+  readonly base: ExperienceRecord;
+  /** Verifiable provenance of the original execution evidence. */
+  readonly provenance: Partial<RescoreProvenance>;
+  /** Contract-scored value of the original trajectory (observedReturn). */
+  readonly contractObservedReturn: number;
+  /** Comparable reference baseline on the same scale, when one exists. */
+  readonly contractBaseline?: number;
+}): ExperienceRecord | undefined {
+  const provenance = options.provenance;
+  if (!isValidRescoreProvenance(provenance)) {
+    return undefined;
+  }
+  if (!Number.isFinite(options.contractObservedReturn)) {
+    return undefined;
+  }
+  const baseline = Number.isFinite(options.contractBaseline)
+    ? (options.contractBaseline as number)
+    : 0;
+  const target = Math.max(-3, Math.min(3, options.contractObservedReturn - baseline));
+  const provenanceVersion =
+    RESCORE_PROVENANCE_VERSION +
+    '#src=' + provenance.sourceTrajectoryHash +
+    '|contract=' + provenance.targetContractId +
+    '|agg=' + provenance.aggregation +
+    '|horizon=' + provenance.horizon +
+    '|weights=' + provenance.weightsHash +
+    '|verifier=' + provenance.verifierId;
+  return {
+    ...options.base,
+    rewardVersion: RESCORE_REWARD_VERSION,
+    provenanceVersion,
+    reward: options.contractObservedReturn,
+    return: options.contractObservedReturn,
+    observedReturn: options.contractObservedReturn,
+    attributionBaseline: baseline,
+    learningTarget: target,
+    rewardSources: { ...options.base.rewardSources, surrogate: 0, completion: options.contractObservedReturn },
+    learningEligible: true
+  };
+}
 
 /** Counts and marked copies produced by one migration pass. */
 export interface ExperienceMigrationResult {
@@ -642,10 +783,19 @@ export async function migrateExperienceRecords(options: {
 
 /**
  * Split a snapshot into the records the NEW learning neighbourhood may use and
- * the ones it must ignore (plan section 6.5, extended by P6.1-D2 / R3 F1-c:
- * an incompatible reward-version generation is an audit-only condition, same
- * as a pre-attribution legacy line). Pure, so replay and the online path can
- * share exactly one rule.
+ * the ones it must ignore (plan section 6.5; P6.1-D2 / R3 F1-c and P6.2 PR-A /
+ * F2). Audit-only covers three classes with ONE rule (the single learning
+ * predicate, through the exact-id compatibility check):
+ *
+ *   - pre-attribution legacy lines (schema below minimum);
+ *   - lines whose rewardVersion is not the exact current contract id or a
+ *     certified compatible id - an old generation (r2), a future generation,
+ *     an unversioned line, or a SURROGATE-ONLY backfill rebuild
+ *     (`r3/backfill-tree-v1`), which is target-heterogeneous with the online
+ *     contract and is quarantined as surrogatePrior/audit-only;
+ *   - records explicitly marked not learning eligible.
+ *
+ * Pure, so replay, the online path and the migration share exactly one rule.
  */
 export function partitionExperienceRecords(
   records: readonly ExperienceRecord[],

@@ -306,10 +306,6 @@ function rationaleFor(sources: Readonly<Record<string, number>>): string {
 // the plan asks for; the optional LLM judge stays a separate, cost-gated path
 // inside createStepEvaluator.
 
-/** Completion signal: a real deliverable was produced. */
-export const COMPLETION_SIGNAL = 1;
-/** Completion signal: the run claimed success but produced no deliverable. */
-export const MISSING_DELIVERABLE_SIGNAL = -1;
 /** Step-efficiency signal scale: -1 at or above the budget, +1 at 1 step. */
 export const STEP_BUDGET_SIGNAL_SCALE = 1;
 /** Default step budget used when the caller does not supply one. */
@@ -438,6 +434,178 @@ export function turnSignalForOutcome(outcome: ExperienceOutcome): number {
   }
 }
 
+// ---------------------------------------------------------------------------
+// P6.2 PR-B / F3: the trusted verifier interface and task-vs-execution split
+// ---------------------------------------------------------------------------
+//
+// The pre-PR-B completion condition was `deliverable.content.length > 0`: any
+// non-empty text earned COMPLETION_SIGNAL (+1), so a fluent-but-wrong
+// deliverable scored ~+0.9333 and became a POSITIVE training sample. Nothing
+// in the trajectory can tell "correct" from "confidently wrong" - only a
+// verifier can. PR-B therefore defines the verifier contract here (the true
+// leaf module: reward-contract.ts imports this file, never the reverse) and
+// makes the completion source a function of the VERIFIER status:
+//
+//   passed   -> +1 (a trusted verifier accepted the task result)
+//   failed   -> -1 and the fused reward is lexicographically clamped <= 0, so
+//               no amount of tool-smoothness / step-efficiency / text presence
+//               can buy back a positive score ("一次少调用不能抵消验收失败")
+//   unknown  ->  no completion bonus at all; the run stays a PROCESS
+//               observation (it may train on execution-level signals, but it
+//               never records a task success)
+//
+// Fail-closed rules:
+//   - a verification payload that is missing or malformed is UNKNOWN, never
+//     passed (the model's self-reported status proves nothing);
+//   - the structural fallback (no verifier wired) NEVER returns 'passed' -
+//     without a verifier, task success is unprovable, only disprovable;
+//   - execution success (`trajectory.status === 'succeeded'`) and task success
+//     (verification passed) are carried as SEPARATE fields on the score.
+
+/** Verifier verdict for one executed trajectory's task result. */
+export type TrustedVerificationStatus = 'passed' | 'failed' | 'unknown';
+
+/**
+ * The trusted verification record (P6.2 PR-B / F3; review section 6).
+ *
+ * `status` is the verdict; `verifierId`/`verifierVersion` identify the judge;
+ * `evidenceHash` binds the verdict to the evidence it judged (deliverable
+ * hash, test output digest, ...); `checks` carries the per-check detail so
+ * "partial pass" stays observable instead of collapsing into the verdict.
+ * `implicit: true` marks the deterministic structural derivation (no external
+ * verifier ran) - see {@link verificationFromTrajectory}.
+ */
+export interface TrustedVerification {
+  readonly status: TrustedVerificationStatus;
+  readonly verifierId: string;
+  readonly verifierVersion: string;
+  readonly evidenceHash: string;
+  readonly checks: readonly { readonly id: string; readonly passed: boolean }[];
+  /** True when derived structurally (no external verifier), not by a trusted judge. */
+  readonly implicit?: boolean;
+}
+
+/** verifierId of the deterministic structural fallback derivation. */
+export const STRUCTURAL_VERIFIER_ID = 'structural-derivation' as const;
+/** verifierVersion of the deterministic structural fallback derivation. */
+export const STRUCTURAL_VERIFIER_VERSION = 'v1' as const;
+
+/** Completion signal: a TRUSTED verifier accepted the task result (F3). */
+export const COMPLETION_SIGNAL = 1;
+/** Completion signal: the run claimed success but produced no deliverable. */
+export const MISSING_DELIVERABLE_SIGNAL = -1;
+/** Completion signal: a trusted verifier REFUTED the task result (F3). */
+export const VERIFICATION_FAILED_SIGNAL = -1;
+
+/**
+ * Structural, fail-closed validation of a verification payload.
+ *
+ * A payload may claim 'passed' only with the complete shape (status in the
+ * three-value set, non-empty verifier identity, evidence hash, and a checks
+ * list whose entries carry an id and a boolean verdict). Anything else - a
+ * string, a partial object, a payload with an unknown status - is rejected,
+ * which the caller interprets as "no trusted verification present".
+ */
+export function isTrustedVerification(
+  value: unknown
+): value is TrustedVerification {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    record['status'] !== 'passed' &&
+    record['status'] !== 'failed' &&
+    record['status'] !== 'unknown'
+  ) {
+    return false;
+  }
+  for (const field of ['verifierId', 'verifierVersion', 'evidenceHash'] as const) {
+    const entry = record[field];
+    if (typeof entry !== 'string' || entry.length === 0) {
+      return false;
+    }
+  }
+  if (!Array.isArray(record['checks'])) {
+    return false;
+  }
+  for (const check of record['checks']) {
+    if (check === null || typeof check !== 'object') {
+      return false;
+    }
+    const entry = check as Record<string, unknown>;
+    if (typeof entry['id'] !== 'string' || entry['id'].length === 0) {
+      return false;
+    }
+    if (typeof entry['passed'] !== 'boolean') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Read a trusted verification a host attached to trajectory metadata, if any. */
+export function readTrustedVerification(
+  trajectory: ProbeTrajectory
+): TrustedVerification | undefined {
+  const metadata = trajectory.metadata as Record<string, unknown> | undefined;
+  const candidate = metadata === undefined ? undefined : metadata['verification'];
+  return isTrustedVerification(candidate) ? candidate : undefined;
+}
+
+/**
+ * Derive the verification verdict from the trajectory alone (no model).
+ *
+ * Deliberately conservative:
+ *   - 'failed' ONLY for the structurally disprovable case: the run claims
+ *     `succeeded` while producing no deliverable at all (the pre-existing
+ *     claimed-success-without-evidence case);
+ *   - 'unknown' for everything else - including every successful run with a
+ *     deliverable, because content presence proves nothing about correctness.
+ *   - never 'passed': without a trusted verifier, task success is not provable.
+ */
+export function deriveStructuralVerification(
+  trajectory: ProbeTrajectory
+): TrustedVerification {
+  const claimedSuccessWithoutDeliverable =
+    trajectory.status === 'succeeded' &&
+    (trajectory.deliverable === undefined || trajectory.deliverable.content.length === 0);
+  return {
+    status: claimedSuccessWithoutDeliverable ? 'failed' : 'unknown',
+    verifierId: STRUCTURAL_VERIFIER_ID,
+    verifierVersion: STRUCTURAL_VERIFIER_VERSION,
+    evidenceHash: trajectory.deliverable?.contentHash ?? '',
+    checks: [
+      {
+        id: 'deliverable-present',
+        passed: !claimedSuccessWithoutDeliverable
+      }
+    ],
+    implicit: true
+  };
+}
+
+/**
+ * THE verification resolution rule (F3): an explicitly attached trusted
+ * verification wins; otherwise the structural fallback decides.
+ *
+ * One guard: a trusted 'passed' attached to a run whose execution FAILED is a
+ * contradiction (the verification cannot have accepted a result that never
+ * completed), so it degrades to 'unknown' rather than rewarding the claim.
+ */
+export function verificationFromTrajectory(
+  trajectory: ProbeTrajectory
+): TrustedVerification {
+  const explicit = readTrustedVerification(trajectory);
+  if (explicit !== undefined) {
+    if (explicit.status === 'passed' && trajectory.status !== 'succeeded') {
+      return { ...explicit, status: 'unknown' };
+    }
+    return explicit;
+  }
+  return deriveStructuralVerification(trajectory);
+}
+
 /** One deterministic, verifiable score for a trajectory that has no step list. */
 export interface TrajectorySignalScore {
   readonly outcome: ExperienceOutcome;
@@ -446,6 +614,16 @@ export interface TrajectorySignalScore {
   readonly reward: number;
   readonly sources: Readonly<Record<string, number>>;
   readonly rationale: string;
+  /** Execution success: the run itself completed (status 'succeeded'). */
+  readonly executionSuccess: boolean;
+  /** Task success: a TRUSTED verifier accepted the result (F3). */
+  readonly taskSuccess: boolean;
+  /** The resolved verification verdict and who produced it. */
+  readonly verification: {
+    readonly status: TrustedVerificationStatus;
+    readonly verifierId: string;
+    readonly implicit: boolean;
+  };
 }
 
 /**
@@ -488,6 +666,12 @@ export function fuseVerifiableSignals(
  * break into steps (for example a failed run with zero recorded steps). Only
  * verifiable signals are used, so a failed action still gets an explainable
  * negative record instead of disappearing (plan section 6.2).
+ *
+ * P6.2 PR-B / F3: the completion source is now VERIFIER-DECIDED (see
+ * {@link verificationFromTrajectory}). A non-empty deliverable alone no longer
+ * earns +1 - only a trusted verification 'passed' does, and a 'failed'
+ * verification lexicographically clamps the fused reward to <= 0 so tool
+ * smoothness can never buy back a positive score.
  */
 export function scoreTrajectorySignals(
   trajectory: ProbeTrajectory,
@@ -496,12 +680,22 @@ export function scoreTrajectorySignals(
     readonly clip?: readonly [number, number];
     readonly stepBudget?: number;
     readonly cancelled?: boolean;
+    /** Optional host user feedback, kept a SEPARATE source (F3: 分列). */
+    readonly user?: UserFeedbackKind;
   } = {}
 ): TrajectorySignalScore {
   const outcome = classifyTrajectoryOutcome(trajectory, {
     ...(options.cancelled === undefined ? {} : { cancelled: options.cancelled })
   });
-  const eligible = isLearningOutcome(outcome);
+  const verification = verificationFromTrajectory(trajectory);
+  // F3: a trusted verification that REFUTED the task result while the run
+  // claims success is a falsified success claim: the record keeps its
+  // execution-level signals (it still says something about tool usage), but it
+  // must not train the policy as a positive task experience. A cancelled /
+  // aborted / infrastructure run was already ineligible.
+  const falsifiedSuccessClaim =
+    verification.status === 'failed' && trajectory.status === 'succeeded';
+  const eligible = isLearningOutcome(outcome) && !falsifiedSuccessClaim;
   const weights = options.weights ?? { tool: 0.2, turn: 0.1 };
   const clip = options.clip ?? [-3, 3];
   const sources: Record<string, number> = {};
@@ -518,22 +712,45 @@ export function scoreTrajectorySignals(
   if (successfulCalls > 0) {
     sources.tool = (sources.tool ?? 0) + TOOL_SUCCESS_SIGNAL * successfulCalls;
   }
-  // Completion: a deliverable is the strongest verifiable success signal.
-  const delivered =
-    trajectory.deliverable !== undefined && trajectory.deliverable.content.length > 0;
-  if (delivered) {
+  // F3 completion: the VERDICT decides, not content presence. 'unknown' earns
+  // no completion signal at all (the run is a process observation); 'failed'
+  // earns -1; only 'passed' earns +1. The claimed-success-without-deliverable
+  // case is carried by the structural fallback as 'failed'.
+  if (verification.status === 'passed') {
     sources.completion = COMPLETION_SIGNAL;
+  } else if (verification.status === 'failed') {
+    sources.completion = VERIFICATION_FAILED_SIGNAL;
   } else if (trajectory.status === 'succeeded') {
-    sources.completion = MISSING_DELIVERABLE_SIGNAL;
+    // Explicit trusted 'failed' maps above; the structural fallback already
+    // marks claimed-success-without-deliverable as failed. An 'unknown'
+    // verification on a succeeded run with NO deliverable still deserves the
+    // historical missing-deliverable penalty: the run produced nothing.
+    sources.completion =
+      trajectory.deliverable === undefined || trajectory.deliverable.content.length === 0
+        ? MISSING_DELIVERABLE_SIGNAL
+        : 0;
   }
   // Step count against a budget, as a cheap efficiency signal in [-1, 1].
   const budget = Math.max(1, options.stepBudget ?? DEFAULT_STEP_BUDGET);
   const steps = Math.max(0, trajectory.metrics.steps);
   sources.steps = steps === 0 ? 0 : 1 - 2 * Math.min(1, steps / budget);
   sources.turn = turnSignalForOutcome(outcome);
+  // F3 分列: user adoption is its own source, never folded into completion or
+  // tool. Execution cost is already carried separately by the `steps` budget
+  // term and trajectory.metrics (durationMs/tokens), not as a quality source.
+  if (options.user !== undefined) {
+    sources.user = userSignal(options.user);
+  }
   // The fused value only uses weighted sources; unknown names contribute 0, so
   // a caller with the frozen llm/surrogate/tool/turn/user weights still works.
-  const reward = eligible ? fuseVerifiableSignals(sources, weights, clip) : 0;
+  let reward = eligible ? fuseVerifiableSignals(sources, weights, clip) : 0;
+  // F3 lexicographic quality constraint: a FAILED verification is a quality
+  // gate violation, and no amount of efficiency (fewer steps, clean tools)
+  // may compensate it. The reward is clamped to <= 0 - the run cannot record a
+  // positive success experience on the shared scale.
+  if (verification.status === 'failed' && eligible && reward > 0) {
+    reward = 0;
+  }
   return {
     outcome,
     learningEligible: eligible,
@@ -544,7 +761,17 @@ export function scoreTrajectorySignals(
       Object.keys(sources).join('+') +
       '); outcome ' +
       outcome +
-      (eligible ? '' : '; not learning eligible')
+      '; verification ' +
+      verification.status +
+      (verification.implicit === true ? ' (structural)' : ' by ' + verification.verifierId) +
+      (eligible ? '' : '; not learning eligible'),
+    executionSuccess: trajectory.status === 'succeeded',
+    taskSuccess: verification.status === 'passed',
+    verification: {
+      status: verification.status,
+      verifierId: verification.verifierId,
+      implicit: verification.implicit === true
+    }
   };
 }
 

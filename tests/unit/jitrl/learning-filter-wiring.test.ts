@@ -180,6 +180,10 @@ interface RecordOptions {
  * `legacy` and `ineligible` are the two exclusion classes:
  *   legacy     -> no experienceSchemaVersion at all (§6.5 stale model)
  *   ineligible -> learningEligible: false (§6.2 cancellation / infra failure)
+ *
+ * A non-legacy record carries the current reward contract id, exactly as the
+ * online recorder writes it (P6.2 PR-A: the learning predicate is
+ * exact-contract and fail-closed, so an unversioned record trains nothing).
  */
 function record(options: RecordOptions): ExperienceRecord {
   const state = parityState();
@@ -198,7 +202,10 @@ function record(options: RecordOptions): ExperienceRecord {
     nodeId: options.id,
     ...(options.legacy === true
       ? {}
-      : { experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION }),
+      : {
+          experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+          rewardVersion: CURRENT_REWARD_VERSION
+        }),
     ...(options.ineligible === true ? { learningEligible: false } : {}),
     createdAt: options.createdAt ?? T0 - 60_000,
     redacted: true

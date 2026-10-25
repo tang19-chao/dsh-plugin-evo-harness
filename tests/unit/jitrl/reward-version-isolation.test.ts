@@ -131,9 +131,12 @@ describe('F1-d ①: r2 and r3 records never mix into one neighbourhood mean', ()
     const r3Record = versionedRecord({ id: 'r3-new', rewardVersion: CURRENT_REWARD_VERSION, value: -1 });
 
     // Compatibility verdicts (the production wiring primitive).
+    // P6.2 PR-A / F2: compatibility is EXACT contract-id matching, so a
+    // surrogate backfill stamp is NOT compatible with the online contract
+    // even though both carry the r3 generation prefix.
     expect(isRewardVersionCompatible('r2/verifiable-v1', CURRENT_REWARD_VERSION)).toBe(false);
     expect(isRewardVersionCompatible(CURRENT_REWARD_VERSION, CURRENT_REWARD_VERSION)).toBe(true);
-    expect(isRewardVersionCompatible(BACKFILL_REWARD_VERSION, CURRENT_REWARD_VERSION)).toBe(true);
+    expect(isRewardVersionCompatible(BACKFILL_REWARD_VERSION, CURRENT_REWARD_VERSION)).toBe(false);
     expect(isRewardVersionCompatible(undefined, CURRENT_REWARD_VERSION)).toBe(false);
     expect(isRewardVersionCompatible('legacy', CURRENT_REWARD_VERSION)).toBe(false);
     expect(isRewardVersionCompatible('r4/future', CURRENT_REWARD_VERSION)).toBe(false);
@@ -221,10 +224,15 @@ describe('F1-d ②: the upgrade quarantines via marked copies, never an in-place
       versionedRecord({ id: 'r3-backfill', rewardVersion: BACKFILL_REWARD_VERSION, value: 2 }),
       versionedRecord({ id: 'no-version', value: 5 })
     ]);
-    // Learning keeps exactly the r3-generation records (online + rebuilt);
-    // audit-only keeps the r2 line and the unversioned line.
-    expect(partition.learning.map((record) => record.id).sort()).toEqual(['r3-backfill', 'r3-stay']);
-    expect(partition.auditOnly.map((record) => record.id).sort()).toEqual(['no-version', 'r2-old']);
+    // P6.2 PR-A / F2: learning keeps exactly the online-contract records;
+    // audit-only keeps the r2 line, the unversioned line AND the surrogate
+    // backfill line (target-heterogeneous with the online contract).
+    expect(partition.learning.map((record) => record.id).sort()).toEqual(['r3-stay']);
+    expect(partition.auditOnly.map((record) => record.id).sort()).toEqual([
+      'no-version',
+      'r2-old',
+      'r3-backfill'
+    ]);
   });
 });
 
@@ -252,19 +260,22 @@ describe('F1-d ③: isLearningEligible isolates cross-version records', () => {
       outcome: undefined
     }) as StoredExperience;
 
-  it('accepts only current-generation records, whatever the schema flag says', () => {
+  it('accepts only exact-current-contract records, whatever the schema flag says', () => {
     // Current generation, schema current, eligible -> learns.
     expect(
       isLearningEligible(
         stored(versionedRecord({ id: 'ok', rewardVersion: CURRENT_REWARD_VERSION, value: 1 }))
       )
     ).toBe(true);
-    // Rebuilt records share the generation -> still learn (cold start works).
+    // P6.2 PR-A / F2: surrogate rebuild stamps a DIFFERENT contract id, which
+    // is not certified compatible -> isolated (the cold-start surrogate prior
+    // is audit-only; only a rescore with original evidence re-enters, stamped
+    // with the rescore id).
     expect(
       isLearningEligible(
         stored(versionedRecord({ id: 'rebuilt', rewardVersion: BACKFILL_REWARD_VERSION, value: 1 }))
       )
-    ).toBe(true);
+    ).toBe(false);
     // Schema-current but r2 generation -> isolated (the F1 scenario).
     expect(
       isLearningEligible(

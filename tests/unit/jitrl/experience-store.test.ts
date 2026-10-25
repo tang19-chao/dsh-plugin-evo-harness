@@ -708,11 +708,17 @@ describe('P6 PR4: record versions and legacy isolation', () => {
   });
 
   it('flags a mirror snapshot that mixes reward versions', () => {
+    // P6.2 PR-A: a foreign rewardVersion (r1 here) is INELIGIBLE under the
+    // unified predicate, so the mirror withholds it and reports isolation;
+    // the accepted set itself can only ever hold certified ids, so a genuinely
+    // mixed accepted set is impossible - mixing now shows up as isolation.
     const visible = mirrorVisibleRecords([
       record('current-a', CURRENT),
       record('current-b', { ...CURRENT, rewardVersion: 'r1/legacy-vector' })
     ]);
-    expect(visible.mixedRewardVersions).toBe(true);
-    expect(visible.isolated).toBe(false);
+    expect(visible.current.map((entry) => entry.id)).toEqual(['current-a']);
+    expect(visible.ineligibleExcluded).toBe(1);
+    expect(visible.isolated).toBe(true);
+    expect(visible.mixedRewardVersions).toBe(false);
   });
 });

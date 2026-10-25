@@ -32,7 +32,11 @@ import {
 } from '../../../src/dream-rsi/active-policy';
 import { abstractMetaState } from '../../../src/jitrl/state-abstraction';
 import { normalizeMetaAction } from '../../../src/jitrl/action-normalizer';
-import { EXPERIENCE_SCHEMA_VERSION } from '../../../src/jitrl/experience-store';
+import {
+  CURRENT_PROVENANCE_VERSION,
+  CURRENT_REWARD_VERSION,
+  EXPERIENCE_SCHEMA_VERSION
+} from '../../../src/jitrl/experience-store';
 import { DEFAULT_EVO_HARNESS_CONFIG } from '../../../src/config';
 import {
   baseEffectivePolicyConfig,
@@ -244,6 +248,13 @@ function makeMetaRecord(options: {
     ...(options.omitSchemaVersion === true
       ? {}
       : { experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION }),
+    // P6.2 PR-A: the live writer stamps the current reward contract id on every
+    // record; the learning-facing predicate is exact-contract and fail-closed,
+    // so a fixture without the stamp would be (correctly) excluded from the
+    // neighbourhood and every behaviour assertion below would go cold.
+    ...(options.omitSchemaVersion === true
+      ? {}
+      : { rewardVersion: CURRENT_REWARD_VERSION, provenanceVersion: CURRENT_PROVENANCE_VERSION }),
     ...(options.learningEligible === undefined
       ? {}
       : { learningEligible: options.learningEligible }),

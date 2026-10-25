@@ -37,7 +37,7 @@ import type {
   GuidanceMode
 } from '../types/contracts';
 import { EXPERIENCE_OUTCOMES } from '../types/contracts';
-import { isRewardVersionCompatible } from './reward-contract';
+import { isLearningEligibleRecord, isRewardVersionExact } from './reward-contract';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -211,22 +211,22 @@ export function isLegacyStoredExperience(
 }
 
 /**
- * True when a record may train the policy (explicit false, or legacy).
+ * True when a record may train the policy (explicit false, legacy, or an
+ * incompatible reward contract).
  *
- * P6.1-D2 / R3 F1-c: a record is also learning-INELIGIBLE when its
- * rewardVersion is not compatible with the current RewardContract generation.
- * Before this check the filter ignored rewardVersion entirely, so after the
- * r2 -> r3 upgrade an old r2 record (schema already v2, never tagged legacy)
- * would still be averaged into the same neighbourhood as fresh r3 records -
- * exactly the cross-yardstick estimation P6.1-D exists to eliminate. The check
- * fails closed: a missing or unknown rewardVersion proves nothing, so it does
- * not train either.
+ * P6.1-D2 / R3 F1-c added the rewardVersion generation check; P6.2 PR-A / F2
+ * replaced generation equality with EXACT contract-id matching (the certified
+ * compatibility table) because a same-generation surrogate rebuild is not the
+ * same target. This store-side helper DELEGATES to the single predicate
+ * (`isLearningEligibleRecord` in ./reward-contract.ts, re-exported as
+ * `isLearningEligibleExperience` from ./decision-kernel.ts) so the query path
+ * and every snapshot consumer share ONE rule - the pre-PR-A world had two
+ * copies and the weaker one leaked (review finding F1). The check fails
+ * closed: a missing or unknown rewardVersion proves nothing, so it does not
+ * train either.
  */
 export function isLearningEligible(record: StoredExperience): boolean {
-  if (record.learningEligible === false || isLegacyStoredExperience(record)) {
-    return false;
-  }
-  return isRewardVersionCompatible(record.rewardVersion, CURRENT_REWARD_VERSION);
+  return isLearningEligibleRecord(record, CURRENT_REWARD_VERSION);
 }
 
 function normalizeRecord(value: unknown): StoredExperience {
@@ -1187,6 +1187,12 @@ export function malformedLineDiagnostic(lineNumber: number, reason: string): Exp
  * This is the single rule every consumer (online retrieval, replay, mirror
  * aggregation) must apply, so a legacy record cannot be re-imported from a
  * remote aggregate after the local log was migrated. Pure and dependency free.
+ *
+ * P6.2 PR-A: "learning" now means the FULL strict predicate (schema + explicit
+ * eligibility + exact reward-contract id), not just the schema cut, so a
+ * surrogate-backfill r3 record or an unversioned line can no longer ride back
+ * in through `current`/`learning` here. The compat classification keeps the
+ * historical bucket names for audit reporting.
  */
 export function partitionByVersion(
   records: readonly ExperienceRecord[],
@@ -1207,7 +1213,10 @@ export function partitionByVersion(
       legacy.push(record);
       continue;
     }
-    if (record.learningEligible === false) {
+    if (
+      record.learningEligible === false ||
+      !isRewardVersionExact(record.rewardVersion, CURRENT_REWARD_VERSION)
+    ) {
       ineligible.push(record);
       continue;
     }
@@ -1220,7 +1229,9 @@ export function partitionByVersion(
  * Per-record legacy classification for a raw snapshot (plan section 6.5), so a
  * caller can annotate rather than drop. `legacy` means the record predates
  * per-execution attribution; `ineligible` means it carries an outcome that may
- * not train (cancelled / aborted / infrastructure).
+ * not train (cancelled / aborted / infrastructure) OR - P6.2 PR-A - its
+ * rewardVersion is not the exact current contract id (old generation,
+ * surrogate backfill, unversioned, or future).
  */
 export function classifyExperienceVersion(
   record: ExperienceRecord,
@@ -1230,7 +1241,13 @@ export function classifyExperienceVersion(
   if (version === undefined || !Number.isFinite(version) || version < minimumSchemaVersion) {
     return 'legacy';
   }
-  return record.learningEligible === false ? 'ineligible' : 'current';
+  if (
+    record.learningEligible === false ||
+    !isRewardVersionExact(record.rewardVersion, CURRENT_REWARD_VERSION)
+  ) {
+    return 'ineligible';
+  }
+  return 'current';
 }
 
 /**

@@ -84,7 +84,12 @@ import type {
 // Pure, dependency-free JitRL helpers (no kernel wiring): the L2 selector needs
 // the same state abstraction and prior-logit projection the L1 decorator uses,
 // so both levels agree on what a "state" and a "prior" are.
-import { normalizeMetaAction, normalizePatchSignature } from './jitrl/action-normalizer';
+import {
+  normalizeMetaAction,
+  normalizePatchSignature,
+  semanticEditKindOf,
+  type SemanticEditKind
+} from './jitrl/action-normalizer';
 import { verbalizedLogit } from './jitrl/logit-sources';
 import { abstractMetaState, abstractProposalState } from './jitrl/state-abstraction';
 import {
@@ -97,6 +102,7 @@ import {
   classifyTrajectoryOutcome,
   isLearningOutcome
 } from './jitrl/step-evaluator';
+import { conservativeAdvantage } from './jitrl/value-estimator';
 import {
   CURRENT_PROVENANCE_VERSION,
   EXPERIENCE_SCHEMA_VERSION
@@ -194,6 +200,15 @@ export interface EvoHarnessOrchestratorDeps {
   ) => readonly MetaSearchPolicy[];
   /** Permanently mount the winning scaffold; defaults to true. */
   readonly applyWinningPatch?: boolean;
+  /**
+   * P6.2 PR-B / F4: enable the conservative L2 replacement gate (the
+   * prior-deviation evidence vetoes described in selectProposal). Defaults to
+   * false: the frozen e2e baseline calibrates the online path without
+   * interception, and PR-B's verifier-first scoring already removed the
+   * reward-side driver of the first-harm counterexample. The release-boundary
+   * PR owns flipping this to true.
+   */
+  readonly conservativeGate?: boolean;
   /**
    * Optional JitRL kernel surface (plan Phase 3: L2 selection and online
    * experience recording). Structural on purpose: the orchestrator never
@@ -586,6 +601,25 @@ interface PreparedSelection {
   /** Index the decision chose, and how many candidates it was offered. */
   readonly chosenIndex: number;
   readonly offered: number;
+  /**
+   * P6.2 PR-B / F4: the prior choice (highest baseLogit), the decision's raw
+   * proposal and the index actually EXECUTED after the conservative gate.
+   * Attempted deviation (proposed != prior) and actual deviation
+   * (executed != prior) are therefore separable in every record.
+   */
+  readonly priorIndex?: number;
+  readonly proposedIndex?: number;
+  /** Gate reason when the executed index is not the decision's raw choice. */
+  readonly gateReason?: 'min-support' | 'implicit-zero-advantage' | 'exploration-budget' | 'proposer-fallback';
+  /** True when this execution was charged to the explicit exploration budget. */
+  readonly exploration?: boolean;
+  /**
+   * F4-4: the semantic edit kind(s) of the executed patch (constructive /
+   * destructive / neutral), from semanticEditKindOf. Persisted next to the
+   * action key so "harmful noop / destructive edit was chosen" is queryable
+   * without changing the store's action-key vocabulary.
+   */
+  readonly semanticKind?: string;
 }
 
 /** One proposal admitted into a round's concurrent probe wave. */
@@ -746,6 +780,17 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  * Evidence-backed orchestrator. Construct with createEvoHarnessOrchestrator.
  */
 export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
+  /**
+   * P6.2 PR-B / F4-5: per-orchestrator-instance exploration budget. A
+   * DEVIATION from the prior that lacks full replacement evidence may only
+   * execute while this budget lasts; each such execution is tagged
+   * exploration in the record. Defaults to ZERO (fail-closed): exploration
+   * must be SEPARATELY granted - `grantExplorationBudget(n)` is the explicit,
+   * revocable allocation - so the online path never silently explores through
+   * the "unknown action happens to have zero advantage" hole.
+   */
+  static readonly EXPLORATION_BUDGET = 0;
+
   private readonly deps: EvoHarnessOrchestratorDeps;
   private readonly now: () => number;
   private readonly newId: () => string;
@@ -770,6 +815,20 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
    * process actually ran.
    */
   private readonly appendedExperienceKeys: Set<string> = new Set();
+  /**
+   * P6.2 PR-B / F4-5: the EXPLICIT, revocable exploration budget.
+   *
+   * Every deviation from the prior that survives the conservative gate but
+   * lacks full replacement evidence is charged here and tagged
+   * `exploration: true` on its record. When the budget is spent, such
+   * deviations fall back to the prior - there is no implicit zero-advantage
+   * exploration path left. `revokeExplorationBudget()` zeroes the allowance
+   * and `grantExplorationBudget(n)` grants one (the "revocable" half: an
+   * operator or a supervision surface can move it without restarting).
+   */
+  private explorationAllowance = EvoHarnessOrchestratorImpl.EXPLORATION_BUDGET;
+  /** P6.2 PR-B / F4: whether the conservative L2 gate intercepts deviations. */
+  private readonly conservativeGate: boolean;
 
   constructor(deps: EvoHarnessOrchestratorDeps) {
     if (deps === undefined || deps === null || deps.config === undefined) {
@@ -785,6 +844,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     // produced count through the dreamer's policyCount option.
     this.candidatePolicies = deps.candidatePolicies ?? (() => []);
     this.applyWinningPatch = deps.applyWinningPatch !== false;
+    this.conservativeGate = deps.conservativeGate === true;
     this.treePool = deps.treePool;
   }
 
@@ -812,6 +872,32 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
 
   lastPlan(): SearchGridPlan | null {
     return this.plan;
+  }
+
+  /** Remaining explicit exploration budget (P6.2 PR-B / F4-5). */
+  explorationBudgetRemaining(): number {
+    return this.explorationAllowance;
+  }
+
+  /**
+   * Grant an explicit, revocable exploration allowance (P6.2 PR-B / F4-5).
+   *
+   * Returns the number actually granted. This is the ONLY way the online path
+   * may execute an under-evidenced deviation: the default allowance is 0, so
+   * without a grant every such decision falls back to the prior (fail-closed,
+   * no implicit exploration).
+   */
+  grantExplorationBudget(count: number): number {
+    if (!Number.isFinite(count) || count <= 0) {
+      return this.explorationAllowance;
+    }
+    this.explorationAllowance += Math.floor(count);
+    return this.explorationAllowance;
+  }
+
+  /** Revoke the exploration budget back to zero (the revocable half). */
+  revokeExplorationBudget(): void {
+    this.explorationAllowance = 0;
   }
 
   dreamReports(): readonly DreamReplayReport[] {
@@ -1098,7 +1184,17 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
 
           stage('propose', { round: rounds, detail: { slot: slot.slot } });
           let proposed: ProposedPatch;
-          let selection: { readonly chosen: number; readonly offered: number } | undefined;
+          let selection:
+            | {
+                readonly chosen: number;
+                readonly offered: number;
+                readonly priorIndex?: number;
+                readonly proposedIndex?: number;
+                readonly gateReason?: PreparedSelection['gateReason'];
+                readonly exploration?: boolean;
+                readonly semanticKind?: string;
+              }
+            | undefined;
           try {
             // L2: when the proposer can emit K candidates and JitRL covers the
             // 'proposal' level, one of them is chosen here BEFORE probing. The
@@ -1118,8 +1214,19 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
             });
             if (picked !== undefined) {
               proposed = picked.proposed;
-              selection = { chosen: picked.chosen, offered: picked.offered };
+              selection = {
+                chosen: picked.chosen,
+                offered: picked.offered,
+                ...(picked.priorIndex === undefined ? {} : { priorIndex: picked.priorIndex }),
+                ...(picked.proposedIndex === undefined ? {} : { proposedIndex: picked.proposedIndex }),
+                ...(picked.gateReason === undefined ? {} : { gateReason: picked.gateReason }),
+                ...(picked.exploration === undefined ? {} : { exploration: picked.exploration }),
+                ...(picked.semanticKind === undefined ? {} : { semanticKind: picked.semanticKind })
+              };
             } else {
+              // No L2 decision ran (single candidate / fallback paths): the
+              // prior/proposed/executed triple stays absent, which the ledger
+              // counts read as "no decision" rather than "no deviation".
               proposed = await this.deps.proposer.propose({
                 task,
                 sessionId,
@@ -1206,7 +1313,12 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
                   actionKey: normalizePatchSignature(proposed.patch),
                   decisionId: 'jit-decision-' + runId + '-r' + String(rounds) + '-s' + String(slot.slotIndex),
                   chosenIndex: selection.chosen,
-                  offered: selection.offered
+                  offered: selection.offered,
+                  ...(selection.priorIndex === undefined ? {} : { priorIndex: selection.priorIndex }),
+                  ...(selection.proposedIndex === undefined ? {} : { proposedIndex: selection.proposedIndex }),
+                  ...(selection.gateReason === undefined ? {} : { gateReason: selection.gateReason }),
+                  ...(selection.exploration === undefined ? {} : { exploration: selection.exploration }),
+                  ...(selection.semanticKind === undefined ? {} : { semanticKind: selection.semanticKind })
                 };
           prepared.push({ slot, node, proposed, executionPatch, ...(selectionState === undefined ? {} : { selection: selectionState }) });
         }
@@ -1890,13 +2002,30 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       let reward: number;
       let observedReturn: number;
       let rewardSources: Readonly<Record<string, number>>;
+      // P6.2 PR-B / F4-3: prior/proposed/executed as SEPARATE persisted marks.
+      // rewardSources is an open record, so the decision triple rides along
+      // with every record (a present key always carries its index; a missing
+      // key means the field was not decided). Attempted deviation
+      // (proposed != prior) and actual deviation (executed != prior) can now
+      // be counted independently from the store - the review's requirement
+      // that the two never be conflated.
+      const decisionMarks: Readonly<Record<string, number>> = probe.selection
+        ? {
+            ...(probe.selection.priorIndex === undefined ? {} : { decisionPriorIndex: probe.selection.priorIndex }),
+            ...(probe.selection.proposedIndex === undefined
+              ? {}
+              : { decisionProposedIndex: probe.selection.proposedIndex }),
+            decisionExecutedIndex: probe.selection.chosenIndex,
+            ...(probe.selection.exploration === true ? { exploration: 1 } : {})
+          }
+        : {};
       if (!eligible) {
         // A user cancellation / abort / infrastructure failure says nothing about
         // action quality (plan section 6.2), so it is audit-only: neutral reward,
         // zero learning target, `learningEligible: false`.
         reward = 0;
         observedReturn = 0;
-        rewardSources = { outcome: 1 };
+        rewardSources = { outcome: 1, ...decisionMarks };
       } else {
         // P6.1-D RewardContract: ONE primary target for every executed probe -
         // winner or not - under the same rewardVersion. The composer's winner
@@ -1907,12 +2036,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         const signal = scoreUnderRewardContract(probe.trajectory);
         reward = clamp(signal.reward, -3, 3);
         observedReturn = clamp(signal.reward, -3, 3);
-        rewardSources = isWinner
-          ? {
-              ...signal.sources,
-              stepJudge: winnerStepSummary(winnerRewards)
-            }
-          : signal.sources;
+        rewardSources = {
+          ...(isWinner ? { ...signal.sources, stepJudge: winnerStepSummary(winnerRewards) } : signal.sources),
+          ...decisionMarks
+        };
       }
       const learningTarget = eligible ? clamp(observedReturn - baseline, -3, 3) : 0;
       const decisionId = probe.selection?.decisionId ?? 'jit-meta-decision-' + input.runId + '-r' + String(probe.round);
@@ -1926,13 +2053,14 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         decisionId,
         runId: input.runId,
         policyVersion: input.policyId + '@v' + String(finiteOr(this.deps.policy.policy?.version, 1)),
-        // P6.1-D: the RewardContract version. The scoring rule changed in this
-        // round (the winner-only evaluator+discounted-return fork was removed),
-        // so the version was bumped from r2/verifiable-v1; the r2 experience
-        // stays readable for audit and is never rewritten in place. The scale
-        // and target-field meaning of this version live in
-        // src/jitrl/reward-contract.ts (REWARD_CONTRACT) and are echoed into the
-        // record_experience stage detail on every run.
+        // P6.2 PR-B: the verifier-first completion rule now decides the
+        // completion source (verdict, not deliverable presence) and falsified
+        // success claims are learning-ineligible. The numeric scale (weights,
+        // clip) is unchanged, and the persisted rewardVersion stays on the
+        // current contract id: the r4 id (REWARD_CONTRACT_VERSION_PR_B) is the
+        // preregistered NEXT contract for the adoption PR that owns the store
+        // constant (out of PR-B scope; experience-store.ts and its frozen
+        // version pins belong to the release-boundary PR).
         rewardVersion: REWARD_CONTRACT.version,
         provenanceVersion: CURRENT_PROVENANCE_VERSION,
         experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
@@ -2015,6 +2143,28 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       return 0;
     }
 
+    // P6.2 PR-B: attempted vs actual deviation, reported separately (F4-3).
+    // attempted = the kernel's raw proposal differed from the prior; actual =
+    // what finally executed differed from the prior. Reporting only the actual
+    // rate would hide the gate's effect; reporting only the attempted rate
+    // would claim deviations that never ran.
+    const decisionsWithPrior = ordered.filter(
+      (probe) => probe.selection !== undefined && probe.selection.priorIndex !== undefined
+    );
+    const attemptedDeviations = decisionsWithPrior.filter(
+      (probe) =>
+        probe.selection !== undefined &&
+        probe.selection.proposedIndex !== undefined &&
+        probe.selection.priorIndex !== probe.selection.proposedIndex
+    ).length;
+    const actualDeviations = decisionsWithPrior.filter(
+      (probe) =>
+        probe.selection !== undefined && probe.selection.priorIndex !== probe.selection.chosenIndex
+    ).length;
+    const explorationCharged = decisionsWithPrior.filter(
+      (probe) => probe.selection?.exploration === true
+    ).length;
+
     input.stage('record_experience', {
       round: input.round,
       detail: {
@@ -2024,13 +2174,28 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         outcomes,
         notLearningEligible: ineligible,
         attributionBaseline: baseline,
-        // P6.1-D: the run's reward yardstick, visible in the stage detail (not
-        // only inside the JSONL records).
+        // P6.2 PR-B: the run's reward yardstick, visible in the stage detail
+        // (not only inside the JSONL records). The persisted id stays on the
+        // current contract (see the association comment); the verifier-first
+        // completion rule is reported as the scale marker.
         rewardVersion: REWARD_CONTRACT.version,
         rewardScale: REWARD_CONTRACT.aggregation,
+        verifierFirstRule: 'verifier-first-completion-v1',
         rewardTargetField: REWARD_CONTRACT.learningTargetField,
         // What the value estimator will consume from these records.
-        estimatorTarget: estimatorTargetLine(deduped, REWARD_CONTRACT.version)
+        estimatorTarget: estimatorTargetLine(deduped, REWARD_CONTRACT.version),
+        // P6.2 PR-B / F4-3: the decision ledger summary of this run.
+        l2Decisions: decisionsWithPrior.length,
+        attemptedDeviations,
+        actualDeviations,
+        explorationCharged,
+        // F4-4: semantic edit kinds executed this run (destructive choices are
+        // separately countable from the stage log).
+        semanticKinds: [
+          ...new Set(
+            decisionsWithPrior.map((probe) => probe.selection?.semanticKind ?? '').filter((kind) => kind !== '')
+          )
+        ]
       }
     });
     try {
@@ -2131,7 +2296,19 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     readonly rounds: number;
     readonly grid: SearchGridPlan;
     readonly diagnostics: string[];
-  }): Promise<{ readonly proposed: ProposedPatch; readonly chosen: number; readonly offered: number } | undefined> {
+  }): Promise<
+    | {
+        readonly proposed: ProposedPatch;
+        readonly chosen: number;
+        readonly offered: number;
+        readonly priorIndex?: number;
+        readonly proposedIndex?: number;
+        readonly gateReason?: PreparedSelection['gateReason'];
+        readonly exploration?: boolean;
+        readonly semanticKind?: string;
+      }
+    | undefined
+  > {
     const kernel = this.deps.jitrl;
     if (kernel === undefined || !kernel.config.enabled || !kernel.config.levels.includes('proposal')) {
       return undefined;
@@ -2198,6 +2375,14 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
 
     // One node must be created per chosen patch, so patches that normalize to the
     // same signature cannot be told apart in the tree or the experience store.
+    // P6.2 PR-B / F4-4: the SEMANTIC key (normalizeSemanticActionKey) is the
+    // next L2 action vocabulary - it encodes edit type + semantic direction +
+    // targets so a correct append and a destructive forbid never share a Q
+    // bucket (see the conflict-rate tests). Persisting it into the store is a
+    // vocabulary switch that belongs to the release PR (it would orphan every
+    // existing record, including the eval replay corpus), so the online path
+    // keeps the slot-shape signature here and carries the semantic key as the
+    // decision's semantic mark (decisionSemanticKind in rewardSources).
     const candidates: JitCandidate<ProposedPatch>[] = [];
     const byKey = new Map<string, ProposedPatch>();
     for (let index = 0; index < offered.length; index += 1) {
@@ -2311,19 +2496,171 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     const rejected = decisionCandidates
       .filter((entry) => entry.actionKey !== chosenKey)
       .map((entry) => entry.actionKey);
+
+    const priorIndex = decisionCandidates.reduce(
+      (best, entry, index, all) =>
+        entry.baseLogit > (all[best]?.baseLogit ?? Number.NEGATIVE_INFINITY) ? index : best,
+      0
+    );
+    const proposedIndex = chosenIndex;
+    let executedIndex = chosenIndex;
+    let gateReason: PreparedSelection['gateReason'] | undefined;
+    let exploration = false;
+
+    // -----------------------------------------------------------------
+    // P6.2 PR-B / F4: conservative replacement gate (estimation != replace).
+    //
+    // The gate is DISABLED by default (L2_CONSERVATIVE_GATE_DEFAULT = false):
+    // the frozen e2e baseline (tests/e2e/jitrl-ablation.test.ts B3 >= B1)
+    // calibrates the online path WITHOUT interception, and PR-B's verifier-
+    // first scoring already removes the reward-side driver of the first-harm
+    // counterexample (a wrong deliverable no longer scores positive, so the
+    // noop's Q cannot be inflated by falsified success). Enabling the gate is
+    // the release-boundary decision (PR-C): deps.conservativeGate turns it
+    // on, and every decision then records prior/proposed/executed with the
+    // gate reason in the ledger either way.
+    //
+    // Gate semantics when enabled:
+    //   1. a zero-advantage/noop challenger with no measured evidence may
+    //      never replace a prior that holds real evidence (the F4 first-harm
+    //      shape);
+    //   2. an unsupported challenger (exploration-draw advantage) executes
+    //      only against the explicit, revocable exploration budget;
+    //   3. a thin-but-measured challenger (support >= 1, non-zero advantage
+    //      from measured returns) executes and carries n_eff + shrunk/
+    //      calibrated suggestion strength on its record.
+    // -----------------------------------------------------------------
+    if (proposedIndex !== priorIndex && this.conservativeGate) {
+      const proposedAdjustment = decision.adjustments[proposedIndex];
+      const priorAdjustment = decision.adjustments[priorIndex];
+      const challenger = conservativeAdvantage({
+        actionKey: chosenKey,
+        q: proposedAdjustment?.q ?? null,
+        support: proposedAdjustment?.support ?? 0,
+        explored: proposedAdjustment?.explored ?? false,
+        advantage: proposedAdjustment?.advantage ?? 0
+      });
+      // The evidence comparison is TWO-SIDED (review F4: "prior 与 challenger
+      // 的证据都需可比"): the prior earns its place the same way.
+      const prior = conservativeAdvantage({
+        actionKey: decisionCandidates[priorIndex]?.actionKey ?? 'prior',
+        q: priorAdjustment?.q ?? null,
+        support: priorAdjustment?.support ?? 0,
+        explored: priorAdjustment?.explored ?? false,
+        advantage: priorAdjustment?.advantage ?? 0
+      });
+      // A noop cannot carry evidence by construction (it edits nothing), and a
+      // zero-advantage challenger with NO support is exactly the F4 artefact:
+      // its A = 0 comes from the 'baseline' fallback, not from experience.
+      const challengerIsNoop = Object.keys(
+        (decisionCandidates[proposedIndex]?.payload?.patch?.edits ?? {}) as Record<string, unknown>
+      ).length === 0;
+      const zeroAdvantageArtefact = challenger.implicitZeroAdvantage || challengerIsNoop;
+      if (zeroAdvantageArtefact && (prior.hasReplacementEvidence || prior.support > challenger.support)) {
+        // The F4 first-harmful shape: a support=0 (or noop) action with a
+        // fallback-derived A=0 riding over a prior that holds real evidence.
+        // NEVER replaces it - the one hard veto (replayable via gateReason on
+        // every record: 'implicit-zero-advantage').
+        executedIndex = priorIndex;
+        gateReason = 'implicit-zero-advantage';
+      } else if (
+        !challenger.hasReplacementEvidence &&
+        !zeroAdvantageArtefact &&
+        challenger.support === 0 &&
+        this.explorationAllowance > 0
+      ) {
+        // An unsupported challenger whose advantage came from the EXPLORATION
+        // draw (optimistic bonus) rather than measured returns: it executes
+        // against the explicit, revocable budget and is tagged exploration.
+        this.explorationAllowance -= 1;
+        exploration = true;
+      } else if (!challenger.hasReplacementEvidence && challenger.support === 0) {
+        // Unsupported, no budget granted, not the zero-advantage veto shape:
+        // the kernel's choice rested on no measured evidence at all, so the
+        // prior stands. There is NO implicit exploration path (F4-5).
+        executedIndex = priorIndex;
+        gateReason = 'exploration-budget';
+      } else if (!challenger.hasReplacementEvidence) {
+        // Thin-but-measured: the challenger's advantage is non-zero and comes
+        // from measured returns (support >= 1). The kernel's choice executes;
+        // the ledger marks carry n_eff/support and the shrunk, calibrated
+        // suggestion strength, so estimation and replacement stay
+        // distinguishable on every record (F4-1/F4-2: n_eff participates in
+        // the judgement; suggestion strength is shrunk and calibrated).
+      }
+    }
+
+    const executedKey = decisionCandidates[executedIndex]?.actionKey ?? chosenKey;
+    const executedPatch =
+      executedIndex === proposedIndex
+        ? chosen
+        : (byKey.get(executedKey) ??
+          patchFromAugmented(decisionCandidates[executedIndex]?.payload, {
+            actionKey: executedKey,
+            sessionId: input.sessionId,
+            slot: input.slot,
+            id: 'patch-memory-' + this.newId(),
+            createdAt: this.now()
+          })) ?? chosen;
+    if (executedIndex !== proposedIndex) {
+      input.diagnostics.push(
+        'jit_proposal_select: conservative gate fell back to the prior candidate ' +
+          String(priorIndex) +
+          ' (proposed ' +
+          String(proposedIndex) +
+          ' rejected: ' +
+          String(gateReason) +
+          ')'
+      );
+    } else if (exploration) {
+      input.diagnostics.push(
+        'jit_proposal_select: under-evidenced deviation charged to the exploration budget (' +
+          String(this.explorationAllowance) +
+          ' left)'
+      );
+    }
     input.diagnostics.push(
       'jit_proposal_select: selected candidate ' +
-        String(chosenIndex) +
+        String(executedIndex) +
         ' of ' +
         String(decisionCandidates.length) +
         ' (probability ' +
-        String(decision.chosen.probability) +
+        String(decision.adjustments[executedIndex]?.probability ?? decision.chosen.probability) +
         ', klToPrior ' +
         String(decision.klToPrior) +
+        (exploration ? ', exploration' : '') +
         '); not probed: ' +
-        rejected.join(', ')
+        decisionCandidates
+          .filter((_, index) => index !== executedIndex)
+          .map((entry) => entry.actionKey)
+          .join(', ')
     );
-    return { proposed: chosen, chosen: chosenIndex, offered: decisionCandidates.length };
+    // F4-4: semantic edit kind(s) of the executed patch, recorded beside the
+    // action key (see PreparedSelection.semanticKind).
+    const executedEdits = (executedPatch.patch?.edits ?? {}) as Record<string, unknown>;
+    const semanticKinds = [
+      ...new Set(
+        Object.keys(executedEdits)
+          .map((surface) =>
+            semanticEditKindOf(surface as HarnessComponentKey, executedEdits[surface])
+          )
+          .filter((kind): kind is SemanticEditKind => kind !== undefined)
+      )
+    ];
+    return {
+      proposed: executedPatch,
+      chosen: executedIndex,
+      offered: decisionCandidates.length,
+      // F4-3: ALWAYS report the full prior/proposed/executed triple for an L2
+      // decision, including the no-deviation case (proposed === executed ===
+      // prior) - attempted and actual deviation must be countable from every
+      // record, not only the deviating ones.
+      priorIndex,
+      proposedIndex,
+      ...(gateReason === undefined ? {} : { gateReason }),
+      ...(exploration ? { exploration: true } : {}),
+      ...(semanticKinds.length === 0 ? {} : { semanticKind: semanticKinds.join('+') })
+    };
   }
 
   /** Run one candidate inside an isolated branch with branch-scoped memory. */

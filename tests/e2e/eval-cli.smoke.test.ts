@@ -23,12 +23,20 @@
  * absolute path with forward slashes, so no shell, PATH lookup or `node.cmd`
  * shim is involved. Timeouts are generous (the protocol itself takes a few
  * seconds; a cold esbuild precompile of the evaluation library adds a little).
+ *
+ * P6.2-ENV portability note: the two buildEvalLib regressions (PR1-L2 and the
+ * default-cache PR1-L1) call the library through `runBuildEvalLib` - a plain
+ * `node` child process - instead of an in-process `import(file://...)`.
+ * Vitest 3.2.7 on Windows does not strip the target's `#!` shebang when it
+ * intercepts such an import, so the in-process form died with
+ * `SyntaxError: Invalid or unexpected token` on the unmodified baseline. The
+ * script itself is fine (plain `node` imports it); see runBuildEvalLib.
  */
 import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
@@ -89,6 +97,93 @@ interface SmokeReport {
     readonly safety?: Record<string, unknown>;
   }[];
   readonly timing?: { readonly totalMs?: unknown };
+}
+
+/** The serializable subset of buildEvalLib's result this suite asserts on. */
+interface BuildEvalLibResult {
+  readonly outfile?: string;
+  readonly digest?: string;
+  readonly mode?: string;
+  readonly rebuilt?: boolean;
+}
+
+/**
+ * Run one `buildEvalLib(...)` call in a plain-node subprocess (P6.2-ENV).
+ *
+ * Why a subprocess instead of `await import(pathToFileURL(BUILD_EVAL))`:
+ * Vitest 3.2.7's transform pipeline does not strip the `#!` shebang line when
+ * it intercepts a dynamic `file://` import of an `.mjs` file on Windows, so
+ * the in-process import dies with `SyntaxError: Invalid or unexpected token`
+ * pointing at the `#!/usr/bin/env node` line of scripts/eval/build-eval.mjs -
+ * even though plain `node` imports the same URL perfectly well (verified by
+ * `node -e "import(pathToFileURL(...))"` succeeding). This is a Vitest
+ * transform limitation, NOT a defect of the script, so the fix belongs in the
+ * test (route the import through a real node child), not in scripts/eval.
+ *
+ * The child is spawned exactly like runCli does for the CLI: `process.execPath`
+ * with `--input-type=commonjs -e <script>`, so no vitest transform is involved
+ * and the behaviour under test is the one a user's `node` would see. The child
+ * prints one JSON line - `{ ok: true, result }` on success, exit 1 + the error
+ * stack on stderr otherwise - and `result` carries the serializable fields
+ * (outfile, digest, mode, rebuilt) the assertions below need.
+ */
+function runBuildEvalLib(options: Record<string, unknown>): Promise<BuildEvalLibResult> {
+  const script =
+    "const { pathToFileURL } = require('node:url');\n" +
+    'const BUILD_EVAL = ' + JSON.stringify(BUILD_EVAL) + ';\n' +
+    'import(pathToFileURL(BUILD_EVAL).href).then(async (m) => {\n' +
+    '  const result = await m.buildEvalLib(' + JSON.stringify(options) + ');\n' +
+    '  process.stdout.write(JSON.stringify({ ok: true, result }));\n' +
+    '}).catch((error) => {\n' +
+    '  process.stderr.write(String((error && error.stack) || error));\n' +
+    '  process.exit(1);\n' +
+    '});\n';
+  return new Promise((resolvePromise, reject) => {
+    execFile(
+      process.execPath,
+      ['--input-type=commonjs', '-e', script],
+      {
+        cwd: REPO_ROOT,
+        timeout: CLI_TIMEOUT_MS,
+        maxBuffer: 32 * 1024 * 1024,
+        windowsHide: true,
+        encoding: 'utf8'
+      },
+      (error, stdout, stderr) => {
+        const status = error === null ? 0 : typeof error.code === 'number' ? error.code : -1;
+        if (status !== 0) {
+          reject(
+            new Error(
+              'buildEvalLib subprocess failed (exit ' + String(status) + ')\nstderr: ' +
+                String(stderr).slice(0, 4_000)
+            )
+          );
+          return;
+        }
+        try {
+          const parsed = JSON.parse(String(stdout)) as {
+            readonly ok: boolean;
+            readonly result?: BuildEvalLibResult;
+            readonly error?: string;
+          };
+          if (!parsed.ok) {
+            reject(new Error('buildEvalLib rejected the call: ' + String(parsed.error)));
+            return;
+          }
+          resolvePromise(parsed.result ?? {});
+        } catch (parseError) {
+          reject(
+            new Error(
+              'buildEvalLib subprocess stdout is not JSON: ' +
+                (parseError instanceof Error ? parseError.message : String(parseError)) +
+                '\nfirst 1_000 chars:\n' +
+                String(stdout).slice(0, 1_000)
+            )
+          );
+        }
+      }
+    );
+  });
 }
 
 describe('eval CLI: the documented command runs as written', () => {
@@ -221,8 +316,6 @@ describe('eval CLI: cache directory and pruning regressions', () => {
   it(
     'PR1-L2: pruning removes the oldest artifacts, not the newest',
     async () => {
-      const { buildEvalLib } = await import(pathToFileURL(BUILD_EVAL).href);
-
       const cacheDir = mkdtempSync(join(tmpdir(), 'dsh-eval-prune-'));
       try {
         // The cap is 12 artifacts; create 13 with strictly increasing mtime so
@@ -239,11 +332,20 @@ describe('eval CLI: cache directory and pruning regressions', () => {
         }
 
         // Building into the same cache with the matching name triggers pruning.
-        const result = await buildEvalLib({ name: 'prime', cacheDir });
-        expect(existsSync(result.outfile), 'the fresh artifact must survive').toBe(true);
+        // The build runs in a plain-node subprocess (see runBuildEvalLib): the
+        // in-process dynamic import of build-eval.mjs is not portable under
+        // vitest's transform on Windows (shebang handling), while the pruning
+        // behaviour under test is filesystem-side and observable either way.
+        const result = await runBuildEvalLib({ name: 'prime', cacheDir });
+        expect(result.outfile, 'buildEvalLib must report an outfile').toBeDefined();
+        expect(existsSync(result.outfile as string), 'the fresh artifact must survive').toBe(true);
 
         const survivors = readdirSync(cacheDir)
-          .filter((name) => name.startsWith(primePrefix) && name !== primePrefix + result.digest.slice(0, 20) + '.mjs')
+          .filter(
+            (name) =>
+              name.startsWith(primePrefix) &&
+              name !== primePrefix + (result.digest ?? '').slice(0, 20) + '.mjs'
+          )
           .sort();
         // 13 spares + keep, cap 12 => two spares are dropped, and they must be
         // the two oldest (prime.00 and prime.01).
@@ -265,11 +367,14 @@ describe('eval CLI: cache directory and pruning regressions', () => {
     async () => {
       // The default/CI path must keep the reviewed behaviour: dependencies stay
       // external there (smaller artifact) because node_modules is resolvable.
-      const { buildEvalLib } = await import(pathToFileURL(BUILD_EVAL).href);
+      // Runs in a plain-node subprocess for the same portability reason as
+      // PR1-L2 (see runBuildEvalLib); the asserted fields (mode, outfile) come
+      // back from the child as JSON, unchanged in meaning.
       const cacheDir = REPO_ROOT + 'node_modules/.cache/dsh-plugin-evo-harness';
-      const result = await buildEvalLib({ cacheDir });
+      const result = await runBuildEvalLib({ cacheDir });
       expect(result.mode).toBe('external');
-      expect(existsSync(result.outfile)).toBe(true);
+      expect(result.outfile).toBeDefined();
+      expect(existsSync(result.outfile as string)).toBe(true);
     },
     CLI_TIMEOUT_MS
   );

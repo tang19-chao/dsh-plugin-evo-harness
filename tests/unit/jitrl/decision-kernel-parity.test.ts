@@ -73,7 +73,7 @@ import {
   slotKindOfActionKey
 } from '../../../src/jitrl/jit-active-policy';
 import { policyPriorLogit } from '../../../src/jitrl/logit-sources';
-import { EXPERIENCE_SCHEMA_VERSION } from '../../../src/jitrl/experience-store';
+import { CURRENT_REWARD_VERSION, EXPERIENCE_SCHEMA_VERSION } from '../../../src/jitrl/experience-store';
 import { createJitReplayHook } from '../../../src/jitrl/index';
 import { retrieveNeighbors } from '../../../src/jitrl/retriever';
 import { abstractMetaState } from '../../../src/jitrl/state-abstraction';
@@ -197,6 +197,7 @@ interface MetaRecordInput {
   readonly actionKey?: string;
   readonly level?: ExperienceRecord['level'];
   readonly experienceSchemaVersion?: number;
+  readonly rewardVersion?: string;
   readonly learningEligible?: boolean;
 }
 
@@ -222,6 +223,14 @@ function makeMetaRecord(options: MetaRecordInput): ExperienceRecord {
     // (plan section 6.5), so the default fixture must carry the live version or
     // a legacy-excluding query would drop the whole history.
     experienceSchemaVersion: options.experienceSchemaVersion ?? EXPERIENCE_SCHEMA_VERSION,
+    // P6.2 PR-A: the live writer also stamps the current reward contract id;
+    // the unified predicate is exact-contract and fail-closed, so the fixture
+    // must carry it too or the whole parity history would be excluded.
+    ...(options.rewardVersion === undefined &&
+      (options.experienceSchemaVersion !== undefined &&
+        options.experienceSchemaVersion < EXPERIENCE_SCHEMA_VERSION)
+      ? {}
+      : { rewardVersion: options.rewardVersion ?? CURRENT_REWARD_VERSION }),
     ...(options.learningEligible === undefined
       ? {}
       : { learningEligible: options.learningEligible })

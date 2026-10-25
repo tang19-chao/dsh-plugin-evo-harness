@@ -12,9 +12,12 @@ import type {
   HarnessComponentKey
 } from '../../../src/types/contracts';
 import {
+  actionKeyConflictRate,
   normalizeMetaAction,
   normalizePatchSignature,
-  normalizeToolActionKey
+  normalizeSemanticActionKey,
+  normalizeToolActionKey,
+  semanticEditKindOf
 } from '../../../src/jitrl/action-normalizer';
 
 function patch(
@@ -423,5 +426,123 @@ describe('normalizeToolActionKey', () => {
         tool: normalizeToolActionKey('shell', { cmd: 'pnpm test', cwd: '/repo' })
       }).toEqual(first);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P6.2 PR-B / F4-4: semantic action keys (correct vs destructive separation)
+// ---------------------------------------------------------------------------
+
+describe('P6.2 PR-B: semanticEditKindOf', () => {
+  it('classifies guardrails edits by direction, not by rule text', () => {
+    expect(
+      semanticEditKindOf('guardrails', { kind: 'guardrails', appendRules: ['be careful'] })
+    ).toBe('constructive');
+    expect(
+      semanticEditKindOf('guardrails', {
+        kind: 'guardrails',
+        toolPreconditions: [{ toolName: 'shell', rule: 'no sudo' }]
+      })
+    ).toBe('constructive');
+    expect(
+      semanticEditKindOf('guardrails', { kind: 'guardrails', forbiddenActions: ['rm -rf /'] })
+    ).toBe('destructive');
+    expect(
+      semanticEditKindOf('guardrails', { kind: 'guardrails', formatContract: 'json' })
+    ).toBe('neutral');
+  });
+
+  it('marks a whole-prompt replacement as destructive', () => {
+    expect(
+      semanticEditKindOf('system_prompt', { kind: 'system_prompt', mode: 'replace' })
+    ).toBe('destructive');
+    expect(
+      semanticEditKindOf('system_prompt', { kind: 'system_prompt', mode: 'append' })
+    ).toBe('constructive');
+  });
+});
+
+describe('P6.2 PR-B: normalizeSemanticActionKey', () => {
+  it('never merges a correct append with a destructive forbid on the same surface', () => {
+    const correct = normalizeSemanticActionKey(
+      patch({ guardrails: { kind: 'guardrails', appendRules: ['always run tests'] } })
+    );
+    const destructive = normalizeSemanticActionKey(
+      patch({ guardrails: { kind: 'guardrails', forbiddenActions: ['run tests'] } })
+    );
+    expect(correct).toContain('constructive');
+    expect(destructive).toContain('destructive');
+    expect(correct).not.toBe(destructive);
+  });
+
+  it('keeps the same semantic edit stable across rule-text changes', () => {
+    const first = normalizeSemanticActionKey(
+      patch({ guardrails: { kind: 'guardrails', appendRules: ['rule one text'] } })
+    );
+    const second = normalizeSemanticActionKey(
+      patch({ guardrails: { kind: 'guardrails', appendRules: ['completely different text'] } })
+    );
+    expect(second).toBe(first);
+  });
+
+  it('encodes preconditions and targets (edit type + semantic signature + preconditions)', () => {
+    const withPrecondition = normalizeSemanticActionKey(
+      patch({
+        guardrails: {
+          kind: 'guardrails',
+          toolPreconditions: [{ toolName: 'shell', rule: 'no sudo' }]
+        }
+      })
+    );
+    expect(withPrecondition).toContain('pre:shell');
+    const key = normalizeSemanticActionKey(
+      patch({ skills: { kind: 'skills', skills: [{ name: 'a-skill', markdown: '# x' }] } })
+    );
+    expect(key).toBe('skills:constructive(a-skill)');
+    expect(normalizeSemanticActionKey(patch({}))).toBe('noop');
+  });
+
+  it('separates by target set: two destructive edits on different tools differ', () => {
+    const forbidShell = normalizeSemanticActionKey(
+      patch({ guardrails: { kind: 'guardrails', forbiddenActions: ['run shell'] } })
+    );
+    const forbidWrite = normalizeSemanticActionKey(
+      patch({ guardrails: { kind: 'guardrails', forbiddenActions: ['write files'] } })
+    );
+    expect(forbidShell).not.toBe(forbidWrite);
+  });
+});
+
+describe('P6.2 PR-B: actionKeyConflictRate (positive/negative conflict-rate test)', () => {
+  // Positive examples: the SAME semantic edit (append two guardrail rules)
+  // with different concrete rule text - these SHOULD collide.
+  const positives = [
+    patch({ guardrails: { kind: 'guardrails', appendRules: ['a', 'b'] } }),
+    patch({ guardrails: { kind: 'guardrails', appendRules: ['c', 'd'] } }),
+    patch({ guardrails: { kind: 'guardrails', appendRules: ['e', 'f'] } })
+  ].map(normalizeSemanticActionKey);
+
+  // Negative examples: correct appends vs destructive forbids on the same
+  // surface - these MUST NOT collide.
+  const destructive = [
+    patch({ guardrails: { kind: 'guardrails', forbiddenActions: ['x'] } }),
+    patch({ guardrails: { kind: 'guardrails', forbiddenActions: ['y'] } }),
+    patch({ guardrails: { kind: 'guardrails', forbiddenActions: ['z'] } })
+  ].map(normalizeSemanticActionKey);
+
+  it('collides far more within a semantic class than across classes', () => {
+    const within = actionKeyConflictRate(positives, positives);
+    const across = actionKeyConflictRate(positives, destructive);
+    expect(within.rate).toBeGreaterThan(0);
+    expect(within.rate).toBeGreaterThan(across.rate);
+    expect(across.rate).toBe(0);
+  });
+
+  it('reports zero collisions for empty inputs and counts pairs honestly', () => {
+    expect(actionKeyConflictRate([], positives).rate).toBe(0);
+    const one = actionKeyConflictRate([positives[0] ?? 'x'], positives);
+    expect(one.pairs).toBe(positives.length);
+    // All three positives share one key, so every pair collides.
+    expect(one.collisions).toBe(positives.length);
   });
 });

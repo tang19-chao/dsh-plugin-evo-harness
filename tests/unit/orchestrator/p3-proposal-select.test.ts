@@ -900,6 +900,87 @@ describe('jit_proposal_select (K proposals, one probe)', () => {
     // the portfolio spelling that alignNeighbors would drop.
     expect(meta[0]?.actionKey.startsWith('slot:')).toBe(true);
     expect(slotKindOfActionKey(meta[0]?.actionKey ?? '')).toBeDefined();
+
+    // P6.2 PR-B / F4-3: the prior/proposed/executed triple rides on every L2
+    // record (decision marks in rewardSources), so attempted deviation and
+    // actual deviation are countable separately from the store.
+    const sources = proposal[0]?.rewardSources as Record<string, number | undefined>;
+    expect(sources?.decisionPriorIndex).toBeDefined();
+    expect(sources?.decisionProposedIndex).toBeDefined();
+    expect(sources?.decisionExecutedIndex).toBeDefined();
+    expect(sources?.decisionExecutedIndex).toBe(sources?.decisionProposedIndex);
+    // No exploration was charged (the gate is off and no budget was granted).
+    expect(sources?.exploration).toBeUndefined();
+  });
+
+  it('P6.2 PR-B F4-3: reports attempted and actual deviation separately in the stage detail', async () => {
+    const harness = makeHarness({ candidatesPerCall: 3 });
+    // Seed the same contrast the chosen-key test uses, so the L2 decision
+    // genuinely runs and the ledger counters have one decision to count.
+    const favored = harness.patches[1] as EightSurfacePatch;
+    const state = abstractProposalState({
+      task: TASK as never,
+      round: 1,
+      parentDepth: 0,
+      parentSlot: 'explore_domain',
+      memoryConfidence: RECALL_CONFIDENCE,
+      referenceStatus: 'failed',
+      slot: 'explore_domain',
+      guidance: 'memory'
+    });
+    await harness.store.append([
+      {
+        id: 'seed-proposal-1-negative',
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        rewardVersion: CURRENT_REWARD_VERSION,
+        level: 'proposal',
+        state,
+        actionKey: normalizePatchSignature(harness.patches[0] as EightSurfacePatch),
+        reward: -3,
+        return: -3,
+        rewardSources: { surrogate: 1 },
+        guidance: 'memory',
+        policyId: POLICY.id,
+        sessionId: 'session-p3',
+        treeId: 'tree-seed',
+        createdAt: CLOCK_START,
+        redacted: true
+      },
+      {
+        id: 'seed-proposal-2-positive',
+        experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        rewardVersion: CURRENT_REWARD_VERSION,
+        level: 'proposal',
+        state,
+        actionKey: normalizePatchSignature(favored),
+        reward: 3,
+        return: 3,
+        rewardSources: { surrogate: 1 },
+        guidance: 'memory',
+        policyId: POLICY.id,
+        sessionId: 'session-p3',
+        treeId: 'tree-seed',
+        createdAt: CLOCK_START,
+        redacted: true
+      }
+    ]);
+    await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    const record = (
+      harness.events
+        .filter((event) => event.stage === 'record_experience')
+        .at(-1)?.detail as { readonly detail?: Record<string, unknown> } | undefined
+    )?.detail;
+    expect(record).toBeDefined();
+    expect(record?.l2Decisions).toBe(1);
+    expect(typeof record?.attemptedDeviations).toBe('number');
+    expect(typeof record?.actualDeviations).toBe('number');
+    expect(record?.explorationCharged).toBe(0);
+    // The verifier-first rule is visible on the stage detail.
+    expect(record?.verifierFirstRule).toBe('verifier-first-completion-v1');
   });
 
   it('reuses the single-candidate result instead of calling propose() again', async () => {

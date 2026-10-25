@@ -28,7 +28,7 @@ import {
 import { parseEvoHarnessConfig, validateEvoHarnessConfig } from '../../../src/config';
 import { abstractMetaState } from '../../../src/jitrl/state-abstraction';
 import { normalizeMetaAction } from '../../../src/jitrl/action-normalizer';
-import { EXPERIENCE_SCHEMA_VERSION } from '../../../src/jitrl/experience-store';
+import { EXPERIENCE_SCHEMA_VERSION, CURRENT_REWARD_VERSION } from '../../../src/jitrl/experience-store';
 import { readJitDiagnostics } from '../../../src/jitrl/jit-active-policy';
 import { e2eConfig } from '../../e2e/fixtures';
 
@@ -168,6 +168,12 @@ function surfaceHistory(
     // correctly excludes all of them - which is what made this test depend on
     // the filter being unimplemented.
     experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+    // P6.2 PR-A: the live writer also stamps the current reward contract id;
+    // without it the record fails the exact-contract eligibility check
+    // (fail-closed on a missing version) and the seeded preference never
+    // reaches the neighbourhood.
+    rewardVersion: CURRENT_REWARD_VERSION,
+    learningEligible: true,
     createdAt: T0 - 100,
     redacted: true
   }));

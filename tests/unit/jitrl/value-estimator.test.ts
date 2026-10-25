@@ -13,6 +13,8 @@ import type {
 } from '../../../src/types/contracts';
 import {
   ADVANTAGE_EPSILON,
+  conservativeAdvantage,
+  effectiveSampleSize,
   estimateActionValues,
   estimateActionValuesWithContract,
   estimateStateValue,
@@ -388,6 +390,120 @@ describe('normalizeAdvantages', () => {
     expect(() => normalizeAdvantages([Number.POSITIVE_INFINITY])).toThrow(RangeError);
     expect(() => normalizeAdvantages([1], -1)).toThrow(RangeError);
     expect(() => normalizeAdvantages([1], Number.NaN)).toThrow(RangeError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P6.2 PR-B / F4: conservative replacement evidence (estimation != replace)
+// ---------------------------------------------------------------------------
+
+describe('P6.2 PR-B: effective sample size', () => {
+  it('computes n_eff = (Σw)² / Σw² and shrinks under concentrated weights', () => {
+    // Equal weights: n_eff equals the raw count.
+    expect(effectiveSampleSize([1, 1, 1, 1])).toBeCloseTo(4, 12);
+    // One dominant weight + nine near-zero: "10 records" is n_eff ~ 1.19.
+    expect(effectiveSampleSize([1, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01])).toBeCloseTo(
+      1.09 * 1.09 / (1 + 9 * 0.0001),
+      12
+    );
+    expect(effectiveSampleSize([0.5, 0.5])).toBeCloseTo(2, 12);
+    expect(effectiveSampleSize([2, 2])).toBeCloseTo(2, 12);
+  });
+
+  it('returns 0 for empty, all-zero or negative-weight inputs', () => {
+    expect(effectiveSampleSize([])).toBe(0);
+    expect(effectiveSampleSize([0, 0])).toBe(0);
+    expect(effectiveSampleSize([-1, 1])).toBe(1);
+  });
+
+  it('is carried on every estimate (nEff participates in the judgement)', () => {
+    const supported = estimateActionValues(
+      STATE,
+      figureNeighbors(),
+      figureCandidates(),
+      { ...CONFIG, unseenFallback: 'zero' }
+    );
+    // a1/a2 hold 2 equally-weighted records (n_eff 2); a3 holds 1 (n_eff 1).
+    expect(byActionKey(supported, 'a1').nEff).toBeCloseTo(2, 12);
+    expect(byActionKey(supported, 'a2').nEff).toBeCloseTo(2, 12);
+    expect(byActionKey(supported, 'a3').nEff).toBeCloseTo(1, 12);
+    // Unsupported actions carry nEff 0.
+    const unsupported = estimateActionValues(
+      STATE,
+      figureNeighbors(),
+      [{ actionKey: 'a4', baseLogit: 0, source: 'policy_prior', payload: 'a4' }],
+      CONFIG,
+      () => 0.99
+    );
+    expect(byActionKey(unsupported, 'a4').nEff).toBe(0);
+  });
+});
+
+describe('P6.2 PR-B: conservativeAdvantage (shrinkage + calibrated scale)', () => {
+  it('marks the zero-advantage-without-support artefact (the F4 hole)', () => {
+    // The first-harm shape: unsupported action, 'baseline' fallback, A = 0.
+    const artefact = conservativeAdvantage({
+      actionKey: 'noop',
+      q: null,
+      support: 0,
+      nEff: 0,
+      explored: false,
+      advantage: 0
+    });
+    expect(artefact.implicitZeroAdvantage).toBe(true);
+    expect(artefact.hasReplacementEvidence).toBe(false);
+    expect(artefact.shrunkAdvantage).toBe(0);
+    // A supported action with the same advantage is NOT the artefact.
+    const supported = conservativeAdvantage({
+      actionKey: 'a',
+      q: 0.6,
+      support: 2,
+      nEff: 2,
+      explored: false,
+      advantage: 0
+    });
+    expect(supported.implicitZeroAdvantage).toBe(false);
+  });
+
+  it('shrinks under-evidenced advantages and calibrates on the fixed scale', () => {
+    // n_eff = 2, k = 2: A_shrunk = A * 2/(2+2) = A/2.
+    const thin = conservativeAdvantage({
+      actionKey: 'a',
+      q: 1.6,
+      support: 2,
+      nEff: 2,
+      explored: false,
+      advantage: 1.0
+    });
+    expect(thin.hasReplacementEvidence).toBe(true);
+    expect(thin.shrunkAdvantage).toBeCloseTo(0.5, 12);
+    // Calibrated: the [-3,3] scale maps a maximal raw advantage to ±1; small
+    // noise stays small instead of being max-normalized to ~±1.
+    expect(thin.calibratedAdvantage).toBeCloseTo(0.5 / 3, 12);
+    const tiny = conservativeAdvantage({
+      actionKey: 'a',
+      q: 0.05,
+      support: 4,
+      nEff: 4,
+      explored: false,
+      advantage: 0.05
+    });
+    expect(tiny.calibratedAdvantage).toBeCloseTo((0.05 * 4 / 6) / 3, 12);
+    expect(Math.abs(tiny.calibratedAdvantage)).toBeLessThan(0.02);
+  });
+
+  it('zeroes the suggestion below the evidence floor (estimation != replacement)', () => {
+    const below = conservativeAdvantage({
+      actionKey: 'a',
+      q: 2,
+      support: 1,
+      nEff: 1,
+      explored: false,
+      advantage: 1.4
+    });
+    expect(below.hasReplacementEvidence).toBe(false);
+    expect(below.shrunkAdvantage).toBe(0);
+    expect(below.calibratedAdvantage).toBe(0);
   });
 });
 

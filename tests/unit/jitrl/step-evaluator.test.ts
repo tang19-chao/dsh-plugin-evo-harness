@@ -9,10 +9,12 @@ import { describe, expect, it } from 'vitest';
 import {
   COMPLETION_SIGNAL,
   MISSING_DELIVERABLE_SIGNAL,
+  VERIFICATION_FAILED_SIGNAL,
   combineStepRewards,
   createStepEvaluator,
   discountedReturn,
   isLearningOutcome,
+  isTrustedVerification,
   scoreTrajectorySignals,
   surrogateSignal,
   turnSignalForStatus,
@@ -481,10 +483,99 @@ describe('P6.1-D: the single trajectory-signal yardstick', () => {
       makeTrajectory({ deliverable: { content: 'the patch', format: 'text' } })
     );
     const empty = scoreUnderRewardContract(makeTrajectory({ deliverable: undefined }));
-    // Both "succeeded", but the verifier-first signal keeps them apart.
-    expect(delivered.sources.completion).toBe(COMPLETION_SIGNAL);
+    // Both "succeeded", but the verifier-first signal keeps them apart: an
+    // UNVERIFIED deliverable is a process observation (completion 0), while a
+    // claimed success without any deliverable is still refuted (-1).
+    expect(delivered.sources.completion).toBe(0);
     expect(empty.sources.completion).toBe(MISSING_DELIVERABLE_SIGNAL);
     expect(delivered.reward).toBeGreaterThan(empty.reward);
+  });
+
+  it('P6.2 PR-B F3: a non-empty but explicitly refuted deliverable is not a success', () => {
+    // The review's probe: a fluent-but-WRONG deliverable under a failed
+    // trusted verification. Pre-PR-B this scored completion=+1, reward
+    // ~+0.9333, learningEligible=true. Now the verdict decides.
+    const wrong = makeTrajectory({
+      deliverable: { content: 'a confident, detailed, but incorrect answer', format: 'text' },
+      metadata: {
+        verification: {
+          status: 'failed',
+          verifierId: 'ci-verifier',
+          verifierVersion: '1.0.0',
+          evidenceHash: 'abc123',
+          checks: [{ id: 'tests-pass', passed: false }]
+        }
+      }
+    });
+    const score = scoreUnderRewardContract(wrong);
+    expect(score.sources.completion).toBe(VERIFICATION_FAILED_SIGNAL);
+    // Lexicographic quality constraint: tool smoothness cannot buy back a
+    // positive score after an acceptance failure.
+    expect(score.reward).toBeLessThanOrEqual(0);
+    // A falsified success claim is not a positive learning sample.
+    expect(score.learningEligible).toBe(false);
+    expect(score.taskSuccess).toBe(false);
+    expect(score.executionSuccess).toBe(true);
+  });
+
+  it('P6.2 PR-B F3: only a trusted PASSED verification earns completion=+1', () => {
+    const verified = makeTrajectory({
+      deliverable: { content: 'the correct patch', format: 'text' },
+      metadata: {
+        verification: {
+          status: 'passed',
+          verifierId: 'ci-verifier',
+          verifierVersion: '1.0.0',
+          evidenceHash: 'abc123',
+          checks: [{ id: 'tests-pass', passed: true }]
+        }
+      }
+    });
+    const score = scoreUnderRewardContract(verified);
+    expect(score.sources.completion).toBe(COMPLETION_SIGNAL);
+    expect(score.taskSuccess).toBe(true);
+    expect(score.learningEligible).toBe(true);
+    expect(score.reward).toBeGreaterThan(0);
+    // A 'passed' attached to a FAILED execution is contradictory -> unknown.
+    const contradicted = makeTrajectory({
+      status: 'failed',
+      deliverable: { content: 'x', format: 'text' },
+      metadata: {
+        verification: {
+          status: 'passed',
+          verifierId: 'ci-verifier',
+          verifierVersion: '1.0.0',
+          evidenceHash: 'abc123',
+          checks: [{ id: 'tests-pass', passed: true }]
+        }
+      }
+    });
+    expect(scoreUnderRewardContract(contradicted).sources.completion).not.toBe(COMPLETION_SIGNAL);
+  });
+
+  it('P6.2 PR-B F3: malformed or missing verification payloads fail closed to unknown', () => {
+    // A verification payload without the complete trusted shape proves
+    // nothing: 'passed' never falls out of a partial object.
+    const malformed = makeTrajectory({
+      deliverable: { content: 'x', format: 'text' },
+      metadata: { verification: { status: 'passed' } }
+    });
+    const score = scoreUnderRewardContract(malformed);
+    expect(score.verification.status).toBe('unknown');
+    expect(score.sources.completion).toBe(0);
+    expect(score.taskSuccess).toBe(false);
+    // A bare string / wrong-shape payload is equally untrusted.
+    expect(isTrustedVerification('passed')).toBe(false);
+    expect(isTrustedVerification({ status: 'passed', checks: [] })).toBe(false);
+    expect(
+      isTrustedVerification({
+        status: 'passed',
+        verifierId: 'v',
+        verifierVersion: '1',
+        evidenceHash: 'h',
+        checks: [{ id: 'c', passed: 'yes' }]
+      })
+    ).toBe(false);
   });
 
   it('④ bounds padding: more meaningless successful calls cannot inflate the score', () => {

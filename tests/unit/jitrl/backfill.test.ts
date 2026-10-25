@@ -528,7 +528,10 @@ describe('P6 PR4: rebuild provenance and legacy isolation', () => {
       expect(record.experienceSchemaVersion).toBe(EXPERIENCE_SCHEMA_VERSION);
       expect(record.rewardVersion).toBe(BACKFILL_REWARD_VERSION);
       expect(record.provenanceVersion).toBe(BACKFILL_PROVENANCE_VERSION);
-      expect(record.learningEligible).toBe(true);
+      // P6.2 PR-A / F2: a surrogate-only rebuild is SURROGATE PRIOR /
+      // audit-only - the surrogate tree rebuild is not the online r3 target,
+      // so the record never enters the learning neighbourhood.
+      expect(record.learningEligible).toBe(false);
       // The tree can prove the node/parent pair, so it is recorded; the round
       // and trajectory are recorded only when the node carries them.
       expect(record.nodeId).toBeTypeOf('string');
@@ -540,9 +543,11 @@ describe('P6 PR4: rebuild provenance and legacy isolation', () => {
     }
   });
 
-  it('makes rebuilt records visible to a legacy-filtered query', async () => {
-    // The point of stamping: a rebuilt record must survive excludeLegacy, unlike
-    // a pre-PR4 line that carries no schema version at all.
+  it('keeps surrogate-only rebuilds AUDIT-visible but OUT of the learning query', async () => {
+    // P6.2 PR-A / F2: the surrogate rebuild survives excludeLegacy (schema is
+    // current) and stays readable for audit, but the learningEligibleOnly
+    // query must not accept it - the online r3 neighbourhood is reserved for
+    // exact-contract records (online writer or certified rescore).
     const store = createMemoryExperienceStore({ now: () => T0 });
     const result = await backfillFromTreePool({ pool: [fixtureTree()], store });
     expect(result.records.length).toBeGreaterThan(0);
@@ -551,14 +556,23 @@ describe('P6 PR4: rebuild provenance and legacy isolation', () => {
     if (first === undefined) {
       return;
     }
-    const learning = await store.query({
+    const audit = await store.query({
       level: 'meta',
       state: first.state,
       k: 10,
       similarityThreshold: 0,
       excludeLegacy: true
     });
-    expect(learning.length).toBeGreaterThan(0);
+    expect(audit.length).toBeGreaterThan(0);
+    const learning = await store.query({
+      level: 'meta',
+      state: first.state,
+      k: 10,
+      similarityThreshold: 0,
+      excludeLegacy: true,
+      learningEligibleOnly: true
+    });
+    expect(learning).toHaveLength(0);
   });
 
   it('counts new vs legacy samples and marks legacy copies without touching the source', async () => {
@@ -580,10 +594,13 @@ describe('P6 PR4: rebuild provenance and legacy isolation', () => {
     const before = JSON.stringify(source);
 
     const result = await migrateExperienceRecords({ records: source });
-    expect(result.current).toBe(rebuilt.length);
-    expect(result.legacy).toBe(1);
-    expect(result.excludedFromLearning).toBe(1);
-    expect(result.marked).toHaveLength(1);
+    // P6.2 PR-A: surrogate backfill lines are quarantined by the migration
+    // (rewardVersion not certified against the current contract), so `current`
+    // is 0 and every rebuilt line plus the legacy line are marked copies.
+    expect(result.current).toBe(0);
+    expect(result.legacy).toBe(source.length);
+    expect(result.excludedFromLearning).toBe(source.length);
+    expect(result.marked).toHaveLength(source.length);
     expect(result.marked[0]?.id).toBe('legacy-online-1');
     expect(result.marked[0]?.rewardVersion).toBe('legacy');
     expect(result.marked[0]?.learningEligible).toBe(false);
@@ -591,8 +608,9 @@ describe('P6 PR4: rebuild provenance and legacy isolation', () => {
     expect(JSON.stringify(source)).toBe(before);
 
     const partition = partitionExperienceRecords(source);
-    expect(partition.learning).toHaveLength(rebuilt.length);
-    expect(partition.auditOnly.map((record) => record.id)).toEqual(['legacy-online-1']);
+    // P6.2 PR-A: surrogate-only rebuilds are audit-only, so learning is empty.
+    expect(partition.learning).toHaveLength(0);
+    expect(partition.auditOnly).toHaveLength(source.length);
   });
 
   it('writes the marked copies only to the injected audit sink (rollback = drop it)', async () => {

@@ -47,6 +47,8 @@ import { DEFAULT_EVO_HARNESS_CONFIG } from '../config';
 import {
   EXPERIENCE_SCHEMA_VERSION
 } from './experience-store';
+import { CURRENT_REWARD_VERSION } from './experience-store';
+import { isLearningEligibleRecord } from './reward-contract';
 import type {
   AbstractState,
   BatchSlotKind,
@@ -648,14 +650,19 @@ export interface ExperienceFilterOptions {
 }
 
 /**
- * The filter a *learning* consumer must apply (plan sections 6.2 and 6.5).
+ * The filter a *learning* consumer must apply (plan sections 6.2 and 6.5,
+ * P6.2 PR-A / F1).
  *
  * A learning consumer is anything whose output trains the policy or decides
  * which policy to publish: the online L1 neighbourhood, the replay
- * neighbourhood, and the M3 fresh-policy support count. For those, evidence
- * produced under an older reward/provenance model (legacy) and evidence that was
- * never a quality signal (user cancellation, infrastructure failure) must not
- * enter the estimate at all.
+ * neighbourhood, the L2 selector, the L3 advisor query, the M3 fresh-policy
+ * support count and the store's `learningEligibleOnly` query. For those,
+ * evidence produced under an older reward/provenance model (legacy), evidence
+ * that was never a quality signal (user cancellation, infrastructure failure),
+ * and - P6.2 PR-A - evidence whose rewardVersion is not the EXACT current
+ * contract id (or a certified compatible id) must not enter the estimate at
+ * all. A record with a missing version field is NOT trusted by default: it
+ * fails closed.
  *
  * The defaults on {@link ExperienceFilterOptions} stay permissive because the
  * store, the audit path and pre-PR5 callers legitimately read the whole level;
@@ -704,9 +711,27 @@ export function isLegacyExperienceRecord(
   return version === undefined || !Number.isFinite(version) || version < minimum;
 }
 
-/** True when a record may train the policy (explicit false, or legacy). */
+/**
+ * THE single learning-eligibility predicate (P6.2 PR-A / F1).
+ *
+ * This name is what every learning consumer imports; the implementation lives
+ * in the leaf contract module (`isLearningEligibleRecord` in
+ * ./reward-contract.ts) so the store and the kernel share ONE rule without an
+ * import cycle. The store's `isLearningEligible(StoredExperience)`, the
+ * partition/migration planners, L1/L2/L3, replay and the M3 fresh count all
+ * delegate here (see the implementation doc for the three checks):
+ *   1. `learningEligible !== false`;
+ *   2. schema version >= current (missing = legacy, fail-closed);
+ *   3. rewardVersion is the EXACT current contract id or a certified
+ *      compatible id (missing fails closed; surrogate backfill is not
+ *      compatible).
+ *
+ * Before P6.2 this function skipped check 3 entirely (the store kept its own
+ * copy), so the L1/replay snapshot path mixed old-r2 and surrogate-r3 records
+ * into estimates the strict store.query path already excluded.
+ */
 export function isLearningEligibleExperience(record: ExperienceRecord): boolean {
-  return record.learningEligible !== false && !isLegacyExperienceRecord(record);
+  return isLearningEligibleRecord(record, CURRENT_REWARD_VERSION);
 }
 
 /** The single filter predicate: every kernel consumer shares it. */

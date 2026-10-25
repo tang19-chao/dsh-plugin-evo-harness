@@ -76,6 +76,12 @@ export interface ActionValueEstimate {
   readonly q: number | null;
   /** Number of usable neighbours for this action. */
   readonly support: number;
+  /**
+   * Effective sample size n_eff = (Σw)²/Σw² behind this action's Q (P6.2
+   * PR-B / F4). 0 when unsupported. Additive field: consumers that ignore it
+   * keep the pre-PR-B behaviour exactly.
+   */
+  readonly nEff?: number;
   /** True when optimistic exploration produced this Q value. */
   readonly explored: boolean;
   /** A = Q - V, using the effective unseen-action value when Q is null. */
@@ -244,6 +250,7 @@ export function estimateActionValues<T>(
         actionKey: candidate.actionKey,
         q,
         support: group.length,
+        nEff: effectiveSampleSize(group.map(neighborWeight)),
         explored: false,
         advantage: q - stateValue
       });
@@ -263,6 +270,7 @@ export function estimateActionValues<T>(
       actionKey: candidate.actionKey,
       q: explored ? optimistic : null,
       support: 0,
+      nEff: 0,
       explored,
       advantage: effectiveQ - stateValue
     });
@@ -329,5 +337,136 @@ export function estimateActionValuesWithContract<T>(
     estimates,
     targetLine: estimatorTargetLine(sampled, rewardVersion),
     rewardVersion
+  };
+}
+
+// ---------------------------------------------------------------------------
+// P6.2 PR-B / F4: conservative replacement evidence (estimation != replacement)
+// ---------------------------------------------------------------------------
+//
+// The pre-PR-B defect chain (review section 7): an unsupported action under the
+// 'baseline' fallback takes effective Q = V, so its advantage is EXACTLY 0;
+// when every supported action has a negative advantage, the zero wins the
+// relative comparison without a shred of evidence. Then A/(max|A|+eps)
+// amplifies tiny sample noise to nearly +-1, letting that zero-advantage
+// unknown override the prior.
+//
+// The helpers below give callers the evidence side of "estimation vs
+// replacement": effective sample size, shrunk advantages on a calibrated fixed
+// scale, and the zero-advantage-without-support marker. They are ADDITIVE -
+// estimateActionValues/normalizeAdvantages keep their frozen semantics (the
+// paper reproduction and the online/replay parity tests pin them), and the
+// conservative gate itself lives with the decision consumers (orchestrator).
+
+/**
+ * Effective sample size n_eff = (sum w)^2 / sum(w^2) of a neighbour group.
+ *
+ * Raw record counts overstate evidence when weights are concentrated: one
+ * weight of 1.0 plus nine of 0.01 is "10 records" but n_eff ~ 1.2. The
+ * replacement gate must see the effective number, not the raw count.
+ */
+export function effectiveSampleSize(
+  weights: readonly number[]
+): number {
+  let sum = 0;
+  let sumSquares = 0;
+  let count = 0;
+  for (const weight of weights) {
+    if (!Number.isFinite(weight) || weight < 0) {
+      continue;
+    }
+    sum += weight;
+    sumSquares += weight * weight;
+    count += 1;
+  }
+  if (count === 0 || sum <= 0 || sumSquares <= 0) {
+    return 0;
+  }
+  return (sum * sum) / sumSquares;
+}
+
+/** Evidence knobs for the conservative replacement gate. */
+export interface ConservativeAdvantageOptions {
+  /**
+   * Effective-sample floor: a challenger must hold at least this much
+   * effective evidence before its advantage may REPLACE the prior. Below the
+   * floor the shrunk advantage is 0 (suggestion only, never a replacement).
+   */
+  readonly minEffectiveSamples: number;
+  /**
+   * Shrinkage ceiling strength: the shrunk advantage is
+   * A_shrunk = A * n_eff / (n_eff + k), so k = 0 disables shrinkage and larger
+   * k shrinks harder. Calibrated per scale, not per candidate pool.
+   */
+  readonly shrinkageK: number;
+}
+
+/** Default floor: two independent-ish observations at least (F4 threshold). */
+export const DEFAULT_MIN_EFFECTIVE_SAMPLES = 2;
+/** Default shrinkage strength for the plugin's [-3, 3] return scale. */
+export const DEFAULT_ADVANTAGE_SHRINKAGE_K = 2;
+
+/**
+ * Calibrated fixed scale for advantage normalization (F4).
+ *
+ * The plugin's learning target lives in [-3, 3], so a raw advantage is already
+ * on a bounded, meaningful scale. Dividing by ADVANTAGE_SCALE maps a maximal
+ * raw advantage (+/-3) to +/-1 and keeps small noise small: a 0.05 advantage
+ * stays 0.017 instead of being blown up to ~1 by max-normalization.
+ */
+export const ADVANTAGE_SCALE = 3;
+
+/** One conservative replacement judgement for a challenger action. */
+export interface ConservativeAdvantage {
+  readonly actionKey: string;
+  /** Raw Q - V estimate (unchanged). */
+  readonly advantage: number;
+  /** Effective sample size behind the challenger's own Q. */
+  readonly nEff: number;
+  /** Raw support count (records), reported alongside n_eff for the ledger. */
+  readonly support: number;
+  /** True when the challenger clears the evidence floor. */
+  readonly hasReplacementEvidence: boolean;
+  /** Advantage after evidence shrinkage (0 below the floor). */
+  readonly shrunkAdvantage: number;
+  /** Advantage on the calibrated fixed scale (never max-normalized). */
+  readonly calibratedAdvantage: number;
+  /**
+   * True when the action has NO support at all and its advantage is exactly
+   * the unseen-fallback artefact (0 under 'baseline', -V under 'zero'). Such
+   * an action may never beat a supported prior action on its "advantage".
+   */
+  readonly implicitZeroAdvantage: boolean;
+}
+
+/**
+ * Shrink-then-calibrate one challenger's advantage, and mark the
+ * zero-advantage-without-support artefact (F4).
+ *
+ * This is the "estimation" half: it produces a SUGGESTION strength. Whether
+ * the suggestion may REPLACE the prior is {@link hasReplacementEvidence} -
+ * an unsupported or under-evidenced challenger returns a shrunk advantage of
+ * 0 and `hasReplacementEvidence: false`, so it can only ever tie, never win.
+ */
+export function conservativeAdvantage(
+  estimate: ActionValueEstimate,
+  options: Partial<ConservativeAdvantageOptions> = {}
+): ConservativeAdvantage {
+  const minEff = options.minEffectiveSamples ?? DEFAULT_MIN_EFFECTIVE_SAMPLES;
+  const shrinkK = options.shrinkageK ?? DEFAULT_ADVANTAGE_SHRINKAGE_K;
+  const nEff = estimate.nEff ?? (estimate.support > 0 ? estimate.support : 0);
+  const hasEvidence = Number.isFinite(nEff) && nEff >= minEff && estimate.support > 0;
+  const shrunk = hasEvidence
+    ? (estimate.advantage * nEff) / (nEff + Math.max(0, shrinkK))
+    : 0;
+  return {
+    actionKey: estimate.actionKey,
+    advantage: estimate.advantage,
+    nEff,
+    support: estimate.support,
+    hasReplacementEvidence: hasEvidence,
+    shrunkAdvantage: shrunk,
+    calibratedAdvantage: shrunk / ADVANTAGE_SCALE,
+    implicitZeroAdvantage: estimate.support === 0 && Math.abs(estimate.advantage) <= 1e-12
   };
 }

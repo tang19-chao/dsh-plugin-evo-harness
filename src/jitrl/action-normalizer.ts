@@ -274,6 +274,243 @@ function surfaceEntries(
   }
 }
 
+// ---------------------------------------------------------------------------
+// P6.2 PR-B / F4-4: semantically stable action keys (conflict-rate discipline)
+// ---------------------------------------------------------------------------
+//
+// The slot-shape signature above deliberately keeps key objects coarse (counts,
+// tool names, format categories). That is right for retrieval dedup, but it
+// also means "append 2 helpful rules" and "append 2 destructive rules" on the
+// guardrails surface normalize to the SAME key - a correct edit and a harmful
+// edit would share one Q bucket. The semantic layer below is the repair: it
+// keys an edit by its EDIT TYPE + semantic signature + preconditions, so
+// praise and prohibition never merge, and it exposes a direct conflict-rate
+// probe for tests.
+
+/**
+ * Semantic edit-type taxonomy for L2 keys (F4-4).
+ *
+ * `constructive` adds or tightens a helpful constraint/capability;
+ * `destructive` removes, forbids or rolls something back; `neutral` reorders
+ * or documents without changing the effect set. The bucket is derived from the
+ * payload SHAPE (which fields are present), never from rule text - so it stays
+ * structural and deterministic.
+ */
+export type SemanticEditKind = 'constructive' | 'destructive' | 'neutral';
+
+/** Derive the semantic edit kind of one surface payload (F4-4). */
+export function semanticEditKindOf(
+  surface: HarnessComponentKey,
+  payload: unknown
+): SemanticEditKind {
+  if (payload === null || typeof payload !== 'object') {
+    return 'neutral';
+  }
+  const edit = payload as Record<string, unknown>;
+  switch (surface) {
+    case 'system_prompt':
+      // Replacing the whole prompt is strictly riskier than appending.
+      return edit['mode'] === 'replace' ? 'destructive' : 'constructive';
+    case 'guardrails': {
+      // Forbidding actions and removing preconditions narrow behaviour:
+      // destructive. Appending rules and adding preconditions widen the
+      // safety envelope: constructive. A pure format contract is neutral.
+      const forbids = Array.isArray(edit['forbiddenActions']) && edit['forbiddenActions'].length > 0;
+      const preconditions = Array.isArray(edit['toolPreconditions']) && edit['toolPreconditions'].length > 0;
+      const appends = Array.isArray(edit['appendRules']) && edit['appendRules'].length > 0;
+      if (forbids) {
+        return 'destructive';
+      }
+      if (preconditions || appends) {
+        return 'constructive';
+      }
+      return 'neutral';
+    }
+    case 'memory':
+    case 'skills':
+    case 'scripts':
+    case 'subagents':
+    case 'plugins':
+    case 'tool_guidance':
+      // Mounting/registering/rewriting guidance adds capability.
+      return 'constructive';
+    default:
+      return 'neutral';
+  }
+}
+
+/**
+ * The semantic action key: surface + edit kind + semantic signature
+ * (sorted precondition/tool targets) + effect fingerprint.
+ *
+ * Two edits share this key only when they touch the same surface, in the same
+ * semantic direction, on the same structural targets, with the same effect
+ * counts. A correct append and a destructive forbid on the same surface
+ * therefore NEVER merge (their edit kinds differ); two different destructive
+ * forbids on the same tool stay distinguishable by target set.
+ */
+export function normalizeSemanticActionKey(patch: EightSurfacePatch): string {
+  const edits = patch?.edits;
+  if (edits === undefined || edits === null || typeof edits !== 'object') {
+    return 'noop';
+  }
+  const parts: string[] = [];
+  for (const surface of HARNESS_COMPONENT_KEYS) {
+    const payload = edits[surface];
+    if (payload === undefined) {
+      continue;
+    }
+    const kind = semanticEditKindOf(surface, payload);
+    const targets = semanticTargetsOf(surface, payload);
+    parts.push(
+      surface + ':' + kind + (targets.length === 0 ? '' : '(' + targets.join(',') + ')')
+    );
+  }
+  const unique = [...new Set(parts)].sort();
+  return unique.length === 0 ? 'noop' : unique.join('+');
+}
+
+/** Structural target set of one surface payload (shared by the key + probes). */
+function semanticTargetsOf(
+  surface: HarnessComponentKey,
+  payload: unknown
+): readonly string[] {
+  if (payload === null || typeof payload !== 'object') {
+    return [];
+  }
+  const edit = payload as Record<string, unknown>;
+  switch (surface) {
+    case 'guardrails': {
+      const targets: string[] = [];
+      for (const precondition of Array.isArray(edit['toolPreconditions']) ? edit['toolPreconditions'] : []) {
+        if (precondition !== null && typeof precondition === 'object') {
+          const name = (precondition as Record<string, unknown>)['toolName'];
+          if (typeof name === 'string') {
+            targets.push('pre:' + safeIdentifier(name, 'tool'));
+          }
+        }
+      }
+      for (const forbidden of Array.isArray(edit['forbiddenActions']) ? edit['forbiddenActions'] : []) {
+        if (typeof forbidden === 'string') {
+          targets.push('forbid:' + safeIdentifier(forbidden, 'action'));
+        }
+      }
+      if (Array.isArray(edit['appendRules'])) {
+        targets.push('append:' + String(edit['appendRules'].length));
+      }
+      return [...new Set(targets)].sort();
+    }
+    case 'system_prompt': {
+      const segment = edit['segment'];
+      return [typeof segment === 'string' ? safeIdentifier(segment, 'default') : 'default'];
+    }
+    case 'skills': {
+      const skills = Array.isArray(edit['skills']) ? edit['skills'] : [];
+      return skills
+        .map((skill) =>
+          skill !== null && typeof skill === 'object'
+            ? safeIdentifier(String((skill as Record<string, unknown>)['name'] ?? 'skill'), 'skill')
+            : 'skill'
+        )
+        .sort();
+    }
+    case 'scripts': {
+      const scripts = Array.isArray(edit['scripts']) ? edit['scripts'] : [];
+      return scripts
+        .map((script) =>
+          script !== null && typeof script === 'object'
+            ? scriptStem(String((script as Record<string, unknown>)['path'] ?? 'script'))
+            : 'script'
+        )
+        .sort();
+    }
+    case 'subagents': {
+      const agents = Array.isArray(edit['agents']) ? edit['agents'] : [];
+      return agents
+        .map((agent) =>
+          agent !== null && typeof agent === 'object'
+            ? safeIdentifier(String((agent as Record<string, unknown>)['name'] ?? 'agent'), 'agent')
+            : 'agent'
+        )
+        .sort();
+    }
+    case 'plugins': {
+      const middleware = Array.isArray(edit['middleware']) ? edit['middleware'] : [];
+      return middleware
+        .map((mw) => {
+          if (mw === null || typeof mw !== 'object') {
+            return 'middleware';
+          }
+          const record = mw as Record<string, unknown>;
+          const hook = typeof record['hook'] === 'string' ? record['hook'] : 'around_tool';
+          const name = typeof record['name'] === 'string' ? record['name'] : 'middleware';
+          return hook + ':' + safeIdentifier(name, 'middleware');
+        })
+        .sort();
+    }
+    case 'tool_guidance': {
+      const targets: string[] = [];
+      const descriptions =
+        edit['descriptions'] !== null && typeof edit['descriptions'] === 'object'
+          ? Object.keys(edit['descriptions'] as Record<string, unknown>)
+          : [];
+      for (const tool of descriptions) {
+        targets.push('rewrite:' + safeIdentifier(tool, 'tool'));
+      }
+      for (const example of Array.isArray(edit['examples']) ? edit['examples'] : []) {
+        if (example !== null && typeof example === 'object') {
+          const name = (example as Record<string, unknown>)['toolName'];
+          if (typeof name === 'string') {
+            targets.push('example:' + safeIdentifier(name, 'tool'));
+          }
+        }
+      }
+      return [...new Set(targets)].sort();
+    }
+    case 'memory': {
+      const targets: string[] = [];
+      for (const tag of Array.isArray(edit['recallTags']) ? edit['recallTags'] : []) {
+        if (typeof tag === 'string') {
+          targets.push('tag:' + safeIdentifier(tag, 'tag'));
+        }
+      }
+      if (typeof edit['scopedViewId'] === 'string') {
+        targets.push('scope:branch');
+      }
+      return [...new Set(targets)].sort();
+    }
+    default:
+      return [];
+  }
+}
+
+/**
+ * Positive/negative conflict-rate probe (F4-4 acceptance).
+ *
+ * A key function is fit for Q-bucketing when positive examples (same semantic
+ * edit) collide FAR more often than negative examples (correct vs destructive
+ * edit of the same surface). This helper measures exactly that rate pair over
+ * two labelled patch lists, so a test can assert
+ * `conflictRate(pos, pos) > conflictRate(pos, neg) + margin` without the
+ * threshold living in production code.
+ */
+export function actionKeyConflictRate(
+  keysOfLeft: readonly string[],
+  keysOfRight: readonly string[]
+): { readonly collisions: number; readonly pairs: number; readonly rate: number } {
+  let collisions = 0;
+  let pairs = 0;
+  for (const left of keysOfLeft) {
+    for (const right of keysOfRight) {
+      pairs += 1;
+      if (left === right) {
+        collisions += 1;
+      }
+    }
+  }
+  return { collisions, pairs, rate: pairs === 0 ? 0 : collisions / pairs };
+}
+
 /**
  * L2 patch signature. Only the structural edit types and key objects are
  * encoded; patch ids, branch ids, session ids, rationale and timestamps are
