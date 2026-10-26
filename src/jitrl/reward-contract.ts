@@ -35,11 +35,25 @@ import {
 /**
  * The reward model version stamped on every record written by this contract.
  *
- * Kept in one place: `CURRENT_REWARD_VERSION` in ./experience-store.ts is the
- * persisted marker, and this module is where its MEANING is defined. The two
- * must never drift apart (see {@link REWARD_CONTRACT}).
+ * P6.2 C1 (ADR 0002 R3): the ONE-TIME ATOMIC SWITCH to the preregistered
+ * verifier-first id `r4/verifier-first-v1` ({@link REWARD_CONTRACT_VERSION_PR_B}).
+ * The numeric yardstick is UNCHANGED (same weights `{completion:0.5,
+ * steps:0.1, tool:0.1, turn:0.3}`, same clip [-3, 3], same F4 constants); what
+ * changed is the version semantics: r3's completion rewarded "text existed",
+ * r4 rewards "the (shape-validated) verification verdict" - and the r3/r4
+ * transition window is closed by this switch.
+ *
+ * C2-PRE TRUST BOUNDARY (ADR 0002 5.2a, t6 revision): `isTrustedVerification`
+ * validates payload SHAPE, not source trust. Until C2 delivers a trusted
+ * verifier producer, this switch means "version-semantic cleanup + conservative
+ * isolation", NOT "trusted verification is live": inside the r4 neighbourhood
+ * there is no task-quality evidence from verification (see
+ * `taskQualityLearningEligible` in ./step-evaluator.ts). Kept in one place:
+ * `CURRENT_REWARD_VERSION` in ./experience-store.ts is the persisted marker,
+ * and this module is where its MEANING is defined. The two must never drift
+ * apart (see {@link REWARD_CONTRACT}).
  */
-export const REWARD_CONTRACT_VERSION = 'r3/unified-signals-v1' as const;
+export const REWARD_CONTRACT_VERSION = 'r4/verifier-first-v1' as const;
 
 /**
  * The one low-cost aggregation every executed trajectory - winner or not - is
@@ -113,7 +127,7 @@ export const REWARD_CONTRACT = {
 } as const;
 
 /** The previous reward scale, kept referenced so upgrades stay explicit. */
-export const PREVIOUS_REWARD_CONTRACT_VERSION = 'r2/verifiable-v1' as const;
+export const PREVIOUS_REWARD_CONTRACT_VERSION = 'r3/unified-signals-v1' as const;
 
 /**
  * The weight record the contract's aggregation fuses. Calibrated so that the
@@ -154,10 +168,20 @@ export const REWARD_CONTRACT_WEIGHTS: Readonly<Record<string, number>> = {
  * verifier-decided inside scoreTrajectorySignals.
  */
 export function scoreUnderRewardContract(
-  trajectory: ProbeTrajectory
+  trajectory: ProbeTrajectory,
+  options: {
+    /**
+     * t10/COV: the injectable trusted-producer seam, forwarded verbatim to
+     * scoreTrajectorySignals. The production recorder passes NOTHING (the
+     * registry stays structurally empty, C2-pre); only test/research callers
+     * that own their trust set supply it.
+     */
+    readonly trustedProducers?: ReadonlySet<string>;
+  } = {}
 ): TrajectorySignalScore {
   const signal = scoreTrajectorySignals(trajectory, {
-    weights: REWARD_CONTRACT_WEIGHTS
+    weights: REWARD_CONTRACT_WEIGHTS,
+    ...(options.trustedProducers === undefined ? {} : { trustedProducers: options.trustedProducers })
   });
   if (!signal.learningEligible) {
     return signal;
@@ -191,21 +215,29 @@ export function rewardVersionGeneration(version: string): number | undefined {
 }
 
 /**
- * P6.2 PR-A / F2: the EXPLICIT compatibilities of {@link isRewardVersionExact}.
+ * P6.2 C1 (ADR 0002 R3): the LIVE compatibility table, now the pre-authored
+ * r4 certification ({@link REWARD_CONTRACT_COMPATIBLE_IDS_PR_B} moved here by
+ * the atomic switch).
  *
  * Compatibility is decided by exact contract-id membership, never by parsing
  * meaning out of a `rN/` prefix: two suffixes within one generation may name
- * producers whose targets are NOT the same function (the r3 backfill rebuild
- * maps a surrogate tree score onto a clip and follows the discounted best
- * successor, while the online r3 contract fuses tool/completion/steps/turn of
+ * producers whose targets are NOT the same function (the surrogate backfill
+ * rebuild maps a surrogate tree score onto a clip and follows the discounted
+ * best successor, while the online contract fuses tool/completion/steps/turn of
  * one executed trajectory - different sources, different horizon). Bumping the
  * shared numeric prefix does not re-derive one into the other, so prefix
  * equality must not make them interchangeable.
  *
- * The ONLY other id that may join an online `r3/unified-signals-v1`
- * neighbourhood is a record RE-SCORED under this exact contract from preserved
- * original execution evidence (`r3/unified-signals-v1@rescore-v1`), which the
- * rescore helper below stamps together with the evidence hash chain.
+ * The r3/r4 boundary is EMPTY in BOTH directions (t6: r4 without trusted
+ * producers means conservative isolation): r3's completion rewarded text
+ * presence, r4's rewards the verification verdict, so an r3 observedReturn
+ * encodes "text existed", never "the task was verified". The ONLY other id
+ * that may join an online `r4/verifier-first-v1` neighbourhood is a record
+ * RE-SCORED under this exact contract from preserved original execution
+ * evidence (`r4/verifier-first-v1@rescore-v1`), which the rescore helper below
+ * stamps together with the evidence hash chain — and even then, version
+ * compatibility alone never confers task-quality learning eligibility (the
+ * C2-pre trusted-provenance gate lives in ./step-evaluator.ts, 5.2a).
  *
  * Adding an entry here is an auditable, deliberate act: the entry must name the
  * producer AND why its target is the same defined objective (same aggregation,
@@ -215,19 +247,22 @@ export const REWARD_CONTRACT_COMPATIBLE_IDS: Readonly<Record<string, readonly st
   // The online contract trusts only itself...
   [REWARD_CONTRACT_VERSION]: [
     // ...and rescored copies that were computed BY this contract's scorer from
-    // preserved original execution evidence (see rescoreUnderCurrentContract).
-    'r3/unified-signals-v1@rescore-v1'
+    // preserved original execution evidence (see buildRescoredBackfillRecord).
+    'r4/verifier-first-v1@rescore-v1'
   ],
-  // 'r3/backfill-tree-v1' is deliberately ABSENT: a surrogate-only tree
-  // rebuild is target-heterogeneous with the online contract (F2) and is
-  // quarantined as surrogatePrior/audit-only instead of being mixed in.
+  // The retired r3 lineage is deliberately EMPTY both ways: a surrogate-only
+  // tree rebuild (F2) AND the retired online r3 scale are target-incompatible
+  // with r4 (r3 rewarded text presence; r4 rewards the verification verdict),
+  // so both stay quarantined instead of being mixed in.
+  'r3/unified-signals-v1': [],
+  'r3/unified-signals-v1@rescore-v1': [],
   'r3/backfill-tree-v1': [],
   // Rescored records trust their base contract id only.
-  'r3/unified-signals-v1@rescore-v1': ['r3/unified-signals-v1']
+  'r4/verifier-first-v1@rescore-v1': [REWARD_CONTRACT_VERSION]
 };
 
 /** Reward version stamped on records rescored under the current contract. */
-export const RESCORE_REWARD_VERSION = 'r3/unified-signals-v1@rescore-v1' as const;
+export const RESCORE_REWARD_VERSION = 'r4/verifier-first-v1@rescore-v1' as const;
 
 /**
  * The exact-contract compatibility rule (P6.2 PR-A / F2).
@@ -280,8 +315,8 @@ export function strictTargetContractIds(
 /**
  * Monotonicity check for a rewardVersion bump.
  *
- * Versions compare by their generation prefix (`rN/...`): `r3/...` strictly
- * follows `r2/...`. An unknown shape is not comparable and therefore never
+ * Versions compare by their generation prefix (`rN/...`): `r4/...` strictly
+ * follows `r3/...`. An unknown shape is not comparable and therefore never
  * "compatible", which fails closed.
  */
 export function isRewardVersionBump(
@@ -301,12 +336,13 @@ export function isRewardVersionBump(
  * neighbourhood scored under `current` (P6.1-D2 / R3 F1-b, P6.2 PR-A / F2).
  *
  * P6.2 PR-A: this is EXACT contract-id matching (or a certified table entry),
- * NOT generation equality. `r3/backfill-tree-v1` and `r3/unified-signals-v1`
- * share the `r3` prefix but define different targets (surrogate tree rebuild
- * vs online trajectory aggregation), so the prefix proves nothing. Anything
+ * NOT generation equality. The retired `r3/backfill-tree-v1` surrogate and the
+ * retired online `r3/unified-signals-v1` scale share prefixes with r4 but
+ * define different targets, so the prefix proves nothing. Anything
  * else fails closed:
- *   - an older generation (`r2/*` under r3) is a different yardstick and must
- *     be quarantined by the upgrade path, never averaged with current records;
+ *   - an older generation (`r3/*` or `r2/*` under r4) is a different yardstick
+ *     and must be quarantined by the upgrade path, never averaged with current
+ *     records;
  *   - a newer generation means this code predates the record's contract;
  *   - a missing/unknown version carries no proof of compatibility.
  *
@@ -327,8 +363,10 @@ export function isRewardVersionCompatible(
  * in-place reinterpretation.
  *
  * A same-generation suffix change (a pure relabel) is not a rebuild; a
- * generation bump is, because the numeric scale itself changed. Anything not
- * provably safe fails closed to "rebuild".
+ * generation bump is, because the numeric scale itself changed (the r3 -> r4
+ * switch is such a bump: generation semantics changed even though the numeric
+ * yardstick stayed identical). Anything not provably safe fails closed to
+ * "rebuild".
  */
 export function requiresExperienceRebuild(
   previous: string,

@@ -443,10 +443,18 @@ export interface ConservativeAdvantage {
  * Shrink-then-calibrate one challenger's advantage, and mark the
  * zero-advantage-without-support artefact (F4).
  *
+ * P6.2 C0 (ADR 0002 R5-2, t6): the replacement judgement reads ONLY nEff.
+ * The pre-C0 fallback `estimate.nEff ?? support` is REMOVED from this path:
+ * a missing or non-finite nEff means "no replacement evidence", never
+ * "assume one unit of evidence per raw record". Support stays reported
+ * alongside nEff as a ledger field. The frozen research path
+ * (normalizeAdvantages) is untouched.
+ *
  * This is the "estimation" half: it produces a SUGGESTION strength. Whether
  * the suggestion may REPLACE the prior is {@link hasReplacementEvidence} -
- * an unsupported or under-evidenced challenger returns a shrunk advantage of
- * 0 and `hasReplacementEvidence: false`, so it can only ever tie, never win.
+ * an unsupported, under-evidenced or nEff-less challenger returns a shrunk
+ * advantage of 0 and `hasReplacementEvidence: false`, so it can only ever
+ * tie, never win.
  */
 export function conservativeAdvantage(
   estimate: ActionValueEstimate,
@@ -454,8 +462,15 @@ export function conservativeAdvantage(
 ): ConservativeAdvantage {
   const minEff = options.minEffectiveSamples ?? DEFAULT_MIN_EFFECTIVE_SAMPLES;
   const shrinkK = options.shrinkageK ?? DEFAULT_ADVANTAGE_SHRINKAGE_K;
-  const nEff = estimate.nEff ?? (estimate.support > 0 ? estimate.support : 0);
-  const hasEvidence = Number.isFinite(nEff) && nEff >= minEff && estimate.support > 0;
+  // Fail-closed: ONLY a finite, non-negative nEff counts as evidence. No
+  // support-based fallback here - that is exactly the "support impersonating
+  // nEff" hole the ADR closes (support is a ledger co-report, not evidence).
+  const nEff =
+    estimate.nEff !== undefined && Number.isFinite(estimate.nEff) && estimate.nEff >= 0
+      ? estimate.nEff
+      : Number.NaN;
+  const hasEvidence =
+    Number.isFinite(nEff) && nEff >= minEff && estimate.support > 0;
   const shrunk = hasEvidence
     ? (estimate.advantage * nEff) / (nEff + Math.max(0, shrinkK))
     : 0;

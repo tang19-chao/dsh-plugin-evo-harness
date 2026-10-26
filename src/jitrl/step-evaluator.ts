@@ -461,9 +461,87 @@ export function turnSignalForOutcome(outcome: ExperienceOutcome): number {
 //     without a verifier, task success is unprovable, only disprovable;
 //   - execution success (`trajectory.status === 'succeeded'`) and task success
 //     (verification passed) are carried as SEPARATE fields on the score.
+//   - C2-PRE (ADR 0002 5.2a, t6 revision): shape-validated passed/failed
+//     verdicts establish NO task-quality learning evidence by themselves - the
+//     trustedSource/taskQualityEvidence fields below are the consumer-side
+//     pin. failed-without-trusted-provenance stays a scale-level negative
+//     signal but is audit-only on the task-quality track (trusted-failure
+//     learning is the explicit C2 unfinished item). t10/V3b: the FACT flag
+//     (taskQualityEvidence: trusted verdict-derived completion only) is
+//     separated from the CONSUMPTION gate (taskQualityLearningEligible: the
+//     process path keeps unknown-verdict records trainable), so the field
+//     semantics can never be conflated again.
 
 /** Verifier verdict for one executed trajectory's task result. */
 export type TrustedVerificationStatus = 'passed' | 'failed' | 'unknown';
+
+/**
+ * C2-pre trust boundary (ADR 0002 5.2a, t6 revision; V5 hardening): verification
+ * SHAPE is not verification SOURCE. `isTrustedVerification` validates payload
+ * structure only - it cannot stop an arbitrary payload from claiming any
+ * verifierId. Trust therefore needs an explicit, fail-closed producer registry:
+ * a verdict proves nothing beyond "the payload claims it" until its verifierId
+ * was registered here by a trusted producer.
+ *
+ * V5 (t7): the registry is FROZEN EMPTY for the whole C0+C1 round. The public
+ * string registrar that previously lived here was REMOVED - any importer could
+ * mint a trusted producer with a plain string, which is exactly the untrusted
+ * promotion channel C0+C1 must not ship (ADR 0002 R7: this round delivers
+ * contract shape + structural validation ONLY; source trust begins at C2,
+ * implemented behind a trusted service/receipt boundary, not a module-level
+ * string set). Until C2 lands, `hasTrustedVerificationProvenance` is
+ * structurally false for every payload: there is no registration path.
+ */
+const TRUSTED_VERIFIER_PRODUCERS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * C2 entry point PLACEHOLDER (ADR 0002 5.2a/R7; V5): deliberately NOT
+ * implemented this round. C2 will deliver trusted verification producers
+ * through a trusted service / receipt boundary that verifies producer
+ * identity cryptographically or via a host-controlled allowlist configured
+ * outside the plugin's import graph. Do NOT add a string-based registrar
+ * here; that would re-open the arbitrary-promotion hole this fix closes.
+ */
+
+/** True when the verifierId belongs to a registered trusted producer. */
+export function isRegisteredTrustedVerifier(verifierId: string): boolean {
+  return TRUSTED_VERIFIER_PRODUCERS.has(verifierId);
+}
+
+/**
+ * True when a verification payload carries TRUSTED provenance (ADR 0002 5.2a):
+ * an explicit (non-structural) payload, a verifierId that belongs to the
+ * caller-supplied trusted producer set, and a bound evidence hash.
+ *
+ * t8/V5b: when `expectedEvidenceHash` is supplied (the hash of the execution
+ * evidence the verdict claims to have judged), the payload's evidenceHash
+ * must MATCH it exactly - a claimed-but-unbound hash establishes nothing.
+ *
+ * t10/V5+COV: the producer set is an INJECTED PARAMETER (defaults to the
+ * frozen empty registry). There is no global string registrar: trust is owned
+ * by the caller that supplies the set, and the production path supplies
+ * nothing (structurally empty, C2-pre). C2 will replace this parameter with
+ * the trusted service/receipt boundary.
+ */
+export function hasTrustedVerificationProvenance(
+  verification: TrustedVerification,
+  expectedEvidenceHash?: string,
+  trustedProducers: ReadonlySet<string> = TRUSTED_VERIFIER_PRODUCERS
+): boolean {
+  if (verification.implicit === true) {
+    return false;
+  }
+  if (!trustedProducers.has(verification.verifierId)) {
+    return false;
+  }
+  if (typeof verification.evidenceHash !== 'string' || verification.evidenceHash.length === 0) {
+    return false;
+  }
+  if (expectedEvidenceHash !== undefined && verification.evidenceHash !== expectedEvidenceHash) {
+    return false;
+  }
+  return true;
+}
 
 /**
  * The trusted verification record (P6.2 PR-B / F3; review section 6).
@@ -609,6 +687,12 @@ export function verificationFromTrajectory(
 /** One deterministic, verifiable score for a trajectory that has no step list. */
 export interface TrajectorySignalScore {
   readonly outcome: ExperienceOutcome;
+  /**
+   * Outcome-level learning eligibility (the pre-existing, frozen semantics the
+   * research/eval paths consume): false for cancelled/aborted/infrastructure
+   * outcomes and falsified success claims. NOT the C2-pre task-quality gate -
+   * see {@link taskQualityLearningEligible}.
+   */
   readonly learningEligible: boolean;
   /** Fused reward from the verifiable signals only (clipped). */
   readonly reward: number;
@@ -616,14 +700,63 @@ export interface TrajectorySignalScore {
   readonly rationale: string;
   /** Execution success: the run itself completed (status 'succeeded'). */
   readonly executionSuccess: boolean;
-  /** Task success: a TRUSTED verifier accepted the result (F3). */
+  /**
+   * Task success: the verification verdict says 'passed'. C2-pre (ADR 0002
+   * 5.2a-1) this means "the payload CLAIMS passed" - without a registered
+   * trusted producer it must NOT be consumed as trusted task success.
+   */
   readonly taskSuccess: boolean;
   /** The resolved verification verdict and who produced it. */
   readonly verification: {
     readonly status: TrustedVerificationStatus;
     readonly verifierId: string;
     readonly implicit: boolean;
+    /**
+     * C2-pre (5.2a): true when the verdict carries trusted provenance
+     * (registered producer + evidence hash). The production path cannot
+     * produce this until C2 registers a real verifier, so every verdict the
+     * default assembly sees is shape-only (trustedSource: false).
+     */
+    readonly trustedSource: boolean;
   };
+  /**
+   * C2-pre task-quality learning gate (ADR 0002 5.2a-2/3/4, t6 revision):
+   * whether this trajectory's fused reward may be consumed as a TASK-QUALITY
+   * training sample. Two tracks, pinned separately:
+   *   - a verdict-derived completion source (shape-only passed +1 / failed -1)
+   *     is task-quality evidence; without trusted provenance it is NOT
+   *     learnable (audit-only: the scale-level negative signal stays in the
+   *     reward column, but trusted-failure learning is the explicit C2
+   *     unfinished item - no provenance is forged);
+   *   - an 'unknown' verdict contributes completion=0, so the fused value
+   *     carries NO task-quality component; such a trajectory trains through
+   *     the pre-existing non-verification (process) eligibility path exactly
+   *     as before (ADR 0002 R4 net effect: "学习面上实际可用的只有非验证来
+   *     源的既有资格路径"). This keeps the frozen research/ablation path
+   *     additive (R6).
+   * The online recorder consults these flags instead of re-deriving the rule.
+   */
+  readonly taskQualityLearningEligible: boolean;
+  /**
+   * t10/V3b (t9 finding): TRUE-ONLY task-quality evidence flag, kept beside the
+   * eligibility flag so the two can never be conflated again.
+   *
+   * `taskQualityEvidence` is the verdict-side FACT: true ONLY when a trusted
+   * source produced a verdict-derived completion (trustedSource && passed/
+   * failed). unknown/untrusted verdicts are ALWAYS false - an unknown verdict
+   * contributes no task-quality component (completion=0), and the old
+   * "eligible && !verdictDerived" shape made this field read as an eligibility
+   * grant when it was really the absence of a task-quality component.
+   *
+   * `taskQualityLearningEligible` (above) remains the CONSUMPTION gate: it is
+   * true when the record may be trained on (the process path for unknown
+   * verdicts) and false only for non-learnable executions and untrusted
+   * verdict-derived completions. Consumers that want "is this record task
+   * quality evidence" must read `taskQualityEvidence`, never the eligibility
+   * flag; the consistency invariant (process track ⇒ NOT task-quality
+   * evidence) is asserted by the production regression.
+   */
+  readonly taskQualityEvidence: boolean;
 }
 
 /**
@@ -682,6 +815,18 @@ export function scoreTrajectorySignals(
     readonly cancelled?: boolean;
     /** Optional host user feedback, kept a SEPARATE source (F3: 分列). */
     readonly user?: UserFeedbackKind;
+    /**
+     * t10/COV (t9 finding): the INJECTABLE trusted-producer seam (C2's
+     * eventual binding point; test/research callers only this round). This is
+     * a caller-supplied SET OBJECT - not a global string registrar - so trust
+     * is scoped to the caller that owns the set, and no importing module can
+     * widen another caller's trust. The production wiring (scoreUnderRewardContract
+     * and the online recorder) passes NOTHING, which keeps the effective
+     * registry empty (C2-pre). A C2 implementation will replace this seam with
+     * the trusted service/receipt boundary; the parameter shape (a set of
+     * producer ids bound to evidence-hash checks) is what it will fill.
+     */
+    readonly trustedProducers?: ReadonlySet<string>;
   } = {}
 ): TrajectorySignalScore {
   const outcome = classifyTrajectoryOutcome(trajectory, {
@@ -751,6 +896,44 @@ export function scoreTrajectorySignals(
   if (verification.status === 'failed' && eligible && reward > 0) {
     reward = 0;
   }
+  // C2-pre trusted-source boundary (ADR 0002 5.2a, t6): the production path
+  // carries only shape-validated payloads, so trustedSource is false unless a
+  // REGISTERED trusted producer signed the verdict (C2's entry point). Shape
+  // alone never proves the source.
+  //
+  // t8/V5b: the provenance judgement is BOUND to the execution evidence - the
+  // payload's evidenceHash must match the trajectory deliverable's own
+  // contentHash when one exists. A verdict claiming an unbound (or foreign)
+  // hash establishes nothing even from a registered producer; C2 inherits this
+  // binding instead of trusting a self-declared string.
+  const executionEvidenceHash =
+    trajectory.deliverable !== undefined && trajectory.deliverable.content.length > 0
+      ? trajectory.deliverable.contentHash
+      : undefined;
+  const trustedSource = hasTrustedVerificationProvenance(
+    verification,
+    executionEvidenceHash,
+    options.trustedProducers
+  );
+  // C2-pre task-quality gate (5.2a-2/3/4): a verdict-derived completion source
+  // (shape-only passed/failed) is task-quality evidence but is NOT learnable
+  // without trusted provenance - it stays audit-only (trusted-failure learning
+  // is the explicit C2 unfinished item, no provenance is forged). An 'unknown'
+  // verdict contributes completion=0, so the fused value carries no task
+  // quality at all and the record trains through the pre-existing process
+  // eligibility path unchanged (R4 net effect; keeps the frozen research path
+  // additive, R6).
+  const verdictDerivedCompletion =
+    verification.status === 'passed' || verification.status === 'failed';
+  // Consumption gate: trainability of the record's fused reward. The process
+  // path keeps unknown-verdict records trainable (completion=0); a
+  // verdict-derived completion is trainable ONLY from a trusted source (C2-pre
+  // the production path never has one).
+  const taskQualityLearningEligible = eligible && (!verdictDerivedCompletion || trustedSource);
+  // t10/V3b: the verdict-side FACT, true only for trusted verdict-derived
+  // completions. Unknown/untrusted verdicts are ALWAYS false - the field can
+  // never be read as an eligibility grant again.
+  const taskQualityEvidence = eligible && verdictDerivedCompletion && trustedSource;
   return {
     outcome,
     learningEligible: eligible,
@@ -764,14 +947,21 @@ export function scoreTrajectorySignals(
       '; verification ' +
       verification.status +
       (verification.implicit === true ? ' (structural)' : ' by ' + verification.verifierId) +
-      (eligible ? '' : '; not learning eligible'),
+      (trustedSource ? '' : ' (shape-only, C2-pre)') +
+      (eligible ? '' : '; not learning eligible') +
+      (eligible && !taskQualityLearningEligible
+        ? '; verdict-derived completion not task-quality eligible (C2-pre)'
+        : ''),
     executionSuccess: trajectory.status === 'succeeded',
     taskSuccess: verification.status === 'passed',
     verification: {
       status: verification.status,
       verifierId: verification.verifierId,
-      implicit: verification.implicit === true
-    }
+      implicit: verification.implicit === true,
+      trustedSource
+    },
+    taskQualityLearningEligible,
+    taskQualityEvidence
   };
 }
 

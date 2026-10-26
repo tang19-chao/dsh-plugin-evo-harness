@@ -97,7 +97,7 @@ transpiles on the fly.
 | `pnpm run check:docs` | `node scripts/verify-readme-counts.mjs` | Mechanically validates README test counts against test results and repo hygiene |
 | `pnpm run verify` | `pnpm run typecheck && pnpm run test` | The full gate: typecheck, then every suite |
 
-A green checkout currently reports `76` test files and `1509` passing tests for `pnpm run test`
+A green checkout currently reports `77` test files and `1562` passing tests for `pnpm run test`
 (see [Testing](#testing) for the breakdown). This package is `private` and is not published to
 any registry, so there are no publication steps.
 
@@ -366,9 +366,9 @@ cross-session promotion, and the offline dream trigger and model wiring.
 
 | Command | Scope | Suites at the time of writing |
 | :--- | :--- | :--- |
-| `pnpm run test:unit` | `tests/unit` | 65 files, 1362 tests |
-| `pnpm run test:e2e` | `tests/e2e` | 11 files, 147 tests |
-| `pnpm run test` | everything | 76 files, 1509 tests |
+| `pnpm run test:unit` | `tests/unit` | 66 files, 1411 tests |
+| `pnpm run test:e2e` | `tests/e2e` | 11 files, 151 tests |
+| `pnpm run test` | everything | 77 files, 1562 tests |
 | `pnpm run verify` | typecheck + everything | the gate to run before a change lands |
 
 Individual files can be run the usual Vitest way, for example

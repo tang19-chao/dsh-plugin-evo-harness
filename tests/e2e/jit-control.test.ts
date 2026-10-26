@@ -28,6 +28,7 @@ import { describe, expect, it } from 'vitest';
 
 import { buildE2E, e2eConfig } from './fixtures';
 import { parseEvoHarnessConfig } from '../../src/config';
+import { resolveExecutionProfile } from '../../src/runtime/execution-profile';
 import { createJitRl } from '../../src/jitrl';
 import type {
   EightSurfacePatch,
@@ -151,7 +152,13 @@ describe('P6 PR2: /evo jit off covers the whole JitRL learning chain', () => {
     const harness = buildE2E({
       config: JIT_CONFIG,
       extra: {
-        deps: { proposer: makeMultiCandidateProposer(counters) },
+        deps: {
+          proposer: makeMultiCandidateProposer(counters),
+          // t10/R2: the mirror switch is only the REQUEST half; this suite
+          // (an ON-state seeding precondition + fake backend) opts in on the
+          // PERMISSION half explicitly. The default assembly still denies.
+          executionProfile: resolveExecutionProfile({ memoryRealWrites: true })
+        },
         mirrorClient: fake.client
       }
     });

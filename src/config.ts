@@ -88,6 +88,31 @@ export interface LoggingConfig {
   includeTrajectorySummaries: boolean;
 }
 
+/**
+ * P6.2 C1 execution-mode configuration (ADR 0002 R1/R2, t6 revision).
+ *
+ * The default assembly is baseline execution + shadow suggestion records with
+ * ZERO side effects: no permanent patch mount, no policy publish, no real
+ * memory write. guarded-active is an explicit opt-in that enables only the
+ * patch layer's evidence-gated channel; publish/memory stay denied this round
+ * regardless of configuration.
+ */
+export interface ExecutionConfig {
+  /**
+   * Declared execution mode: 'shadow' (default), 'baseline', 'guarded-active'
+   * or 'off'. Declared explicitly on every record the run produces (ADR R8).
+   */
+  mode: 'shadow' | 'baseline' | 'guarded-active' | 'off';
+  /**
+   * PERMANENT winning-patch mount after probing. Baseline default was true
+   * (src/index.ts); the ADR t6 revision removes that exemption - the default
+   * assembly must NOT permanently mount anything. Only 'guarded-active' may
+   * enable it, and the resolved profile still gates every individual
+   * deviation through the replacement-evidence rules.
+   */
+  applyWinningPatch: boolean;
+}
+
 /** JitRL exploration schedule (plan section 6.4). */
 export interface JitRlExplorationConfig {
   /** Probability of optimistic exploration for an action without support. */
@@ -222,6 +247,8 @@ export interface EvoHarnessConfig {
   memoryBridge: MemoryBridgeConfig;
   dreamRsi: DreamRsiConfig;
   jitrl: JitRlConfig;
+  /** P6.2 C1 execution mode + permanent-patch switch (ADR 0002 R1/R2). */
+  execution: ExecutionConfig;
   logging: LoggingConfig;
 }
 
@@ -306,7 +333,10 @@ const DEFAULT_CONFIG_VALUES: EvoHarnessConfig = {
     namespacePrefix: 'harness2',
     requireEvidence: true,
     enableNegativeFirewall: true,
-    promoteOnComposeSuccess: true
+    // P6.2 C1 (ADR 0002 R2/t6): real memory writes stay denied in the default
+    // assembly - the promotion path writes to the real global namespace, so it
+    // now requires an explicit opt-in.
+    promoteOnComposeSuccess: false
   },
   dreamRsi: {
     maxOnlineRolloutBudget: 8,
@@ -368,6 +398,9 @@ const DEFAULT_CONFIG_VALUES: EvoHarnessConfig = {
     },
     privacy: { redactSecrets: true, storeRawText: false }
   },
+  // P6.2 C1 default assembly (ADR 0002 R1/t6): shadow records, NO permanent
+  // patch mount, no publish, no real memory write.
+  execution: { mode: 'shadow', applyWinningPatch: false },
   logging: {
     level: 'info',
     includeTrajectorySummaries: false
@@ -418,6 +451,7 @@ const ROOT_KEYS = new Set<string>([
   'memoryBridge',
   'dreamRsi',
   'jitrl',
+  'execution',
   'logging'
 ]);
 const PROBE_KEYS = new Set<string>(['maxConcurrentProbes', 'probeTimeoutMs']);
@@ -493,6 +527,8 @@ const JITRL_HOST_ADVISOR_KEYS = new Set<string>([
   'minSupport'
 ]);
 const JITRL_PRIVACY_KEYS = new Set<string>(['redactSecrets', 'storeRawText']);
+const EXECUTION_KEYS = new Set<string>(['mode', 'applyWinningPatch']);
+const EXECUTION_MODES_ALLOWED: readonly string[] = ['baseline', 'shadow', 'guarded-active', 'off'];
 const JITRL_DREAM_KEYS = new Set<string>([
   'driftRho',
   'hyperparamPerturbation',
@@ -1006,6 +1042,28 @@ function validateLoggingGroup(root: Record<string, unknown>, issues: ConfigValid
   );
 }
 
+/** P6.2 C1: the execution group (mode + permanent-patch switch). */
+function validateExecutionGroup(root: Record<string, unknown>, issues: ConfigValidationIssue[]): void {
+  const execution = asGroup(root.execution, 'execution', issues);
+  if (execution === null) {
+    return;
+  }
+  validateEnum(execution.mode, 'execution.mode', EXECUTION_MODES_ALLOWED, issues);
+  validateBoolean(execution.applyWinningPatch, 'execution.applyWinningPatch', issues);
+  // Cross-field guard: a permanent mount may only be requested in
+  // guarded-active. Any other combination is rejected outright rather than
+  // silently downgraded (fail-closed, no implicit permission loss).
+  if (execution.applyWinningPatch === true && execution.mode !== 'guarded-active') {
+    pushIssue(
+      issues,
+      'execution.applyWinningPatch',
+      'invalid_value',
+      'applyWinningPatch requires execution.mode=guarded-active (ADR 0002 R2: the patch permission is denied in every other mode).',
+      execution.applyWinningPatch
+    );
+  }
+}
+
 function validateJitRlLevels(value: unknown, issues: ConfigValidationIssue[]): void {
   validateStringArray(value, 'jitrl.levels', 1, issues);
   if (!Array.isArray(value)) {
@@ -1236,6 +1294,7 @@ function buildConfig(rawInput: unknown): ConfigBuildResult {
     collectUnknownKeys(raw.jitrl.privacy, JITRL_PRIVACY_KEYS, 'jitrl.privacy', issues);
     collectUnknownKeys(raw.jitrl.dream, JITRL_DREAM_KEYS, 'jitrl.dream', issues);
   }
+  collectUnknownKeys(raw.execution, EXECUTION_KEYS, 'execution', issues);
   collectUnknownKeys(raw.logging, LOGGING_KEYS, 'logging', issues);
 
   const merged = deepMerge(createDefaultConfig(), raw);
@@ -1261,6 +1320,7 @@ function buildConfig(rawInput: unknown): ConfigBuildResult {
   validateMemoryGroup(merged, issues);
   validateDreamGroup(merged, issues);
   validateJitRlGroup(merged, issues);
+  validateExecutionGroup(merged, issues);
   validateLoggingGroup(merged, issues);
 
   return { config: merged as unknown as EvoHarnessConfig, issues };

@@ -31,6 +31,7 @@ import {
   createEvoHarnessOrchestrator,
   type EvoHarnessOrchestratorDeps
 } from '../../../src/orchestrator';
+import { resolveExecutionProfile } from '../../../src/runtime/execution-profile';
 
 function trajectory(overrides: Partial<ProbeTrajectory> = {}): ProbeTrajectory {
   return {
@@ -372,7 +373,7 @@ describe('P6.2 PR-B F4: exploration budget and gate switch', () => {  it('starts
     expect(typeof EvoHarnessOrchestratorImpl.prototype.revokeExplorationBudget).toBe('function');
   });
 
-  it('the conservative gate defaults off and switches via deps.conservativeGate', () => {
+  it('the conservative gate defaults off and switches only through guarded-active (t7/V2)', () => {
     const minimal = {
       config: { probe: { maxConcurrentProbes: 1, probeTimeoutMs: 1000 } },
       memory: {},
@@ -390,8 +391,26 @@ describe('P6.2 PR-B F4: exploration budget and gate switch', () => {  it('starts
     expect((minimal as { conservativeGate?: boolean }).conservativeGate).toBeUndefined();
     const off = new EvoHarnessOrchestratorImpl(minimal);
     expect(off.explorationBudgetRemaining()).toBe(0);
-    // The deps field is the documented switch for the release-boundary PR.
-    const on = new EvoHarnessOrchestratorImpl({ ...minimal, conservativeGate: true });
+    expect((off as unknown as { conservativeGate: boolean }).conservativeGate).toBe(false);
+    // t7/V2 (ADR 0002 R1): the legacy deps.conservativeGate=true opt-in no
+    // longer bypasses the execution profile. Outside guarded-active the
+    // combination is INVALID and fails closed at construction - shadow /
+    // baseline / off must never intercept selection.
+    expect(() => new EvoHarnessOrchestratorImpl({ ...minimal, conservativeGate: true })).toThrow(
+      /guarded-active/
+    );
+    // The one valid explicit request: a guarded-active profile plus the switch.
+    const on = new EvoHarnessOrchestratorImpl({
+      ...minimal,
+      conservativeGate: true,
+      executionProfile: resolveExecutionProfile({ mode: 'guarded-active' })
+    });
     expect((on as unknown as { conservativeGate: boolean }).conservativeGate).toBe(true);
+    // And the profile alone (the release wiring path) still enables the gate.
+    const profiled = new EvoHarnessOrchestratorImpl({
+      ...minimal,
+      executionProfile: resolveExecutionProfile({ mode: 'guarded-active' })
+    });
+    expect((profiled as unknown as { conservativeGate: boolean }).conservativeGate).toBe(true);
   });
 });

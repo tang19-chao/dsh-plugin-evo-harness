@@ -30,14 +30,22 @@
 
 import type {
   AbstractState,
+  ActionKeyVocabulary,
+  DecisionMode,
   ExperienceOutcome,
   ExperienceQuery,
   ExperienceRecord,
   JitLevel,
-  GuidanceMode
+  GuidanceMode,
+  LearningTrack
 } from '../types/contracts';
-import { EXPERIENCE_OUTCOMES } from '../types/contracts';
-import { isLearningEligibleRecord, isRewardVersionExact } from './reward-contract';
+import {
+  ACTION_KEY_VOCABULARIES,
+  DECISION_MODES,
+  EXPERIENCE_OUTCOMES,
+  LEARNING_TRACKS
+} from '../types/contracts';
+import { isLearningEligibleRecord, isRewardVersionExact, REWARD_CONTRACT_VERSION } from './reward-contract';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -73,19 +81,26 @@ export const LEGACY_EXPERIENCE_SCHEMA_VERSION = 1 as const;
 /**
  * Reward-model version stamped on every record written by this round.
  *
- * P6.1-D2 / R3 F1-a: this constant POINTS AT the RewardContract version so the
- * persisted marker and the contract that defines its meaning cannot drift
- * apart (previously it stayed on 'r2/verifiable-v1' while the orchestrator
- * already wrote 'r3/unified-signals-v1'). The contract module
- * (./reward-contract.ts) owns the version and its compatibility rule.
+ * P6.2 C1 (ADR 0002 R3): the ONE-TIME ATOMIC SWITCH to the preregistered
+ * verifier-first id `r4/verifier-first-v1`. P6.1-D2 / R3 F1-a keeps this
+ * constant POINTING AT the RewardContract version so the persisted marker and
+ * the contract that defines its meaning cannot drift apart. The r3/r4
+ * boundary is empty both ways (see REWARD_CONTRACT_COMPATIBLE_IDS in
+ * ./reward-contract.ts): every r3 record is excluded from the r4 learning
+ * neighbourhood automatically by the exact-id predicate, no batch migration
+ * runs, and no audit log is rewritten in place.
+ *
+ * C2-pre (ADR 0002 5.2a): inside r4 the verdict field may still come from a
+ * shape-only payload, so this switch is conservative isolation, not proof
+ * that trusted verification is live.
  */
-export const CURRENT_REWARD_VERSION = 'r3/unified-signals-v1' as const;
+export const CURRENT_REWARD_VERSION: 'r4/verifier-first-v1' = REWARD_CONTRACT_VERSION;
 
 /**
  * The reward version this store upgraded FROM; kept explicit so upgrade paths
- * and tests can name the r2 lineage instead of hard-coding the string.
+ * and tests can name the r3 lineage instead of hard-coding the string.
  */
-export const PREVIOUS_REWARD_VERSION = 'r2/verifiable-v1' as const;
+export const PREVIOUS_REWARD_VERSION = 'r3/unified-signals-v1' as const;
 
 /** Provenance-model version stamped on every record written by this round. */
 export const CURRENT_PROVENANCE_VERSION = 'p2/per-execution-v1' as const;
@@ -193,6 +208,12 @@ export interface StoredExperience {
   readonly learningTarget: number | undefined;
   readonly outcome: ExperienceOutcome | undefined;
   readonly learningEligible: boolean | undefined;
+  /** P6.2 C0 (ADR 0002 R8): declared execution mode; undefined = undeclared. */
+  readonly decisionMode: DecisionMode | undefined;
+  /** P6.2 C0 (ADR 0002 R8): declared action-key vocabulary; undefined = undeclared. */
+  readonly actionKeyVocabulary: ActionKeyVocabulary | undefined;
+  /** P6.2 t7/V3 (ADR 0002 5.2a-4): declared learning track; undefined = undeclared (treated as 'process'). */
+  readonly learningTrack: LearningTrack | undefined;
   readonly createdAt: number;
   readonly redacted: boolean;
 }
@@ -228,6 +249,82 @@ export function isLegacyStoredExperience(
 export function isLearningEligible(record: StoredExperience): boolean {
   return isLearningEligibleRecord(record, CURRENT_REWARD_VERSION);
 }
+
+/**
+ * P6.2 t8/R3+R8 (ADR 0002 §10): the REPLAY-side declaration reconstruction
+ * query. Extends the base query with two fail-closed declaration filters:
+ *
+ *   - `requireDeclaredMode`: only records whose `decisionMode` equals the
+ *     declared mode join the neighbourhood; an UNDECLARED record is excluded
+ *     (never guessed - R8 "缺省 fail-closed（不猜模式）").
+ *   - `requireDeclaredVocabulary`: the same rule for `actionKeyVocabulary`
+ *     ("不猜词表"). Different vocabularies never mix in one estimate.
+ *
+ * Together with the exact rewardVersion predicate this makes "same log
+ * reloaded -> same neighbourhood" a property of the query, not of the caller:
+ * a replay that declares its mode and vocabulary deterministically rebuilds
+ * the same neighbourhood set from the same persisted log.
+ */
+export interface ReplayExperienceQuery extends ExperienceQuery {
+  /** Fail-closed: keep only records declaring exactly this decision mode. */
+  readonly requireDeclaredMode?: DecisionMode;
+  /** Fail-closed: keep only records declaring exactly this vocabulary. */
+  readonly requireDeclaredVocabulary?: ActionKeyVocabulary;
+}
+
+/** t8/R3: true when the record satisfies the replay declaration filters. */
+export function matchesReplayDeclarations(
+  record: Readonly<Pick<StoredExperience, 'decisionMode' | 'actionKeyVocabulary'>>,
+  query: Readonly<Pick<ReplayExperienceQuery, 'requireDeclaredMode' | 'requireDeclaredVocabulary'>>
+): boolean {
+  if (query.requireDeclaredMode !== undefined && record.decisionMode !== query.requireDeclaredMode) {
+    return false;
+  }
+  if (
+    query.requireDeclaredVocabulary !== undefined &&
+    record.actionKeyVocabulary !== query.requireDeclaredVocabulary
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * P6.2 t7/V3 (ADR 0002 5.2a-4): the track-isolation predicate shared by every
+ * snapshot-fed learning consumer.
+ *
+ * 'task-quality' accepts ONLY records that explicitly declared the
+ * task-quality track (a trusted-source verdict contributed their completion
+ * source); an UNDECLARED record fails closed - never guessed up, because a
+ * pre-t7 record's fused reward cannot prove which track it belonged to.
+ * 'process' accepts undeclared records (pre-t7 history, host-tool, rescore -
+ * the pre-existing eligibility path) and declared-process records, but NEVER
+ * a task-quality record: the two tracks must not mix in one neighbourhood.
+ *
+ * This mirrors the store query filter (`ExperienceQuery.learningTrack`, same
+ * file) so the query path and the snapshot path share ONE rule; the kernel's
+ * own filter deliberately stays untouched (R6: the frozen research path calls
+ * the kernel directly and must not change behaviour).
+ */
+export function isOnLearningTrack(
+  record: Readonly<Pick<ExperienceRecord, 'learningTrack'>>,
+  track: LearningTrack
+): boolean {
+  if (track === 'task-quality') {
+    return record.learningTrack === 'task-quality';
+  }
+  return record.learningTrack !== 'task-quality';
+}
+
+/**
+ * P6.2 t7/V3: the production learning track. Every production L1/L2/L3/replay
+ * /M3 consumer estimates execution-level signals (the pre-existing
+ * eligibility path; no trusted task-quality verdict exists before C2), so it
+ * consumes the PROCESS track. Declaring it here keeps a future task-quality
+ * record from ever leaking into a process estimate once C2 starts producing
+ * them, without touching the shared kernel filter.
+ */
+export const PRODUCTION_LEARNING_TRACK: LearningTrack = 'process';
 
 function normalizeRecord(value: unknown): StoredExperience {
   if (!isPlainObject(value)) {
@@ -352,6 +449,17 @@ function normalizeRecord(value: unknown): StoredExperience {
       'learningEligible'
     );
   }
+  // P6.2 C0 (ADR 0002 R8): the explicit decision fields. Optional so a
+  // pre-P6.2 record normalizes exactly as before and simply stays undeclared;
+  // a present field with the wrong type is a producer bug and is rejected
+  // (never guessed).
+  const decisionMode = optionalDecisionMode(value, 'decisionMode');
+  const actionKeyVocabulary = optionalActionKeyVocabulary(value, 'actionKeyVocabulary');
+  // P6.2 t7/V3 (ADR 0002 5.2a-4): the explicit learning track. Optional so a
+  // pre-t7 record normalizes exactly as before and stays undeclared (the
+  // strict filter treats undeclared as 'process', never guessed up); a present
+  // field with a wrong spelling is a producer bug and is rejected.
+  const learningTrack = optionalLearningTrack(value, 'learningTrack');
   return {
     id,
     level,
@@ -384,6 +492,9 @@ function normalizeRecord(value: unknown): StoredExperience {
     learningTarget,
     outcome,
     learningEligible: learningEligibleRaw as boolean | undefined,
+    decisionMode,
+    actionKeyVocabulary,
+    learningTrack,
     createdAt,
     redacted
   };
@@ -451,6 +562,44 @@ function optionalOutcome(source: object, field: string): ExperienceOutcome | und
     );
   }
   return value as ExperienceOutcome;
+}
+
+/** Read an optional enum field, rejecting any value outside the frozen set. */
+function optionalEnum<E extends string>(
+  source: object,
+  field: string,
+  allowed: readonly string[]
+): E | undefined {
+  const value = readField(source, field);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== 'string' || !allowed.includes(value)) {
+    throw new ExperienceRecordError(
+      'invalid_field',
+      'experience record ' + field + ' is not one of ' + allowed.join(', '),
+      field
+    );
+  }
+  return value as E;
+}
+
+/** Read the optional declared execution mode (ADR 0002 R8), rejecting typos. */
+function optionalDecisionMode(source: object, field: string): DecisionMode | undefined {
+  return optionalEnum<DecisionMode>(source, field, DECISION_MODES as readonly string[]);
+}
+
+/** Read the optional declared action-key vocabulary (ADR 0002 R8). */
+function optionalActionKeyVocabulary(
+  source: object,
+  field: string
+): ActionKeyVocabulary | undefined {
+  return optionalEnum<ActionKeyVocabulary>(source, field, ACTION_KEY_VOCABULARIES as readonly string[]);
+}
+
+/** Read the optional declared learning track (t7/V3), rejecting typos. */
+function optionalLearningTrack(source: object, field: string): LearningTrack | undefined {
+  return optionalEnum<LearningTrack>(source, field, LEARNING_TRACKS as readonly string[]);
 }
 
 /** Validate a batch, dropping duplicate ids inside the batch. Never echoes payloads. */
@@ -532,6 +681,11 @@ export function toExperienceRecord(stored: StoredExperience): ExperienceRecord {
     ...(stored.learningEligible === undefined
       ? {}
       : { learningEligible: stored.learningEligible }),
+    ...(stored.decisionMode === undefined ? {} : { decisionMode: stored.decisionMode }),
+    ...(stored.actionKeyVocabulary === undefined
+      ? {}
+      : { actionKeyVocabulary: stored.actionKeyVocabulary }),
+    ...(stored.learningTrack === undefined ? {} : { learningTrack: stored.learningTrack }),
     createdAt: stored.createdAt,
     redacted: stored.redacted
   };
@@ -616,8 +770,31 @@ function guidanceOf(value: unknown): GuidanceMode | undefined {
   return GUIDANCE_MODES.find((mode) => mode === value);
 }
 
+/**
+ * t8/R3+R8: validate the optional replay declaration filters. A declared
+ * filter must be a member of its frozen set; a typo is rejected (never
+ * guessed), keeping replay reconstruction fail-closed.
+ */
+function validateReplayDeclarations(query: ReplayExperienceQuery): void {
+  if (
+    query.requireDeclaredMode !== undefined &&
+    !(DECISION_MODES as readonly string[]).includes(query.requireDeclaredMode)
+  ) {
+    throw new RangeError('query: requireDeclaredMode must be one of ' + DECISION_MODES.join(', '));
+  }
+  if (
+    query.requireDeclaredVocabulary !== undefined &&
+    !(ACTION_KEY_VOCABULARIES as readonly string[]).includes(query.requireDeclaredVocabulary)
+  ) {
+    throw new RangeError(
+      'query: requireDeclaredVocabulary must be one of ' + ACTION_KEY_VOCABULARIES.join(', ')
+    );
+  }
+}
+
 /** Validate an ExperienceQuery; throws RangeError/TypeError on a contract violation. */
 export function validateExperienceQuery(query: ExperienceQuery, halfLifeMs: number): void {
+  validateReplayDeclarations(query as ReplayExperienceQuery);
   if (!isPlainObject(query as unknown)) {
     throw new TypeError('query: an ExperienceQuery object is required');
   }
@@ -663,6 +840,12 @@ export function validateExperienceQuery(query: ExperienceQuery, halfLifeMs: numb
     typeof query.learningEligibleOnly !== 'boolean'
   ) {
     throw new TypeError('query: learningEligibleOnly must be a boolean');
+  }
+  if (
+    query.learningTrack !== undefined &&
+    !(LEARNING_TRACKS as readonly string[]).includes(query.learningTrack)
+  ) {
+    throw new RangeError('query: learningTrack must be one of ' + LEARNING_TRACKS.join(', '));
   }
   if (!Number.isFinite(halfLifeMs) || halfLifeMs < 0) {
     throw new RangeError('query: halfLifeMs must be a finite number >= 0');
@@ -959,7 +1142,8 @@ function matchesBaseFilters(
   before: number | undefined,
   excludeLegacy: boolean,
   minimumSchemaVersion: number,
-  learningEligibleOnly: boolean
+  learningEligibleOnly: boolean,
+  learningTrack: LearningTrack | undefined
 ): boolean {
   if (record.level !== level) {
     return false;
@@ -980,6 +1164,19 @@ function matchesBaseFilters(
   }
   if (learningEligibleOnly && !isLearningEligible(record)) {
     return false;
+  }
+  // P6.2 t7/V3 (ADR 0002 5.2a-4): track isolation. A 'process' query keeps
+  // undeclared records (pre-t7 history, host-tool, rescore - the pre-existing
+  // eligibility path) and declared-process records, but NEVER a task-quality
+  // record; a 'task-quality' query keeps ONLY records that explicitly declared
+  // the task-quality track (undeclared fails closed - never guessed up).
+  if (learningTrack !== undefined) {
+    if (learningTrack === 'task-quality' && record.learningTrack !== 'task-quality') {
+      return false;
+    }
+    if (learningTrack === 'process' && record.learningTrack === 'task-quality') {
+      return false;
+    }
   }
   return true;
 }
@@ -1017,6 +1214,13 @@ export function executeExperienceQuery(
 ): readonly ScoredStoredExperience[] {
   const halfLifeMs = options.halfLifeMs ?? DEFAULT_EXPERIENCE_HALF_LIFE_MS;
   validateExperienceQuery(query, halfLifeMs);
+  // t8/R3+R8: the replay declaration filters ride the same query object
+  // (absent on every non-replay caller = behaviour unchanged).
+  const replayQuery = query as ReplayExperienceQuery;
+  const requireDeclaredMode = replayQuery.requireDeclaredMode;
+  const requireDeclaredVocabulary = replayQuery.requireDeclaredVocabulary;
+  const replayDeclarationsActive =
+    requireDeclaredMode !== undefined || requireDeclaredVocabulary !== undefined;
   const now = options.now ?? Date.now();
   if (!Number.isFinite(now) || now < 0) {
     throw new RangeError('query: now must be a finite non-negative number');
@@ -1031,6 +1235,11 @@ export function executeExperienceQuery(
       ? query.minimumExperienceSchemaVersion
       : EXPERIENCE_SCHEMA_VERSION;
   const learningEligibleOnly = query.learningEligibleOnly === true;
+  const learningTrack =
+    query.learningTrack !== undefined &&
+    (LEARNING_TRACKS as readonly string[]).includes(query.learningTrack)
+      ? query.learningTrack
+      : undefined;
 
   // Stage 1a: exact (level, bucket) pre-filter.
   const bucketRecords = index.exactBucketRecords(level, query.state.bucket);
@@ -1060,8 +1269,17 @@ export function executeExperienceQuery(
         before,
         excludeLegacy,
         minimumSchemaVersion,
-        learningEligibleOnly
+        learningEligibleOnly,
+        learningTrack
       )
+    ) {
+      continue;
+    }
+    // t8/R3+R8: fail-closed replay declaration partition (undeclared records
+    // never join a declared replay neighbourhood).
+    if (
+      replayDeclarationsActive &&
+      !matchesReplayDeclarations(record, { requireDeclaredMode, requireDeclaredVocabulary })
     ) {
       continue;
     }

@@ -216,6 +216,11 @@ function makeSeams(now: () => number, probes: string[]): ICordisSeamManager {
         },
         steps: result.steps ?? [],
         toolErrors: result.toolErrors ?? [],
+        // PR-B fixture fidelity: the executor's deliverable is part of the
+        // executed trajectory. Dropping it here turned every successful run
+        // into "claimed success without a deliverable" (structural verdict
+        // failed), which the C2-pre eligibility rules keep audit-only.
+        ...(result.deliverable === undefined ? {} : { deliverable: result.deliverable }),
         failureSignals: result.failureSignals ?? [],
         memoryRecallIds: request.memoryRecallIds ?? []
       } as ProbeTrajectory;
@@ -1061,17 +1066,16 @@ describe('evaluate_steps and record_experience', () => {
     // the expected return is the verifiable-signal reward of the executed
     // trajectory, not the discounted step-evaluator return.
     //
-    // The runBranch fixture returns status 'succeeded' with one message step
-    // and zero tool calls, and makeSeams does not copy the executor's
-    // deliverable onto the trajectory, so the executed shape is a claimed
-    // success without a deliverable (completion = -1) - scored exactly as the
-    // contract says such a run must be scored.
+    // P6.2 C1/t6 fixture note: the executor returns a deliverable and makeSeams
+    // forwards it, so the recorded shape is a succeeded run with an UNVERIFIED
+    // deliverable - structural verdict 'unknown', completion 0, trainable
+    // through the process path (the ADR R4 net effect).
     const executedShape = {
       ...makeMinimalTrajectory(),
       status: 'succeeded' as const,
       metrics: { steps: 1, toolCalls: 0, toolErrors: 0, durationMs: 10 },
       steps: [{ index: 0, at: 1, kind: 'message' as const, text: 'recovered' }],
-      deliverable: undefined,
+      deliverable: { content: 'recovered', format: 'text' as const },
       failureSignals: []
     };
     const expected = Math.min(3, Math.max(-3, scoreUnderRewardContract(executedShape).reward));
@@ -1080,6 +1084,10 @@ describe('evaluate_steps and record_experience', () => {
     for (const record of online) {
       expect(record.return).toBeCloseTo(expected, 12);
       expect(record.reward).toBeCloseTo(expected, 12);
+      // P6.2 C0: explicit decision fields on every record (ADR R8).
+      expect(record.decisionMode).toBe('shadow');
+      expect(record.actionKeyVocabulary).toBe('signature');
+      expect(record.rewardVersion).toBe('r4/verifier-first-v1');
     }
     // The judge's step vector is still visible, as the auxiliary entry only.
     const winnerRecord = online.find((record) => record.rewardSources.stepJudge !== undefined);
@@ -1087,6 +1095,48 @@ describe('evaluate_steps and record_experience', () => {
       (rewards[0] as number + (rewards[1] as number)) / 2,
       12
     );
+  });
+
+  it('keeps a claimed-success-without-deliverable run audit-only under the C2-pre rule (t6)', async () => {
+    // The structural fallback marks "succeeded but nothing delivered" as a
+    // FAILED verdict. The -1 completion is a verdict-derived task-quality
+    // source, and C2-pre it is NOT learnable (no trusted provenance): the
+    // record stays audit-only instead of becoming a negative training sample.
+    // Trusted-failure learning is the explicit C2 unfinished item.
+    const harness = makeHarness({ candidatesPerCall: 1 });
+    // Strip the deliverable after the seam: simulate a claimed success with
+    // no deliverable reaching the recorder.
+    const originalRun = harness.orchestrator.run.bind(harness.orchestrator);
+    const seams = harness.deps.seams as unknown as {
+      runInIsolatedBranch: (request: ProbeBranchRequest) => Promise<ProbeTrajectory>;
+    };
+    const originalProbe = seams.runInIsolatedBranch.bind(seams);
+    seams.runInIsolatedBranch = async (request) => {
+      const trajectory = await originalProbe(request);
+      if (request.role === 'candidate') {
+        const { deliverable: _dropped, ...rest } = trajectory as ProbeTrajectory & {
+          deliverable?: unknown;
+        };
+        return rest as ProbeTrajectory;
+      }
+      return trajectory;
+    };
+    void originalRun;
+    await harness.orchestrator.run({
+      sessionId: 'session-c2pre',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    const online = harness.store
+      .snapshot()
+      .filter((record) => record.id.startsWith('online-'));
+    expect(online.length).toBeGreaterThan(0);
+    for (const record of online) {
+      // Audit-only: no learning target, no trainability, but the negative
+      // scale signal stays visible in the reward column.
+      expect(record.learningEligible).toBe(false);
+      expect(record.learningTarget).toBe(0);
+    }
   });
 
   it('is silent when JitRL is disabled: no stages, no records', async () => {

@@ -68,6 +68,7 @@ import {
   type EffectivePolicyConfigProvider,
   type LayerDecisionConfig
 } from './decision-kernel';
+import { isOnLearningTrack, PRODUCTION_LEARNING_TRACK } from './experience-store';
 import {
   abstractMetaState,
   type JitReferenceStatus,
@@ -177,6 +178,12 @@ export interface JitBatchAdjustment {
   readonly adjustedLogit: number;
   readonly probability: number;
   readonly support: number;
+  /**
+   * P6.2 C0 (ADR 0002 R5): Kish effective sample size behind this action's Q,
+   * carried into the L1 diagnostics so the ledger co-reports support and nEff
+   * on every L1 decision.
+   */
+  readonly nEff?: number;
   readonly explored: boolean;
 }
 
@@ -271,6 +278,18 @@ export interface JitActivePolicyOptions {
    * no history entry, no diagnostics. Defaults to always-on.
    */
   readonly isRuntimeEnabled?: () => boolean;
+  /**
+   * t10/R1b (ADR 0002 §3 baseline 行, option ①): the EXECUTION-interception
+   * switch. While it returns false the decorator behaves exactly like the
+   * runtime-off path - the inner plan is returned byte-identical (no L1
+   * adjustment, no metadata.jit, no history entry) even though the kernel is
+   * configured and the volatile switch is on. The wiring point is the plugin
+   * entry: only a guarded-active profile intercepts; baseline/shadow return
+   * the unadjusted plan (shadow still records suggestions elsewhere, baseline
+   * records audit-level only). Defaults to true (intercept) so the pre-t10
+   * behaviour is unchanged for callers that do not wire the profile.
+   */
+  readonly interceptExecution?: () => boolean;
   /** Recovery slots the derived policy may schedule (config dreamRsi). */
   readonly maxRecoverySlots?: number;
   /** Surfaces the derived policy falls back to when the tree hints none. */
@@ -653,11 +672,36 @@ class JitActivePolicyImpl implements JitActivePolicy {
     }
   }
 
+  /**
+   * t10/R1b: the execution-interception switch (see JitActivePolicyOptions).
+   * A throwing check fails OPEN? No - it fails CLOSED to no-interception, so a
+   * broken wiring can never re-enable an execution-side effect (the same
+   * failure direction as orchestrator.surfaceEnabled).
+   */
+  private interceptsExecution(): boolean {
+    const check = this.options.interceptExecution;
+    if (check === undefined) {
+      return true;
+    }
+    try {
+      return check() !== false;
+    } catch {
+      return false;
+    }
+  }
+
   selectBatch(request: SelectBatchRequest): BatchPlan {
     const baseline = this.base.selectBatch(request);
     // Runtime off (/evo jit off): return the baseline untouched, with no
     // metadata.jit and no history entry, so /evo jit on restores immediately.
     if (!this.runtimeEnabled()) {
+      return baseline;
+    }
+    // t10/R1b (ADR 0002 §3 baseline 行): a declared baseline/shadow-free
+    // assembly must NOT adjust the plan either - the inner policy's plan is
+    // returned byte-identical (no L1 correction, no metadata.jit). Only
+    // guarded-active intercepts.
+    if (!this.interceptsExecution()) {
       return baseline;
     }
     if (baseline.width <= 0 || baseline.slots.length === 0) {
@@ -692,7 +736,15 @@ class JitActivePolicyImpl implements JitActivePolicy {
       level: 'meta',
       state,
       candidates,
-      records: resolveSnapshot(this.options.experiences),
+      // P6.2 t7/V3 (ADR 0002 5.2a-4): the L1 neighbourhood is a PROCESS
+      // estimate. The snapshot is pre-filtered HERE (the kernel's shared
+      // filter stays untouched - R6: the frozen research path calls the same
+      // kernel directly and must not change behaviour): undeclared records
+      // keep flowing (the pre-existing eligibility path) but a task-quality
+      // record never enters an online L1 estimate.
+      records: resolveSnapshot(this.options.experiences).filter((entry) =>
+        isOnLearningTrack(entry, PRODUCTION_LEARNING_TRACK)
+      ),
       config: layerFromResolved(config),
       ...(resolved.policyVersion === undefined
         ? {}
@@ -977,6 +1029,7 @@ function toDiagnostics(
       adjustedLogit: entry.adjustedLogit,
       probability: entry.probability,
       support: entry.support,
+      ...(entry.nEff === undefined ? {} : { nEff: entry.nEff }),
       explored: entry.explored
     });
   }

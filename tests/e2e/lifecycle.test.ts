@@ -13,6 +13,7 @@ import type {
 } from '../../src/types/contracts';
 import { createCordisSeamManager, createInMemoryCordisHost } from '../../src/cordis-seams';
 import { createEvoHarnessPlugin } from '../../src/index';
+import { resolveExecutionProfile } from '../../src/runtime/execution-profile';
 import {
   buildE2E,
   createDefaultRecordingTaxonomy,
@@ -47,7 +48,15 @@ const DOCUMENTED_ORDER = [
 
 describe('end-to-end lifecycle', () => {
   it('executes the documented stages in order and recovers from a reference tool failure', async () => {
-    const { plugin, runner } = buildE2E();
+    // t10/R2 + t12/R2-residual: this suite asserts the governed-commit machinery
+    // end to end (lessonsCommitted against the in-memory mock backend), so the
+    // assembly explicitly opts in on the memory PERMISSION half. The default
+    // assembly never calls the memory bridge at all (the denial is enforced at
+    // the call site) and is pinned by the t12/R2-residual negative regression in
+    // tests/unit/p62/release-contract.test.ts.
+    const { plugin, runner } = buildE2E({
+      extra: { deps: { executionProfile: resolveExecutionProfile({ memoryRealWrites: true }) } }
+    });
     const task = plugin.makeTask({
       id: 'task-e2e',
       prompt: 'Fix the failing build without breaking the release train.',
@@ -75,9 +84,12 @@ describe('end-to-end lifecycle', () => {
     expect(selected?.contrasts.some((contrast) => contrast.dimension === 'task_completion')).toBe(true);
     expect(composition?.selectedTrajectoryId).not.toBeNull();
 
-    // the winning scaffold is mounted permanently and the tree is retained
-    expect(result.composedPatchId).toBeDefined();
-    expect(plugin.orchestrator.activePatchIds()).toContain(result.composedPatchId);
+    // P6.2 C1 (ADR 0002 R2/t6): the default assembly does NOT permanently
+    // mount the winning scaffold (patch layer denied). The composition still
+    // selects and reports the winner (see the shadow no-mount regression
+    // below); here we assert the documented stage order survives unchanged.
+    expect(result.metadata?.appliedPatchId).toBeUndefined();
+    expect(plugin.orchestrator.activePatchIds()).toEqual([]);
     expect(plugin.orchestrator.treePool.size()).toBe(1);
 
     // 2. lifecycle order
@@ -351,9 +363,17 @@ describe('end-to-end lifecycle', () => {
     expect(policy.batchPlans).toHaveLength(1);
   });
 
-  it('replaces the permanent scaffold instead of stacking it across runs', async () => {
+  it('replaces the permanent scaffold instead of stacking it across runs (opt-in patch layer)', async () => {
+    // P6.2 C1 (ADR 0002 R2/t6): the permanent mount now requires the patch
+    // permission - guarded-active + execution.applyWinningPatch. This suite
+    // exercises the rollback/replace machinery on the EXPLICIT opt-in, while
+    // the default assembly is covered by the no-mount regression below.
     const host = createInMemoryCordisHost();
-    const { plugin } = buildE2E({ host, dreamEveryNTasks: 100 });
+    const { plugin } = buildE2E({
+      host,
+      dreamEveryNTasks: 100,
+      config: { execution: { mode: 'guarded-active', applyWinningPatch: true } }
+    });
     const task = plugin.makeTask({ id: 'task-replace', prompt: 'Fix the failing build.' });
 
     const first = await plugin.run({ sessionId: 'sess-replace', task, trigger: 'always' });
@@ -377,7 +397,39 @@ describe('end-to-end lifecycle', () => {
     ).toEqual([]);
   });
 
-  it('records a throwing patch rollback as a diagnostic without aborting the run', async () => {
+  it('default assembly never permanently mounts the winning patch (shadow, C1)', async () => {
+    // ADR 0002 R1/R2 (t6): the default assembly is baseline execution + shadow
+    // records with ZERO side effects - no applyPatch, no publish, no real
+    // memory write. The composed winner is still selected and reported; it is
+    // simply not mounted.
+    const host = createInMemoryCordisHost();
+    const { plugin } = buildE2E({ host, dreamEveryNTasks: 100 });
+    const task = plugin.makeTask({ id: 'task-shadow-nomount', prompt: 'Fix the failing build.' });
+
+    const result = await plugin.run({ sessionId: 'sess-nomount', task, trigger: 'always' });
+    expect(result.outcome).toBe('composed');
+    // P6.2 C1: without the patch permission the winner is NOT mounted, so no
+    // applied/composed patch id is reported as applied.
+    expect(result.composedPatchId).toBeUndefined();
+    expect(result.metadata?.appliedPatchId).toBeUndefined();
+    // NOTHING is permanently mounted, nothing rolled back, no host effects.
+    expect(plugin.orchestrator.activePatchIds()).toEqual([]);
+    expect(host.activeEffects().length).toBe(0);
+    // The profile reports the fail-closed permission set.
+    const profile = (plugin.orchestrator as unknown as {
+      executionProfileSnapshot?: () => {
+        mode: string;
+        permissions: Record<string, { allowed: boolean }>;
+      };
+    }).executionProfileSnapshot?.();
+    expect(profile).toBeDefined();
+    expect(profile?.mode).toBe('shadow');
+    expect(profile?.permissions['patch']?.allowed).toBe(false);
+    expect(profile?.permissions['publish']?.allowed).toBe(false);
+    expect(profile?.permissions['memory']?.allowed).toBe(false);
+  });
+
+  it('records a throwing patch rollback as a diagnostic without aborting the run (opt-in patch layer)', async () => {
     const host = createInMemoryCordisHost();
     const now = makeClock();
     const seams = createCordisSeamManager({
@@ -390,7 +442,8 @@ describe('end-to-end lifecycle', () => {
     const { plugin } = buildE2E({
       host,
       dreamEveryNTasks: 100,
-      extra: { deps: { seams: throwing } }
+      extra: { deps: { seams: throwing } },
+      config: { execution: { mode: 'guarded-active', applyWinningPatch: true } }
     });
     const task = plugin.makeTask({ id: 'task-throwing', prompt: 'Fix the failing build.' });
 

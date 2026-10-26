@@ -34,6 +34,7 @@ import { parseEvoHarnessConfig } from '../../src/config';
 import { createActivePolicyFromDefaults, createSurrogateScorer } from '../../src/dream-rsi';
 import { createAnonymousComposer, createDualTrackProposer } from '../../src/harness2';
 import { createEvoHarnessPlugin } from '../../src/index';
+import { resolveExecutionProfile } from '../../src/runtime/execution-profile';
 import { createMemoryBridge } from '../../src/memory-bridge';
 import {
   buildE2E,
@@ -359,9 +360,18 @@ describe('fix-wave composition', () => {
     expect(recoverSlot?.seedPatchIds?.length ?? 0).toBeGreaterThan(0);
   });
 
-  it('promotes only positive lessons to global scope through the governed commit', async () => {
+  it('promotes only positive lessons to global scope through the governed commit (explicit opt-in)', async () => {
     const server = mem0LikeServer();
-    const config = parseEvoHarnessConfig(e2eConfig({ maxWidth: 2, maxDepth: 1, rolloutBudget: 4 }));
+    // P6.2 C1 (ADR 0002 R2): promotion is a real memory write - the default
+    // assembly keeps it denied, so this suite opts in explicitly.
+    const config = parseEvoHarnessConfig(
+      e2eConfig({
+        maxWidth: 2,
+        maxDepth: 1,
+        rolloutBudget: 4,
+        config: { memoryBridge: { promoteOnComposeSuccess: true } }
+      })
+    );
     const now = makeClock();
     const memory = createMemoryBridge({ config: config.memoryBridge, clients: [server.client], now });
     const plugin = createEvoHarnessPlugin(
@@ -372,7 +382,8 @@ describe('fix-wave composition', () => {
         runBranch: createScriptedRunner(now, { candidateOutcomes: ['fail', 'succeed'] }),
         now,
         newId: makeIdFactory('polarity'),
-        deps: { memory }
+        // t10/R2: the explicit permission opt-in (fake in-memory backend).
+        deps: { memory, executionProfile: resolveExecutionProfile({ memoryRealWrites: true }) }
       },
       {}
     );

@@ -26,7 +26,9 @@ import type { EvoHarnessConfig, JitRlConfig } from '../config';
 import { BATCH_SLOT_KINDS } from '../types/contracts';
 import type {
   AbstractState,
+  ActionKeyVocabulary,
   BatchSlotKind,
+  DecisionMode,
   ExperienceQuery,
   ExperienceRecord,
   GuidanceMode,
@@ -52,7 +54,9 @@ import { backfillFromTreePool, type BackfillResult, type BackfillTreeSource } fr
 import {
   CURRENT_PROVENANCE_VERSION,
   CURRENT_REWARD_VERSION,
-  EXPERIENCE_SCHEMA_VERSION
+  EXPERIENCE_SCHEMA_VERSION,
+  PRODUCTION_LEARNING_TRACK,
+  isOnLearningTrack
 } from './experience-store';
 import {
   createEffectivePolicyConfigProvider,
@@ -167,7 +171,14 @@ export interface JitRl {
    * P4: synchronous Dream-replay simulator over a causal experience snapshot
    * (plan section 7.3-2). The plugin hands it to createOfflineDreamer().
    */
-  createReplayHook(options?: { readonly driftRho?: number }): JitReplayHook;
+  createReplayHook(options?: {
+    readonly driftRho?: number;
+    /** t10/R3b: caller-declared replay declarations (see JitReplayHookInput). */
+    readonly replayDeclarations?: {
+      readonly decisionMode?: DecisionMode;
+      readonly actionKeyVocabulary?: ActionKeyVocabulary;
+    };
+  }): JitReplayHook;
   /** P5-a: L3 host advisor over this kernel's experience store. */
   createHostAdvisor(options?: { readonly rng?: () => number }): HostAdvisor;
   /** P5-b: aggregate-statistics mirror over the configured MCP client. */
@@ -435,10 +446,43 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
     count(level?: JitLevel): number {
       return store.count(level);
     },
-    createReplayHook(replayOptions = {}): JitReplayHook {
+    createReplayHook(replayOptions: {
+      readonly driftRho?: number;
+      /**
+       * t10/R3b + t12/R3b2: the caller-declared replay declarations. They WIN
+       * over the factory default (a caller reconstructing an older generation
+       * passes that generation's declarations); absent keeps the default below.
+       */
+      readonly replayDeclarations?: {
+        readonly decisionMode?: DecisionMode;
+        readonly actionKeyVocabulary?: ActionKeyVocabulary;
+      };
+    } = {}): JitReplayHook {
+      // t12/R3b2 (t11 high finding): the defaults are resolved ONCE, in front of
+      // the caller's value - `caller ?? default`, field by field. The t10
+      // revision spread the caller value and then re-declared
+      // `replayDeclarations` further down in the same object literal, so the
+      // later key silently overwrote the caller's declaration (the comment
+      // claimed the opposite) and every production replay ran shadow/signature
+      // - excluding guarded-active/baseline stamped records entirely.
+      //
+      // Field-by-field: a caller that declares only one field still gets the
+      // documented default for the other, so a partial declaration can never
+      // accidentally un-partition the replay (the wrapper always partitioned,
+      // before and after this fix).
+      const replayDeclarations = {
+        // t10/R3b (ADR 0002 R8/R9): the factory-level default = the CURRENT
+        // producer stamps (what new records carry). The plugin wiring passes
+        // the DECLARED/effective execution mode, so the production
+        // replay/restart path consumes the declarations actually in force.
+        decisionMode: replayOptions.replayDeclarations?.decisionMode ?? ('shadow' as DecisionMode),
+        actionKeyVocabulary:
+          replayOptions.replayDeclarations?.actionKeyVocabulary ?? ('signature' as ActionKeyVocabulary)
+      };
       return createJitReplayHook({
         config: jitrl,
-        ...(replayOptions.driftRho === undefined ? {} : { driftRho: replayOptions.driftRho })
+        ...(replayOptions.driftRho === undefined ? {} : { driftRho: replayOptions.driftRho }),
+        replayDeclarations
       });
     },
     createHostAdvisor(advisorOptions = {}): HostAdvisor {
@@ -455,7 +499,13 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
         // one evidence set.
         store: {
           query: (query: ExperienceQuery) =>
-            store.query({ ...query, ...learningFacingFilterOptions() })
+            store.query({
+              ...query,
+              ...learningFacingFilterOptions(),
+              // P6.2 t7/V3: the L3 advisor estimates the production (process)
+              // track; a task-quality record must never shape its advice.
+              learningTrack: PRODUCTION_LEARNING_TRACK
+            })
         },
         now,
         ...(advisorOptions.rng === undefined ? {} : { rng: advisorOptions.rng })
@@ -552,7 +602,11 @@ export function createStoreOptimizer(options: {
         ...(decideOptions.guidanceFilter === undefined
           ? {}
           : { guidanceFilter: decideOptions.guidanceFilter }),
-        ...learningFacingFilterOptions()
+        ...learningFacingFilterOptions(),
+        // P6.2 t7/V3 (ADR 0002 5.2a-4): the L2 neighbourhood is a PROCESS
+        // estimate - it keeps undeclared records (the pre-existing eligibility
+        // path) but never a task-quality record.
+        learningTrack: PRODUCTION_LEARNING_TRACK
       });
       return decide(level, state, candidates, {
         neighbors,
@@ -715,6 +769,19 @@ export interface JitReplayHookFactoryOptions {
    * comparable term by term.
    */
   readonly priorLogitOf?: (slotKind: BatchSlotKind, slotWeights: Readonly<Record<BatchSlotKind, number>>) => number;
+  /**
+   * t10/R3b (ADR 0002 R8/R9): the replay declarations attached to every hook
+   * input (see JitReplayHookInput.replayDeclarations). The production kernel
+   * wiring (`createReplayHook`) defaults this to the CURRENT declared
+   * mode/vocabulary (what new records are stamped with), so the production
+   * replay/restart path actually consumes the declarations instead of leaving
+   * the store-level capability unwired. Absent keeps the hook unpartitioned
+   * (the pre-t10 behaviour for parity callers that reconstruct mixed eras).
+   */
+  readonly replayDeclarations?: {
+    readonly decisionMode?: DecisionMode;
+    readonly actionKeyVocabulary?: ActionKeyVocabulary;
+  };
 }
 
 /**
@@ -796,14 +863,36 @@ export function createJitReplayHook(options: JitReplayHookFactoryOptions): JitRe
           ? replayCandidates(priorShares)
           : replayCandidates(priorShares, options.priorLogitOf);
       const jit = input.jit;
-      // Policy hyperparameters of the candidate under replay. k and beta come
-      // from the perturbed grid, which is what makes a candidate meaningful now
-      // that replay runs the same retrieval and correction as online.
+      // t10/R3b (ADR 0002 R8/R9): the replay DECLARATIONS. The factory-level
+      // option is the production default (what new records are stamped with);
+      // a caller-supplied input declaration wins (a caller reconstructing an
+      // older generation passes that generation's declarations). Undeclared
+      // (neither level sets anything) keeps the hook unpartitioned.
+      const declaredMode =
+        input.replayDeclarations?.decisionMode ?? options.replayDeclarations?.decisionMode;
+      const declaredVocabulary =
+        input.replayDeclarations?.actionKeyVocabulary ??
+        options.replayDeclarations?.actionKeyVocabulary;
+      const declaredFilter = (entry: ExperienceRecord): boolean =>
+        (declaredMode === undefined || entry.decisionMode === declaredMode) &&
+        (declaredVocabulary === undefined ||
+          entry.actionKeyVocabulary === declaredVocabulary);
+      const replaySnapshot = (
+        Array.isArray(input.experiences) ? input.experiences : []
+      ).filter(
+        (entry) =>
+          isOnLearningTrack(entry, PRODUCTION_LEARNING_TRACK) &&
+          declaredFilter(entry)
+      );
       const kernel = runDecisionKernel({
         level: 'meta',
         state,
         candidates,
-        records: Array.isArray(input.experiences) ? input.experiences : [],
+        // P6.2 t7/V3 (ADR 0002 5.2a-4): replay is a PROCESS-track consumer -
+        // the snapshot is pre-filtered here (the kernel's own filter stays
+        // untouched, R6) so a task-quality record never enters the replayed
+        // neighbourhood, exactly like the online L1/L2/L3 filters.
+        records: replaySnapshot,
         config: {
           beta: finiteNumber(jit.beta) && jit.beta >= 0 ? jit.beta : 0,
           k: Math.max(1, Math.trunc(finiteNumber(jit.k) ? jit.k : config.k)),
@@ -856,6 +945,10 @@ export function createJitReplayHook(options: JitReplayHookFactoryOptions): JitRe
           advantage: entry?.advantage ?? 0,
           normalizedAdvantage: entry?.normalizedAdvantage ?? 0,
           support: entry?.support ?? 0,
+          // P6.2 C0 (ADR 0002 R5): replay reports the same effective-sample
+          // evidence the online decision saw, so the ledger compares like with
+          // like (support co-reported for the raw count).
+          nEff: entry?.nEff ?? 0,
           explored: entry?.explored ?? false
         };
       });
@@ -876,7 +969,11 @@ export function createJitReplayHook(options: JitReplayHookFactoryOptions): JitRe
         }
       }
       const support = freshPolicySupport(
-        Array.isArray(input.experiences) ? input.experiences : [],
+        // P6.2 t7/V3: the M3 fresh count is a PROCESS-track count (same
+        // pre-filter as the replay kernel above; the shared filter helper in
+        // decision-kernel stays untouched, R6). t10/R3b: the declared
+        // mode/vocabulary partition applies identically.
+        replaySnapshot,
         {
           level: 'meta',
           bucket: state.bucket,

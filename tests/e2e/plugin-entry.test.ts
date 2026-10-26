@@ -257,7 +257,11 @@ describe('plugin entrypoint', () => {
 
   it('exposes the orchestrator through the plugin handle and disposes cleanly', async () => {
     const bare = createBareContext();
-    const plugin = buildPlugin(bare);
+    // P6.2 C1: the permanent mount is now an explicit opt-in (patch layer);
+    // this suite exercises the mount/dispose machinery, so it opts in.
+    const plugin = buildPlugin(bare, {
+      config: { execution: { mode: 'guarded-active', applyWinningPatch: true } }
+    });
 
     const result = await plugin.run({
       sessionId: 'sess-dispose',

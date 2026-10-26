@@ -1296,6 +1296,63 @@ export interface AbstractState {
 }
 
 /**
+ * Execution modes of the P6.2 release contract (ADR 0002 R1, as revised by t6).
+ *
+ * Every L2 decision / experience record states explicitly which mode produced
+ * it, so a replay or restart rebuilds neighbourhoods from the recorded mode
+ * instead of guessing (ADR 0002 R8):
+ *
+ *   - 'baseline'       the host's own control execution; Jit intercepts nothing
+ *                      and the host behaviour is byte-identical. Audit-level
+ *                      process records only.
+ *   - 'shadow'         baseline execution byte for byte PLUS suggestion
+ *                      records (prior/proposed/executed, shrunk/calibrated
+ *                      strength, nEff/support, gateReason). Zero side effects:
+ *                      no permanent patch mount, no publish, no real memory
+ *                      write. THE DEFAULT ASSEMBLY (ADR 0002 R1/t6).
+ *   - 'guarded-active' the conservative evidence gate may actually replace the
+ *                      prior and execute an explicit exploration-budget
+ *                      deviation; publish/memory stay forbidden (R2). Explicit
+ *                      opt-in only, never a default.
+ */
+export const DECISION_MODES = ['baseline', 'shadow', 'guarded-active'] as const;
+export type DecisionMode = (typeof DECISION_MODES)[number];
+
+/**
+ * Action-key vocabularies a record may declare (ADR 0002 R8).
+ *
+ * 'signature' is the persisted default (slot-shape signatures), so existing
+ * records and the eval replay corpus are never orphaned. 'semantic' keys carry
+ * the semantic edit-kind vocabulary; the two vocabularies must never be mixed
+ * in one neighbourhood estimate (the same isolation discipline as reward
+ * versions). A record without a declaration fails closed on replay: the
+ * vocabulary is not guessed.
+ */
+export const ACTION_KEY_VOCABULARIES = ['signature', 'semantic'] as const;
+export type ActionKeyVocabulary = (typeof ACTION_KEY_VOCABULARIES)[number];
+
+/**
+ * P6.2 t7/V3 (ADR 0002 5.2a-4): the TWO learning tracks an experience record
+ * may belong to. The tracks are consumed differently and must never mix in one
+ * neighbourhood estimate:
+ *
+ *   - 'task-quality' the record's reward carries TASK-QUALITY evidence (a
+ *                    trusted-source verification verdict contributed the
+ *                    completion source). Before C2 delivers trusted producers
+ *                    no production record can honestly declare this track.
+ *   - 'process'      the record is a PROCESS observation: its fused reward
+ *                    carries only execution-level signals (tool/steps/turn;
+ *                    completion=0). It stays learnable on the process track
+ *                    and audit-visible, but must never enter a task-quality
+ *                    neighbourhood as if its reward measured task success.
+ *
+ * Absent means a pre-t7 record; the strict learning filter treats absence as
+ * 'process' (fail-closed: never guessed up into the task-quality track).
+ */
+export const LEARNING_TRACKS = ['task-quality', 'process'] as const;
+export type LearningTrack = (typeof LEARNING_TRACKS)[number];
+
+/**
  * Terminal outcome of the execution an experience record describes.
  *
  * P6 PR4 (plan section 6.2) requires these to stay distinguishable: a user
@@ -1384,6 +1441,30 @@ export interface ExperienceRecord {
   readonly outcome?: ExperienceOutcome;
   /** False for cancelled/infrastructure records: audit only, never training. */
   readonly learningEligible?: boolean;
+  /**
+   * P6.2 C0 (ADR 0002 R8, t6 revision): the execution mode that produced this
+   * record ('baseline' | 'shadow' | 'guarded-active'). Declared explicitly on
+   * every new record; absent means a pre-P6.2 record, which replay treats as
+   * undeclared (fail-closed: not guessed). Different modes never mix into one
+   * decision neighbourhood.
+   */
+  readonly decisionMode?: DecisionMode;
+  /**
+   * P6.2 C0 (ADR 0002 R8): the action-key vocabulary of `actionKey`
+   * ('signature' | 'semantic'). Persisted default 'signature'; buckets from
+   * different vocabularies must never be co-estimated. Absent (legacy) fails
+   * closed on replay instead of being guessed.
+   */
+  readonly actionKeyVocabulary?: ActionKeyVocabulary;
+  /**
+   * P6.2 t7/V3 (ADR 0002 5.2a-4): which learning track this record belongs to.
+   * 'task-quality' only when a trusted-source verdict contributed the
+   * completion source of the reward; 'process' for process observations
+   * (unknown verdicts / untrusted shape-only verdicts whose fused reward
+   * carries only tool/steps/turn). Absent (pre-t7) is treated as 'process'
+   * by the strict learning filter - fail-closed, never guessed up.
+   */
+  readonly learningTrack?: LearningTrack;
   /** Creation timestamp in ms since epoch (injected clock). */
   readonly createdAt: number;
   /** True once secrets have been redacted from this record. */
@@ -1425,6 +1506,15 @@ export interface ExperienceQuery {
   readonly minimumExperienceSchemaVersion?: number;
   /** Restrict results to records that may train the policy. */
   readonly learningEligibleOnly?: boolean;
+  /**
+   * P6.2 t7/V3 (ADR 0002 5.2a-4): restrict results to one learning track.
+   * 'process' keeps process observations and UNDECLARED records (legacy,
+   * host-tool, rescore) - the pre-existing eligibility path - and excludes
+   * task-quality records; 'task-quality' keeps ONLY records that explicitly
+   * declared the task-quality track (trusted-source verdict evidence).
+   * Absent keeps every track (the audit / research path).
+   */
+  readonly learningTrack?: LearningTrack;
 }
 
 /** Append-only experience store backing all JitRL levels. */
@@ -1477,6 +1567,14 @@ export interface JitAdjustment<TPayload = unknown> {
   readonly probability: number;
   /** Neighbour support |N(s, a)| for this action. */
   readonly support: number;
+  /**
+   * P6.2 C0 (ADR 0002 R5): Kish effective sample size (Σw)²/Σw² behind this
+   * action's Q, carried through the whole decision chain (L1/L2/replay) so a
+   * guarded replacement judgement reads the effective evidence, not the raw
+   * count. Present on estimates from supported actions; 0 when unsupported.
+   * Additive: consumers that ignore it keep the pre-P6.2 behaviour.
+   */
+  readonly nEff?: number;
   /** True when optimistic exploration produced this Q value. */
   readonly explored: boolean;
 }
@@ -1572,6 +1670,22 @@ export interface JitReplayHookInput {
   readonly jit: NonNullable<MetaSearchPolicy['jit']>;
   /** Current policy id used for drift down-weighting (plan section 7.3-4). */
   readonly driftRho?: number;
+  /**
+   * P6.2 t10/R3b (t9 finding; ADR 0002 R8/R9): the DECLARATIONS the replayed
+   * neighbourhood must be rebuilt from. When set, the hook filters the
+   * snapshot to records whose `decisionMode`/`actionKeyVocabulary` EQUAL the
+   * declared values (undeclared records never join a declared replay
+   * neighbourhood - fail-closed, same rule as the store query). This is what
+   * makes "rebuild from the record's declared semantics; the same log reloads
+   * to the same neighbourhood" hold on the production replay path, not only
+   * at the store query layer. The production wiring passes the CURRENT
+   * declared mode/vocabulary (what new records are stamped with); a caller
+   * reconstructing an older generation passes that generation's declarations.
+   */
+  readonly replayDeclarations?: {
+    readonly decisionMode?: DecisionMode;
+    readonly actionKeyVocabulary?: ActionKeyVocabulary;
+  };
 }
 
 /** One slot/action correction produced by a replay hook. */
@@ -1589,6 +1703,12 @@ export interface JitReplayAdjustment {
   readonly normalizedAdvantage: number;
   /** Neighbour support |N(s, a)|. */
   readonly support: number;
+  /**
+   * P6.2 C0 (ADR 0002 R5): Kish effective sample size of the same neighbour
+   * group, carried through replay diagnostics exactly like the online
+   * adjustments so replay and online report comparable evidence.
+   */
+  readonly nEff?: number;
   /** True when optimistic exploration produced this Q value. */
   readonly explored: boolean;
 }

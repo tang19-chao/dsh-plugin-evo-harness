@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { parseEvoHarnessConfig } from '../../src/config';
 import { createMemoryBridge, parseLessonDocument } from '../../src/memory-bridge';
 import { createEvoHarnessPlugin } from '../../src/index';
+import { resolveExecutionProfile } from '../../src/runtime/execution-profile';
 import type { CanonicalLesson } from '../../src/types/contracts';
 import {
   createScriptedModel,
@@ -82,7 +83,9 @@ describe.each(BACKENDS)('$label', (backend) => {
         runBranch: createScriptedRunner(now),
         now,
         newId: makeIdFactory('backend'),
-        deps: { memory }
+        // t10/R2: this suite IS the governed-commit machinery test against
+        // an in-memory mock backend - explicit permission opt-in.
+        deps: { memory, executionProfile: resolveExecutionProfile({ memoryRealWrites: true }) }
       },
       {}
     );
@@ -130,6 +133,56 @@ describe.each(BACKENDS)('$label', (backend) => {
     // and the backend's recall tool was exercised during the run
     const recallCalls = backend.recallTools.flatMap((tool) => server.callsTo(tool));
     expect(recallCalls.length).toBeGreaterThan(0);
+  });
+
+  it('t12/R2-residual: the DEFAULT assembly never calls the memory bridge (zero backend writes)', async () => {
+    // t11 blocker: the t10 revision issued a real governed-commit request with a
+    // renamed "ephemeral" scope and let the host bridge refuse it, so a bridge
+    // that accepted any scope persisted a denied write. This runs the REAL
+    // plugin assembly (default profile, no permission opt-in) against a mock
+    // backend that would happily accept the write and asserts the backend saw
+    // NOTHING: zero commit-tool calls, zero records, zero committed lessons.
+    const server = backend.factory();
+    const config = parseEvoHarnessConfig(e2eConfig());
+    const now = makeClock();
+    const memory = createMemoryBridge({ config: config.memoryBridge, clients: [server.client], now });
+    const plugin = createEvoHarnessPlugin(
+      {
+        config: {
+          ...config,
+          memoryBridge: { ...config.memoryBridge, promoteOnComposeSuccess: true }
+        },
+        model: createScriptedModel(),
+        clients: [server.client],
+        runBranch: createScriptedRunner(now),
+        now,
+        newId: makeIdFactory('backend-denied'),
+        deps: { memory }
+      },
+      {}
+    );
+
+    const result = await plugin.run({
+      sessionId: 'sess-e2e-denied',
+      task: plugin.makeTask({ id: 'task-e2e-denied', prompt: 'Fix the failing build.' }),
+      trigger: 'always'
+    });
+
+    expect(result.outcome).toBe('composed');
+    expect(result.lessonsCommitted).toBe(0);
+    expect(server.records.length).toBe(0);
+    // The commit tools are also recall tools for the white-box (cg) family, so
+    // count WRITE-shaped calls only: a non-write op can never have persisted.
+    const writeCalls = backend.commitTools
+      .flatMap((tool) => server.callsTo(tool))
+      .filter((call) => call.args['op'] === undefined || call.args['op'] === 'write');
+    expect(writeCalls, 'the denied assembly must not issue a memory write').toEqual([]);
+    const diagnostics = result.diagnostics.join(' ');
+    expect(diagnostics).toContain('memory permission');
+    expect(diagnostics).toContain('NOT committed');
+    expect(diagnostics).not.toContain('ephemeral');
+    // Recall still works (the denial is a write-side gate, not a memory blackout).
+    expect(backend.recallTools.flatMap((tool) => server.callsTo(tool)).length).toBeGreaterThan(0);
   });
 
   it('round-trips a committed lesson back through recall with the negative firewall intact', async () => {
@@ -213,7 +266,7 @@ describe('post-compose lesson evidence and cross-session promotion', () => {
         runBranch: createScriptedRunner(now, { candidateOutcomes: ['fail', 'succeed'] }),
         now,
         newId: makeIdFactory('evidence'),
-        deps: { memory }
+        deps: { memory, executionProfile: resolveExecutionProfile({ memoryRealWrites: true }) }
       },
       {}
     );
@@ -242,9 +295,13 @@ describe('post-compose lesson evidence and cross-session promotion', () => {
     expect(Object.keys(withDiffs?.executionPatch.componentDiffs ?? {})).toContain('guardrails');
   });
 
-  it('promotes committed positive lessons to global scope for later sessions', async () => {
+  it('promotes committed positive lessons to global scope for later sessions (explicit opt-in)', async () => {
     const server = mem0LikeServer();
-    const config = parseEvoHarnessConfig(e2eConfig());
+    // P6.2 C1 (ADR 0002 R2): the default assembly keeps REAL memory writes
+    // denied, so the promotion machinery is exercised with an explicit opt-in.
+    const config = parseEvoHarnessConfig(
+      e2eConfig({ config: { memoryBridge: { promoteOnComposeSuccess: true } } })
+    );
     expect(config.memoryBridge.promoteOnComposeSuccess).toBe(true);
     const now = makeClock();
     const memory = createMemoryBridge({ config: config.memoryBridge, clients: [server.client], now });
@@ -256,7 +313,10 @@ describe('post-compose lesson evidence and cross-session promotion', () => {
         runBranch: createScriptedRunner(now),
         now,
         newId: makeIdFactory('promote'),
-        deps: { memory }
+        // t10/R2: promoteOnComposeSuccess is only the REQUEST half; the
+        // deterministic test assembly (in-memory mock backend) explicitly
+        // opts in on the PERMISSION half. The default assembly still denies.
+        deps: { memory, executionProfile: resolveExecutionProfile({ memoryRealWrites: true }) }
       },
       {}
     );
@@ -300,7 +360,11 @@ describe('post-compose lesson evidence and cross-session promotion', () => {
         runBranch: createScriptedRunner(now),
         now,
         newId: makeIdFactory('nopromo'),
-        deps: { memory }
+        // t10/R2: the negative promoteOnComposeSuccess=false case - the explicit
+        // opt-in only arms the REQUEST half; the flag still denies, and the
+        // permission half stays granted in this fake-backend assembly so the
+        // test isolates the config flag's effect.
+        deps: { memory, executionProfile: resolveExecutionProfile({ memoryRealWrites: true }) }
       },
       {}
     );
@@ -324,9 +388,12 @@ describe('post-compose lesson evidence and cross-session promotion', () => {
     expect(laterSession.positiveLessons).toEqual([]);
   });
 
-  it('records a promotion failure without aborting the run', async () => {
+  it('records a promotion failure without aborting the run (explicit opt-in)', async () => {
     const server = mem0LikeServer();
-    const config = parseEvoHarnessConfig(e2eConfig());
+    // P6.2 C1: promotion is a real memory write - explicit opt-in required.
+    const config = parseEvoHarnessConfig(
+      e2eConfig({ config: { memoryBridge: { promoteOnComposeSuccess: true } } })
+    );
     const now = makeClock();
     const memory = createMemoryBridge({ config: config.memoryBridge, clients: [server.client], now });
     const failingMemory: typeof memory = {
@@ -343,7 +410,9 @@ describe('post-compose lesson evidence and cross-session promotion', () => {
         runBranch: createScriptedRunner(now),
         now,
         newId: makeIdFactory('promofail'),
-        deps: { memory: failingMemory }
+        // t10/R2: the explicit permission opt-in keeps the promotion-failure
+        // path reachable in this fake-backend assembly.
+        deps: { memory: failingMemory, executionProfile: resolveExecutionProfile({ memoryRealWrites: true }) }
       },
       {}
     );
@@ -359,3 +428,5 @@ describe('post-compose lesson evidence and cross-session promotion', () => {
     expect(result.diagnostics.join(' ')).toContain('promotion failed');
   });
 });
+
+

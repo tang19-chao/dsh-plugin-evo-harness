@@ -130,6 +130,12 @@ import {
   createAgentLoopExecutor,
   type AgentLoopAdapters
 } from './dsh-bridge';
+import {
+  recordModeOf,
+  resolveExecutionProfile,
+  type ExecutionProfile
+} from './runtime/execution-profile';
+import { matchesReplayDeclarations } from './jitrl/experience-store';
 import type {
   BranchExecutor,
   DreamReplayReport,
@@ -1080,6 +1086,15 @@ export function createJitWiredDreamer(input: {
   readonly base: OfflineDreamerOptions;
   readonly recorder: DreamReplayRecorder;
   /**
+   * t12/R1c (t11 finding): the SAME resolved effective execution profile the
+   * orchestrator enforces and the L1 decorator intercepts on. The replay
+   * declarations it produces below are the effective declared mode, so a host
+   * that injects `deps.executionProfile` never gets an orchestrator on one mode
+   * and a replay partition on another. Absent keeps the pre-t12 behaviour for
+   * hand-built dreamers: derive the declarations from `config.execution.mode`.
+   */
+  readonly executionProfile?: ExecutionProfile;
+  /**
    * P6 PR2 repair F1: the `dreamJit` surface. Re-read at the START of every
    * replay so `/evo jit off` takes effect on the next dream without recreating
    * the dreamer. Absent keeps the pre-repair behaviour (hook always injected)
@@ -1089,6 +1104,17 @@ export function createJitWiredDreamer(input: {
 }): WiredOfflineDreamer {
   let lastDiagnostics: readonly string[] = [];
   const now = input.base.now ?? ((): number => Date.now());
+  /**
+   * t12/R1c + t12/R3b2: the declared replay mode, resolved ONCE from the
+   * effective profile (the same source the orchestrator stamps records with).
+   * `config.execution.mode` is only the fallback for a hand-built dreamer that
+   * received no profile.
+   */
+  const declaredProfile = input.executionProfile ?? resolveExecutionProfile({ mode: input.config.execution.mode });
+  const replayDeclarations = {
+    decisionMode: recordModeOf(declaredProfile.mode),
+    actionKeyVocabulary: 'signature' as const
+  };
   /**
    * Re-read the switch, fail closed.
    *
@@ -1151,8 +1177,12 @@ export function createJitWiredDreamer(input: {
           readonly driftRho: number
         }>();
       let hookCalls = 0;
+      // t12/R3b2 (t11 finding): the declarations travel as the FACTORY option,
+      // which the factory now resolves as `caller ?? default` - the t10 shape
+      // declared them after spreading the caller value and silently lost it.
       const innerHook = input.kernel.createReplayHook({
-        driftRho
+        driftRho,
+        replayDeclarations
       });
       const recordingHook: JitReplayHook = (hookInput) => {
         hookCalls += 1;
@@ -1165,10 +1195,28 @@ export function createJitWiredDreamer(input: {
           });
         return innerHook(hookInput);
       };
+      const experiences = snapshot();
+      // t12/NOTE (t11 finding, contract item 5): the declared partition is
+      // FAIL-CLOSED and it is NOT papered over. Records written by producers
+      // that declare no mode/vocabulary (the L3 host-tool collector, the
+      // cold-start backfill) are excluded from a declared replay - they are
+      // never silently re-stamped with the current mode. The exclusion is
+      // reported so a status page/reviewer can see it instead of reading an
+      // empty neighbourhood as "no evidence".
+      const excludedByDeclaration = experiences.filter(
+        (entry) =>
+          !matchesReplayDeclarations(
+            { decisionMode: entry.decisionMode, actionKeyVocabulary: entry.actionKeyVocabulary },
+            {
+              requireDeclaredMode: replayDeclarations.decisionMode,
+              requireDeclaredVocabulary: replayDeclarations.actionKeyVocabulary
+            }
+          )
+      ).length;
       const baseOptions: OfflineDreamerOptions = {
         ...input.base,
         generatePolicies,
-        experiences: snapshot()
+        experiences
       };
       const dreamer = createOfflineDreamer(
         jitOn
@@ -1227,7 +1275,9 @@ export function createJitWiredDreamer(input: {
         right) => left - right);
       lastDiagnostics = [jitOn
         ? 'offline dream jit: ' + String(hookCalls) + ' replay hook call(s) across ' + String(candidates.length) + ' polic' + (candidates.length === 1 ? 'y' : 'ies') + ' (beta ' + (betas.length === 0 ? 'n/a' : betas.join('/')) + ', driftRho ' + String(driftRho) + ')'
-        : 'offline dream jit: the dreamJit runtime surface is off; the basic Dream-RSI replay ran without the Jit hook (Jit hyperparameters were not hot-swapped)'];
+        : 'offline dream jit: the dreamJit runtime surface is off; the basic Dream-RSI replay ran without the Jit hook (Jit hyperparameters were not hot-swapped)',
+        'offline dream jit: replay declarations ' + replayDeclarations.decisionMode + '/' + replayDeclarations.actionKeyVocabulary + ' (the effective execution profile) excluded ' + String(excludedByDeclaration) + ' record(s) outside the declared partition; fail-closed - an undeclared producer (host_tool/backfill) is never re-stamped to the current mode'
+      ];
       return report;
     }
   };
@@ -1251,12 +1301,27 @@ export function buildJitRlWiring(input: {
   readonly persistence: PersistenceRuntime | undefined;
   readonly diagnostics: string[];
   readonly now: () => number;
+  /**
+   * t12/R1c (t11 finding): the resolved effective execution profile. The L1
+   * interception switch below is derived from THIS, not from
+   * `config.execution.mode`, so an injected profile cannot leave the decorator
+   * on a different mode than the orchestrator enforces. Absent keeps the
+   * config-declared mode (hand-built wirings).
+   */
+  readonly executionProfile?: ExecutionProfile;
 }): {
   readonly policy: IActivePolicy;
   readonly wiring: JitRlWiring
 } {
   const jitrl = input.config.jitrl;
   const enabled = jitrl.enabled && jitrl.levels.includes('meta');
+  // t12/R1c: ONE effective profile for this wiring - the injected one when the
+  // assembly passes it, else the config-declared mode. The caller
+  // (buildOrchestratorDeps) hands the identical object to the orchestrator and
+  // the dreamer, so L1 interception, record stamping and replay declarations
+  // can never disagree.
+  const effectiveWiringProfile =
+    input.executionProfile ?? resolveExecutionProfile({ mode: input.config.execution.mode });
   const disabledStatus: EvoHarnessJitRlStatus = {
     enabled: false,
     levels: [...jitrl.levels],
@@ -1313,7 +1378,22 @@ export function buildJitRlWiring(input: {
       inner: input.policy,
       now: input.now,
       maxRecoverySlots: input.config.dreamRsi.maxRecoverySlots,
-      isRuntimeEnabled: () => runtimeEnabled.enabled
+      isRuntimeEnabled: () => runtimeEnabled.enabled,
+      // t10/R1b (ADR 0002 §3 baseline 行, option ①) + t12/R1c: baseline/off
+      // return the inner plan byte-identical (no L1 adjustment, no metadata.jit)
+      // - the mode contract "Jit 不拦截、不注入、不探测" is real wiring, not a
+      // stamp. Shadow keeps the pre-t10 interception behaviour (the captain's
+      // t10 scope ruling: baseline executes the prior unconditionally; shadow's
+      // t6-frozen "基础 evo search 共存" behaviour stays and its ADR §3 wording
+      // is the docs-side revision task).
+      //
+      // t12/R1c (t11 finding): the switch reads the SAME resolved effective
+      // profile the orchestrator enforces (input.executionProfile), never the
+      // raw config field. Before this, an injected deps.executionProfile could
+      // leave L1 intercepting on `config.execution.mode` while the orchestrator
+      // skipped L2 on the injected mode - two sources of truth for one mode.
+      interceptExecution: () =>
+        effectiveWiringProfile.mode !== 'baseline' && effectiveWiringProfile.mode !== 'off'
     });
     if (input.options.deps?.policy !== undefined) {
       // A host that injects its own policy owns that decision; the decorator
@@ -1516,6 +1596,16 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
   // kernel is synchronous, so the returned policy is usable right away; the
   // durable experience log and the cold-start backfill are attached later by
   // createEvoHarnessPlugin (they need an async startup hook).
+  //
+  // t12/R1c (t11 finding): resolve the effective execution profile ONCE, before
+  // any consumer is built. The config-declared mode is the default; a host that
+  // injects `deps.executionProfile` (the documented seam) replaces it for the
+  // orchestrator, the L1 decorator, the replay declarations and the
+  // diagnostics alike - a diagnostic-only acknowledgement would leave the run
+  // split across two modes.
+  const configProfile = resolveExecutionProfile({ mode: config.execution.mode });
+  const effectiveProfile = options.deps?.executionProfile ?? configProfile;
+  const injectedProfile = options.deps?.executionProfile !== undefined;
   const jitWiring = buildJitRlWiring({
     config,
     policy,
@@ -1523,7 +1613,8 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     scopeRegistry,
     persistence,
     diagnostics,
-    now
+    now,
+    executionProfile: effectiveProfile
   });
   const activePolicy = jitWiring.policy;
   const model = options.deps?.proposer === undefined ? options.model ?? missingModelAdapter() : undefined;
@@ -1565,6 +1656,10 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
       config,
       base: dreamBase,
       recorder: jitWiring.wiring.dream,
+      // t12/R1c: the dreamer's replay declarations come from the SAME resolved
+      // profile the orchestrator stamps records with, so guarded-active /
+      // baseline logs are replayed under their own declared partition.
+      executionProfile: effectiveProfile,
       // P6 PR2 repair F1: the `dreamJit` surface, read at every replay. This is
       // the consumer the plan requires ("离线 Jit 重放和热替换也必须明确受哪个
       // 开关管理"), and it is the ONLY thing `/evo jit off` changes about dreaming:
@@ -1615,10 +1710,62 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     } : {
       commitScope: options.commitScope
     }),
-    applyWinningPatch: options.applyWinningPatch ?? true,
+    // P6.2 C1 (ADR 0002 R1/R2, t6 revision): the default assembly forbids the
+    // PERMANENT winning-patch mount - the baseline `options.applyWinningPatch
+    // ?? true` default is replaced by config.execution.applyWinningPatch,
+    // which defaults to false and is only meaningful in guarded-active. A
+    // host may still pass an explicit options.applyWinningPatch, but the
+    // resolved execution profile below keeps the patch permission denied
+    // unless the declared mode is guarded-active (fail-closed: an explicit
+    // option can never silently widen the permission).
+    applyWinningPatch: options.applyWinningPatch ?? config.execution.applyWinningPatch,
+    // P6.2 C1: the resolved, fail-closed execution profile handed to the
+    // orchestrator (mode, layer permissions, shadow-records flag). t12/R1c:
+    // this is the SAME object the L1 decorator and the dreamer received above.
+    executionProfile: effectiveProfile,
     ... (options.deps ?? {
     })
   };
+  // t10/CFG + t12/R1c (t9/t11 findings): the injected-deps spread above can
+  // replace the config-resolved execution profile (the documented test seam).
+  // It no longer splits the assembly: everything downstream was built from the
+  // injected section. The diagnostics below report the EFFECTIVE section (what
+  // the orchestrator will actually enforce), and an injected profile whose
+  // declared mode differs from config.execution.mode gets an explicit
+  // consistency line. Nothing is downgraded silently in either direction.
+  if (injectedProfile && effectiveProfile.mode !== config.execution.mode) {
+    diagnostics.push(
+      'execution profile: INJECTED profile mode=' +
+        effectiveProfile.mode +
+        ' overrides config.execution.mode=' +
+        config.execution.mode +
+        ' (explicit assembly override; the orchestrator, the L1 decorator and the replay declarations all follow the injected section)'
+    );
+  }
+  if (effectiveProfile.permissions.memory.allowed) {
+    diagnostics.push(
+      'execution profile: memory permission EXPLICITLY ALLOWED by the injected profile override' +
+        ' (no config field can produce this; production assemblies never see it)'
+    );
+  }
+  if (jitWiring.wiring.kernel !== undefined) {
+    diagnostics.push(
+      // t10/CFG: the diagnostic uses the EFFECTIVE section, not the config field.
+      'execution profile: mode=' +
+        effectiveProfile.mode +
+        ', patch=' +
+        (deps.applyWinningPatch === true && effectiveProfile.permissions.patch.allowed
+          ? 'evidence-gated'
+          : 'denied') +
+        ', publish=' +
+        (effectiveProfile.permissions.publish.allowed ? 'allowed' : 'denied') +
+        ', memory=' +
+        (effectiveProfile.permissions.memory.allowed ? 'allowed (override)' : 'denied') +
+        ' (ADR 0002 R2; shadow records ' +
+        (effectiveProfile.shadowRecords ? 'on' : 'stopped') +
+        ')'
+    );
+  }
   return {
     deps,
     hostAdapter,
@@ -2007,10 +2154,35 @@ export function createEvoHarnessPlugin(
    * (level, bucket, actionKey) and never a raw record. With
    * `mirrorToMemoryBridge: false` this returns before calling mirror(), so the
    * disabled switch costs exactly zero backend calls.   */
+  // t10/R2: the permission refusal is diagnosed once per process (the profile
+  // is static for the process lifetime, so repeating it per run adds noise).
+  let mirrorPermissionDiagnosed = false;
   const syncJitMirror = async (): Promise<void> => {
     const mirror = jitWiring.mirror;
     const state = jitWiring.mirrorState;
     if (mirror === undefined || state === undefined || !resolved.jitrl.store.mirrorToMemoryBridge) {
+      return;
+    }
+    // t10/R2 (t9 blocker; ADR 0002 §4): the mirror config flag is only the
+    // REQUEST half of the memory double gate. The PERMISSION half is the
+    // resolved execution profile's memory permission - denied in every mode
+    // this round - so the real-namespace mirror write is structurally
+    // unreachable until the captain re-adjudicates. The refusal is a visible
+    // diagnostic (once per process, not per run), never a silent skip and
+    // never a backend call.
+    const mirrorProfile =
+      deps.executionProfile ??
+      resolveExecutionProfile({ mode: resolved.execution.mode });
+    if (!mirrorProfile.permissions.memory.allowed) {
+      if (!mirrorPermissionDiagnosed) {
+        mirrorPermissionDiagnosed = true;
+        diagnostics.push(
+          'jitrl mirror: REFUSED - mirrorToMemoryBridge=true is only the request half; ' +
+            'the execution profile denies real-namespace memory writes this round (' +
+            mirrorProfile.permissions.memory.reason +
+            ')'
+        );
+      }
       return;
     }
     // Repair F1, unified by P6 PR2: `/evo jit off` also stops the mirror, so

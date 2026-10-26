@@ -15,6 +15,7 @@ import type { HostAdvisor } from '../../../src/jitrl';
 import { parseEvoHarnessConfig } from '../../../src/config';
 import { createHookFixture } from '../cordis-seams/hook-fixtures';
 import { buildE2E, e2eConfig } from '../../e2e/fixtures';
+import { resolveExecutionProfile } from '../../../src/runtime/execution-profile';
 import type { ExperienceRecord } from '../../../src/types/contracts';
 
 afterEach(() => {
@@ -261,7 +262,13 @@ describe('aggregate statistics mirror wiring', () => {
     const fake = fakeMirrorClient();
     const harness = buildE2E({
       config: { jitrl: { store: { mirrorToMemoryBridge: true } } },
-      extra: { mirrorClient: fake.client }
+      extra: {
+        mirrorClient: fake.client,
+        // t10/R2: the mirror switch is only the REQUEST half; the deterministic
+        // test assembly explicitly opts in on the PERMISSION half too (in-memory
+        // fake backend). The default assembly (no override) still denies.
+        deps: { executionProfile: resolveExecutionProfile({ memoryRealWrites: true }) }
+      }
     });
     const plugin = harness.plugin;
     await runOnce(plugin);
@@ -276,6 +283,29 @@ describe('aggregate statistics mirror wiring', () => {
     expect(mirror?.calls).toBeGreaterThan(0);
     expect(mirror?.writes).toBeGreaterThan(0);
     expect(mirror?.lastWritten).toBeGreaterThan(0);
+    await plugin.dispose();
+  });
+
+  it('t10/R2 negative: mirror switch ON with the DEFAULT assembly writes the backend zero times', async () => {
+    // The mirrorToMemoryBridge flag is only the REQUEST half; without the
+    // explicit permission opt-in the default assembly refuses every backend
+    // call and records the refusal as a diagnostic (t9 blocker closed).
+    const fake = fakeMirrorClient();
+    const harness = buildE2E({
+      config: { jitrl: { store: { mirrorToMemoryBridge: true } } },
+      extra: { mirrorClient: fake.client }
+    });
+    const plugin = harness.plugin;
+    const result = await runOnce(plugin);
+
+    expect(result.outcome).toBe('composed');
+    expect(fake.calls.listTools).toBe(0);
+    expect(fake.calls.callTool).toBe(0);
+    expect(plugin.jitrl.mirror?.calls).toBe(0);
+    expect(plugin.jitrl.mirror?.writes).toBe(0);
+    // The refusal rides the process-level diagnostics (the mirror sync runs
+    // after the run, outside the run result's own diagnostic list).
+    expect(plugin.diagnostics.join(' ')).toContain('jitrl mirror: REFUSED');
     await plugin.dispose();
   });
 
@@ -296,7 +326,12 @@ describe('aggregate statistics mirror wiring', () => {
 
   it('degrades to zero writes without a client but never throws', async () => {
     const harness = buildE2E({
-      config: { jitrl: { store: { mirrorToMemoryBridge: true } } }
+      config: { jitrl: { store: { mirrorToMemoryBridge: true } } },
+      extra: {
+        // t10/R2: the degraded-mirror test asserts the no-client path; the
+        // explicit permission opt-in keeps it on the pre-t10 semantics.
+        deps: { executionProfile: resolveExecutionProfile({ memoryRealWrites: true }) }
+      }
     });
     const plugin = harness.plugin;
     const result = await runOnce(plugin);

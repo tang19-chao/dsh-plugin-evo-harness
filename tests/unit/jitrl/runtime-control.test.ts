@@ -22,6 +22,7 @@ import {
 } from '../../../src/jitrl/runtime-control';
 import { buildE2E } from '../../e2e/fixtures';
 import { createHookFixture } from '../cordis-seams/hook-fixtures';
+import { resolveExecutionProfile } from '../../../src/runtime/execution-profile';
 import type { EightSurfacePatch, IHarnessProposer, MetaSearchPolicy, ProposeRequest, ProposedPatch, ProposedPatchSet } from '../../../src/types/contracts';
 
 describe('createJitRuntimeControl: configured is not runtimeEnabled', () => {
@@ -570,7 +571,15 @@ describe('each surface is read by a production path (F2)', () => {
     const fake = countingMirrorClient();
     const harness = buildE2E({
       config: JIT_CONFIG,
-      extra: { deps: { proposer: countingProposer(counters) }, mirrorClient: fake.client }
+      extra: {
+        deps: {
+          proposer: countingProposer(counters),
+          // t10/R2: the mirror switch is only the REQUEST half; this test
+          // assembly explicitly opts in on the PERMISSION half (fake backend).
+          executionProfile: resolveExecutionProfile({ memoryRealWrites: true })
+        },
+        mirrorClient: fake.client
+      }
     });
     const { plugin } = harness;
     await plugin.run({

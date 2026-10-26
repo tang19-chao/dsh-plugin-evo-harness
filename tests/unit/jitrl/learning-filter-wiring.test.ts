@@ -360,6 +360,10 @@ describe('online decision neighbourhood excludes legacy and ineligible records',
   it('is the behaviour the learning-facing defaults declare', () => {
     // The opt-in is not incidental: the kernel publishes the strict filter and
     // the call sites spread it. This pins the constant the wiring depends on.
+    // t7/V3: the shared kernel filter deliberately stays track-free (R6: the
+    // frozen research path calls the kernel directly); the track isolation is
+    // declared at each production consumer boundary instead (snapshot
+    // pre-filter isOnLearningTrack / store query learningTrack).
     expect(LEARNING_CONSUMER_FILTER).toEqual({
       excludeLegacy: true,
       learningEligibleOnly: true

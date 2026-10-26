@@ -310,6 +310,10 @@ export function composeDecision<T>(
       adjustedLogit: adjustedLogits[index] as number,
       probability: probabilities[index] as number,
       support: estimate.support,
+      // P6.2 C0 (ADR 0002 R5): nEff rides every adjustment so the guarded
+      // replacement judgement (and any ledger consumer) reads the EFFECTIVE
+      // evidence; support stays reported alongside it for the ledger.
+      nEff: estimate.nEff,
       explored: estimate.explored
     };
   });

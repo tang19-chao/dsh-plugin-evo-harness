@@ -14,6 +14,15 @@ import { describe, expect, it } from 'vitest';
 import { createHookFixture } from '../cordis-seams/hook-fixtures';
 import type { HookFixture } from '../cordis-seams/hook-fixtures';
 import { buildE2E } from '../../e2e/fixtures';
+import { resolveExecutionProfile } from '../../../src/runtime/execution-profile';
+
+/**
+ * t10/R2: the mirror-ON tests exercise the write machinery against an
+ * in-memory fake backend, so they explicitly opt in on the PERMISSION half
+ * (the mirror config flag is only the request half). The default assembly
+ * (no override) still denies every real-namespace write.
+ */
+const MEMORY_ALLOWED_PROFILE = resolveExecutionProfile({ memoryRealWrites: true });
 
 /** Minimal DSH hook context: on() + one service for real hook detection. */
 function dshContext(): HookFixture {
@@ -223,7 +232,7 @@ describe('H2: the default advisor gets real host_tool evidence', () => {
       config: {
         jitrl: { hostAdvisor: GATE_ADVISOR, store: { mirrorToMemoryBridge: true } }
       },
-      extra: { mirrorClient: fake.client }
+      extra: { mirrorClient: fake.client, deps: { executionProfile: MEMORY_ALLOWED_PROFILE } }
     });
     const plugin = harness.plugin;
 
@@ -253,7 +262,7 @@ describe('F1: /evo jit off gates L3 advice, gate asks, mirror and collection', (
       config: {
         jitrl: { hostAdvisor: GATE_ADVISOR, store: { mirrorToMemoryBridge: true } }
       },
-      extra: { mirrorClient: fake.client }
+      extra: { mirrorClient: fake.client, deps: { executionProfile: MEMORY_ALLOWED_PROFILE } }
     });
     const plugin = harness.plugin;
     registerTrustedScope(plugin, 'sess-f1');

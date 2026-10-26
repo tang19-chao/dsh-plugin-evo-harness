@@ -31,17 +31,20 @@ import type { EvoHarnessConfig } from './config';
 import { HARNESS_COMPONENT_KEYS } from './types/contracts';
 import type {
   AbstractState,
+  ActionKeyVocabulary,
   BatchPlan,
   BatchSlotPlan,
   BranchExecutor,
   CanonicalLesson,
   CompositionResult,
+  DecisionMode,
   DiscoveryNode,
   DreamReplayReport,
   EvoHarnessRunOutcome,
   EvoHarnessRunRequest,
   EightSurfacePatch,
   EvoHarnessRunResult,
+  ExperienceOutcome,
   ExperienceRecord,
   FailureCategory,
   FailureDiagnosis,
@@ -59,6 +62,7 @@ import type {
   JitDecision,
   JitLevel,
   GuidanceMode,
+  LearningTrack,
   HarnessComponentKey,
   IOfflineDreamer,
   ISurrogateScorer,
@@ -99,20 +103,21 @@ import {
   type RehydratedAction
 } from './jitrl/candidate-augmenter';
 import {
-  classifyTrajectoryOutcome,
-  isLearningOutcome
+  classifyTrajectoryOutcome
 } from './jitrl/step-evaluator';
-import { conservativeAdvantage } from './jitrl/value-estimator';
 import {
-  CURRENT_PROVENANCE_VERSION,
-  EXPERIENCE_SCHEMA_VERSION
-} from './jitrl/experience-store';
+  decideReplacement,
+  shouldReleaseReservation
+} from './jitrl/replacement-policy';
+import { conservativeAdvantage } from './jitrl/value-estimator';
+import { CURRENT_PROVENANCE_VERSION, EXPERIENCE_SCHEMA_VERSION } from './jitrl/experience-store';
 import {
   REWARD_CONTRACT,
   estimatorTargetLine,
   scoreUnderRewardContract
 } from './jitrl/reward-contract';
 import type { JitRuntimeControl, JitSurface } from './jitrl/runtime-control';
+import { recordModeOf, resolveExecutionProfile, type ExecutionProfile } from './runtime/execution-profile';
 import { createDiscoveryTree } from './dream-rsi';
 import type {
   DiscoveryTree,
@@ -198,17 +203,29 @@ export interface EvoHarnessOrchestratorDeps {
     baseline: MetaSearchPolicy,
     count: number
   ) => readonly MetaSearchPolicy[];
-  /** Permanently mount the winning scaffold; defaults to true. */
+  /**
+   * P6.2 C1 + t7/V1 (ADR 0002 R2): REQUEST the permanent mount of the winning
+   * scaffold. Defaults to false (fail-closed). This flag alone NEVER mounts:
+   * the resolved execution profile's patch permission (guarded-active only)
+   * must ALSO allow it. A mount happens iff both hold.
+   */
   readonly applyWinningPatch?: boolean;
   /**
-   * P6.2 PR-B / F4: enable the conservative L2 replacement gate (the
+   * P6.2 PR-B / F4 + t7/V2: request the conservative L2 replacement gate (the
    * prior-deviation evidence vetoes described in selectProposal). Defaults to
-   * false: the frozen e2e baseline calibrates the online path without
-   * interception, and PR-B's verifier-first scoring already removed the
-   * reward-side driver of the first-harm counterexample. The release-boundary
-   * PR owns flipping this to true.
+   * false. Only valid together with an execution profile whose mode is
+   * 'guarded-active'; any other combination is rejected at construction
+   * (fail-closed) because shadow/baseline/off must never intercept selection.
    */
   readonly conservativeGate?: boolean;
+  /**
+   * P6.2 C1 (ADR 0002 R1/R2): the resolved execution profile. The plugin
+   * entrypoint resolves config.execution + permissions into this shape;
+   * absent means "hand-built orchestrator, conservative defaults": shadow
+   * records, patch layer denied (permanent mounts off), publish/memory
+   * denied. The orchestrator NEVER derives permissions from anywhere else.
+   */
+  readonly executionProfile?: ExecutionProfile;
   /**
    * Optional JitRL kernel surface (plan Phase 3: L2 selection and online
    * experience recording). Structural on purpose: the orchestrator never
@@ -284,6 +301,17 @@ export interface EvoHarnessOrchestrator extends IEvoHarnessOrchestrator {
   lastPlan(): SearchGridPlan | null;
   dreamReports(): readonly DreamReplayReport[];
   activePatchIds(): readonly string[];
+  /**
+   * t8/R5 (ADR 0002 R5-6): the explicit exploration budget is part of the
+   * public handle. `grant(n)` adds n seats (returns the new total), `revoke()`
+   * zeroes the allowance, `remaining()` reports what is left. This is the ONLY
+   * public authorization path for under-evidenced deviations; the default
+   * allowance is 0 (fail-closed) and the patch permission can still deny
+   * budget execution entirely (V2b).
+   */
+  grantExplorationBudget(count: number): number;
+  revokeExplorationBudget(): void;
+  explorationBudgetRemaining(): number;
 }
 
 interface RunBudget {
@@ -610,9 +638,22 @@ interface PreparedSelection {
   readonly priorIndex?: number;
   readonly proposedIndex?: number;
   /** Gate reason when the executed index is not the decision's raw choice. */
-  readonly gateReason?: 'min-support' | 'implicit-zero-advantage' | 'exploration-budget' | 'proposer-fallback';
+  readonly gateReason?: 'min-support' | 'implicit-zero-advantage' | 'exploration-budget' | 'proposer-fallback' | 'patch-permission';
   /** True when this execution was charged to the explicit exploration budget. */
   readonly exploration?: boolean;
+  /**
+   * t8/R4 (ADR 0002 R1 shadow 行): the challenger's measured replacement
+   * strength (nEff/support co-report, shrunk + calibrated suggestion) for
+   * EVERY L2 decision - gate open or closed. estimation stays separated from
+   * replacement: this is what the suggestion WAS, not whether it replaced.
+   */
+  readonly challenger?: {
+    readonly nEff: number;
+    readonly support: number;
+    readonly shrunkAdvantage: number;
+    readonly calibratedAdvantage: number;
+    readonly implicitZeroAdvantage: boolean;
+  };
   /**
    * F4-4: the semantic edit kind(s) of the executed patch (constructive /
    * destructive / neutral), from semanticEditKindOf. Persisted next to the
@@ -620,6 +661,32 @@ interface PreparedSelection {
    * without changing the store's action-key vocabulary.
    */
   readonly semanticKind?: string;
+}
+
+/**
+ * t8/R4: stable numeric encoding of the L2 gate outcome for the shadow
+ * record's `rewardSources.gateReason` mark (rewardSources is numeric-only).
+ * 0 means "no gate applied / executed as proposed". The mapping is frozen:
+ * renumbering would silently reinterpret persisted records.
+ */
+export const GATE_REASON_CODES = {
+  none: 0,
+  'min-support': 1,
+  'implicit-zero-advantage': 2,
+  'exploration-budget': 3,
+  'proposer-fallback': 4,
+  // t10/R1b: a suggested deviation that did not execute because the patch
+  // permission is denied (shadow/baseline; the prior executed instead).
+  'patch-permission': 5
+} as const;
+
+/** t8/R4: the numeric code of one gate outcome (unknown -> none). */
+export function gateReasonCodeOf(reason: string | undefined): number {
+  if (reason === undefined) {
+    return GATE_REASON_CODES.none;
+  }
+  const code = (GATE_REASON_CODES as Readonly<Record<string, number>>)[reason];
+  return code === undefined ? GATE_REASON_CODES.none : code;
 }
 
 /** One proposal admitted into a round's concurrent probe wave. */
@@ -827,8 +894,18 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
    * operator or a supervision surface can move it without restarting).
    */
   private explorationAllowance = EvoHarnessOrchestratorImpl.EXPLORATION_BUDGET;
+  /**
+   * t8/R5 (ADR 0002 R5-6): per-execution reservation ledger. A released seat
+   * is keyed by the executed trajectory id and remembered, so re-entering the
+   * recorder (dedup path, off mid-flight) can never refund the SAME cancelled
+   * execution twice - the accounting is idempotent per execution key and the
+   * budget can never exceed what was actually granted plus released-once.
+   */
+  private readonly releasedReservationKeys: Set<string> = new Set();
   /** P6.2 PR-B / F4: whether the conservative L2 gate intercepts deviations. */
   private readonly conservativeGate: boolean;
+  /** P6.2 C1: the resolved execution profile (fail-closed defaults when absent). */
+  private readonly executionProfile: ExecutionProfile;
 
   constructor(deps: EvoHarnessOrchestratorDeps) {
     if (deps === undefined || deps === null || deps.config === undefined) {
@@ -843,9 +920,39 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     // explicit override. config.dreamRsi.candidatePoliciesCount still bounds the
     // produced count through the dreamer's policyCount option.
     this.candidatePolicies = deps.candidatePolicies ?? (() => []);
-    this.applyWinningPatch = deps.applyWinningPatch !== false;
-    this.conservativeGate = deps.conservativeGate === true;
+    // P6.2 C1 + t7/V1 (ADR 0002 R2): applyWinningPatch alone NEVER grants the
+    // permanent mount. The resolved execution profile's patch permission is the
+    // authority; deps.applyWinningPatch is only the caller's additional request
+    // (default FALSE - fail-closed for hand-built orchestrators, matching the
+    // default assembly). A mount happens only when BOTH allow it:
+    //   profile.permissions.patch.allowed (guarded-active only) AND
+    //   deps.applyWinningPatch === true.
+    const resolvedProfile = deps.executionProfile ?? resolveExecutionProfile();
+    this.executionProfile = resolvedProfile;
+    this.applyWinningPatch =
+      deps.applyWinningPatch === true && resolvedProfile.permissions.patch.allowed;
+    // P6.2 C1 (ADR 0002 R1) + t7/V2: the conservative gate IS the
+    // guarded-active channel. An explicit deps.conservativeGate=true is only
+    // accepted when the resolved profile declares 'guarded-active' - the
+    // pre-C1 "hand-built opt-in" that let a shadow/off profile intercept
+    // execution was an invalid combination and now FAILS CLOSED (constructor
+    // throws, no silent downgrade: the caller must fix the assembly).
+    if (deps.conservativeGate === true && resolvedProfile.mode !== 'guarded-active') {
+      throw new Error(
+        'EvoHarnessOrchestrator: deps.conservativeGate=true requires executionProfile mode ' +
+          "'guarded-active' (ADR 0002 R1/V2: shadow/baseline/off must never intercept selection); " +
+          'got mode ' +
+          String(resolvedProfile.mode)
+      );
+    }
+    this.conservativeGate =
+      deps.conservativeGate === true || this.executionProfile.mode === 'guarded-active';
     this.treePool = deps.treePool;
+  }
+
+  /** The resolved execution profile (status-page / diagnostics surface). */
+  executionProfileSnapshot(): ExecutionProfile {
+    return this.executionProfile;
   }
 
   readonly treePool: IDiscoveryTreePool;
@@ -899,6 +1006,12 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
   revokeExplorationBudget(): void {
     this.explorationAllowance = 0;
   }
+
+  // t10/DEAD (t9 finding): settleExplorationReservation was REMOVED. It had no
+  // caller and bypassed the releasedReservationKeys idempotency ledger, so a
+  // future caller could have double-refunded one cancelled execution. The ONLY
+  // reservation settlement path is recordOnlineExperience (keyed by the
+  // executed trajectory id; the T8-R5 probe pins the idempotency).
 
   dreamReports(): readonly DreamReplayReport[] {
     return this.dreams;
@@ -1193,6 +1306,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
                 readonly gateReason?: PreparedSelection['gateReason'];
                 readonly exploration?: boolean;
                 readonly semanticKind?: string;
+                readonly challenger?: PreparedSelection['challenger'];
               }
             | undefined;
           try {
@@ -1221,7 +1335,8 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
                 ...(picked.proposedIndex === undefined ? {} : { proposedIndex: picked.proposedIndex }),
                 ...(picked.gateReason === undefined ? {} : { gateReason: picked.gateReason }),
                 ...(picked.exploration === undefined ? {} : { exploration: picked.exploration }),
-                ...(picked.semanticKind === undefined ? {} : { semanticKind: picked.semanticKind })
+                ...(picked.semanticKind === undefined ? {} : { semanticKind: picked.semanticKind }),
+                ...(picked.challenger === undefined ? {} : { challenger: picked.challenger })
               };
             } else {
               // No L2 decision ran (single candidate / fallback paths): the
@@ -1318,7 +1433,8 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
                   ...(selection.proposedIndex === undefined ? {} : { proposedIndex: selection.proposedIndex }),
                   ...(selection.gateReason === undefined ? {} : { gateReason: selection.gateReason }),
                   ...(selection.exploration === undefined ? {} : { exploration: selection.exploration }),
-                  ...(selection.semanticKind === undefined ? {} : { semanticKind: selection.semanticKind })
+                  ...(selection.semanticKind === undefined ? {} : { semanticKind: selection.semanticKind }),
+                  ...(selection.challenger === undefined ? {} : { challenger: selection.challenger })
                 };
           prepared.push({ slot, node, proposed, executionPatch, ...(selectionState === undefined ? {} : { selection: selectionState }) });
         }
@@ -1623,7 +1739,17 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
 
         stage('apply_patch');
         const winningPatch = composition.composedPatch ?? composition.selectedPatch;
-        if (winningPatch !== null && this.applyWinningPatch) {
+        // t7/V1 (ADR 0002 R2): the mount requires BOTH the caller's explicit
+        // applyWinningPatch request AND the execution profile's patch
+        // permission (guarded-active only). The profile check is repeated HERE
+        // - at the single permanent-mount call site - so the permission is
+        // enforced even if the constructor flag ever drifts: defense in depth,
+        // and the diagnostic makes a denied mount visible instead of silent.
+        if (
+          winningPatch !== null &&
+          this.applyWinningPatch &&
+          this.executionProfile.permissions.patch.allowed
+        ) {
           // Roll back the scaffold mounted by an earlier run() before mounting the
           // new winner, so a long-lived host never stacks prompt segments,
           // middleware or skills across successive runs.
@@ -1633,6 +1759,13 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           composedPatchId = winningPatch.id;
           appliedPatchId = winningPatch.id;
           diagnostics.push('permanently mounted scaffold ' + winningPatch.id);
+        } else if (winningPatch !== null && this.applyWinningPatch) {
+          diagnostics.push(
+            'apply_patch: winning patch NOT mounted - the execution profile denies the ' +
+              'patch layer (' +
+              this.executionProfile.permissions.patch.reason +
+              ')'
+          );
         }
         selectedNodeId = composition.selectedNodeId ?? undefined;
         selectedBranchId = composition.selectedBranchId ?? undefined;
@@ -1760,6 +1893,13 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
    * external effect.
    */
   private surfaceEnabled(surface: JitSurface): boolean {
+    // t8/R1 (ADR 0002 §3): a DECLARED mode 'off' stops the Jit surfaces this
+    // orchestrator drives (L2 selection, online record, mirror gating) on top
+    // of the volatile PR2 control. Static declaration and runtime command are
+    // distinct stop paths: either one alone halts the surface (fail-closed).
+    if (this.executionProfile.off) {
+      return false;
+    }
     const control = this.deps.jitRuntime;
     if (control === undefined) {
       return true;
@@ -1990,14 +2130,69 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     const records: ExperienceRecord[] = [];
     const outcomes: string[] = [];
     let ineligible = 0;
+    let notTaskQuality = 0;
+    // P6.2 C0 (ADR R8): the mode/vocabulary stamps are resolved ONCE per run
+    // from the execution profile, so every record of the run declares the same
+    // explicit decisionMode (baseline/shadow/guarded-active).
+    const mode: DecisionMode = recordModeOf(this.executionProfile.mode);
+    const actionKeyVocabulary: ActionKeyVocabulary = 'signature';
+    let releasedReservations = 0;
 
     for (const probe of ordered) {
-      const outcome = classifyTrajectoryOutcome(probe.trajectory);
-      const eligible = isLearningOutcome(outcome);
+      // R5-6: a budget-charged execution whose outcome carries no quality
+      // evidence (cancel/abort/infra) releases its reserved seat.
+      // t8/R5: the refund is IDEMPOTENT per executed trajectory - the release
+      // key is remembered, so a re-entered recorder (dedup / off mid-flight)
+      // can never refund the same cancelled execution twice.
+      if (probe.selection?.exploration === true) {
+        const releaseKey = 'release\u0000' + probe.trajectory.id;
+        if (!this.releasedReservationKeys.has(releaseKey)) {
+          const wasReleased = shouldReleaseReservation({
+            exploration: true,
+            completed: true,
+            outcome: classifyTrajectoryOutcome(probe.trajectory)
+          });
+          if (wasReleased) {
+            this.releasedReservationKeys.add(releaseKey);
+            this.explorationAllowance += 1;
+            releasedReservations += 1;
+          }
+        }
+      }
+      // P6.2 C0 (ADR 0002 R4): ONE evaluation object per executed trajectory;
+      // the record consumes it (reward / outcome / eligibility) instead of
+      // re-deriving anything. The winner's step rewards remain an AUXILIARY
+      // stepJudge source (judge-policy), never the yardstick.
+      const evaluation = scoreUnderRewardContract(probe.trajectory);
+      const outcome = evaluation.outcome;
       outcomes.push(outcome);
+      // t10/V3b (t9 finding): the recorder reads the SEPARATED flags instead of
+      // re-deriving the rule through a && chain:
+      //   - `learningEligible` is the outcome-level process eligibility;
+      //   - `taskQualityLearningEligible` is the CONSUMPTION gate (the process
+      //     path keeps unknown-verdict records trainable; a verdict-derived
+      //     completion trains only from a trusted source);
+      //   - `taskQualityEvidence` is the verdict-side FACT (true only for a
+      //     trusted verdict-derived completion; unknown/untrusted ALWAYS false).
+      // The learning track is stamped from the evaluation directly: process
+      // ⇔ NOT taskQualityEvidence, so the field⇔track consistency the
+      // regression asserts is structural, not incidental.
+      const eligible = evaluation.taskQualityLearningEligible;
+      if (!eligible && evaluation.learningEligible) {
+        notTaskQuality += 1;
+      }
       if (!eligible) {
         ineligible += 1;
       }
+      // P6.2 t7/V3 + t10/V3b (ADR 0002 5.2a-4): the EXPLICIT learning track,
+      // stamped from the evaluation's own separated fields. The task-quality
+      // track requires the FACT flag (trusted verdict-derived completion only);
+      // every other learnable record is a process observation. The invariant
+      // "learningTrack ∈ process ⇒ taskQualityEvidence === false" is therefore
+      // structural and pinned by the production regression (field⇔track).
+      const learningTrack: LearningTrack = evaluation.taskQualityEvidence
+        ? 'task-quality'
+        : 'process';
       const isWinner = winnerRewards !== undefined && probe.nodeId === input.selectedNodeId;
       let reward: number;
       let observedReturn: number;
@@ -2009,20 +2204,52 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       // (proposed != prior) and actual deviation (executed != prior) can now
       // be counted independently from the store - the review's requirement
       // that the two never be conflated.
-      const decisionMarks: Readonly<Record<string, number>> = probe.selection
-        ? {
-            ...(probe.selection.priorIndex === undefined ? {} : { decisionPriorIndex: probe.selection.priorIndex }),
-            ...(probe.selection.proposedIndex === undefined
-              ? {}
-              : { decisionProposedIndex: probe.selection.proposedIndex }),
-            decisionExecutedIndex: probe.selection.chosenIndex,
-            ...(probe.selection.exploration === true ? { exploration: 1 } : {})
-          }
-        : {};
+      //
+      // t8/R1 (ADR 0002 §3): the suggestion triple is the SHADOW record
+      // content. A run in a mode without shadow records ('baseline'/'off')
+      // keeps its records audit-level: outcome/reward/eligibility persist,
+      // but no suggestion marks and no gate strength are attached, so the
+      // declared mode stays readable from the record shape itself.
+      const shadowMarks = this.executionProfile.shadowRecords;
+      const decisionMarks: Readonly<Record<string, number>> =
+        probe.selection !== undefined && shadowMarks
+          ? {
+              ...(probe.selection.priorIndex === undefined ? {} : { decisionPriorIndex: probe.selection.priorIndex }),
+              ...(probe.selection.proposedIndex === undefined
+                ? {}
+                : { decisionProposedIndex: probe.selection.proposedIndex }),
+              decisionExecutedIndex: probe.selection.chosenIndex,
+              ...(probe.selection.exploration === true ? { exploration: 1 } : {}),
+              // t8/R4 (ADR 0002 R1 shadow 行): the per-decision replacement
+              // strength - challenger nEff/support co-report plus the shrunk
+              // and calibrated suggestion strength - rides EVERY shadow
+              // record, gate open or closed, so the suggestion strength is
+              // retrievable per record without parsing diagnostics.
+              ...(probe.selection.challenger === undefined
+                ? {}
+                : {
+                    gateNeff: probe.selection.challenger.nEff,
+                    gateSupport: probe.selection.challenger.support,
+                    gateShrunkAdvantage: probe.selection.challenger.shrunkAdvantage,
+                    gateCalibratedAdvantage: probe.selection.challenger.calibratedAdvantage,
+                    ...(probe.selection.challenger.implicitZeroAdvantage
+                      ? { gateImplicitZeroAdvantage: 1 }
+                      : {}),
+                    // t8/R4: the gate outcome as a stable numeric code (see
+                    // GATE_REASON_CODES); 0 = no gate applied / executed as
+                    // proposed.
+                    gateReason: gateReasonCodeOf(probe.selection.gateReason)
+                  })
+            }
+          : {};
       if (!eligible) {
-        // A user cancellation / abort / infrastructure failure says nothing about
-        // action quality (plan section 6.2), so it is audit-only: neutral reward,
-        // zero learning target, `learningEligible: false`.
+        // Audit-only: user cancellation / abort / infrastructure failure say
+        // nothing about action quality (plan section 6.2), and - C2-pre (ADR
+        // 0002 5.2a) - so does any shape-only verdict. Neutral reward, zero
+        // learning target, `learningEligible: false`. The failed verdict keeps
+        // its scale-level negative signal in the reward column for audit, but
+        // no provenance is forged to make it learnable (trusted-failure
+        // learning is the explicit C2 unfinished item).
         reward = 0;
         observedReturn = 0;
         rewardSources = { outcome: 1, ...decisionMarks };
@@ -2033,11 +2260,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         // its per-step vector survives only as an auxiliary rewardSources entry
         // (judge-policy: auxiliary field, never the yardstick), so the same
         // trajectory measures the same whether or not it won composition.
-        const signal = scoreUnderRewardContract(probe.trajectory);
-        reward = clamp(signal.reward, -3, 3);
-        observedReturn = clamp(signal.reward, -3, 3);
+        reward = clamp(evaluation.reward, -3, 3);
+        observedReturn = clamp(evaluation.reward, -3, 3);
         rewardSources = {
-          ...(isWinner ? { ...signal.sources, stepJudge: winnerStepSummary(winnerRewards) } : signal.sources),
+          ...(isWinner ? { ...evaluation.sources, stepJudge: winnerStepSummary(winnerRewards) } : evaluation.sources),
           ...decisionMarks
         };
       }
@@ -2053,17 +2279,22 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         decisionId,
         runId: input.runId,
         policyVersion: input.policyId + '@v' + String(finiteOr(this.deps.policy.policy?.version, 1)),
-        // P6.2 PR-B: the verifier-first completion rule now decides the
-        // completion source (verdict, not deliverable presence) and falsified
-        // success claims are learning-ineligible. The numeric scale (weights,
-        // clip) is unchanged, and the persisted rewardVersion stays on the
-        // current contract id: the r4 id (REWARD_CONTRACT_VERSION_PR_B) is the
-        // preregistered NEXT contract for the adoption PR that owns the store
-        // constant (out of PR-B scope; experience-store.ts and its frozen
-        // version pins belong to the release-boundary PR).
+        // P6.2 C1 (ADR 0002 R3): the ATOMIC r4 switch - the producer stamp is
+        // now the preregistered verifier-first id. r3 records are isolated
+        // automatically by the exact-id predicate; no relabel, no migration.
+        // C2-pre caveat (ADR 0002 5.2a/5.4): r4 here means conservative
+        // isolation + version-semantic cleanup, not trusted verification.
         rewardVersion: REWARD_CONTRACT.version,
         provenanceVersion: CURRENT_PROVENANCE_VERSION,
         experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+        // P6.2 C0 (ADR 0002 R8): the explicit decision fields. The vocabulary
+        // stays the persisted slot-shape signature default (the semantic key
+        // remains a decision mark, not a store key - R8).
+        decisionMode: mode,
+        actionKeyVocabulary,
+        // P6.2 t7/V3 (ADR 0002 5.2a-4): the explicit learning track this
+        // record's reward belongs to (see the per-probe derivation above).
+        learningTrack,
         observedReturn,
         attributionBaseline: baseline,
         learningTarget,
@@ -2173,14 +2404,25 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         rounds: new Set(ordered.map((probe) => probe.round)).size,
         outcomes,
         notLearningEligible: ineligible,
+        // P6.2 C0/t6: executions whose verdict carried no trusted provenance
+        // and were therefore audit-only on the task-quality track (the C2
+        // unfinished item: trusted-failure learning).
+        notTaskQualityEligible: notTaskQuality,
+        // P6.2 C0 (R5-6): budget seats released because the execution carried
+        // no quality evidence (cancel/abort/infra).
+        explorationReservationsReleased: releasedReservations,
+        explorationBudgetRemaining: this.explorationAllowance,
+        // P6.2 C0 (ADR 0002 R8): the run's declared decision fields.
+        decisionMode: mode,
+        actionKeyVocabulary,
         attributionBaseline: baseline,
-        // P6.2 PR-B: the run's reward yardstick, visible in the stage detail
-        // (not only inside the JSONL records). The persisted id stays on the
-        // current contract (see the association comment); the verifier-first
-        // completion rule is reported as the scale marker.
+        // P6.2 C1 (ADR 0002 R3): the run's reward yardstick after the atomic
+        // r4 switch, plus the honest C2-pre trust marker (5.2a/5.4): the
+        // verdict fields are shape-validated, not trusted-source.
         rewardVersion: REWARD_CONTRACT.version,
         rewardScale: REWARD_CONTRACT.aggregation,
         verifierFirstRule: 'verifier-first-completion-v1',
+        trustedVerificationSource: 'shape-only (C2-pre: no trusted producer registered)',
         rewardTargetField: REWARD_CONTRACT.learningTargetField,
         // What the value estimator will consume from these records.
         estimatorTarget: estimatorTargetLine(deduped, REWARD_CONTRACT.version),
@@ -2189,6 +2431,12 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         attemptedDeviations,
         actualDeviations,
         explorationCharged,
+        // P6.2 C1 (ADR 0002 R2): the resolved layer permissions of this run.
+        permissions: {
+          patch: this.executionProfile.permissions.patch.allowed,
+          publish: this.executionProfile.permissions.publish.allowed,
+          memory: this.executionProfile.permissions.memory.allowed
+        },
         // F4-4: semantic edit kinds executed this run (destructive choices are
         // separately countable from the stage log).
         semanticKinds: [
@@ -2306,6 +2554,8 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         readonly gateReason?: PreparedSelection['gateReason'];
         readonly exploration?: boolean;
         readonly semanticKind?: string;
+        /** t8/R4: the measured challenger strength (every deviation, gate or not). */
+        readonly challenger?: PreparedSelection['challenger'];
       }
     | undefined
   > {
@@ -2317,6 +2567,16 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     // control is authoritative, so `/evo jit off` stops the K-candidate path even
     // though the kernel stays configured (plan R1 root cause).
     if (!this.surfaceEnabled('proposal')) {
+      return undefined;
+    }
+    // t10/R1b (ADR 0002 §3 baseline 行, option ①): a DECLARED baseline run has
+    // Jit make NO selection: the K-candidate Jit decision is skipped and the
+    // pre-existing single propose() path runs exactly as a Jit-unconfigured
+    // assembly - Jit intercepts nothing (the mode contract: "Jit 不拦截、不注
+    // 入、不探测，宿主原行为逐字节不变"). The probe still runs through the
+    // baseline evo search (discovery/probing are the host's own flow, R1's
+    // "基础 evo search" carve-out) and records audit-level experience.
+    if (this.executionProfile.mode === 'baseline') {
       return undefined;
     }
     // K == 1 means there is nothing to choose between: stay on the single-call
@@ -2508,85 +2768,118 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     let exploration = false;
 
     // -----------------------------------------------------------------
-    // P6.2 PR-B / F4: conservative replacement gate (estimation != replace).
+    // P6.2 PR-B / F4 + C0: conservative replacement gate (estimation != replace).
     //
-    // The gate is DISABLED by default (L2_CONSERVATIVE_GATE_DEFAULT = false):
-    // the frozen e2e baseline (tests/e2e/jitrl-ablation.test.ts B3 >= B1)
-    // calibrates the online path WITHOUT interception, and PR-B's verifier-
-    // first scoring already removes the reward-side driver of the first-harm
-    // counterexample (a wrong deliverable no longer scores positive, so the
-    // noop's Q cannot be inflated by falsified success). Enabling the gate is
-    // the release-boundary decision (PR-C): deps.conservativeGate turns it
-    // on, and every decision then records prior/proposed/executed with the
-    // gate reason in the ledger either way.
+    // The gate is DISABLED by default (deps.conservativeGate = false): the
+    // frozen e2e baseline calibrates the online path WITHOUT interception, and
+    // the release assembly enables it through the guarded-active mode wiring.
+    // The decision RULES live in ./jitrl/replacement-policy.ts (decideReplacement)
+    // so the online path, the tests and the guarded regression script all run
+    // the same rule set:
+    //   1. hard veto: a zero-advantage/no-evidence artefact (fallback-derived
+    //      A=0, or a noop that edits nothing) over an evidenced prior;
+    //   2. an unsupported challenger executes only against the explicit,
+    //      revocable exploration budget;
+    //   3. thin-but-measured (nEff below floor): prior stands, strength recorded.
+    // C0 (ADR 0002 R5-2): the judgement consumes ONLY nEff - a challenger
+    // whose estimate carries no nEff has NO replacement evidence (support
+    // never impersonates nEff).
     //
-    // Gate semantics when enabled:
-    //   1. a zero-advantage/noop challenger with no measured evidence may
-    //      never replace a prior that holds real evidence (the F4 first-harm
-    //      shape);
-    //   2. an unsupported challenger (exploration-draw advantage) executes
-    //      only against the explicit, revocable exploration budget;
-    //   3. a thin-but-measured challenger (support >= 1, non-zero advantage
-    //      from measured returns) executes and carries n_eff + shrunk/
-    //      calibrated suggestion strength on its record.
+    // t8/R4 (ADR 0002 R1 shadow 行): the challenger's SUGGESTION STRENGTH is
+    // measured for EVERY deviation - gate open or closed - because the shadow
+    // record must carry nEff/support/shrunk/calibrated per decision. The gate
+    // only decides whether the suggestion may REPLACE; estimation always runs.
+    //
+    // t8/V2b (ADR 0002 R2): the exploration budget is part of the patch layer.
+    // When the resolved profile denies the patch permission, the allowance is
+    // passed as 0 - an under-evidenced deviation can never ride the budget in
+    // a mode where the patch layer is denied (fail-closed, R2).
     // -----------------------------------------------------------------
-    if (proposedIndex !== priorIndex && this.conservativeGate) {
+    let challengerStrength: PreparedSelection['challenger'] | undefined;
+    if (proposedIndex !== priorIndex) {
       const proposedAdjustment = decision.adjustments[proposedIndex];
       const priorAdjustment = decision.adjustments[priorIndex];
-      const challenger = conservativeAdvantage({
+      const challengerEstimate = {
         actionKey: chosenKey,
         q: proposedAdjustment?.q ?? null,
         support: proposedAdjustment?.support ?? 0,
+        ...(proposedAdjustment?.nEff === undefined ? {} : { nEff: proposedAdjustment.nEff }),
         explored: proposedAdjustment?.explored ?? false,
         advantage: proposedAdjustment?.advantage ?? 0
-      });
-      // The evidence comparison is TWO-SIDED (review F4: "prior 与 challenger
-      // 的证据都需可比"): the prior earns its place the same way.
-      const prior = conservativeAdvantage({
+      };
+      const priorEstimate = {
         actionKey: decisionCandidates[priorIndex]?.actionKey ?? 'prior',
         q: priorAdjustment?.q ?? null,
         support: priorAdjustment?.support ?? 0,
+        ...(priorAdjustment?.nEff === undefined ? {} : { nEff: priorAdjustment.nEff }),
         explored: priorAdjustment?.explored ?? false,
         advantage: priorAdjustment?.advantage ?? 0
-      });
-      // A noop cannot carry evidence by construction (it edits nothing), and a
-      // zero-advantage challenger with NO support is exactly the F4 artefact:
-      // its A = 0 comes from the 'baseline' fallback, not from experience.
-      const challengerIsNoop = Object.keys(
-        (decisionCandidates[proposedIndex]?.payload?.patch?.edits ?? {}) as Record<string, unknown>
-      ).length === 0;
-      const zeroAdvantageArtefact = challenger.implicitZeroAdvantage || challengerIsNoop;
-      if (zeroAdvantageArtefact && (prior.hasReplacementEvidence || prior.support > challenger.support)) {
-        // The F4 first-harmful shape: a support=0 (or noop) action with a
-        // fallback-derived A=0 riding over a prior that holds real evidence.
-        // NEVER replaces it - the one hard veto (replayable via gateReason on
-        // every record: 'implicit-zero-advantage').
-        executedIndex = priorIndex;
-        gateReason = 'implicit-zero-advantage';
-      } else if (
-        !challenger.hasReplacementEvidence &&
-        !zeroAdvantageArtefact &&
-        challenger.support === 0 &&
-        this.explorationAllowance > 0
-      ) {
-        // An unsupported challenger whose advantage came from the EXPLORATION
-        // draw (optimistic bonus) rather than measured returns: it executes
-        // against the explicit, revocable budget and is tagged exploration.
-        this.explorationAllowance -= 1;
-        exploration = true;
-      } else if (!challenger.hasReplacementEvidence && challenger.support === 0) {
-        // Unsupported, no budget granted, not the zero-advantage veto shape:
-        // the kernel's choice rested on no measured evidence at all, so the
-        // prior stands. There is NO implicit exploration path (F4-5).
-        executedIndex = priorIndex;
-        gateReason = 'exploration-budget';
-      } else if (!challenger.hasReplacementEvidence) {
-        // Thin-but-measured: the challenger's advantage is non-zero and comes
-        // from measured returns (support >= 1). The kernel's choice executes;
-        // the ledger marks carry n_eff/support and the shrunk, calibrated
-        // suggestion strength, so estimation and replacement stay
-        // distinguishable on every record (F4-1/F4-2: n_eff participates in
-        // the judgement; suggestion strength is shrunk and calibrated).
+      };
+      // Estimation half (t8/R4): always measured, even when the gate is off.
+      const measured = conservativeAdvantage(challengerEstimate);
+      challengerStrength = {
+        nEff: measured.nEff,
+        support: measured.support,
+        shrunkAdvantage: measured.shrunkAdvantage,
+        calibratedAdvantage: measured.calibratedAdvantage,
+        implicitZeroAdvantage: measured.implicitZeroAdvantage
+      };
+      if (this.conservativeGate) {
+        // A noop cannot carry evidence by construction (it edits nothing), and a
+        // zero-advantage challenger with NO support is exactly the F4 artefact:
+        // its A = 0 comes from the 'baseline' fallback, not from experience.
+        const challengerIsNoop = Object.keys(
+          (decisionCandidates[proposedIndex]?.payload?.patch?.edits ?? {}) as Record<string, unknown>
+        ).length === 0;
+        const verdict = decideReplacement({
+          proposedIndex,
+          priorIndex,
+          challenger: challengerEstimate,
+          prior: priorEstimate,
+          challengerIsNoop,
+          explorationAllowance: this.executionProfile.permissions.patch.allowed
+            ? this.explorationAllowance
+            : 0
+        });
+        if (verdict.kind === 'kept-prior') {
+          executedIndex = verdict.executedIndex;
+          gateReason = verdict.gateReason;
+        } else if (verdict.kind === 'executed-exploration') {
+          this.explorationAllowance -= 1;
+          exploration = true;
+        }
+        // P6.2 C0: the calibrated advantage genuinely participated - the verdict
+        // (and its strength) rides the decision diagnostics for the ledger.
+        input.diagnostics.push(
+          'jit_proposal_select: replacement verdict=' +
+            verdict.kind +
+            (verdict.gateReason === undefined ? '' : ' reason=' + verdict.gateReason) +
+            ' challenger nEff=' +
+            String(verdict.challenger.nEff) +
+            '/' +
+            String(verdict.challenger.support) +
+            ' shrunk=' +
+            verdict.challenger.shrunkAdvantage.toFixed(6) +
+            ' calibrated=' +
+            verdict.challenger.calibratedAdvantage.toFixed(6)
+        );
+      } else {
+        // t8/R4: the gate is closed (shadow default) - the strength is still
+        // measured and will ride the shadow record; the diagnostic states that
+        // no gate intercepted the decision. (t10/R1b scope note: the captain's
+        // ruling wires ONLY baseline to execute the prior unconditionally;
+        // shadow keeps the t6-frozen "基础 evo search 共存" behaviour, which the
+        // ADR §3 revision task tracks separately.)
+        input.diagnostics.push(
+          'jit_proposal_select: suggestion strength (gate closed) challenger nEff=' +
+            String(measured.nEff) +
+            '/' +
+            String(measured.support) +
+            ' shrunk=' +
+            measured.shrunkAdvantage.toFixed(6) +
+            ' calibrated=' +
+            measured.calibratedAdvantage.toFixed(6)
+        );
       }
     }
 
@@ -2659,7 +2952,9 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       proposedIndex,
       ...(gateReason === undefined ? {} : { gateReason }),
       ...(exploration ? { exploration: true } : {}),
-      ...(semanticKinds.length === 0 ? {} : { semanticKind: semanticKinds.join('+') })
+      ...(semanticKinds.length === 0 ? {} : { semanticKind: semanticKinds.join('+') }),
+      // t8/R4: the measured strength rides the decision even when no gate ran.
+      ...(challengerStrength === undefined ? {} : { challenger: challengerStrength })
     };
   }
 
@@ -2718,10 +3013,54 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     scope: MemoryScope,
     diagnostics: string[]
   ): Promise<number> {
+    // t10/R2 + t12/R2-residual (t11 blocker finding; ADR 0002 §4): the memory
+    // layer is a REQUEST + PERMISSION double gate, exactly like the patch layer
+    // (t7/V1).
+    //
+    //   REQUEST half  - the caller asked for a real backend write
+    //                   (promoteOnComposeSuccess=true, or a mirror config).
+    //   PERMISSION    - executionProfile.permissions.memory.allowed. It is
+    //                   half  CONST false for every mode this round (ADR §4:
+    //                   "memory 本轮一律不真实写入"), so the real-namespace
+    //                   paths below are structurally unreachable until the
+    //                   captain re-adjudicates the permission - a config flag
+    //                   alone can never widen it (fail-closed, no implicit
+    //                   permission loss).
+    //
+    // t12/R2-residual: a DENIED permission means the memory bridge is NOT
+    // CALLED AT ALL. The t10 revision still issued a real `deps.memory.commit`
+    // request with an "ephemeral" per-run scope and relied on the host bridge
+    // to refuse it (the default warehouse bridge answers 'scope_violation');
+    // an injected bridge that accepts any scope (deps.memory is a public
+    // seam) then persisted a write the profile had denied, and the run
+    // diagnostic even claimed the lesson had landed in that namespace. There
+    // is no renamed/derived scope that fixes this: only skipping the call
+    // does. The denial is therefore enforced HERE, in front of the bridge, and
+    // is reported as a diagnostic that says exactly that.
+    //
+    // The governed session-scope commit below is the plugin's lesson-store
+    // write path (asserted by the e2e suites). It runs ONLY under an explicit
+    // memory-allowed profile - the `ExecutionProfileInput.memoryRealWrites`
+    // override the deterministic TEST assemblies pass in (in-memory fake
+    // backends); no config field and no default wiring produces that shape.
+    const memoryPermission = this.executionProfile.permissions.memory;
+    if (!memoryPermission.allowed) {
+      diagnostics.push(
+        'memory permission: ' +
+          String(lessons.length) +
+          ' lesson(s) NOT committed - real memory writes are denied (' +
+          memoryPermission.reason +
+          '); the memory bridge was not called and promote/mirror stay structurally unreachable'
+      );
+      return 0;
+    }
     let committed = 0;
     for (const lesson of lessons) {
       try {
-        const outcome = await this.deps.memory.commit(lesson, { scope, enforceGovernance: true });
+        const outcome = await this.deps.memory.commit(lesson, {
+          scope,
+          enforceGovernance: true
+        });
         if (outcome.accepted && outcome.persisted) {
           committed += 1;
           await this.promoteLessonIfConfigured(lesson, scope, diagnostics);
@@ -2742,6 +3081,14 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
    * promoteOnComposeSuccess: a committed positive lesson is re-stamped into the
    * global namespace so later sessions can recall it. Promotion problems are
    * diagnostics and never abort the run; the false setting is respected.
+   *
+   * t10/R2 (t9 blocker): the config flag is only the REQUEST half. The
+   * PERMISSION half is the execution profile's memory permission - denied in
+   * every mode this round (ADR §4), so promotion is structurally unreachable
+   * and the real global namespace receives nothing until the captain
+   * re-adjudicates. t12 keeps this check as defense in depth: the only caller
+   * (commitLessons) now returns BEFORE the bridge when the permission is
+   * denied, so this branch is belt-and-braces, not the enforcement point.
    */
   private async promoteLessonIfConfigured(
     lesson: CanonicalLesson,
@@ -2752,6 +3099,18 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       return;
     }
     if (lesson.polarity !== 'positive' || scope.kind === 'global') {
+      return;
+    }
+    // t10/R2: the PERMISSION half. Config flag + denied permission = refusal
+    // with an explicit diagnostic (never a real-namespace write).
+    if (!this.executionProfile.permissions.memory.allowed) {
+      diagnostics.push(
+        'memory permission: promotion of lesson ' +
+          lesson.id +
+          ' REFUSED - promoteOnComposeSuccess=true is only the request half; the execution profile denies real-namespace writes this round (' +
+          this.executionProfile.permissions.memory.reason +
+          ')'
+      );
       return;
     }
     try {

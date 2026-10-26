@@ -110,13 +110,18 @@ describe('F1-a: the persisted version constant IS the contract version', () => {
     // Pre-fix: the store said 'r2/verifiable-v1' while the orchestrator wrote
     // the contract's 'r3/unified-signals-v1' - two sources of truth.
     expect(CURRENT_REWARD_VERSION).toBe(REWARD_CONTRACT.version);
-    expect(CURRENT_REWARD_VERSION).toBe('r3/unified-signals-v1');
-    // The previous lineage stays explicitly named, not implicit.
-    expect(PREVIOUS_REWARD_VERSION).toBe('r2/verifiable-v1');
+    // P6.2 C1 (ADR 0002 R3): the ATOMIC r4 switch - the persisted marker is
+    // now the preregistered verifier-first id; the r3 transition window is
+    // closed (r3 records are isolated by the exact-id predicate).
+    expect(CURRENT_REWARD_VERSION).toBe('r4/verifier-first-v1');
+    // The previous lineages stay explicitly named, not implicit.
+    expect(PREVIOUS_REWARD_VERSION).toBe('r3/unified-signals-v1');
     expect(CURRENT_REWARD_VERSION).not.toBe(PREVIOUS_REWARD_VERSION);
   });
 
-  it('the r2 -> r3 change is a real generation bump requiring a rebuild', () => {
+  it('the r2 -> r3 and r3 -> r4 changes are real generation bumps requiring a rebuild', () => {
+    expect(isRewardVersionBump('r2/verifiable-v1', PREVIOUS_REWARD_VERSION)).toBe(true);
+    expect(requiresExperienceRebuild('r2/verifiable-v1', PREVIOUS_REWARD_VERSION)).toBe(true);
     expect(isRewardVersionBump(PREVIOUS_REWARD_VERSION, CURRENT_REWARD_VERSION)).toBe(true);
     expect(requiresExperienceRebuild(PREVIOUS_REWARD_VERSION, CURRENT_REWARD_VERSION)).toBe(true);
   });
@@ -133,13 +138,16 @@ describe('F1-d ①: r2 and r3 records never mix into one neighbourhood mean', ()
     // Compatibility verdicts (the production wiring primitive).
     // P6.2 PR-A / F2: compatibility is EXACT contract-id matching, so a
     // surrogate backfill stamp is NOT compatible with the online contract
-    // even though both carry the r3 generation prefix.
+    // even when both carry the same generation prefix.
     expect(isRewardVersionCompatible('r2/verifiable-v1', CURRENT_REWARD_VERSION)).toBe(false);
+    // P6.2 C1: the retired r3 online scale is NOT compatible with r4 either
+    // (r3 rewarded text presence; r4 rewards the verification verdict).
+    expect(isRewardVersionCompatible('r3/unified-signals-v1', CURRENT_REWARD_VERSION)).toBe(false);
     expect(isRewardVersionCompatible(CURRENT_REWARD_VERSION, CURRENT_REWARD_VERSION)).toBe(true);
     expect(isRewardVersionCompatible(BACKFILL_REWARD_VERSION, CURRENT_REWARD_VERSION)).toBe(false);
     expect(isRewardVersionCompatible(undefined, CURRENT_REWARD_VERSION)).toBe(false);
     expect(isRewardVersionCompatible('legacy', CURRENT_REWARD_VERSION)).toBe(false);
-    expect(isRewardVersionCompatible('r4/future', CURRENT_REWARD_VERSION)).toBe(false);
+    expect(isRewardVersionCompatible('r5/future', CURRENT_REWARD_VERSION)).toBe(false);
 
     // Filtering to the compatible subset must leave ONLY the r3 record, so the
     // mean is the r3 value, not (2.5 + -1) / 2.
@@ -156,8 +164,10 @@ describe('F1-d ①: r2 and r3 records never mix into one neighbourhood mean', ()
       versionedRecord({ id: 'r3-a', rewardVersion: CURRENT_REWARD_VERSION, value: 2 }),
       versionedRecord({ id: 'r3-b', rewardVersion: CURRENT_REWARD_VERSION, value: 4 }),
       // Schema is current, eligibility flag is true, but the reward generation
-      // is r2: the exact F1 scenario after a real upgrade.
+      // is retired (r2 AND r3): the F1 scenario after a real upgrade. The r3
+      // poison is the exact P6.2 C1 case (r3 records under the r4 switch).
       versionedRecord({ id: 'r2-poison', rewardVersion: 'r2/verifiable-v1', value: 99 }),
+      versionedRecord({ id: 'r3-poison', rewardVersion: 'r3/unified-signals-v1', value: 77 }),
       versionedRecord({ id: 'unversioned-poison', value: 88 })
     ]);
 
@@ -173,8 +183,8 @@ describe('F1-d ①: r2 and r3 records never mix into one neighbourhood mean', ()
       { actionKey: 'patch:a', baseLogit: 0, source: 'policy_prior', payload: undefined }
     ];
     const decision = await optimizer.decide('proposal', makeState(), candidates);
-    // Only the two r3 records are neighbours; the 99/88 poison never lands in
-    // the mean (pre-fix: neighbourCount 4 and stateValue ~48).
+    // Only the two r4 records are neighbours; the 99/77/88 poison never lands
+    // in the mean (pre-fix: neighbourCount 4 and stateValue ~48).
     expect(decision.neighborCount).toBe(2);
     expect(decision.stateValue).toBeCloseTo(3, 6);
   });
@@ -188,9 +198,11 @@ describe('F1-d ②: the upgrade quarantines via marked copies, never an in-place
       value: 1.5,
       learningEligible: true
     });
+    // The retired r3 online record: schema-current but quarantined after the
+    // P6.2 C1 r4 switch (r3 rewarded text presence, r4 rewards the verdict).
     const r3OnlineRecord = versionedRecord({
       id: 'r3-online',
-      rewardVersion: CURRENT_REWARD_VERSION,
+      rewardVersion: 'r3/unified-signals-v1',
       value: 2,
       learningEligible: true
     });
@@ -198,15 +210,15 @@ describe('F1-d ②: the upgrade quarantines via marked copies, never an in-place
     const before = JSON.stringify(source);
 
     const dryRun = await migrateExperienceRecords({ records: source });
-    // The r2 record is quarantined BECAUSE of its reward version (schema was
-    // current), and the count says so explicitly.
-    expect(dryRun.rewardVersionIsolated).toBe(1);
-    expect(dryRun.legacy).toBe(1);
-    expect(dryRun.current).toBe(1);
+    // Both old-generation records are quarantined BECAUSE of their reward
+    // version (schema was current), and the count says so explicitly.
+    expect(dryRun.rewardVersionIsolated).toBe(2);
+    expect(dryRun.legacy).toBe(2);
+    expect(dryRun.current).toBe(0);
     // The audit diagnostic names the version conflict.
     expect(dryRun.diagnostics.join(' ')).toContain('incompatible with ' + CURRENT_REWARD_VERSION);
-    // Marked copy: legacy tag + audit-only, same identity.
-    expect(dryRun.marked).toHaveLength(1);
+    // Marked copies: legacy tag + audit-only, same identity.
+    expect(dryRun.marked).toHaveLength(2);
     expect(dryRun.marked[0]?.id).toBe('r2-online');
     expect(dryRun.marked[0]?.rewardVersion).toBe('legacy');
     expect(dryRun.marked[0]?.learningEligible).toBe(false);
@@ -214,24 +226,27 @@ describe('F1-d ②: the upgrade quarantines via marked copies, never an in-place
     expect(JSON.stringify(source)).toBe(before);
 
     // The r3 record's own bytes are untouched by the pass.
-    expect(source[1]?.rewardVersion).toBe(CURRENT_REWARD_VERSION);
+    expect(source[1]?.rewardVersion).toBe('r3/unified-signals-v1');
   });
 
   it('partitionExperienceRecords keeps old-yardstick records out of the learning set', () => {
     const partition = partitionExperienceRecords([
       versionedRecord({ id: 'r2-old', rewardVersion: 'r2/verifiable-v1', value: 3 }),
-      versionedRecord({ id: 'r3-stay', rewardVersion: CURRENT_REWARD_VERSION, value: 1 }),
+      versionedRecord({ id: 'r3-old', rewardVersion: 'r3/unified-signals-v1', value: 1 }),
+      versionedRecord({ id: 'r4-stay', rewardVersion: CURRENT_REWARD_VERSION, value: 1 }),
       versionedRecord({ id: 'r3-backfill', rewardVersion: BACKFILL_REWARD_VERSION, value: 2 }),
       versionedRecord({ id: 'no-version', value: 5 })
     ]);
-    // P6.2 PR-A / F2: learning keeps exactly the online-contract records;
-    // audit-only keeps the r2 line, the unversioned line AND the surrogate
-    // backfill line (target-heterogeneous with the online contract).
-    expect(partition.learning.map((record) => record.id).sort()).toEqual(['r3-stay']);
+    // P6.2 PR-A / F2 + C1: learning keeps exactly the online-contract records;
+    // audit-only keeps the r2 line, the retired r3 line, the unversioned line
+    // AND the surrogate backfill line (target-heterogeneous with the online
+    // contract).
+    expect(partition.learning.map((record) => record.id).sort()).toEqual(['r4-stay']);
     expect(partition.auditOnly.map((record) => record.id).sort()).toEqual([
       'no-version',
       'r2-old',
-      'r3-backfill'
+      'r3-backfill',
+      'r3-old'
     ]);
   });
 });
@@ -276,10 +291,15 @@ describe('F1-d ③: isLearningEligible isolates cross-version records', () => {
         stored(versionedRecord({ id: 'rebuilt', rewardVersion: BACKFILL_REWARD_VERSION, value: 1 }))
       )
     ).toBe(false);
-    // Schema-current but r2 generation -> isolated (the F1 scenario).
+    // Schema-current but a retired generation (r2 AND r3) -> isolated.
     expect(
       isLearningEligible(
         stored(versionedRecord({ id: 'old-gen', rewardVersion: 'r2/verifiable-v1', value: 1 }))
+      )
+    ).toBe(false);
+    expect(
+      isLearningEligible(
+        stored(versionedRecord({ id: 'r3-gen', rewardVersion: 'r3/unified-signals-v1', value: 1 }))
       )
     ).toBe(false);
     // No version at all -> proves nothing -> fails closed.
@@ -290,7 +310,7 @@ describe('F1-d ③: isLearningEligible isolates cross-version records', () => {
     ).toBe(false);
     // Future generation -> this code predates that contract -> fails closed.
     expect(
-      isLearningEligible(stored(versionedRecord({ id: 'future', rewardVersion: 'r4/x', value: 1 })))
+      isLearningEligible(stored(versionedRecord({ id: 'future', rewardVersion: 'r5/x', value: 1 })))
     ).toBe(false);
     // Explicit learningEligible: false keeps vetoing regardless of version.
     expect(
