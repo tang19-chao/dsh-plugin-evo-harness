@@ -54,6 +54,8 @@ import {
   createSurrogateScorer,
   generateCandidatePolicies,
   resolveJitPerturbationGrid,
+  type DreamReplayReportWithShadow,
+  type IOfflineDreamerWithShadow,
   type OfflineDreamerOptions,
   type PolicyGenerator
 } from './dream-rsi';
@@ -1031,7 +1033,7 @@ function pickMirrorClient(clients: readonly unknown[] | undefined): JitMirrorMcp
   return undefined;
 }
 /** Dreamer surface plus the P4 diagnostic accessor the orchestrator reads. */
-export interface WiredOfflineDreamer extends IOfflineDreamer {
+export interface WiredOfflineDreamer extends IOfflineDreamerWithShadow {
   /**
    * True while a JitReplayHook is actually injected on replay.
    *
@@ -1162,7 +1164,7 @@ export function createJitWiredDreamer(input: {
     lastDreamDiagnostics(): readonly string[] {
       return lastDiagnostics;
     },
-    async replay(request): Promise<DreamReplayReport> {
+    async replay(request): Promise<DreamReplayReportWithShadow> {
       const driftRho = input.config.jitrl.dream.driftRho;
       // F1: read the `dreamJit` surface at the START of every replay. Off means
       // the basic Dream-RSI replay still runs (it must - plan section 4 R1), but
@@ -1213,10 +1215,20 @@ export function createJitWiredDreamer(input: {
             }
           )
       ).length;
+      const publishAuthorized =
+        input.executionProfile !== undefined
+          ? input.executionProfile.permissions.publish.allowed === true && input.base.publishAuthorized === true
+          : input.base.publishAuthorized === true;
+      const shadowMode =
+        input.base.shadowMode !== undefined
+          ? input.base.shadowMode
+          : (input.executionProfile?.shadowRecords ?? true);
       const baseOptions: OfflineDreamerOptions = {
         ...input.base,
         generatePolicies,
-        experiences
+        experiences,
+        shadowMode,
+        publishAuthorized
       };
       const dreamer = createOfflineDreamer(
         jitOn
@@ -1256,7 +1268,10 @@ export function createJitWiredDreamer(input: {
       } | undefined;
       // With the switch off there is no Jit hot swap to report, even when the
       // basic replay improved: `appliedJit` describes a Jit swap, not replay gain.
-      const appliedJit = jitOn && report.improved ? holder?.policy?.jit : undefined;
+      const appliedJit =
+        jitOn && report.publication?.publish === true
+          ? holder?.policy?.jit
+          : undefined;
       input.recorder.lastReplay = {
         ranAt: report.ranAt,
         hookCalls,
@@ -1645,7 +1660,9 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     activePolicy,
     policyCount: config.dreamRsi.candidatePoliciesCount,
     rhoPreferences: config.dreamRsi.rhoPreferences,
-    modelAdapter: options.model
+    modelAdapter: options.model,
+    shadowMode: effectiveProfile.shadowRecords || !effectiveProfile.permissions.publish.allowed,
+    publishAuthorized: effectiveProfile.permissions.publish.allowed === true
   };
   const dreamer = options.deps?.dreamer ??
     // P4: with a live JitRL kernel the dreamer is wrapped so replay simulates
@@ -1746,6 +1763,27 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     diagnostics.push(
       'execution profile: memory permission EXPLICITLY ALLOWED by the injected profile override' +
         ' (no config field can produce this; production assemblies never see it)'
+    );
+  }
+  // C2a (ADR 0003 §4.5.2): the host verification seam is an EXPLICIT host
+  // injection only - no config field produces it, and the diagnostic states
+  // which identity is active so an operator never has to guess whether verdicts
+  // are host-authenticated or merely shape-validated.
+  if (deps.verification !== undefined && deps.verification.enabled !== false) {
+    diagnostics.push(
+      'c2a verification: host-owned runner ' +
+        deps.verification.runner.verifierId +
+        '@' +
+        deps.verification.runner.verifierVersion +
+        ' active (testSet=' +
+        deps.verification.runner.testSetId +
+        ', env=' +
+        deps.verification.runner.envId +
+        '); verdicts are registry-authenticated, not shape-only'
+    );
+  } else {
+    diagnostics.push(
+      'c2a verification: no host runner injected; verdicts stay structural/shape-only (C2-pre conservative default)'
     );
   }
   if (jitWiring.wiring.kernel !== undefined) {
@@ -2755,6 +2793,14 @@ export function createEvoHarnessPlugin(
       const trees = orchestrator.treePool.list();
       if (trees.length === 0) {
         return undefined;
+      }
+      if (typeof orchestrator.triggerDream === 'function') {
+        const idleDiagnostics: string[] = [];
+        const reportResult = await orchestrator.triggerDream(idleDiagnostics);
+        for (const line of idleDiagnostics) {
+          report(line);
+        }
+        return reportResult;
       }
       return deps.dreamer.replay({
         trees,

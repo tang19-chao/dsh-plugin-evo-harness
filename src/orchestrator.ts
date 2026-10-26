@@ -103,7 +103,8 @@ import {
   type RehydratedAction
 } from './jitrl/candidate-augmenter';
 import {
-  classifyTrajectoryOutcome
+  classifyTrajectoryOutcome,
+  isLearningOutcome
 } from './jitrl/step-evaluator';
 import {
   decideReplacement,
@@ -118,10 +119,23 @@ import {
 } from './jitrl/reward-contract';
 import type { JitRuntimeControl, JitSurface } from './jitrl/runtime-control';
 import { recordModeOf, resolveExecutionProfile, type ExecutionProfile } from './runtime/execution-profile';
+import {
+  accumulateVerificationSummary,
+  readVerificationDisposition,
+  readVerificationView,
+  verificationRewardMarks,
+  verificationSourceDescription,
+  verifyAndAttach,
+  type HostVerificationSeam,
+  type VerificationDisposition,
+  type VerificationRunSummary,
+  type VerificationView
+} from './verification';
 import { createDiscoveryTree } from './dream-rsi';
 import type {
   DiscoveryTree,
   DiscoveryTreeOptions,
+  DreamReplayReportWithShadow,
   IFailureTaxonomy
 } from './dream-rsi';
 
@@ -227,6 +241,16 @@ export interface EvoHarnessOrchestratorDeps {
    */
   readonly executionProfile?: ExecutionProfile;
   /**
+   * C2a (ADR 0003 §4.1/§4.5): the host-owned trusted-verification seam.
+   *
+   * Absent (or `enabled: false`) means "no host runner": every trajectory keeps
+   * the pre-C2a shape (structural fallback only), no receipt is attached, no
+   * audit marks are written - byte-identical to the default assembly. There is
+   * deliberately NO config field that produces this seam; only an explicit host
+   * injection does (same discipline as `ExecutionProfileInput.memoryRealWrites`).
+   */
+  readonly verification?: HostVerificationSeam;
+  /**
    * Optional JitRL kernel surface (plan Phase 3: L2 selection and online
    * experience recording). Structural on purpose: the orchestrator never
    * imports src/jitrl/**, and a host without JitRL pays nothing. Absent means
@@ -297,10 +321,19 @@ export interface EvoHarnessOrchestrator extends IEvoHarnessOrchestrator {
   isDisposed(): boolean;
   lastTrace(): readonly EvoHarnessStage[];
   lastComposition(): CompositionResult | null;
+  /**
+   * C2a (ADR-0003 §4.2): the host-authenticated verification views of the last
+   * run (empty when no host runner is configured).
+   */
+  lastVerificationViews(): readonly VerificationView[];
   lastLessons(): readonly CanonicalLesson[];
   lastPlan(): SearchGridPlan | null;
   dreamReports(): readonly DreamReplayReport[];
   activePatchIds(): readonly string[];
+  /**
+   * C1.1 (ADR-0003 §3.5): Orchestrator-owned unified dream entrypoint.
+   */
+  triggerDream(diagnostics?: string[]): Promise<DreamReplayReportWithShadow | null>;
   /**
    * t8/R5 (ADR 0002 R5-6): the explicit exploration budget is part of the
    * public handle. `grant(n)` adds n seats (returns the new total), `revoke()`
@@ -871,6 +904,12 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
   private readonly dreams: DreamReplayReport[] = [];
   private trace: EvoHarnessStage[] = [];
   private composition: CompositionResult | null = null;
+  /**
+   * C2a (ADR 0003 §4.2): the host-authenticated trajectory views of the last
+   * run - "which trajectory got which verdict, authenticated how, and why not".
+   * Cleared at the start of every run, exactly like `trace`/`composition`.
+   */
+  private verificationView: VerificationView[] = [];
   private lessons: readonly CanonicalLesson[] = [];
   private plan: SearchGridPlan | null = null;
   private count = 0;
@@ -969,6 +1008,16 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     return this.trace;
   }
 
+  /**
+   * C2a (ADR 0003 §4.2): the host-authenticated trajectory views of the last
+   * run, in verification order (reference first). This is the status-page
+   * window onto "which probe was verified, by whom, and what happened to the
+   * verdict" - never a claim of real-world benefit.
+   */
+  lastVerificationViews(): readonly VerificationView[] {
+    return this.verificationView;
+  }
+
   lastComposition(): CompositionResult | null {
     return this.composition;
   }
@@ -1017,6 +1066,27 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     return this.dreams;
   }
 
+  /**
+   * C1.1 (ADR-0003 §3.5): Orchestrator-owned unified dream entrypoint.
+   * Records replay reports in dreamReports(), increments taskCounter.recordDream(),
+   * and emits publication status in diagnostics.
+   */
+  async triggerDream(diagnostics?: string[]): Promise<DreamReplayReportWithShadow | null> {
+    const diag = diagnostics ?? [];
+    const report = await this.runDream(this.deps.config, diag);
+    if (report !== null) {
+      const recordDream = this.deps.taskCounter?.recordDream;
+      if (recordDream !== undefined) {
+        try {
+          await recordDream.call(this.deps.taskCounter);
+        } catch (error) {
+          diag.push('dream counter update failed: ' + errorMessage(error));
+        }
+      }
+    }
+    return report;
+  }
+
   activePatchIds(): readonly string[] {
     return this.patchDisposers.filter((disposer) => disposer.active).map((disposer) => disposer.patchId);
   }
@@ -1034,6 +1104,8 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     this.composition = null;
     this.lessons = [];
     this.plan = null;
+    // C2a: the host-authenticated verification views are per-run state.
+    this.verificationView = [];
 
     let probesRun = 0;
     let lessonsCommitted = 0;
@@ -1178,7 +1250,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       }
 
       stage('reference_probe');
-      const reference = await this.deps.seams.runInIsolatedBranch({
+      const referenceProbe = await this.deps.seams.runInIsolatedBranch({
         sessionId,
         task,
         patch: referencePatch,
@@ -1190,6 +1262,18 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         memoryRecallIds: recall.lessons.map((lesson) => lesson.id),
         timeoutMs: config.probe.probeTimeoutMs
       });
+      // C2a (ADR 0003 §4.4): the reference goes through the SAME verification
+      // rules as every candidate, so the baseline and the probe are scored on
+      // one volume. A reference without a trusted receipt forces the whole
+      // run's candidate verdicts to audit-only (fail-closed, §4.4.2).
+      const referenceVerification = await this.verifyTrajectory(referenceProbe, {
+        runId,
+        taskId: task.id,
+        referenceReceiptMissing: false,
+        diagnostics
+      });
+      const reference = referenceVerification.trajectory;
+      const referenceHasReceipt = referenceVerification.disposition?.attached === true;
       probesRun += 1;
       referenceStatus = reference.status;
       tree.recordProbe(rootNode.id, {
@@ -1466,6 +1550,8 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
                   treeId: tree.id,
                   referenceTrajectoryId: reference.id,
                   recallIds: recall.lessons.map((lesson) => lesson.id),
+                  runId,
+                  referenceReceiptMissing: !referenceHasReceipt,
                   diagnostics
                 });
               }
@@ -1788,17 +1874,9 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
 
       if (this.shouldDream(config)) {
         stage('offline_dream');
-        const dream = await this.runDream(config, diagnostics);
+        const dream = await this.triggerDream(diagnostics);
         if (dream !== null) {
           dreamTriggered = true;
-          const recordDream = this.deps.taskCounter?.recordDream;
-          if (recordDream !== undefined) {
-            try {
-              await recordDream.call(this.deps.taskCounter);
-            } catch (error) {
-              diagnostics.push('dream counter update failed: ' + errorMessage(error));
-            }
-          }
         }
       }
 
@@ -2125,7 +2203,21 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     // reference run, the comparable same-task context of plan section 6.3) is
     // scored by the SAME aggregation as every candidate below, so the
     // learningTarget contrast compares like with like.
-    const baseline = clamp(scoreUnderRewardContract(input.reference).reward, -3, 3);
+    //
+    // C2a (ADR 0003 §4.4): BOTH roles are scored with the SAME host-owned
+    // trusted-producer set and both carry their own host receipt, so the
+    // contrast measures the patch, not a one-sided verification coverage. With
+    // no seam this argument is undefined and the call is byte-identical.
+    const trustedProducers = this.verificationTrustedProducers();
+    const scoreOptions =
+      trustedProducers === undefined ? {} : { trustedProducers };
+    const baseline = clamp(scoreUnderRewardContract(input.reference, scoreOptions).reward, -3, 3);
+    // C2a: the run's verification summary for the stage detail (factual, not a
+    // constant claim). No seam => the exact pre-C2a literal is emitted below.
+    let verificationSummary: VerificationRunSummary = accumulateVerificationSummary(
+      { trusted: 0, auditOnly: 0, reasonCodes: [] },
+      readVerificationDisposition(input.reference)
+    );
     const createdAt = this.now();
     const records: ExperienceRecord[] = [];
     const outcomes: string[] = [];
@@ -2163,7 +2255,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       // the record consumes it (reward / outcome / eligibility) instead of
       // re-deriving anything. The winner's step rewards remain an AUXILIARY
       // stepJudge source (judge-policy), never the yardstick.
-      const evaluation = scoreUnderRewardContract(probe.trajectory);
+      const evaluation = scoreUnderRewardContract(probe.trajectory, scoreOptions);
       const outcome = evaluation.outcome;
       outcomes.push(outcome);
       // t10/V3b (t9 finding): the recorder reads the SEPARATED flags instead of
@@ -2177,13 +2269,45 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       // The learning track is stamped from the evaluation directly: process
       // ⇔ NOT taskQualityEvidence, so the field⇔track consistency the
       // regression asserts is structural, not incidental.
-      const eligible = evaluation.taskQualityLearningEligible;
-      if (!eligible && evaluation.learningEligible) {
+      //
+      // C2a (ADR 0003 §5.1-§5.2, captain option (a) - zero behaviour change):
+      // TWO explicitly named gates. `outcomeEligible` is the OUTCOME-level
+      // process eligibility (`isLearningOutcome`, i.e. not cancel/abort/infra);
+      // `consumptionEligible` is the task-quality consumption gate. The LEARNING
+      // branch writes `learningEligible = consumptionEligible && outcomeEligible`
+      // (always true there, i.e. exactly `evaluation.learningEligible` as the ADR
+      // requires), and the AUDIT branch keeps the audit-only encoding
+      // `learningEligible: false` + reward 0 so a shape-only verdict can never
+      // become a learnable positive sample and never counts as support/nEff.
+      //
+      // C2a (ADR 0003 §4.3): the truth-table rows that are audit-only REGARDLESS
+      // of the process gate (abnormal execution, contradictory verdict,
+      // falsified success claim, missing reference receipt) arrive as
+      // `forceAuditOnly` on the host disposition and veto consumption here.
+      const verificationDisposition = readVerificationDisposition(probe.trajectory);
+      const outcomeKind = classifyTrajectoryOutcome(probe.trajectory);
+      const outcomeEligible = isLearningOutcome(outcomeKind);
+      const forcedAuditOnly =
+        verificationDisposition?.forceAuditOnly === true ||
+        verificationDisposition?.reasonCode === 'falsified-success-claim';
+      const consumptionEligible = evaluation.taskQualityLearningEligible && !forcedAuditOnly;
+      const eligible = consumptionEligible;
+      if (!eligible && outcomeEligible) {
         notTaskQuality += 1;
       }
       if (!eligible) {
         ineligible += 1;
       }
+      // C2a: the host-authenticated view of this trajectory (undefined when no
+      // seam is configured, in which case NO verification marks are persisted).
+      verificationSummary = accumulateVerificationSummary(verificationSummary, verificationDisposition);
+      const verificationMarks = verificationRewardMarks({
+        disposition: verificationDisposition,
+        verdict: evaluation.verification.status,
+        trustedSource: evaluation.verification.trustedSource,
+        outcomeEligible,
+        consumed: consumptionEligible
+      });
       // P6.2 t7/V3 + t10/V3b (ADR 0002 5.2a-4): the EXPLICIT learning track,
       // stamped from the evaluation's own separated fields. The task-quality
       // track requires the FACT flag (trusted verdict-derived completion only);
@@ -2250,9 +2374,13 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         // its scale-level negative signal in the reward column for audit, but
         // no provenance is forged to make it learnable (trusted-failure
         // learning is the explicit C2 unfinished item).
+        //
+        // C2a (ADR 0003 §5.1): this `learningEligible: false` is the AUDIT-ONLY
+        // ENCODING, not an outcome veto - the two are distinguished by the
+        // `outcomeEligible` mark below (1 = audit encoding, 0 = outcome veto).
         reward = 0;
         observedReturn = 0;
-        rewardSources = { outcome: 1, ...decisionMarks };
+        rewardSources = { outcome: 1, ...verificationMarks, ...decisionMarks };
       } else {
         // P6.1-D RewardContract: ONE primary target for every executed probe -
         // winner or not - under the same rewardVersion. The composer's winner
@@ -2264,6 +2392,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         observedReturn = clamp(evaluation.reward, -3, 3);
         rewardSources = {
           ...(isWinner ? { ...evaluation.sources, stepJudge: winnerStepSummary(winnerRewards) } : evaluation.sources),
+          ...verificationMarks,
           ...decisionMarks
         };
       }
@@ -2299,7 +2428,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         attributionBaseline: baseline,
         learningTarget,
         outcome,
-        learningEligible: eligible
+        // C2a (ADR 0003 §5.1/§5.2): the learning branch writes the two-gate
+        // conjunction (in this branch both gates are true, i.e. exactly
+        // `evaluation.learningEligible`); the audit branch wrote `false` above.
+        learningEligible: eligible && outcomeEligible
       } as const;
 
       // L1: this executed action's own record, in the L1 candidate key vocabulary
@@ -2422,7 +2554,13 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         rewardVersion: REWARD_CONTRACT.version,
         rewardScale: REWARD_CONTRACT.aggregation,
         verifierFirstRule: 'verifier-first-completion-v1',
-        trustedVerificationSource: 'shape-only (C2-pre: no trusted producer registered)',
+        // C2a (ADR 0003 §4.5): with no seam this stays the exact pre-C2a
+        // literal (default-assembly equivalence); with a seam it reports what
+        // actually happened this run (trusted / audit-only counts + reasons).
+        trustedVerificationSource: verificationSourceDescription(
+          this.deps.verification,
+          verificationSummary
+        ),
         rewardTargetField: REWARD_CONTRACT.learningTargetField,
         // What the value estimator will consume from these records.
         estimatorTarget: estimatorTargetLine(deduped, REWARD_CONTRACT.version),
@@ -2969,6 +3107,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     readonly treeId: string;
     readonly referenceTrajectoryId: string;
     readonly recallIds: readonly string[];
+    /** C2a (ADR 0003 §4.1): the run identity the host binding is scoped to. */
+    readonly runId: string;
+    /** C2a (ADR 0003 §4.4.2): no reference receipt => candidate receipt audit-only. */
+    readonly referenceReceiptMissing: boolean;
     readonly diagnostics: string[];
   }): Promise<ProbeTrajectory> {
     const config = this.deps.config;
@@ -2984,7 +3126,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     }
 
     try {
-      return await this.deps.seams.runInIsolatedBranch({
+      const probe = await this.deps.seams.runInIsolatedBranch({
         sessionId: input.sessionId,
         task: input.task,
         patch: input.patch,
@@ -2997,6 +3139,16 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         memoryRecallIds: input.recallIds,
         timeoutMs: config.probe.probeTimeoutMs
       });
+      // C2a: verify BEFORE the trajectory enters the tree, the composer or the
+      // recorder, so every downstream consumer sees the same authenticated
+      // digest/verdict pair (no re-collection, no branch self-declaration).
+      const verified = await this.verifyTrajectory(probe, {
+        runId: input.runId,
+        taskId: input.task.id,
+        referenceReceiptMissing: input.referenceReceiptMissing,
+        diagnostics: input.diagnostics
+      });
+      return verified.trajectory;
     } finally {
       if (handle !== undefined) {
         try {
@@ -3006,6 +3158,52 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         }
       }
     }
+  }
+
+  /**
+   * C2a (ADR 0003 §4.1-§4.4): run the host-owned verifier over one probe and
+   * return the trajectory every later stage must use.
+   *
+   * No seam => the trajectory is returned untouched and no disposition exists,
+   * which is what keeps the default assembly byte-identical (§4.5.1).
+   */
+  private async verifyTrajectory(
+    trajectory: ProbeTrajectory,
+    input: {
+      readonly runId: string;
+      readonly taskId: string;
+      readonly referenceReceiptMissing: boolean;
+      readonly diagnostics: string[];
+    }
+  ): Promise<{ readonly trajectory: ProbeTrajectory; readonly disposition: VerificationDisposition | undefined }> {
+    const result = await verifyAndAttach({
+      seam: this.deps.verification,
+      trajectory,
+      runId: input.runId,
+      taskId: input.taskId,
+      referenceReceiptMissing: input.referenceReceiptMissing,
+      diagnostics: input.diagnostics
+    });
+    // C2a: record the host view for the run (status page / independent
+    // verification), regardless of whether a receipt was attached.
+    const view = readVerificationView(result.trajectory);
+    if (view !== undefined) {
+      this.verificationView = [...this.verificationView, view];
+    }
+    return { trajectory: result.trajectory, disposition: result.disposition };
+  }
+
+  /**
+   * The trusted-producer set the scorer consumes as its second necessary
+   * condition (ADR 0003 §4.1). `undefined` with no seam keeps the scorer's own
+   * frozen default (the empty registry).
+   */
+  private verificationTrustedProducers(): ReadonlySet<string> | undefined {
+    const seam = this.deps.verification;
+    if (seam === undefined || seam.enabled === false) {
+      return undefined;
+    }
+    return seam.runner.trustedProducers;
   }
 
   private async commitLessons(
@@ -3148,15 +3346,15 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
   private async runDream(
     config: EvoHarnessConfig,
     diagnostics: string[]
-  ): Promise<DreamReplayReport | null> {
+  ): Promise<DreamReplayReportWithShadow | null> {
     try {
       const baseline = this.deps.policy.policy;
       const trees = this.treePool.list();
-      const report = await this.deps.dreamer.replay({
+      const report = (await this.deps.dreamer.replay({
         trees,
         baselinePolicy: baseline,
         candidatePolicies: this.candidatePolicies(baseline, config.dreamRsi.candidatePoliciesCount)
-      });
+      })) as DreamReplayReportWithShadow;
       this.dreams.push(report);
       // P4: a dreamer wired to the JitRL kernel reports how many replay hook
       // calls it made and which candidate jit hyperparameters were simulated.
@@ -3170,13 +3368,17 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           diagnostics.push(line);
         }
       }
+      const pub = report.publication;
       diagnostics.push(
         'offline dream: replayed ' +
           String(report.replayedTreeIds.length) +
           ' tree(s), improved=' +
           String(report.improved) +
           ', selected ' +
-          report.selectedPolicyId
+          report.selectedPolicyId +
+          (pub !== undefined
+            ? ', published=' + String(pub.publish) + ', reason=' + pub.reason
+            : '')
       );
       return report;
     } catch (error) {

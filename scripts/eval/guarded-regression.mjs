@@ -143,9 +143,53 @@ import {
   gateReasonCodeOf
 } from '${'../../src/orchestrator.ts'}';
 import { readFileSync } from 'node:fs';
+import { createOfflineDreamer } from '${'../../src/dream-rsi/offline-dreamer.ts'}';;
+import { createDiscoveryTree } from '${'../../src/dream-rsi/discovery-tree.ts'}';;
+import { createDefaultPolicy } from '${'../../src/dream-rsi/active-policy.ts'}';;
+import { createJitWiredDreamer } from '${'../../src/index.ts'}';;
+import { parseEvoHarnessConfig } from '${'../../src/config.ts'}';;
 import { abstractMetaState } from '${'../../src/jitrl/state-abstraction.ts'}';
+import {
+  artifactDigestOf,
+  readVerificationDisposition,
+  readVerificationView,
+  createHostOwnedVerificationRunner,
+  verificationRewardMarks,
+  verifyAndAttach
+} from '${'../../src/verification/index.ts'}';
 
 const T0 = 1_700_000_000_000;
+
+function makeDeepTree(id) {
+  let at = T0;
+  const tree = createDiscoveryTree({
+    id,
+    sessionId: 'sess-' + id,
+    taskId: 'task-' + id,
+    rootPatchId: 'root-' + id,
+    clock: () => at++
+  });
+  const add = (parentId, nodeId, score) => {
+    tree.addNode({
+      id: nodeId,
+      parentId,
+      patchId: 'patch-' + nodeId,
+      patchOrigin: 'domain',
+      purpose: parentId === tree.rootId ? 'explore' : 'deepen',
+      guidance: 'memory',
+      createdAt: at++
+    });
+    tree.recordProbe(nodeId, { trajectoryId: 'traj-' + nodeId, score });
+  };
+  add(tree.rootId, id + '-s1', 0.1);
+  add(tree.rootId, id + '-s2', 0.3);
+  add(tree.rootId, id + '-s3', 0.2);
+  add(tree.rootId, id + '-s4', 0.15);
+  add(id + '-s2', id + '-d1', 0.35);
+  add(id + '-d1', id + '-d2', 0.4);
+  add(id + '-d2', id + '-d3', 0.55);
+  return tree.snapshot();
+}
 
 function record(overrides = {}) {
   return {
@@ -197,6 +241,40 @@ function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
   }
+}
+
+/** C2a fixtures: a deterministic host runner over a JSON artifact contract. */
+const C2A_TASK = 'task-guarded-c2a';
+const C2A_RUN = 'run-guarded-c2a';
+
+function c2aRunner() {
+  return createHostOwnedVerificationRunner({
+    verifierId: 'guarded-c2a-verifier',
+    verifierVersion: '1.0.0',
+    testSetId: 'guarded-tests@v1',
+    envId: 'guarded-env-1',
+    cases: [
+      {
+        taskId: C2A_TASK,
+        checks: [
+          {
+            id: 'json-ok',
+            run: (artifact) => JSON.parse(artifact.content)['ok'] === true
+          }
+        ]
+      }
+    ]
+  });
+}
+
+function c2aTrajectory(overrides = {}) {
+  return trajectory({
+    id: 'traj-guarded-c2a',
+    sessionId: 'sess-guarded-c2a',
+    role: 'candidate',
+    deliverable: { content: '{"ok":true}', format: 'json' },
+    ...overrides
+  });
 }
 
 const PROBES = [
@@ -1593,6 +1671,85 @@ const PROBES = [
     }
   },
   {
+    id: 'C1.1-publish-receptor-boundary',
+    section: 'C1.1',
+    async fn() {
+      const tree1 = makeDeepTree('tree-reg-1');
+      const tree2 = makeDeepTree('tree-reg-2');
+      const baseline = {
+        ...createDefaultPolicy({ id: 'pi-reg-base', version: 1 }, () => T0),
+        maxWidth: 4,
+        maxDepth: 1
+      };
+      const candidate = {
+        ...createDefaultPolicy({ id: 'pi-reg-deep', version: 2 }, () => T0),
+        maxWidth: 1,
+        maxDepth: 4
+      };
+
+      // 1. Default shadow mode + profile deny:
+      const applied = [];
+      const dreamer = createOfflineDreamer({
+        now: () => T0,
+        applyPolicy: (p) => { applied.push(p); }
+      });
+      const report = await dreamer.replay({
+        trees: [tree1],
+        baselinePolicy: baseline,
+        candidatePolicies: [candidate]
+      });
+      assert(report.improved === true, 'candidate must strictly improve on deep tree');
+      assert(report.publication.publish === false, 'publish must be false under default deny');
+      assert(report.shadow.published === false, 'shadow.published must be false under default deny');
+      assert(applied.length === 0, 'applyPolicy must not be called under default deny');
+      assert(report.publication.reason.includes('holdout-missing'), 'default reason must be holdout-missing');
+
+      // 2. Fail-closed: base.shadowMode = false without authorization
+      const shadowOverrideApplied = [];
+      const failClosedDreamer = createOfflineDreamer({
+        now: () => T0,
+        shadowMode: false,
+        holdoutTreeCount: 1,
+        applyPolicy: (p) => { shadowOverrideApplied.push(p); }
+      });
+      const failClosedReport = await failClosedDreamer.replay({
+        trees: [tree1, tree2],
+        baselinePolicy: baseline,
+        candidatePolicies: [candidate]
+      });
+      assert(failClosedReport.publication.publish === false, 'shadowMode=false cannot override deny');
+      assert(failClosedReport.shadow.published === false, 'shadow.published must be false without authorization');
+      assert(shadowOverrideApplied.length === 0, 'apply count must be 0 without authorization');
+      assert(failClosedReport.publication.reason.includes('publish-denied'), 'reason must be publish-denied');
+
+      // 3. Authorized positive control: publishAuthorized + holdout passes
+      const authApplied = [];
+      const authDreamer = createOfflineDreamer({
+        now: () => T0,
+        publishAuthorized: true,
+        holdoutTreeCount: 1,
+        applyPolicy: (p) => { authApplied.push(p); }
+      });
+      const authReport = await authDreamer.replay({
+        trees: [tree1, tree2],
+        baselinePolicy: baseline,
+        candidatePolicies: [candidate]
+      });
+      assert(authReport.improved === true, 'authorized candidate strictly improves');
+      assert(authReport.publication.publish === true, 'authorized publication is true');
+      assert(authReport.shadow.published === true, 'authorized shadow.published is true');
+      assert(authApplied.length === 1, 'authorized candidate applies');
+      assert(authApplied[0].id === 'pi-reg-deep', 'applied winner is pi-reg-deep');
+
+      return {
+        defaultDenyVerified: true,
+        failClosedShadowOverride: true,
+        authorizedPositiveControl: true,
+        winnerPolicyId: authApplied[0].id
+      };
+    }
+  },
+  {
     id: 'T10-R3b-replay-declarations-production',
     section: 't10/R3b',
     fn: async () => {
@@ -1712,6 +1869,379 @@ const PROBES = [
           callerDeclared: mixedDeclared.diagnostics.stateValue
         },
         undeclaredExcluded: true
+      };
+    }
+  },
+  {
+    id: 'C2a-host-runner-verdicts',
+    section: 'ADR-0003 4.1-4.3',
+    fn: async () => {
+      // A REAL correct artifact and a REAL wrong artifact through the host
+      // runner + attach + the shared yardstick: trusted passed / trusted failed
+      // with the host-recomputed digest bound into the trajectory.
+      const host = c2aRunner();
+      const seam = { runner: host };
+      const correct = await verifyAndAttach({
+        seam,
+        trajectory: c2aTrajectory(),
+        runId: C2A_RUN,
+        taskId: C2A_TASK
+      });
+      assert(correct.disposition?.attached === true, 'a correct artifact must attach');
+      assert(correct.disposition?.verdict === 'passed', 'a correct artifact must pass');
+      assert(correct.disposition?.auditOnly === false, 'a trusted pass is task-quality eligible');
+      const expectedDigest = artifactDigestOf({ content: '{"ok":true}', producedFiles: [] });
+      assert(
+        correct.trajectory.deliverable.contentHash === expectedDigest,
+        'the host digest must be written into the trajectory (T3)'
+      );
+      const passScore = scoreUnderRewardContract(correct.trajectory, {
+        trustedProducers: host.trustedProducers
+      });
+      assert(passScore.verification.trustedSource === true, 'the trusted pass must reach the scorer');
+      assert(passScore.taskQualityEvidence === true, 'the trusted pass must be task-quality evidence');
+      assert(passScore.sources.completion === 1, 'the trusted pass earns the completion signal');
+
+      const wrong = await verifyAndAttach({
+        seam,
+        trajectory: c2aTrajectory({
+          id: 'traj-guarded-c2a-wrong',
+          deliverable: { content: '{"ok":false}', format: 'json' }
+        }),
+        runId: C2A_RUN,
+        taskId: C2A_TASK
+      });
+      assert(wrong.disposition?.verdict === 'failed', 'a wrong artifact must be refuted');
+      assert(
+        wrong.disposition?.reasonCode === 'falsified-success-claim',
+        'a refuted success claim is the falsified row'
+      );
+      assert(wrong.disposition?.auditOnly === true, 'the falsified row is audit-only');
+      const wrongScore = scoreUnderRewardContract(wrong.trajectory, {
+        trustedProducers: host.trustedProducers
+      });
+      assert(wrongScore.learningEligible === false, 'a falsified claim is not learnable');
+      assert(wrongScore.reward <= 0, 'a refuted result can never score positive');
+      return {
+        passedDigestBound: true,
+        falsifiedAuditOnly: true,
+        registryEntries: host.size
+      };
+    }
+  },
+  {
+    id: 'C2a-forgery-and-misbinding-rejected',
+    section: 'ADR-0003 4.2/4.4',
+    fn: async () => {
+      const host = c2aRunner();
+      const real = (
+        await host.verify({
+          runId: C2A_RUN,
+          sessionId: 'sess-guarded-c2a',
+          trajectoryId: 'traj-guarded-c2a',
+          role: 'candidate',
+          taskId: C2A_TASK,
+          executionStatus: 'succeeded',
+          artifact: { content: '{"ok":true}', producedFiles: [] }
+        })
+      ).receipt;
+      // 1. A payload the runner never registered (a branch self-declaration).
+      const lying = {
+        ...host,
+        verify: async () => ({ receipt: real }),
+        receiptFor: () => undefined
+      };
+      const forged = await verifyAndAttach({
+        seam: { runner: lying },
+        trajectory: c2aTrajectory(),
+        runId: C2A_RUN,
+        taskId: C2A_TASK
+      });
+      assert(forged.disposition?.reasonCode === 'unregistered-receipt', 'forged payload must be refused');
+      assert(forged.trajectory.metadata.verification === undefined, 'the forged payload must be stripped');
+      // 2. An inherited receipt when the host produces none must be stripped too.
+      const inherited = await verifyAndAttach({
+        seam: { runner: host },
+        trajectory: c2aTrajectory({
+          id: 'traj-guarded-inherit',
+          deliverable: undefined,
+          metadata: { verification: real }
+        }),
+        runId: C2A_RUN,
+        taskId: C2A_TASK
+      });
+      assert(inherited.disposition?.reasonCode === 'artifact-missing', 'no artifact => artifact-missing');
+      assert(
+        inherited.trajectory.metadata.verification === undefined,
+        'the inherited payload must not survive (no replay channel)'
+      );
+      // 3. Old test set / old artifact / foreign run are named refusals.
+      const hybrid = (receipt, hostOverride) => ({
+        ...hostOverride,
+        verify: async () => ({ receipt }),
+        receiptFor: () => receipt
+      });
+      const foreignDigest = artifactDigestOf({ content: '{"ok":true,"value":9}', producedFiles: [] });
+      const digestCase = await verifyAndAttach({
+        seam: {
+          runner: hybrid(
+            { ...real, evidenceHash: foreignDigest, binding: { ...real.binding, artifactDigest: foreignDigest } },
+            host
+          )
+        },
+        trajectory: c2aTrajectory(),
+        runId: C2A_RUN,
+        taskId: C2A_TASK
+      });
+      assert(digestCase.disposition?.reasonCode === 'digest-mismatch', 'a foreign digest must be refused');
+      const testSetCase = await verifyAndAttach({
+        seam: {
+          runner: hybrid(
+            { ...real, binding: { ...real.binding, testSetId: 'guarded-tests@v0' } },
+            host
+          )
+        },
+        trajectory: c2aTrajectory(),
+        runId: C2A_RUN,
+        taskId: C2A_TASK
+      });
+      assert(testSetCase.disposition?.reasonCode === 'test-set-mismatch', 'an old test set must be refused');
+      const replayCase = await verifyAndAttach({
+        seam: { runner: hybrid(real, host) },
+        trajectory: c2aTrajectory({ id: 'traj-guarded-c2a' }),
+        runId: 'run-other',
+        taskId: C2A_TASK
+      });
+      assert(replayCase.disposition?.reasonCode === 'run-mismatch', 'a cross-run replay must be refused');
+      const emptyChecks = await verifyAndAttach({
+        seam: { runner: hybrid({ ...real, checks: [] }, host) },
+        trajectory: c2aTrajectory(),
+        runId: C2A_RUN,
+        taskId: C2A_TASK
+      });
+      assert(emptyChecks.disposition?.reasonCode === 'malformed-receipt', 'empty checks must be refused');
+      return {
+        refused: [
+          'unregistered-receipt',
+          'artifact-missing',
+          'digest-mismatch',
+          'test-set-mismatch',
+          'run-mismatch',
+          'malformed-receipt'
+        ]
+      };
+    }
+  },
+  {
+    id: 'C2a-timeout-not-task-quality',
+    section: 'ADR-0003 4.3 row 5',
+    fn: async () => {
+      // ORIGINAL DEFECT SHAPE (t3 P-7): a timeout carrying a trusted failed
+      // verdict became task-quality evidence (taskQualityEvidence=true,
+      // learningTrack='task-quality', reward -0.6833). The attach-side
+      // abnormal-execution gate must make it audit-only with the reason kept.
+      const host = c2aRunner();
+      const timedOut = await verifyAndAttach({
+        seam: { runner: host },
+        trajectory: c2aTrajectory({
+          id: 'traj-guarded-timeout',
+          status: 'timeout',
+          deliverable: { content: '{"ok":false}', format: 'json' },
+          failureSignals: [{ kind: 'timeout', message: 'budget exhausted', repairable: false }]
+        }),
+        runId: C2A_RUN,
+        taskId: C2A_TASK
+      });
+      assert(
+        timedOut.disposition?.reasonCode === 'execution-not-completed',
+        'a timeout verdict must be audit-only'
+      );
+      assert(timedOut.disposition?.forceAuditOnly === true, 'the abnormal row forces audit-only');
+      assert(
+        timedOut.trajectory.metadata.verification === undefined,
+        'the timeout receipt must not reach the scorer'
+      );
+      const score = scoreUnderRewardContract(timedOut.trajectory, {
+        trustedProducers: host.trustedProducers
+      });
+      assert(score.taskQualityEvidence === false, 'a timeout must never be task-quality evidence');
+      assert(
+        readVerificationView(timedOut.trajectory).disposition.reason.includes('timeout'),
+        'the reason must be readable'
+      );
+      // The persisted marks encode the audit facts (verdict kept, audit-only).
+      const marks = verificationRewardMarks({
+        disposition: readVerificationDisposition(timedOut.trajectory),
+        verdict: score.verification.status,
+        trustedSource: score.verification.trustedSource,
+        outcomeEligible: false,
+        consumed: false
+      });
+      assert(marks.verificationVerdict === 2, 'the host failed verdict is kept for audit');
+      assert(marks.verificationAuditOnly === 1, 'the record is marked audit-only');
+      assert(marks.outcomeEligible === 0, 'the outcome veto is marked');
+      return { reasonCode: timedOut.disposition.reasonCode, marks };
+    }
+  },
+  {
+    id: 'C2a-audit-records-out-of-learning',
+    section: 'ADR-0003 5.3',
+    fn: async () => {
+      const store = createMemoryExperienceStore({ now: () => T0 + 1000 });
+      const base = record({
+        id: 'audit-only',
+        reward: 0,
+        return: 0,
+        observedReturn: 0,
+        learningEligible: false,
+        learningTrack: 'process',
+        rewardSources: {
+          outcomeEligible: 1,
+          verificationVerdict: 2,
+          verificationTrusted: 1,
+          verificationAuditOnly: 1
+        }
+      });
+      await store.append([base]);
+      const strict = await store.query({
+        level: 'proposal',
+        state: { level: 'proposal', bucket: 'b', tokens: ['t'], summary: '' },
+        k: 10,
+        similarityThreshold: 0,
+        learningEligibleOnly: true
+      });
+      assert(strict.length === 0, 'an audit-only record must not enter a learning neighbourhood');
+      const all = await store.query({
+        level: 'proposal',
+        state: { level: 'proposal', bucket: 'b', tokens: ['t'], summary: '' },
+        k: 10,
+        similarityThreshold: 0
+      });
+      assert(all.length === 1, 'the audit record stays readable for audit');
+      const marks = all[0].record.rewardSources;
+      assert(
+        marks.outcomeEligible === 1 &&
+          marks.verificationVerdict === 2 &&
+          marks.verificationTrusted === 1 &&
+          marks.verificationAuditOnly === 1,
+        'the numeric audit marks must round-trip through the store'
+      );
+      // ...and support/nEff see nothing: the single filter predicate drops it.
+      assert(
+        isLearningEligibleRecord(all[0].record, CURRENT_REWARD_VERSION) === false,
+        'the shared eligibility predicate must exclude it (support/nEff stay untouched)'
+      );
+      return { learningVisible: 0, auditReadable: 1, marks: Object.keys(marks).sort() };
+    }
+  },
+  {
+    id: 'C2a-task-quality-not-leaked-into-process',
+    section: 'ADR-0003 5.4',
+    fn: () => {
+      // C2a writes task-quality records; every production consumer pins the
+      // process track, so the record is written-but-not-consumed - and must
+      // never leak into a process estimate.
+      const taskQuality = record({ id: 'tq', learningTrack: 'task-quality', learningEligible: true });
+      const process = record({ id: 'proc', learningTrack: 'process', learningEligible: true });
+      const undeclared = record({ id: 'undeclared', learningTrack: undefined, learningEligible: true });
+      const snapshot = [taskQuality, process, undeclared];
+      const productionView = snapshot.filter((entry) => isOnLearningTrack(entry, PRODUCTION_LEARNING_TRACK));
+      assert(
+        JSON.stringify(productionView.map((entry) => entry.id).sort()) ===
+          JSON.stringify(['proc', 'undeclared']),
+        'the production consumers must never see a task-quality record'
+      );
+      const taskQualityView = snapshot.filter((entry) => isOnLearningTrack(entry, 'task-quality'));
+      assert(
+        taskQualityView.length === 1 && taskQualityView[0].id === 'tq',
+        'only the explicit task-quality declaration enters that neighbourhood'
+      );
+      return { productionTrack: PRODUCTION_LEARNING_TRACK, taskQualityVisible: ['tq'], notConsumed: true };
+    }
+  },
+  {
+    id: 'C2a-no-config-grant-and-offline-runner',
+    section: 'ADR-0003 4.5/4.1 T6',
+    fn: () => {
+      // 1. No config shape can enable a host runner (fail-closed default).
+      const configText = readFileSync(REPO_ROOT + '/src/config.ts', 'utf8');
+      assert(
+        configText.indexOf('verification') < 0 && configText.indexOf('hostRunner') < 0,
+        'src/config.ts must not carry a verification/host-runner field'
+      );
+      const deps = new EvoHarnessOrchestratorImpl({
+        config: { probe: { maxConcurrentProbes: 1, probeTimeoutMs: 1000 } },
+        memory: {},
+        seams: {},
+        policy: {},
+        proposer: {},
+        composer: {},
+        reflector: {},
+        scorer: {},
+        taxonomy: {},
+        dreamer: {},
+        treePool: {},
+        runBranch: async () => ({})
+      });
+      assert(
+        deps.lastVerificationViews().length === 0,
+        'the default assembly must have no host verification views'
+      );
+      // 2. The runner modules have no network/model/permission side channels.
+      for (const rel of [
+        'src/verification/host-runner.ts',
+        'src/verification/artifact-digest.ts',
+        'src/verification/attach.ts',
+        'src/verification/types.ts'
+      ]) {
+        const text = readFileSync(REPO_ROOT + '/' + rel, 'utf8');
+        for (const forbidden of ['fetch(', 'node:http', 'node:https', 'node:net', 'IModelAdapter', 'memory.commit', 'applyPermanentPatch']) {
+          assert(text.indexOf(forbidden) < 0, rel + ' must not reference ' + forbidden);
+        }
+      }
+      // 3. The r4 numeric scale is untouched by C2a.
+      assert(REWARD_CONTRACT.version === 'r4/verifier-first-v1', 'the contract id is frozen');
+      assert(REWARD_CONTRACT.aggregation === 'trajectory-signals-v1', 'the aggregation is frozen');
+      return {
+        configFieldsScanned: 1,
+        offlineRunner: true,
+        defaultViews: 0,
+        weightsHash: contractWeightsHash()
+      };
+    }
+  },
+  {
+    id: 'C2a-scale-unchanged-by-trust',
+    section: 'ADR-0003 4.3 约束 2',
+    fn: async () => {
+      // Trust changes eligibility/track, never the numeric scale: the same
+      // trajectory scores the same with and without the producer set; only the
+      // trustedSource/taskQuality flags move.
+      const host = c2aRunner();
+      const attached = await verifyAndAttach({
+        seam: { runner: host },
+        trajectory: c2aTrajectory({ id: 'traj-guarded-scale' }),
+        runId: C2A_RUN,
+        taskId: C2A_TASK
+      });
+      const withTrust = scoreUnderRewardContract(attached.trajectory, {
+        trustedProducers: host.trustedProducers
+      });
+      const withoutTrust = scoreUnderRewardContract(attached.trajectory);
+      assert(
+        Math.abs(withTrust.reward - withoutTrust.reward) < 1e-9,
+        'the numeric reward must not depend on the producer set'
+      );
+      assert(withTrust.verification.trustedSource === true, 'the trusted view is flagged');
+      assert(withoutTrust.verification.trustedSource === false, 'without the set it stays shape-only');
+      assert(
+        withTrust.taskQualityLearningEligible !== withoutTrust.taskQualityLearningEligible,
+        'only the consumption gate may differ'
+      );
+      return {
+        reward: withTrust.reward,
+        trustedSource: { withSet: true, withoutSet: false },
+        weightsHash: contractWeightsHash()
       };
     }
   },

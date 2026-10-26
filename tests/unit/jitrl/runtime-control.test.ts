@@ -376,10 +376,11 @@ describe('F1 (dreamJit): the Jit hyperparameter hot swap is gated separately fro
     expect(incumbent.jit?.beta).toBe(1);
     const applied: MetaSearchPolicy[] = [];
 
+    const recorder = { hookAttached: false } as { hookAttached: boolean; lastReplay?: any };
     const dreamer = createJitWiredDreamer({
       kernel,
       config,
-      recorder: { hookAttached: false },
+      recorder,
       isJitRuntimeEnabled: () => false,
       base: {
         now: () => 1_700_000_000_000,
@@ -407,17 +408,191 @@ describe('F1 (dreamJit): the Jit hyperparameter hot swap is gated separately fro
       ]
     });
 
-    // Precondition: the replay really did improve, so applyPolicy ran. Without
-    // this the assertion below would pass vacuously.
+    // ADR-0003 §3.6: Precondition holds - candidate strictly improves, but publish
+    // is denied by default (holdout-missing + no explicit authorization).
     expect(report.improved).toBe(true);
-    expect(applied).toHaveLength(1);
-    // The basic Dream-RSI swap happened (off must not disable the base loop)...
-    const swapped = applied[0] as MetaSearchPolicy;
+    expect(report.publication.publish).toBe(false);
+    expect(applied).toHaveLength(0);
+    expect(incumbent.jit?.beta).toBe(1);
+    expect(incumbent.jit?.lambda).toBe(0.05);
+    expect(recorder.lastReplay?.appliedJit).toBeUndefined();
+
+    // ADR-0003 §3.6 (i) 授权正控形态：同一夹具改为显式授予 publish + 显式 holdout 通过
+    // 真实 apply 发生，此时非空洞地继续断言 swapped.jit.beta===1 (扰动未泄漏进在线策略)
+    const authApplied: MetaSearchPolicy[] = [];
+    const authDreamer = createJitWiredDreamer({
+      kernel,
+      config,
+      recorder: { hookAttached: false },
+      isJitRuntimeEnabled: () => false,
+      executionProfile: {
+        mode: 'shadow',
+        permissions: {
+          patch: { allowed: false, reason: '' },
+          memory: { allowed: false, reason: '' },
+          publish: { allowed: true, reason: 'test explicit authorization' }
+        },
+        shadowRecords: true,
+        off: false
+      },
+      base: {
+        now: () => 1_700_000_000_000,
+        publishAuthorized: true,
+        shadowMode: false,
+        holdoutTreeCount: 1,
+        activePolicy: {
+          get policy() {
+            return incumbent;
+          },
+          update(policy: MetaSearchPolicy) {
+            authApplied.push(policy);
+          }
+        } as any
+      }
+    });
+
+    const treeHoldout = createDiscoveryTree({
+      id: 'tree-t21-holdout',
+      sessionId: 'session-t21',
+      taskId: 'task-t21',
+      rootPatchId: 'patch-root',
+      clock: fixedClock()
+    });
+    treeHoldout.addNode(childInput(treeHoldout.rootId, { id: 's1', origin: 'domain', purpose: 'explore' }));
+    treeHoldout.recordProbe('s1', { trajectoryId: 'traj-s1-h', score: 0.1 });
+    treeHoldout.addNode(childInput(treeHoldout.rootId, { id: 's2', origin: 'domain', purpose: 'explore' }));
+    treeHoldout.recordProbe('s2', { trajectoryId: 'traj-s2-h', score: 0.3 });
+    treeHoldout.addNode(childInput(treeHoldout.rootId, { id: 's3', origin: 'domain', purpose: 'explore' }));
+    treeHoldout.recordProbe('s3', { trajectoryId: 'traj-s3-h', score: 0.2 });
+    treeHoldout.addNode(childInput(treeHoldout.rootId, { id: 's4', origin: 'domain', purpose: 'explore' }));
+    treeHoldout.recordProbe('s4', { trajectoryId: 'traj-s4-h', score: 0.15 });
+    treeHoldout.addNode(childInput('s2', { id: 'd1', purpose: 'deepen' }));
+    treeHoldout.recordProbe('d1', { trajectoryId: 'traj-d1-h', score: 0.35 });
+    treeHoldout.addNode(childInput('d1', { id: 'd2', purpose: 'deepen' }));
+    treeHoldout.recordProbe('d2', { trajectoryId: 'traj-d2-h', score: 0.4 });
+    treeHoldout.addNode(childInput('d2', { id: 'd3', purpose: 'deepen' }));
+    treeHoldout.recordProbe('d3', { trajectoryId: 'traj-d3-h', score: 0.55 });
+
+    const authReport = await authDreamer.replay({
+      trees: [tree.snapshot(), treeHoldout.snapshot()],
+      baselinePolicy: makePolicy({ id: 'pi-baseline', maxWidth: 4, maxDepth: 1 }),
+      candidatePolicies: [
+        {
+          ...makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4 }),
+          jit: { beta: 2, lambda: 0.1, alpha: 0.1, k: 8, gamma: 0.9, similarityThreshold: 0.75 }
+        }
+      ]
+    });
+    expect(authReport.improved).toBe(true);
+    expect(authReport.publication.publish).toBe(true);
+    expect(authApplied).toHaveLength(1);
+    const swapped = authApplied[0] as MetaSearchPolicy;
     expect(swapped.id).toBe('pi-deep');
     expect(swapped.maxDepth).toBe(4);
-    // ... but the Jit perturbation grid never reached the live policy.
+    // Preserved independent security assertion: Jit perturbation never leaks
     expect(swapped.jit?.beta).toBe(1);
     expect(swapped.jit?.lambda).toBe(0.05);
+
+    // ADR-0003 §3.5 & t10 F-1: Under jit-on AND default deny, even when candidate strictly improves
+    // and incumbent policy carries a pre-existing jit block, appliedJit must NOT report a fake swap.
+    const jitOnRecorder = { hookAttached: false } as { hookAttached: boolean; lastReplay?: any };
+    const jitOnApplied: MetaSearchPolicy[] = [];
+    const jitOnDenyDreamer = createJitWiredDreamer({
+      kernel,
+      config,
+      recorder: jitOnRecorder,
+      isJitRuntimeEnabled: () => true,
+      base: {
+        now: () => 1_700_000_000_000,
+        activePolicy: {
+          get policy() {
+            return incumbent;
+          },
+          update(policy: MetaSearchPolicy) {
+            jitOnApplied.push(policy);
+          }
+        } as any
+      }
+    });
+
+    const jitOnDenyReport = await jitOnDenyDreamer.replay({
+      trees: [tree.snapshot()],
+      baselinePolicy: makePolicy({ id: 'pi-baseline', maxWidth: 4, maxDepth: 1 }),
+      candidatePolicies: [
+        {
+          ...makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4 }),
+          jit: { beta: 2, lambda: 0.1, alpha: 0.1, k: 8, gamma: 0.9, similarityThreshold: 0.75 }
+        }
+      ]
+    });
+    expect(jitOnDenyReport.improved).toBe(true);
+    expect(jitOnDenyReport.publication.publish).toBe(false);
+    expect(jitOnDenyReport.shadow.published).toBe(false);
+    expect(jitOnApplied).toHaveLength(0);
+    expect(jitOnRecorder.lastReplay?.appliedJit).toBeUndefined();
+    expect(jitOnDenyReport.publication.publish).toBe(jitOnDenyReport.shadow.published);
+
+    // ADR-0003 §3.6 + t10 F-1 positive control: when jit-on AND authorized on holdout,
+    // actual swap occurs and appliedJit is populated with the newly applied policy's jit block
+    // (proving appliedJit is not hardcoded to undefined).
+    const jitOnAuthRecorder = { hookAttached: false } as { hookAttached: boolean; lastReplay?: any };
+    const jitOnAuthApplied: MetaSearchPolicy[] = [];
+    let currentAuthPolicy = incumbent;
+    const jitOnAuthDreamer = createJitWiredDreamer({
+      kernel,
+      config,
+      recorder: jitOnAuthRecorder,
+      isJitRuntimeEnabled: () => true,
+      executionProfile: {
+        mode: 'shadow',
+        permissions: {
+          patch: { allowed: false, reason: '' },
+          memory: { allowed: false, reason: '' },
+          publish: { allowed: true, reason: 'test explicit authorization with jit-on' }
+        },
+        shadowRecords: true,
+        off: false
+      },
+      base: {
+        now: () => 1_700_000_000_000,
+        publishAuthorized: true,
+        shadowMode: false,
+        holdoutTreeCount: 1,
+        activePolicy: {
+          get policy() {
+            return currentAuthPolicy;
+          },
+          update(policy: MetaSearchPolicy) {
+            currentAuthPolicy = policy;
+            jitOnAuthApplied.push(policy);
+          }
+        } as any
+      }
+    });
+
+    const jitOnAuthReport = await jitOnAuthDreamer.replay({
+      trees: [tree.snapshot(), treeHoldout.snapshot()],
+      baselinePolicy: makePolicy({ id: 'pi-baseline', maxWidth: 4, maxDepth: 1 }),
+      candidatePolicies: [
+        {
+          ...makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4 }),
+          jit: { beta: 2, lambda: 0.1, alpha: 0.1, k: 8, gamma: 0.9, similarityThreshold: 0.75 }
+        }
+      ]
+    });
+    expect(jitOnAuthReport.improved).toBe(true);
+    expect(jitOnAuthReport.publication.publish).toBe(true);
+    expect(jitOnAuthReport.shadow.published).toBe(true);
+    expect(jitOnAuthApplied).toHaveLength(1);
+    const jitOnSwapped = jitOnAuthApplied[0] as MetaSearchPolicy;
+    expect(jitOnSwapped.id).toBe('pi-deep');
+    expect(jitOnSwapped.jit?.beta).toBe(2);
+    expect(jitOnSwapped.jit?.lambda).toBe(0.1);
+    expect(jitOnAuthRecorder.lastReplay?.appliedJit).toBeDefined();
+    expect(jitOnAuthRecorder.lastReplay?.appliedJit?.beta).toBe(2);
+    expect(jitOnAuthRecorder.lastReplay?.appliedJit?.lambda).toBe(0.1);
+    expect(jitOnAuthReport.publication.publish).toBe(jitOnAuthReport.shadow.published);
+    expect(Boolean(jitOnAuthRecorder.lastReplay?.appliedJit)).toBe(jitOnAuthReport.publication.publish);
   });
 });
 

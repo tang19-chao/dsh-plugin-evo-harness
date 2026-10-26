@@ -1195,6 +1195,15 @@ export function decideReplayPublication(
       boundary
     };
   }
+  if (input.validatedOnHoldout !== true) {
+    return {
+      improved: true,
+      publish: false,
+      reason:
+        'holdout-missing: held-out validation was not performed; publication withheld',
+      boundary
+    };
+  }
   return {
     improved: true,
     publish: true,

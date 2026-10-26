@@ -1,0 +1,206 @@
+/**
+ * Pricing and Usage Cost Adapter.
+ *
+ * Implements ADR-0003 §7.3:
+ * - Anti-double counting for cacheRead / cacheWrite and reasoning tokens.
+ * - Explicit counting semantics enforcement (undeclared semantics => unknown provenance).
+ * - Three-state measurement precision tracking (measured, estimated, unknown).
+ * - Strictly non-zero conservative cost ceiling for unknown usage.
+ */
+
+import {
+  CostCalculation,
+  CountingSemantics,
+  MeasurementPrecision,
+  ModelRateCard,
+  ProviderUsagePayload,
+  TokenMetric
+} from './types.js';
+
+/**
+ * Determine overall precision across a set of metrics and semantic declaration.
+ */
+export function aggregatePrecision(
+  metrics: Array<TokenMetric | undefined>,
+  semanticsDeclared: boolean
+): MeasurementPrecision {
+  if (!semanticsDeclared) {
+    return 'unknown';
+  }
+
+  let hasEstimated = false;
+  for (const m of metrics) {
+    if (!m) continue;
+    if (m.precision === 'unknown') {
+      return 'unknown';
+    }
+    if (m.precision === 'estimated') {
+      hasEstimated = true;
+    }
+  }
+
+  return hasEstimated ? 'estimated' : 'measured';
+}
+
+/**
+ * Calculate cost for a provider usage payload given a model rate card.
+ *
+ * Guarantees:
+ * 1. If countingSemantics is missing, provenance is 'unknown' and conservative fallback is applied.
+ * 2. If inputIncludesCacheRead is true, net uncached input tokens = inputTokens - cacheReadTokens.
+ *    cacheRead is never double-charged with input!
+ * 3. If outputIncludesReasoning is true and reasoning is not separately billed, reasoning is NOT added again.
+ *    If reasoning IS separately billed, net output tokens = outputTokens - reasoningTokens.
+ *    reasoning is never double-charged with output!
+ * 4. If any metric is unknown, or if the calculation results in 0 cost when unknown/conservative,
+ *    conservativeFallbackCostMicros (> 0) is applied.
+ */
+export function calculateUsageCost(
+  usage: ProviderUsagePayload,
+  rateCard: ModelRateCard
+): CostCalculation {
+  const semantics = usage.countingSemantics;
+  const semanticsDeclared = semantics !== undefined && semantics !== null;
+
+  const rawInput = usage.inputTokens?.tokens ?? 0;
+  const rawCacheRead = usage.cacheReadTokens?.tokens ?? 0;
+  const rawCacheWrite = usage.cacheWriteTokens?.tokens ?? 0;
+  const rawOutput = usage.outputTokens?.tokens ?? 0;
+  const rawReasoning = usage.reasoningTokens?.tokens ?? 0;
+
+  const metrics: Array<TokenMetric | undefined> = [
+    usage.inputTokens,
+    usage.outputTokens,
+    usage.cacheReadTokens,
+    usage.cacheWriteTokens,
+    usage.reasoningTokens
+  ];
+
+  const provenance = aggregatePrecision(metrics, semanticsDeclared);
+  const isUnknown = provenance === 'unknown';
+  let conservative = isUnknown;
+
+  // 1. Input & Cache Deduplication
+  let netInputTokens = Math.max(0, rawInput);
+  const cacheReadTokens = Math.max(0, rawCacheRead);
+  const cacheWriteTokens = Math.max(0, rawCacheWrite);
+
+  if (semanticsDeclared && semantics.inputIncludesCacheRead) {
+    // If input already includes cache read, subtract it to prevent double charging
+    netInputTokens = Math.max(0, rawInput - cacheReadTokens);
+  }
+
+  const cacheReadRate = rateCard.cacheReadRatePerMillion ?? rateCard.inputRatePerMillion;
+  const cacheWriteRate = rateCard.cacheWriteRatePerMillion ?? rateCard.inputRatePerMillion;
+
+  const inputCostMicros = Math.round((netInputTokens * rateCard.inputRatePerMillion) / 1_000_000);
+  const cacheReadCostMicros = Math.round((cacheReadTokens * cacheReadRate) / 1_000_000);
+  const cacheWriteCostMicros = Math.round((cacheWriteTokens * cacheWriteRate) / 1_000_000);
+
+  // 2. Output & Reasoning Deduplication
+  let netOutputTokens = Math.max(0, rawOutput);
+  let reasoningTokens = Math.max(0, rawReasoning);
+  let reasoningCostMicros = 0;
+
+  if (rateCard.reasoningSeparatelyBilled && (rateCard.reasoningRatePerMillion ?? 0) > 0) {
+    const reasoningRate = rateCard.reasoningRatePerMillion!;
+    if (semanticsDeclared && semantics.outputIncludesReasoning) {
+      // Raw output contains reasoning; deduct reasoning to price each separately
+      netOutputTokens = Math.max(0, rawOutput - reasoningTokens);
+    }
+    reasoningCostMicros = Math.round((reasoningTokens * reasoningRate) / 1_000_000);
+  } else {
+    // Reasoning is not separately billed
+    if (semanticsDeclared && semantics.outputIncludesReasoning) {
+      // Already included in outputTokens; reasoning cost is 0 and no extra tokens added
+      reasoningCostMicros = 0;
+    } else {
+      // Not included in outputTokens; add reasoning tokens to net output at standard output rate
+      netOutputTokens = rawOutput + reasoningTokens;
+      reasoningCostMicros = 0;
+    }
+  }
+
+  const outputCostMicros = Math.round((netOutputTokens * rateCard.outputRatePerMillion) / 1_000_000);
+
+  const baseCalculatedCost =
+    inputCostMicros +
+    cacheReadCostMicros +
+    cacheWriteCostMicros +
+    outputCostMicros +
+    reasoningCostMicros;
+
+  // 3. Conservative Non-Zero Upper Bound for Unknown Usage (ADR-0003 §7.3.5)
+  // unknown 必须落到保守上界金额，绝不允许静默记 0
+  let conservativeSurchargeMicros = 0;
+  let totalCostMicros = baseCalculatedCost;
+
+  const fallbackFloor = Math.max(1, rateCard.conservativeFallbackCostMicros);
+
+  if (conservative) {
+    if (totalCostMicros < fallbackFloor) {
+      conservativeSurchargeMicros = fallbackFloor - totalCostMicros;
+      totalCostMicros = fallbackFloor;
+    }
+  }
+
+  let auditNote: string | undefined;
+  if (!semanticsDeclared) {
+    auditNote = 'countingSemantics undeclared; provenance forced to unknown with conservative floor';
+  } else if (conservativeSurchargeMicros > 0) {
+    auditNote = `conservative fallback floor applied: base=${baseCalculatedCost}u, floor=${fallbackFloor}u`;
+  }
+
+  return {
+    totalCostMicros,
+    breakdown: {
+      netInputTokens,
+      inputCostMicros,
+      cacheReadTokens,
+      cacheReadCostMicros,
+      cacheWriteTokens,
+      cacheWriteCostMicros,
+      netOutputTokens,
+      outputCostMicros,
+      reasoningTokens,
+      reasoningCostMicros,
+      conservativeSurchargeMicros: conservativeSurchargeMicros > 0 ? conservativeSurchargeMicros : undefined
+    },
+    provenance,
+    conservative,
+    auditNote
+  };
+}
+
+/**
+ * Helper to construct a standard token metric.
+ */
+export function metric(
+  tokens: number,
+  precision: MeasurementPrecision = 'measured'
+): TokenMetric {
+  return { tokens: Math.max(0, tokens), precision };
+}
+
+/**
+ * Helper to construct a ProviderUsagePayload with specified counting semantics.
+ */
+export function createUsagePayload(params: {
+  input: number;
+  output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  reasoning?: number;
+  semantics?: CountingSemantics;
+  precision?: MeasurementPrecision;
+}): ProviderUsagePayload {
+  const p = params.precision ?? 'measured';
+  return {
+    inputTokens: metric(params.input, p),
+    outputTokens: metric(params.output, p),
+    ...(params.cacheRead !== undefined ? { cacheReadTokens: metric(params.cacheRead, p) } : {}),
+    ...(params.cacheWrite !== undefined ? { cacheWriteTokens: metric(params.cacheWrite, p) } : {}),
+    ...(params.reasoning !== undefined ? { reasoningTokens: metric(params.reasoning, p) } : {}),
+    countingSemantics: params.semantics
+  };
+}

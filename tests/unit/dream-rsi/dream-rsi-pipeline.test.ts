@@ -35,9 +35,9 @@ const TASK: ProbeTask = {
   taskSignature: 'sig-1'
 };
 
-function freshTree() {
+function freshTree(id = 'tree-e2e') {
   return createDiscoveryTree({
-    id: 'tree-e2e',
+    id,
     sessionId: 'session-1',
     taskId: 'task-1',
     rootPatchId: 'patch-root',
@@ -271,10 +271,46 @@ describe('dream-rsi online-to-offline pipeline', () => {
     });
     expect(better.improved).toBe(true);
     expect(better.selectedPolicyId).toBe('pi-deep');
-    expect(active.policy.id).toBe('pi-deep');
-    expect(active.policy.version).toBe(2);
-    expect(active.appliedPolicyIds).toEqual(['pi-0@1', 'pi-deep@2']);
+    // ADR-0003 §3.6: deny by default - active policy remains at pi-0@1
+    expect(better.publication.publish).toBe(false);
+    expect(active.policy.id).toBe('pi-0');
+    expect(active.policy.version).toBe(1);
+    expect(active.appliedPolicyIds).toEqual(['pi-0@1']);
     expect(better.replayedTreeIds).toEqual(['tree-e2e']);
+
+    // Authorized positive control: publishAuthorized + holdout passes -> applies
+    const authActive = createActivePolicyFromDefaults({
+      maxWidth: 1,
+      maxDepth: 1
+    });
+    const authDreamer = createOfflineDreamer({
+      now: () => 500,
+      activePolicy: authActive,
+      publishAuthorized: true,
+      holdoutTreeCount: 1
+    });
+    const treeHoldout = freshTree('tree-e2e-holdout');
+    probeNode(treeHoldout, 0, 'succeeded');
+    treeHoldout.recordProbe('n0', { trajectoryId: 'traj-n0-h', score: 0.2 });
+    treeHoldout.addNode({
+      id: 'n0-deep',
+      parentId: 'n0',
+      patchId: 'patch-n0-deep-h',
+      patchOrigin: 'reference',
+      purpose: 'deepen',
+      guidance: 'memory'
+    });
+    treeHoldout.recordProbe('n0-deep', { trajectoryId: 'traj-n0-deep-h', score: 0.9 });
+    const authBetter = await authDreamer.replay({
+      trees: [snapshot, treeHoldout.snapshot()],
+      baselinePolicy: authActive.policy,
+      candidatePolicies: [makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4, version: 2 })]
+    });
+    expect(authBetter.improved).toBe(true);
+    expect(authBetter.publication.publish).toBe(true);
+    expect(authActive.policy.id).toBe('pi-deep');
+    expect(authActive.policy.version).toBe(2);
+    expect(authActive.appliedPolicyIds).toEqual(['pi-0@1', 'pi-deep@2']);
   });
 
   it('performs zero execution and leaves the historical snapshot untouched', async () => {

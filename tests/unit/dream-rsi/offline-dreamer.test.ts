@@ -77,9 +77,9 @@ function narrowPolicy(overrides: Partial<MetaSearchPolicy> = {}): MetaSearchPoli
  * outcome (every score stays below the default early-stop threshold): this
  * distinguishes a wide-shallow policy from a narrow-deep one.
  */
-function deepTree(): DiscoveryTreeSnapshot {
+function deepTree(id = 'tree-deep'): DiscoveryTreeSnapshot {
   const tree = createDiscoveryTree({
-    id: 'tree-deep',
+    id,
     sessionId: 'session-1',
     taskId: 'task-1',
     rootPatchId: 'patch-root',
@@ -512,7 +512,7 @@ describe('offline dreamer monotonic replay', () => {
     expect(report.rhoPreferences).toEqual([0, 0.25, 0.5, 0.75, 1]);
   });
 
-  it('hot-swaps to the strictly better candidate', async () => {
+  it('strictly better candidate suggests winner but publish is denied by default; authorized holdout positive control applies', async () => {
     const applied: MetaSearchPolicy[] = [];
     const dreamer = createOfflineDreamer({
       now: () => 100,
@@ -527,16 +527,42 @@ describe('offline dreamer monotonic replay', () => {
         candidatePolicies: [makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4, version: 2 })]
       })
     );
+    // ADR-0003 §3.6: improved and suggestedPolicyId remain established...
     expect(report.improved).toBe(true);
     expect(report.selectedPolicyId).toBe('pi-deep');
     expect(report.best.policyId).toBe('pi-deep');
     expect(report.best.hypervolume).toBeGreaterThan(report.baseline.hypervolume);
     expect(report.baseline.hypervolume).toBeCloseTo(0.1875, 6);
     expect(report.best.hypervolume).toBeCloseTo(0.235, 6);
-    expect(applied.map((policy) => policy.id)).toEqual(['pi-deep']);
+    // ... but default publish is denied (holdout-missing), apply count is 0
+    expect(report.publication.publish).toBe(false);
+    expect(report.shadow.published).toBe(false);
+    expect(applied).toHaveLength(0);
+
+    // Authorized positive control: explicit publish authorization + holdout passes -> applies
+    const authorizedApplied: MetaSearchPolicy[] = [];
+    const authorizedDreamer = createOfflineDreamer({
+      now: () => 100,
+      publishAuthorized: true,
+      holdoutTreeCount: 1,
+      applyPolicy: (policy) => {
+        authorizedApplied.push(policy);
+      }
+    });
+    const authorizedReport = await authorizedDreamer.replay(
+      dreamRequest({
+        trees: [deepTree('tree-select'), deepTree('tree-holdout')],
+        baselinePolicy: shallowPolicy(),
+        candidatePolicies: [makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4, version: 2 })]
+      })
+    );
+    expect(authorizedReport.improved).toBe(true);
+    expect(authorizedReport.publication.publish).toBe(true);
+    expect(authorizedReport.shadow.published).toBe(true);
+    expect(authorizedApplied.map((policy) => policy.id)).toEqual(['pi-deep']);
   });
 
-  it('applies the winner through an injected active policy', async () => {
+  it('applies the winner through an injected active policy only when authorized + holdout passes', async () => {
     const updates: MetaSearchPolicy[] = [];
     const dreamer = createOfflineDreamer({
       now: () => 100,
@@ -554,7 +580,31 @@ describe('offline dreamer monotonic replay', () => {
       })
     );
     expect(report.improved).toBe(true);
-    expect(updates.map((policy) => policy.id)).toEqual(['pi-deep']);
+    expect(report.publication.publish).toBe(false);
+    expect(updates).toHaveLength(0);
+
+    // Authorized positive control
+    const authorizedUpdates: MetaSearchPolicy[] = [];
+    const authorizedDreamer = createOfflineDreamer({
+      now: () => 100,
+      publishAuthorized: true,
+      holdoutTreeCount: 1,
+      activePolicy: {
+        update: (policy) => {
+          authorizedUpdates.push(policy);
+        }
+      }
+    });
+    const authorizedReport = await authorizedDreamer.replay(
+      dreamRequest({
+        trees: [deepTree('tree-sel'), deepTree('tree-hold')],
+        baselinePolicy: shallowPolicy(),
+        candidatePolicies: [makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4, version: 2 })]
+      })
+    );
+    expect(authorizedReport.improved).toBe(true);
+    expect(authorizedReport.publication.publish).toBe(true);
+    expect(authorizedUpdates.map((policy) => policy.id)).toEqual(['pi-deep']);
   });
 
   it('picks the best of several candidates deterministically', async () => {

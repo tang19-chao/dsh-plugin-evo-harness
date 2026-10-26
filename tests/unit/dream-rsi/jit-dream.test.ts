@@ -159,8 +159,8 @@ function createTree(options: { id: string; createdAt: number }): TreeParts {
  * makes the replayed policy early-stop after one candidate probe instead of
  * crawling down the low-value branch. That is why the true optimum is beta=2.
  */
-function acceptanceTree(): DiscoveryTreeSnapshot {
-  const tree = createTree({ id: 'tree-acceptance', createdAt: 900 });
+function acceptanceTree(id = 'tree-acceptance'): DiscoveryTreeSnapshot {
+  const tree = createTree({ id, createdAt: 900 });
   tree.addNode({
     id: 'X',
     parentId: 'root',
@@ -919,7 +919,7 @@ describe('synchronous replay hook', () => {
 // ---------------------------------------------------------------------------
 
 describe('dual-loop hot-swap', () => {
-  it('reaches beta in [1.5, 2.5] after two dream rounds', async () => {
+  it('deny by default: round produces improved suggestion without hot swap; authorized positive control reaches beta in [1.5, 2.5]', async () => {
     const applied: MetaSearchPolicy[] = [];
     const active = createActivePolicy({ policy: policy() });
     const dreamer = createOfflineDreamer({
@@ -941,20 +941,55 @@ describe('dual-loop hot-swap', () => {
         ]
       })
     );
+    // ADR-0003 §3.6: suggestion is preserved, but publish is denied by default
     expect(roundOne.improved).toBe(true);
     expect(roundOne.selectedPolicyId).toBe('pi-0::dream-3');
-    expect(applied).toHaveLength(1);
-    expect(applied[0]?.id).toBe('pi-0::dream-3');
-    expect(applied[0]?.jit?.beta).toBe(2);
-    expect(applied[0]?.jit?.lambda).toBe(0.1);
-    // pi and its hyperparameters travel together.
-    expect(applied[0]?.slotWeights).toEqual(TRADE_OFF_WEIGHTS);
-    expect(active.policy.jit?.beta).toBe(2);
+    expect(roundOne.publication.publish).toBe(false);
+    expect(roundOne.shadow.published).toBe(false);
+    expect(applied).toHaveLength(0);
+    expect(active.policy.version).toBe(1);
+    expect(active.policy.jit?.beta).toBe(ACCEPTANCE_JIT.beta);
 
-    const secondBaseline = active.policy;
-    expect(secondBaseline.version).toBe(2);
-    const roundTwo = await dreamer.replay(
+    // Authorized positive control
+    const authApplied: MetaSearchPolicy[] = [];
+    const authActive = createActivePolicy({ policy: policy() });
+    const authDreamer = createOfflineDreamer({
+      now: () => 100,
+      publishAuthorized: true,
+      holdoutTreeCount: 1,
+      jitHook: adapterHook(ACCEPTANCE_EVIDENCE),
+      experiences: [makeExperience('prior-experience', 900)],
+      applyPolicy: (winner) => {
+        authApplied.push(winner);
+        authActive.update(winner);
+      }
+    });
+    const authRoundOne = await authDreamer.replay(
       dreamRequest({
+        trees: [acceptanceTree(), acceptanceTree('tree-acceptance-holdout')],
+        candidatePolicies: [
+          policy({ id: 'pi-0::dream-1', version: 2, jit: { ...ACCEPTANCE_JIT, beta: 0.5, lambda: 0.02 } }),
+          policy({ id: 'pi-0::dream-2', version: 2, jit: { ...ACCEPTANCE_JIT, beta: 1, lambda: 0.05 } }),
+          policy({ id: 'pi-0::dream-3', version: 2, jit: { ...ACCEPTANCE_JIT, beta: 2, lambda: 0.1 } })
+        ]
+      })
+    );
+    expect(authRoundOne.improved).toBe(true);
+    expect(authRoundOne.selectedPolicyId).toBe('pi-0::dream-3');
+    expect(authRoundOne.publication.publish).toBe(true);
+    expect(authRoundOne.shadow.published).toBe(true);
+    expect(authApplied).toHaveLength(1);
+    expect(authApplied[0]?.id).toBe('pi-0::dream-3');
+    expect(authApplied[0]?.jit?.beta).toBe(2);
+    expect(authApplied[0]?.jit?.lambda).toBe(0.1);
+    expect(authApplied[0]?.slotWeights).toEqual(TRADE_OFF_WEIGHTS);
+    expect(authActive.policy.jit?.beta).toBe(2);
+
+    const secondBaseline = authActive.policy;
+    expect(secondBaseline.version).toBe(2);
+    const authRoundTwo = await authDreamer.replay(
+      dreamRequest({
+        trees: [acceptanceTree(), acceptanceTree('tree-acceptance-holdout-2')],
         baselinePolicy: secondBaseline,
         candidatePolicies: [
           policy({ id: 'pi-0::dream-4', version: 3, jit: { ...ACCEPTANCE_JIT, beta: 0.5, lambda: 0.02 } }),
@@ -963,12 +998,11 @@ describe('dual-loop hot-swap', () => {
         ]
       })
     );
-    // The incumbent already holds the optimum: no churn, no non-monotone swap.
-    expect(roundTwo.improved).toBe(false);
-    expect(roundTwo.selectedPolicyId).toBe(secondBaseline.id);
-    expect(roundTwo.best).toEqual(roundTwo.baseline);
-    expect(applied).toHaveLength(1);
-    const inheritedBeta = active.policy.jit?.beta;
+    expect(authRoundTwo.improved).toBe(false);
+    expect(authRoundTwo.selectedPolicyId).toBe(secondBaseline.id);
+    expect(authRoundTwo.best).toEqual(authRoundTwo.baseline);
+    expect(authApplied).toHaveLength(1);
+    const inheritedBeta = authActive.policy.jit?.beta;
     expect(inheritedBeta).toBe(2);
     expect(inheritedBeta).toBeGreaterThanOrEqual(1.5);
     expect(inheritedBeta).toBeLessThanOrEqual(2.5);

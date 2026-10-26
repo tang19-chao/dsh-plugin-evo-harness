@@ -1445,3 +1445,461 @@ describe('t12/R1c: one resolved effective profile for orchestrator, L1 and repla
   });
 });
 
+describe("C1.1 Dreamer release boundary and safe defaults (ADR-0003 §3)", () => {
+  const now = (): number => T0;
+
+  async function makeDeepTree(id: string) {
+    const { createDiscoveryTree } = await import("../../../src/dream-rsi/discovery-tree");
+    let at = T0;
+    const tree = createDiscoveryTree({
+      id,
+      sessionId: "sess-" + id,
+      taskId: "task-" + id,
+      rootPatchId: "root-" + id,
+      clock: () => at++
+    });
+    const add = (parentId: string, nodeId: string, score: number) => {
+      tree.addNode({
+        id: nodeId,
+        parentId,
+        patchId: "patch-" + nodeId,
+        patchOrigin: "domain",
+        purpose: parentId === tree.rootId ? "explore" : "deepen",
+        guidance: "memory",
+        createdAt: at++
+      });
+      tree.recordProbe(nodeId, { trajectoryId: "traj-" + nodeId, score });
+    };
+    add(tree.rootId, id + "-s1", 0.1);
+    add(tree.rootId, id + "-s2", 0.3);
+    add(tree.rootId, id + "-s3", 0.2);
+    add(tree.rootId, id + "-s4", 0.15);
+    add(id + "-s2", id + "-d1", 0.35);
+    add(id + "-d1", id + "-d2", 0.4);
+    add(id + "-d2", id + "-d3", 0.55);
+    return tree.snapshot();
+  }
+
+  it("Criterion 1: 真实改进深树夹具覆盖四模式×Jit on/off，deny 时实际 update/apply 为零且 improved/suggested 仍可成立、published=false", async () => {
+    const { createOfflineDreamer } = await import("../../../src/dream-rsi/offline-dreamer");
+    const { createJitWiredDreamer } = await import("../../../src/index");
+    const { createActivePolicy, createDefaultPolicy } = await import("../../../src/dream-rsi/active-policy");
+    const { createJitRl } = await import("../../../src/jitrl");
+    const { createPersistenceRuntime } = await import("../../../src/persistence");
+    const { parseEvoHarnessConfig } = await import("../../../src/config");
+    const { resolveExecutionProfile } = await import("../../../src/runtime/execution-profile");
+    const { tmpdir } = await import("node:os");
+    const { mkdtempSync, readFileSync, existsSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { createHash } = await import("node:crypto");
+
+    const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+    const tree = await makeDeepTree("tree-c11-c1");
+    const modes = ["baseline", "shadow", "guarded-active", "off"] as const;
+    const jitStates = [true, false];
+
+    for (const mode of modes) {
+      for (const jitOn of jitStates) {
+        const scratch = mkdtempSync(join(tmpdir(), "c11-test-"));
+        const persistence = await createPersistenceRuntime({ dataDir: scratch });
+        const config = parseEvoHarnessConfig({
+          execution: { mode: mode === "off" ? "off" : mode },
+          jitrl: { enabled: jitOn, levels: ["meta"] }
+        });
+        const baseActive = createActivePolicy({
+          policy: {
+            ...createDefaultPolicy({ id: "pi-0", version: 1 }, now),
+            maxWidth: 4,
+            maxDepth: 1
+          },
+          now
+        });
+        // Connect activePolicy to persistence via wrapPolicy
+        const active = persistence.wrapPolicy(baseActive, { recordRevision: true });
+
+        // Seed a real revision baseline so "unchanged" is non-vacuous
+        active.update({
+          ...createDefaultPolicy({ id: "pi-seed", version: 2 }, now),
+          maxWidth: 4,
+          maxDepth: 1,
+          jit: { beta: 1.25, lambda: 0.04, alpha: 0.1, k: 8, gamma: 0.9, similarityThreshold: 0.75 }
+        });
+        await persistence.flush();
+
+        const currentPath = join(scratch, "policy.current.json");
+        const baselineHistoryCount = persistence.policyStore.history.length;
+        expect(baselineHistoryCount).toBe(1);
+        expect(existsSync(currentPath)).toBe(true);
+        const baselineCurrentHash = sha(readFileSync(currentPath, "utf8"));
+
+        const applied: unknown[] = [];
+        const baseOptions = {
+          now,
+          activePolicy: {
+            get policy() {
+              return active.policy;
+            },
+            update(p: unknown) {
+              applied.push(p);
+              active.update(p as any);
+            }
+          } as any,
+          applyPolicy: (p: unknown) => {
+            applied.push(p);
+            active.update(p as any);
+          },
+          shadowMode: true,
+          publishAuthorized: false
+        };
+
+        const kernel = createJitRl({ config, now });
+        const recorder = { hookAttached: false } as { hookAttached: boolean; lastReplay?: any };
+        const dreamer = createJitWiredDreamer({
+          kernel,
+          config,
+          recorder,
+          isJitRuntimeEnabled: () => jitOn,
+          executionProfile: resolveExecutionProfile({ mode }),
+          base: baseOptions
+        });
+
+        const candidate = {
+          ...createDefaultPolicy({ id: "pi-deep", version: 3 }, now),
+          maxWidth: 1,
+          maxDepth: 4
+        };
+
+        const report = await dreamer.replay({
+          trees: [tree],
+          baselinePolicy: active.policy,
+          candidatePolicies: [candidate]
+        });
+
+        // 1. Candidate strictly improved on replayed set
+        expect(report.improved).toBe(true);
+        // 2. Suggestion points to winning candidate
+        expect(report.selectedPolicyId).toBe("pi-deep");
+        expect(report.shadow.suggestedPolicyId).toBe("pi-deep");
+        expect(report.shadow.incumbentPolicyId).toBe("pi-seed");
+        // 3. Publication is denied across all 4 modes x Jit on/off
+        expect(report.publication.publish).toBe(false);
+        expect(report.shadow.published).toBe(false);
+        // t10 F-1: under deny + incumbent with jit, appliedJit must NOT report a fake swap across all 4 modes x Jit on/off
+        expect(recorder.lastReplay?.appliedJit).toBeUndefined();
+        // 4. Actual apply/update count is strictly 0
+        expect(applied).toHaveLength(0);
+        // 5. Active policy unchanged
+        expect(active.policy.id).toBe("pi-seed");
+        expect(active.policy.version).toBe(2);
+        // 6. Durable history unchanged relative to baseline, current file hash unchanged
+        await persistence.flush();
+        expect(persistence.policyStore.history.length - baselineHistoryCount).toBe(0);
+        expect(persistence.policyStore.history).toHaveLength(baselineHistoryCount);
+        expect(sha(readFileSync(currentPath, "utf8"))).toBe(baselineCurrentHash);
+      }
+    }
+
+    // 7. Positive control under explicit authorization: proves activePolicy IS connected to policyStore,
+    // and that a real publish event DOES append a revision and update policy.current.json.
+    const authScratch = mkdtempSync(join(tmpdir(), "c11-auth-c1-"));
+    const authPersistence = await createPersistenceRuntime({ dataDir: authScratch });
+    const authBaseActive = createActivePolicy({
+      policy: {
+        ...createDefaultPolicy({ id: "pi-0", version: 1 }, now),
+        maxWidth: 4,
+        maxDepth: 1
+      },
+      now
+    });
+    const authActive = authPersistence.wrapPolicy(authBaseActive, { recordRevision: true });
+    authActive.update({
+      ...createDefaultPolicy({ id: "pi-seed", version: 2 }, now),
+      maxWidth: 4,
+      maxDepth: 1
+    });
+    await authPersistence.flush();
+
+    const authCurrentPath = join(authScratch, "policy.current.json");
+    const authBaselineHistory = authPersistence.policyStore.history.length;
+    expect(authBaselineHistory).toBe(1);
+    const authBaselineCurrentHash = sha(readFileSync(authCurrentPath, "utf8"));
+
+    const authApplied: unknown[] = [];
+    const authTree1 = await makeDeepTree("tree-auth-c1-1");
+    const authTree2 = await makeDeepTree("tree-auth-c1-2");
+    const authConfig = parseEvoHarnessConfig({});
+    const authKernel = createJitRl({ config: authConfig, now });
+    const authDreamer = createJitWiredDreamer({
+      kernel: authKernel,
+      config: authConfig,
+      recorder: { hookAttached: false },
+      isJitRuntimeEnabled: () => false,
+      executionProfile: {
+        mode: "shadow",
+        permissions: {
+          patch: { allowed: false, reason: "" },
+          memory: { allowed: false, reason: "" },
+          publish: { allowed: true, reason: "explicit authorization for test" }
+        },
+        shadowRecords: true,
+        off: false
+      },
+      base: {
+        now,
+        activePolicy: {
+          get policy() {
+            return authActive.policy;
+          },
+          update(p: unknown) {
+            authApplied.push(p);
+            authActive.update(p as any);
+          }
+        } as any,
+        applyPolicy: (p) => {
+          authApplied.push(p);
+          authActive.update(p as any);
+        },
+        shadowMode: false,
+        publishAuthorized: true,
+        holdoutTreeCount: 1
+      }
+    });
+
+    const authCandidate = {
+      ...createDefaultPolicy({ id: "pi-deep", version: 3 }, now),
+      maxWidth: 1,
+      maxDepth: 4
+    };
+
+    const authReport = await authDreamer.replay({
+      trees: [authTree1, authTree2],
+      baselinePolicy: authActive.policy,
+      candidatePolicies: [authCandidate]
+    });
+
+    expect(authReport.improved).toBe(true);
+    expect(authReport.publication.publish).toBe(true);
+    expect(authReport.shadow.published).toBe(true);
+    expect(authApplied).toHaveLength(1);
+    expect(authActive.policy.id).toBe("pi-deep");
+    expect(authActive.policy.version).toBe(3);
+
+    await authPersistence.flush();
+    // Proves that under authorized apply, history delta is exactly +1 and current file hash changes
+    expect(authPersistence.policyStore.history.length - authBaselineHistory).toBe(1);
+    expect(authPersistence.policyStore.history[authBaselineHistory]?.id).toBe("pi-deep");
+    expect(sha(readFileSync(authCurrentPath, "utf8"))).not.toBe(authBaselineCurrentHash);
+  });
+
+  it("Criterion 2: 普通 Dreamer、Jit-wired Dreamer、任务周期与 idle 入口均有真实效果点回归；活动策略及持久化 revision 不变", async () => {
+    const { createOfflineDreamer } = await import("../../../src/dream-rsi/offline-dreamer");
+    const { createJitWiredDreamer, createEvoHarnessPlugin } = await import("../../../src/index");
+    const { createActivePolicy, createDefaultPolicy } = await import("../../../src/dream-rsi/active-policy");
+    const { createJitRl } = await import("../../../src/jitrl");
+    const { createDiscoveryTree } = await import("../../../src/dream-rsi/discovery-tree");
+    const { createPersistenceRuntime } = await import("../../../src/persistence");
+    const { tmpdir } = await import("node:os");
+    const { mkdtempSync } = await import("node:fs");
+    const { join } = await import("node:path");
+
+    const tree = await makeDeepTree("tree-c11-c2");
+    const candidate = {
+      ...createDefaultPolicy({ id: "pi-deep", version: 2 }, now),
+      maxWidth: 1,
+      maxDepth: 4
+    };
+
+    // 2a. Plain Dreamer
+    const plainApplied: unknown[] = [];
+    const plainActive = createActivePolicy({
+      policy: { ...createDefaultPolicy({ id: "pi-0", version: 1 }, now), maxWidth: 4, maxDepth: 1 },
+      now
+    });
+    const plainDreamer = createOfflineDreamer({
+      now,
+      applyPolicy: (p) => { plainApplied.push(p); },
+      activePolicy: plainActive
+    });
+    const plainReport = await plainDreamer.replay({
+      trees: [tree],
+      baselinePolicy: plainActive.policy,
+      candidatePolicies: [candidate]
+    });
+    expect(plainReport.improved).toBe(true);
+    expect(plainReport.publication.publish).toBe(false);
+    expect(plainReport.shadow.published).toBe(false);
+    expect(plainApplied).toHaveLength(0);
+    expect(plainActive.policy.id).toBe("pi-0");
+    expect(plainActive.policy.version).toBe(1);
+
+    // 2b. Jit-wired Dreamer
+    const config = parseEvoHarnessConfig({ jitrl: { enabled: true, levels: ["meta"] } });
+    const wiredApplied: unknown[] = [];
+    const wiredActive = createActivePolicy({
+      policy: { ...createDefaultPolicy({ id: "pi-0", version: 1 }, now), maxWidth: 4, maxDepth: 1 },
+      now
+    });
+    const kernel = createJitRl({ config, now });
+    const wiredDreamer = createJitWiredDreamer({
+      kernel,
+      config,
+      recorder: { hookAttached: false },
+      isJitRuntimeEnabled: () => true,
+      executionProfile: resolveExecutionProfile({ mode: "shadow" }),
+      base: {
+        now,
+        activePolicy: wiredActive,
+        applyPolicy: (p) => { wiredApplied.push(p); }
+      }
+    });
+    const wiredReport = await wiredDreamer.replay({
+      trees: [tree],
+      baselinePolicy: wiredActive.policy,
+      candidatePolicies: [candidate]
+    });
+    expect(wiredReport.improved).toBe(true);
+    expect(wiredReport.publication.publish).toBe(false);
+    expect(wiredReport.shadow.published).toBe(false);
+    expect(wiredApplied).toHaveLength(0);
+    expect(wiredActive.policy.id).toBe("pi-0");
+    expect(wiredActive.policy.version).toBe(1);
+
+    // 2c. Idle entrance via orchestrator.triggerDream
+    const scratch = mkdtempSync(join(tmpdir(), "c11-idle-"));
+    const persistence = await createPersistenceRuntime({ dataDir: scratch });
+    const harness = createEvoHarnessPlugin({
+      config,
+      persistence,
+      now
+    });
+    const { orchestrator } = harness;
+    orchestrator.treePool.add(tree);
+
+    const idleDiagnostics: string[] = [];
+    const idleReport = await orchestrator.triggerDream(idleDiagnostics);
+    expect(idleReport).not.toBeNull();
+    expect(idleReport!.improved).toBe(true);
+    expect(idleReport!.publication.publish).toBe(false);
+    expect(orchestrator.dreamReports()).toHaveLength(1);
+    expect(idleDiagnostics.some((d) => d.includes("published=false"))).toBe(true);
+    expect(idleDiagnostics.some((d) => d.includes("shadow mode"))).toBe(true);
+    expect(persistence.policyStore.history).toHaveLength(0);
+  });
+
+  it("Criterion 3: 真实 apply 边界 fail-closed，base.shadowMode=false 不覆盖 profile deny；未来授权正控确定有效", async () => {
+    const { createOfflineDreamer } = await import("../../../src/dream-rsi/offline-dreamer");
+    const { createJitWiredDreamer } = await import("../../../src/index");
+    const { createActivePolicy, createDefaultPolicy } = await import("../../../src/dream-rsi/active-policy");
+    const { createJitRl } = await import("../../../src/jitrl");
+
+    const tree1 = await makeDeepTree("tree-c11-fc-1");
+    const tree2 = await makeDeepTree("tree-c11-fc-2");
+    const baseline = { ...createDefaultPolicy({ id: "pi-0", version: 1 }, now), maxWidth: 4, maxDepth: 1 };
+    const candidate = { ...createDefaultPolicy({ id: "pi-deep", version: 2 }, now), maxWidth: 1, maxDepth: 4 };
+
+    // 3a. shadowMode: false under denied profile -> publish-denied, apply count is 0
+    const overrideApplied: unknown[] = [];
+    const config = parseEvoHarnessConfig({});
+    const kernel = createJitRl({ config, now });
+    const deniedProfile = resolveExecutionProfile({ mode: "shadow" });
+    expect(deniedProfile.permissions.publish.allowed).toBe(false);
+
+    const failClosedDreamer = createJitWiredDreamer({
+      kernel,
+      config,
+      recorder: { hookAttached: false },
+      isJitRuntimeEnabled: () => false,
+      executionProfile: deniedProfile,
+      base: {
+        now,
+        shadowMode: false,
+        holdoutTreeCount: 1,
+        applyPolicy: (p) => { overrideApplied.push(p); }
+      }
+    });
+
+    const fcReport = await failClosedDreamer.replay({
+      trees: [tree1, tree2],
+      baselinePolicy: baseline,
+      candidatePolicies: [candidate]
+    });
+    expect(fcReport.improved).toBe(true);
+    expect(fcReport.publication.publish).toBe(false);
+    expect(fcReport.shadow.published).toBe(false);
+    expect(fcReport.shadow.comparisons[0]?.selected).toBe(false);
+    expect(overrideApplied).toHaveLength(0);
+    expect(fcReport.publication.reason).toContain("publish-denied");
+
+    // 3b. Future authorized positive control
+    const authApplied: unknown[] = [];
+    const authProfile = {
+      mode: "shadow" as const,
+      permissions: {
+        patch: { allowed: false, reason: "" },
+        memory: { allowed: false, reason: "" },
+        publish: { allowed: true, reason: "explicit authorization for test" }
+      },
+      shadowRecords: true,
+      off: false
+    };
+
+    const authDreamer = createJitWiredDreamer({
+      kernel,
+      config,
+      recorder: { hookAttached: false },
+      isJitRuntimeEnabled: () => false,
+      executionProfile: authProfile,
+      base: {
+        now,
+        shadowMode: false,
+        publishAuthorized: true,
+        holdoutTreeCount: 1,
+        applyPolicy: (p) => { authApplied.push(p); }
+      }
+    });
+
+    const authReport = await authDreamer.replay({
+      trees: [tree1, tree2],
+      baselinePolicy: baseline,
+      candidatePolicies: [candidate]
+    });
+    expect(authReport.improved).toBe(true);
+    expect(authReport.publication.publish).toBe(true);
+    expect(authReport.shadow.published).toBe(true);
+    expect(authReport.shadow.comparisons.find((c) => c.policyId === "pi-deep")?.selected).toBe(true);
+    expect(authApplied).toHaveLength(1);
+    expect((authApplied[0] as any).id).toBe("pi-deep");
+  });
+
+  it("Criterion 4: 新增反例在旧实现失败、修复后通过，既有冲突测试按 ADR 修正且不弱化其他安全断言", async () => {
+    const { decideReplayPublication } = await import("../../../src/jitrl/decision-kernel");
+    const { createOfflineDreamer } = await import("../../../src/dream-rsi/offline-dreamer");
+    const { createDefaultPolicy } = await import("../../../src/dream-rsi/active-policy");
+
+    // A-layer: old implementation returned publish: true for improved without holdout.
+    // New implementation strictly requires validatedOnHoldout === true.
+    const verdictWithoutHoldout = decideReplayPublication({ improved: true });
+    expect(verdictWithoutHoldout.publish).toBe(false);
+    expect(verdictWithoutHoldout.reason).toContain("holdout-missing");
+
+    const verdictWithPassedHoldout = decideReplayPublication({ improved: true, validatedOnHoldout: true });
+    expect(verdictWithPassedHoldout.publish).toBe(true);
+
+    // B-layer: old implementation called applyPolicy without publishAuthorized.
+    // New implementation requires publishAuthorized === true.
+    const applied: unknown[] = [];
+    const dreamer = createOfflineDreamer({
+      now,
+      applyPolicy: (p) => { applied.push(p); }
+    });
+    const tree = await makeDeepTree("tree-c11-c4");
+    const report = await dreamer.replay({
+      trees: [tree],
+      baselinePolicy: { ...createDefaultPolicy({ id: "pi-0", version: 1 }, now), maxWidth: 4, maxDepth: 1 },
+      candidatePolicies: [{ ...createDefaultPolicy({ id: "pi-deep", version: 2 }, now), maxWidth: 1, maxDepth: 4 }]
+    });
+    expect(report.publication.publish).toBe(false);
+    expect(applied).toHaveLength(0);
+  });
+});
+

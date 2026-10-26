@@ -1560,6 +1560,11 @@ export interface OfflineDreamerOptions {
    * remaining trees and the winner must also beat the baseline on the holdout.
    */
   readonly holdoutTreeCount?: number;
+  /**
+   * C1.1 (ADR-0003 §3.3): explicit publish authorization gate, derived from
+   * effective profile permissions.publish.allowed. Defaults to false.
+   */
+  readonly publishAuthorized?: boolean;
 }
 
 /** One candidate's comparison against the incumbent, for the shadow log. */
@@ -1648,6 +1653,7 @@ class OfflineDreamerImpl implements IOfflineDreamer {
   private readonly driftRho: number | undefined;
   private readonly shadowMode: boolean;
   private readonly holdoutTreeCount: number;
+  private readonly publishAuthorized: boolean;
 
   constructor(options: OfflineDreamerOptions) {
     this.now = options.now ?? ((): number => Date.now());
@@ -1663,6 +1669,7 @@ class OfflineDreamerImpl implements IOfflineDreamer {
       0,
       Math.floor(finiteOr(options.holdoutTreeCount ?? 0, 0))
     );
+    this.publishAuthorized = options.publishAuthorized === true;
     this.driftRho =
       options.driftRho === undefined
         ? undefined
@@ -1831,18 +1838,56 @@ class OfflineDreamerImpl implements IOfflineDreamer {
       validatedOnHoldout = holdoutHypervolume > holdoutBaselineHypervolume + this.epsilon;
     }
 
-    const publication = decideReplayPublication({
+    const verdict = decideReplayPublication({
       improved: improvedOnSelection,
       shadowMode: this.shadowMode,
       ...(validatedOnHoldout === undefined ? {} : { validatedOnHoldout })
     });
     const improved = improvedOnSelection;
 
-    // Hot-swap stays monotone AND gated: only a strictly better candidate that
-    // passed the publication gate replaces the incumbent, and the winner carries
-    // pi *and* its jit hyperparameters.
-    if (publication.publish && bestCandidate !== undefined && this.applyPolicy !== undefined) {
+    // C1.1 (ADR-0003 §3.3): B-layer apply gate
+    // applied = verdict.publish && publishAuthorized === true && applyPolicy !== undefined && bestCandidate !== undefined
+    const canApply =
+      verdict.publish &&
+      this.publishAuthorized &&
+      this.applyPolicy !== undefined &&
+      bestCandidate !== undefined;
+
+    let applied = false;
+    if (canApply && bestCandidate !== undefined) {
       await this.applyPolicy(bestCandidate.policy);
+      applied = true;
+    }
+
+    // C1.1 (ADR-0003 §3.3): reported = applied
+    let publication: ReplayPublicationDecision;
+    if (!verdict.publish) {
+      publication = verdict;
+    } else if (!this.publishAuthorized) {
+      publication = {
+        improved: true,
+        publish: false,
+        reason:
+          'publish-denied: execution profile permissions disallow publishing without explicit authorization',
+        boundary: verdict.boundary
+      };
+    } else if (this.applyPolicy === undefined) {
+      publication = {
+        improved: true,
+        publish: false,
+        reason:
+          'no-apply-target: publication was authorized and validated, but no applyPolicy handler was configured',
+        boundary: verdict.boundary
+      };
+    } else if (bestCandidate === undefined) {
+      publication = {
+        improved: false,
+        publish: false,
+        reason: 'no-candidate: candidate policy was undefined',
+        boundary: verdict.boundary
+      };
+    } else {
+      publication = verdict;
     }
 
     // Shadow record (plan section 7.4): what was suggested, how it differed, and
@@ -1850,14 +1895,14 @@ class OfflineDreamerImpl implements IOfflineDreamer {
     const shadow: DreamShadowRecord = {
       suggestedPolicyId: bestCandidate?.policy.id ?? baseline.id,
       incumbentPolicyId: baseline.id,
-      published: publication.publish,
+      published: applied,
       comparisons: candidateEvaluations.map((evaluation) => ({
         policyId: evaluation.policyId,
         hypervolume: evaluation.hypervolume,
         delta: evaluation.hypervolume - baselineEvaluation.hypervolume,
         improved: evaluation.hypervolume > baselineEvaluation.hypervolume + this.epsilon,
         selected:
-          publication.publish && bestCandidate !== undefined
+          applied && bestCandidate !== undefined
             ? evaluation.policyId === bestCandidate.policy.id
             : false
       })),
