@@ -204,3 +204,61 @@ export function createUsagePayload(params: {
     countingSemantics: params.semantics
   };
 }
+
+/**
+ * Standard counting semantics for DSH / DeepSeek models (ADR-0004 §3.3).
+ */
+export const DEFAULT_DSH_COUNTING_SEMANTICS: CountingSemantics = Object.freeze({
+  inputIncludesCacheRead: true,
+  outputIncludesReasoning: true,
+  semanticTag: 'dsh-deepseek-v1'
+});
+
+export interface RawDshUsageLike {
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly totalTokens?: number;
+  readonly cacheReadTokens?: number;
+  readonly cacheWriteTokens?: number;
+  readonly reasoningTokens?: number;
+}
+
+/**
+ * Convert raw DSH usage telemetry into a ProviderUsagePayload without discarding
+ * cacheRead, cacheWrite, or reasoning tokens (ADR-0004 §3.2).
+ */
+export function dshUsageToProviderPayload(
+  usage: RawDshUsageLike | undefined,
+  semantics: CountingSemantics = DEFAULT_DSH_COUNTING_SEMANTICS
+): ProviderUsagePayload {
+  if (!usage) {
+    return {
+      inputTokens: { tokens: 0, precision: 'unknown' },
+      outputTokens: { tokens: 0, precision: 'unknown' },
+      countingSemantics: semantics
+    };
+  }
+  return {
+    inputTokens: {
+      tokens: usage.inputTokens ?? 0,
+      precision: usage.inputTokens !== undefined ? 'measured' : 'unknown'
+    },
+    outputTokens: {
+      tokens: usage.outputTokens ?? 0,
+      precision: usage.outputTokens !== undefined ? 'measured' : 'unknown'
+    },
+    ...(usage.cacheReadTokens !== undefined
+      ? { cacheReadTokens: { tokens: usage.cacheReadTokens, precision: 'measured' } }
+      : {}),
+    ...(usage.cacheWriteTokens !== undefined
+      ? { cacheWriteTokens: { tokens: usage.cacheWriteTokens, precision: 'measured' } }
+      : {}),
+    ...(usage.reasoningTokens !== undefined
+      ? { reasoningTokens: { tokens: usage.reasoningTokens, precision: 'measured' } }
+      : {}),
+    ...(usage.totalTokens !== undefined
+      ? { totalTokens: { tokens: usage.totalTokens, precision: 'measured' } }
+      : {}),
+    countingSemantics: semantics
+  };
+}

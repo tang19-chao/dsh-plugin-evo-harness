@@ -95,9 +95,12 @@ transpiles on the fly.
 | `pnpm run test:unit` | `vitest run tests/unit` | Unit suites only |
 | `pnpm run test:e2e` | `vitest run tests/e2e` | End-to-end suites only |
 | `pnpm run check:docs` | `node scripts/verify-readme-counts.mjs` | Mechanically validates README test counts against test results and repo hygiene |
+| `pnpm run check:encoding` | `node scripts/eval/check-encoding-policy.mjs` | Every tracked blob must be LF text or a declared `-text` exception |
+| `pnpm run check:build-smoke` | `node scripts/eval/smoke-build.mjs` | Builds the bundle and imports it as ESM, asserting the public surface |
+| `pnpm run check:negative-result` | `node scripts/eval/negative-result-diag.mjs --assert` | Fails if the recorded historical negative result (−0.250) drifts |
 | `pnpm run verify` | `pnpm run typecheck && pnpm run test` | The full gate: typecheck, then every suite |
 
-A green checkout currently reports `86` test files and `1666` passing tests for `pnpm run test`
+A green checkout currently reports `96` test files and `1963` passing tests for `pnpm run test`
 (see [Testing](#testing) for the breakdown). This package is `private` and is not published to
 any registry, so there are no publication steps.
 
@@ -366,9 +369,9 @@ cross-session promotion, and the offline dream trigger and model wiring.
 
 | Command | Scope | Suites at the time of writing |
 | :--- | :--- | :--- |
-| `pnpm run test:unit` | `tests/unit` | 74 files, 1509 tests |
-| `pnpm run test:e2e` | `tests/e2e` | 12 files, 157 tests |
-| `pnpm run test` | everything | 86 files, 1666 tests |
+| `pnpm run test:unit` | `tests/unit` | 83 files, 1804 tests |
+| `pnpm run test:e2e` | `tests/e2e` | 13 files, 159 tests |
+| `pnpm run test` | everything | 96 files, 1963 tests |
 | `pnpm run verify` | typecheck + everything | the gate to run before a change lands |
 
 Individual files can be run the usual Vitest way, for example
@@ -376,6 +379,43 @@ Individual files can be run the usual Vitest way, for example
 
 Because `check:docs` compares the counts above against the live suite, it must be re-run as the
 release gate whenever tests are added, removed or renamed.
+
+### Evidence and attestation
+
+A digest is only evidence if someone else can recompute it. Everything below therefore reads the
+**git object database** and never the working tree: with `core.autocrlf=true` this checkout holds
+CRLF bytes while the object database holds LF, so hashing files on disk would make the same commit
+digest differently on Windows and on the Linux CI runner.
+
+```bash
+pnpm run attest            # write docs/reports/final-attestation.json for HEAD
+pnpm run attest:verify     # recompute it from the object database and fail on any difference
+```
+
+| Field | Meaning |
+| :--- | :--- |
+| `commit.commitId` / `commit.treeId` | the exact commit and its root tree (`^{commit}` / `^{tree}`) |
+| `compositeSha256` | SHA-256 over sorted `path:blobSha256` lines, `src/` + `tests/` + `scripts/` |
+| `bindingSha256` | SHA-256 over `commit`, `tree` and `composite` — content identity plus commit identity |
+| `environment` | node/platform/arch/timestamp and worktree state; **recorded, never hashed** |
+
+Two commits that carry identical content share a `compositeSha256` and differ in `bindingSha256`;
+that separation is asserted by `tests/unit/p62/commit-attestation.test.ts`.
+
+`.gitattributes` declares the content policy: everything is committed as LF text unless a path is an
+explicit `-text` exception (`tests/fixtures/encoding/**` holds the CRLF, BOM and binary fixtures).
+`pnpm run check:encoding` fails the build on an **undeclared** non-LF blob, and also refuses a
+blanket `* text=auto` rule, because a repo-wide renormalisation would rewrite every historical blob
+and invalidate every digest ever recorded. There is deliberately no silent normalisation.
+
+The gate inspects the **committed** tree, not the working tree. That is intentional: if the check
+read whatever is on disk it would reintroduce the very coupling to the checkout that PR-1 removes. A
+new non-LF file that is still untracked therefore passes locally and fails in CI after it is
+committed — which is the earliest point at which it becomes evidence.
+
+CI additionally recomputes the same commit on Linux, macOS and Windows and fails unless all three
+produce one identical `compositeSha256` and one identical `bindingSha256` — the cross-platform claim
+is measured, not assumed.
 
 ## Limitations and status
 

@@ -21,9 +21,40 @@
  * Usage:
  *   node scripts/eval/negative-result-diag.mjs            human summary
  *   node scripts/eval/negative-result-diag.mjs --json     machine-readable
+ *   node scripts/eval/negative-result-diag.mjs --assert   fail (exit 1) if the
+ *                                                        historical frame drifted
+ *
+ * ASSERTIONS (PR-1)
+ * -----------------
+ * Before PR-1 this script only PRINTED its findings, so a regression that moved
+ * the reproduction away from the historical -0.250 still exited 0 — the gate
+ * reported "pass" no matter what. `--assert` turns the recorded historical facts
+ * into real checks. It is opt-in so the historical diagnostic output stays
+ * byte-identical for readers and existing callers.
+ *
+ * The rules themselves live in `./lib/negative-result-assertions.mjs` (a pure,
+ * shebang-free module) so they can be unit-tested against mutated copies of the
+ * real result. That split matters here: vitest does not strip a `#!` line when
+ * the transformed file has CRLF endings, so this CLI cannot be imported by a
+ * test on a `core.autocrlf=true` checkout — the pure module can, and the CLI
+ * wiring is asserted through a child process instead.
+ *
+ *   A1  the reproduction frame matches history within tolerance
+ *       (|meanDelta - (-0.250)| < 0.05, the script's own `matchesHistorical`,
+ *       plus the recorded anchor itself);
+ *   A2  the degraded-task list is non-empty (the negative result is about
+ *       specific tasks, not a flat mean shift);
+ *   A3  every minimal counterexample carries a replayable anchor
+ *       (task id + replay coordinates + observed outcome);
+ *   A4  the decision ledger is payload-free (no prompt/patch/deliverable text);
+ *   A5  no hypothesis claims a confirmed root cause (they are hypotheses), and
+ *       the report still states that boundary in so many words;
+ *   A6  the strategy gates did NOT silently pass (H4 benefit gate stays unmet,
+ *       i.e. the probe is not promoted to a default).
  */
 
 import { loadEvalLib } from './build-eval.mjs';
+import { evaluateAssertions } from './lib/negative-result-assertions.mjs';
 
 const lib = await loadEvalLib();
 const {
@@ -678,7 +709,31 @@ function renderHuman(data) {
 }
 
 const json = process.argv.includes('--json');
-if (json) {
+const assertMode = process.argv.includes('--assert');
+
+// The A1..A6 rules live in ./lib/negative-result-assertions.mjs (imported above)
+// so they can be unit-tested against mutated copies of this result.
+
+if (assertMode) {
+  const { ok, failures } = evaluateAssertions(result);
+  if (json) {
+    console.log(JSON.stringify({ ...result, assertions: { ok, failures } }, null, 2));
+  } else {
+    console.log(renderHuman(result));
+    console.log('');
+    console.log('assertions (PR-1):');
+    if (ok) {
+      console.log('  A1..A6 PASS - the historical negative result is intact');
+    } else {
+      for (const failure of failures) {
+        console.log('  FAIL ' + failure);
+      }
+    }
+  }
+  if (!ok) {
+    process.exitCode = 1;
+  }
+} else if (json) {
   console.log(JSON.stringify(result, null, 2));
 } else {
   console.log(renderHuman(result));

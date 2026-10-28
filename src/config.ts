@@ -74,6 +74,22 @@ export interface DreamRsiConfig {
   maxRecoverySlots: number;
   earlyStopThreshold: number;
   minMemoryConfidenceForSkip: number;
+  /**
+   * PR-4B (ADR 0004 §4.1/§4.4): EXPLICIT opt-in size of the Dreamer holdout
+   * split. 0 (the default) means "no holdout configured": the dreamer keeps the
+   * pre-PR-4B behaviour byte for byte and `validatedOnHoldout` stays undefined,
+   * so the G3 gate still refuses publication with `holdout-missing`.
+   *
+   * When > 0 the configured number of trees is carved out of the pool BEFORE any
+   * candidate generation, and the winner must additionally beat the baseline on
+   * them. A pool that cannot supply the requested holdout (while still leaving at
+   * least one selection tree) is `insufficient-evidence`: publication stays
+   * refused and the reason is reported, instead of silently shrinking the split.
+   *
+   * Cross-field rule: `holdoutTreeCount` must stay below `maxTreePoolSize`, so a
+   * configuration can never describe a split its own pool bound cannot satisfy.
+   */
+  holdoutTreeCount: number;
 }
 
 /** Probe execution limits. */
@@ -355,7 +371,11 @@ const DEFAULT_CONFIG_VALUES: EvoHarnessConfig = {
     maxDepth: 3,
     maxRecoverySlots: 1,
     earlyStopThreshold: 0.8,
-    minMemoryConfidenceForSkip: 0.75
+    minMemoryConfidenceForSkip: 0.75,
+    // PR-4B (ADR 0004 §4.4): the holdout is an EXPLICIT opt-in. 0 keeps the
+    // default assembly on the pre-PR-4B path (no split), so `validatedOnHoldout`
+    // stays undefined and G3 keeps refusing publication with holdout-missing.
+    holdoutTreeCount: 0
   },
   jitrl: {
     enabled: true,
@@ -485,7 +505,9 @@ const DREAM_KEYS = new Set<string>([
   'maxDepth',
   'maxRecoverySlots',
   'earlyStopThreshold',
-  'minMemoryConfidenceForSkip'
+  'minMemoryConfidenceForSkip',
+  // PR-4B (ADR 0004 §4.1/§4.4): explicit holdout opt-in.
+  'holdoutTreeCount'
 ]);
 const WEIGHT_KEYS = ['selection', 'adoption', 'efficiency', 'toolErrorPenalty'] as const;
 const SURROGATE_WEIGHT_KEYS = new Set<string>([...WEIGHT_KEYS]);
@@ -1027,6 +1049,47 @@ function validateDreamGroup(root: Record<string, unknown>, issues: ConfigValidat
     1,
     issues
   );
+  validateHoldoutTreeCount(dream, issues);
+}
+
+/**
+ * PR-4B (ADR 0004 §4.1/§4.4): validate the explicit holdout opt-in.
+ *
+ * The split has to be satisfiable by the same configuration that declares it, so
+ * the rule is cross-field rather than a bare range check:
+ *   - integer >= 0 (`0` = no holdout configured, the default);
+ *   - `holdoutTreeCount < maxTreePoolSize`, because the selection set must keep at
+ *     least one tree from a full pool (`minReplayTrees` is at least 1, and the
+ *     dreamer never splits a pool down to an empty selection set).
+ * The pair is rejected outright instead of being silently clamped: a clamped
+ * holdout would be an undisclosed shrink of the validation set.
+ */
+function validateHoldoutTreeCount(
+  dream: Record<string, unknown>,
+  issues: ConfigValidationIssue[]
+): void {
+  const raw = dream.holdoutTreeCount;
+  validateInteger(raw, 'dreamRsi.holdoutTreeCount', 0, 10_000, issues);
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || !Number.isInteger(raw) || raw < 0) {
+    return;
+  }
+  const pool = dream.maxTreePoolSize;
+  if (typeof pool !== 'number' || !Number.isFinite(pool)) {
+    return;
+  }
+  if (raw >= pool) {
+    pushIssue(
+      issues,
+      'dreamRsi.holdoutTreeCount',
+      'invalid_value',
+      'The holdout must leave at least one selection tree: expected holdoutTreeCount < maxTreePoolSize (received ' +
+        String(raw) +
+        ' with maxTreePoolSize ' +
+        String(pool) +
+        ').',
+      raw
+    );
+  }
 }
 
 function validateLoggingGroup(root: Record<string, unknown>, issues: ConfigValidationIssue[]): void {

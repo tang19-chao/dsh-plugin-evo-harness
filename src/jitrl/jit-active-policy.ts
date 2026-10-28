@@ -66,7 +66,9 @@ import {
   runDecisionKernel,
   slotWeightsFromDecision,
   type EffectivePolicyConfigProvider,
-  type LayerDecisionConfig
+  type LayerDecisionConfig,
+  type DualTrackConsumptionOptions,
+  type AtomicTrackSelectionVerdict
 } from './decision-kernel';
 import { isOnLearningTrack, PRODUCTION_LEARNING_TRACK } from './experience-store';
 import {
@@ -134,6 +136,7 @@ export interface JitBatchDiagnostics {
   readonly klToPrior: number;
   readonly adjustments: readonly JitBatchAdjustment[];
   readonly rationale: string;
+  readonly trackSelection?: AtomicTrackSelectionVerdict<unknown>;
   readonly degraded?: boolean;
   readonly degradedReason?: string;
   /**
@@ -303,6 +306,8 @@ export interface JitActivePolicyOptions {
    * keeps the pre-PR5 behaviour (construction config merged with policy.jit).
    */
   readonly policyConfigProvider?: EffectivePolicyConfigProvider;
+  /** C2b (ADR 0004 §8): Dual-track consumption options */
+  readonly dualTrack?: DualTrackConsumptionOptions;
 }
 
 function resolveSnapshot(source: ExperienceSnapshotSource | undefined): readonly ExperienceRecord[] {
@@ -742,9 +747,12 @@ class JitActivePolicyImpl implements JitActivePolicy {
       // kernel directly and must not change behaviour): undeclared records
       // keep flowing (the pre-existing eligibility path) but a task-quality
       // record never enters an online L1 estimate.
-      records: resolveSnapshot(this.options.experiences).filter((entry) =>
-        isOnLearningTrack(entry, PRODUCTION_LEARNING_TRACK)
-      ),
+      records:
+        this.options.dualTrack?.enableQualityTrackConsumption === true
+          ? resolveSnapshot(this.options.experiences)
+          : resolveSnapshot(this.options.experiences).filter((entry) =>
+              isOnLearningTrack(entry, PRODUCTION_LEARNING_TRACK)
+            ),
       config: layerFromResolved(config),
       ...(resolved.policyVersion === undefined
         ? {}
@@ -758,7 +766,8 @@ class JitActivePolicyImpl implements JitActivePolicy {
       // same filter, which is what keeps offline and online on one evidence set.
       ...learningFacingFilterOptions(),
       projectNeighbors: (neighbors, projected) =>
-        this.alignNeighbors(neighbors, projected)
+        this.alignNeighbors(neighbors, projected),
+      ...(this.options.dualTrack === undefined ? {} : { dualTrack: this.options.dualTrack })
     });
     const decision = kernel.decision;
     const diagnostics = toDiagnostics(decision, candidates, config.surfaceActions, {
@@ -766,6 +775,7 @@ class JitActivePolicyImpl implements JitActivePolicy {
         ? {}
         : { policyVersion: resolved.policyVersion }),
       ignoredDimensions: kernel.ignored.map((entry) => entry.dimension),
+      ...(kernel.trackSelection === undefined ? {} : { trackSelection: kernel.trackSelection }),
       filter: {
         records: kernel.filters.records,
         kept: kernel.filters.kept,
@@ -992,6 +1002,7 @@ function withJitMetadata(plan: BatchPlan, diagnostics: JitBatchDiagnostics): Bat
 
 /** Extra audit fields attached to one decision's diagnostics. */
 interface DiagnosticsAudit {
+  readonly trackSelection?: AtomicTrackSelectionVerdict<unknown>;
   readonly policyVersion?: string;
   readonly ignoredDimensions?: readonly string[];
   readonly filter?: {
@@ -1040,6 +1051,7 @@ function toDiagnostics(
     klToPrior: decision.klToPrior,
     adjustments,
     rationale: decision.rationale,
+    ...(audit.trackSelection === undefined ? {} : { trackSelection: audit.trackSelection }),
     ...(audit.policyVersion === undefined ? {} : { policyVersion: audit.policyVersion }),
     ...(audit.ignoredDimensions === undefined
       ? {}

@@ -454,7 +454,10 @@ describe('F1 (dreamJit): the Jit hyperparameter hot swap is gated separately fro
     const treeHoldout = createDiscoveryTree({
       id: 'tree-t21-holdout',
       sessionId: 'session-t21',
-      taskId: 'task-t21',
+      // PR-4B (ADR 0004 §4.3-1): a holdout tree must belong to its own task. The
+      // split never cuts a task group, so reusing 'task-t21' here would make the
+      // pair one group and the authorized positive control unreachable.
+      taskId: 'task-t21-holdout',
       rootPatchId: 'patch-root',
       clock: fixedClock()
     });

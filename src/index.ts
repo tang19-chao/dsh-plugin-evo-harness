@@ -99,7 +99,8 @@ import {
   type JitMirrorMcpClient,
   type JitReplayHook,
   type JitRl,
-  type JitRlDiagnostic
+  type JitRlDiagnostic,
+  type DualTrackConsumptionOptions
 } from './jitrl';
 import {
   createScopeRegistry,
@@ -253,6 +254,8 @@ export type CordisCommandHandler = (args?: unknown,
   context?: unknown) => unknown | Promise<unknown>;
 /** Host-neutral plugin options; also accepts a raw cordis.yml plugin section. */
 export interface EvoHarnessPluginOptions {
+  /** C2b (ADR 0004 §8): Dual-track consumption options for JitRL. */
+  readonly dualTrack?: DualTrackConsumptionOptions;
   /** Raw plugin configuration (parsed and validated by src/config.ts). */
   readonly config?: unknown;
   /** LLM boundary used by Harness2 propose/compose/reflect. */
@@ -1370,6 +1373,7 @@ export function buildJitRlWiring(input: {
     const kernel = createJitRl({
       config: input.config,
       now: input.now,
+      ...(input.options.dualTrack === undefined ? {} : { dualTrack: input.options.dualTrack }),
       ... (input.options.model === undefined ? {
       } : {
         model: input.options.model
@@ -1394,6 +1398,7 @@ export function buildJitRlWiring(input: {
       now: input.now,
       maxRecoverySlots: input.config.dreamRsi.maxRecoverySlots,
       isRuntimeEnabled: () => runtimeEnabled.enabled,
+      ...(input.options.dualTrack === undefined ? {} : { dualTrack: input.options.dualTrack }),
       // t10/R1b (ADR 0002 §3 baseline 行, option ①) + t12/R1c: baseline/off
       // return the inner plan byte-identical (no L1 adjustment, no metadata.jit)
       // - the mode contract "Jit 不拦截、不注入、不探测" is real wiring, not a
@@ -1662,6 +1667,16 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     rhoPreferences: config.dreamRsi.rhoPreferences,
     modelAdapter: options.model,
     shadowMode: effectiveProfile.shadowRecords || !effectiveProfile.permissions.publish.allowed,
+    // PR-4B (ADR 0004 §4.1): the EXPLICIT holdout opt-in from config, threaded
+    // through the ONE object both dreamers are built from. A deploy that leaves
+    // `dreamRsi.holdoutTreeCount` at its default 0 keeps the pre-PR-4B path
+    // exactly (no split, holdout-missing, publication refused), and a positive
+    // value enables the split WITHOUT granting any permission: G1 still requires
+    // publishAuthorized === true (profile publish is hard-deny in every mode),
+    // G2 still requires an applyPolicy target, G3 still requires a validated
+    // holdout. Passing a value here is a data-only widening of the VALIDATION
+    // SET, never of the permission surface - patch/memory/publish stay denied.
+    holdoutTreeCount: config.dreamRsi.holdoutTreeCount,
     publishAuthorized: effectiveProfile.permissions.publish.allowed === true
   };
   const dreamer = options.deps?.dreamer ??
@@ -2794,19 +2809,28 @@ export function createEvoHarnessPlugin(
       if (trees.length === 0) {
         return undefined;
       }
-      if (typeof orchestrator.triggerDream === 'function') {
-        const idleDiagnostics: string[] = [];
-        const reportResult = await orchestrator.triggerDream(idleDiagnostics);
-        for (const line of idleDiagnostics) {
-          report(line);
-        }
-        return reportResult;
+      // PR-4B (ADR 0004 §4.5-2, captain ruling R3): the idle entrance goes
+      // through the orchestrator and ONLY through it. The previous
+      // `deps.dreamer.replay(...)` fallback bypassed `dreamReports()`,
+      // `recordDream()` and the whole publication gate chain, so a dreamer that
+      // did not answer `triggerDream` would have performed an unaudited replay.
+      // `triggerDream` is a facade method on every orchestrator this file builds
+      // (src/orchestrator.ts:336), so the fallback was unreachable in production
+      // while still being a structural bypass. It is now deleted: a dreamer that
+      // cannot be reached through the orchestrator simply does not dream, and
+      // says so in the diagnostics instead of replaying behind the gate.
+      if (typeof orchestrator.triggerDream !== 'function') {
+        report(
+          'idle dream skipped: the orchestrator exposes no triggerDream, and a direct dreamer replay would bypass the dreamReports/publication gate chain'
+        );
+        return undefined;
       }
-      return deps.dreamer.replay({
-        trees,
-        baselinePolicy: deps.policy.policy,
-        candidatePolicies: []
-      });
+      const idleDiagnostics: string[] = [];
+      const reportResult = await orchestrator.triggerDream(idleDiagnostics);
+      for (const line of idleDiagnostics) {
+        report(line);
+      }
+      return reportResult;
     };
     const registration: DshTriggerRegistration = registerDshTriggers(ctx, {
       triggerMode: resolved.triggerMode,
@@ -3037,8 +3061,21 @@ export {
   type HostAdvisor,
   type HostAdvisorOptions,
   type BridgeMirrorStore,
-  type JitMirrorMcpClient
+  type JitMirrorMcpClient,
+  selectTrackAtomically,
+  type DualTrackConsumptionOptions,
+  type AtomicTrackSelectionVerdict
 } from './jitrl';
+
+export {
+  computeQualityRecordDigest,
+  registerAuthenticatedQualityRecord,
+  isAuthenticatedQualityRecord,
+  clearQualityRecordRegistry,
+  qualityProvenanceRegistry,
+  type AuthenticatedQualityEntry,
+  type QualityProvenanceContext
+} from './verification';
 /**
  * P6 PR2: the unified runtime control, re-exported so a host (or a status page
  * built outside this package) can read the SAME object the plugin uses instead

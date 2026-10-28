@@ -16,9 +16,15 @@ f1-repro/
 asar-*.cjs
 
 # build and test output
-lib/
-dist/
-coverage/
+#
+# NOTE (PR-1): these are ANCHORED with a leading slash on purpose. The old
+# `lib/` pattern matched ANY directory named `lib` at any depth, which silently
+# excluded `scripts/eval/lib/` - the canonical git-object evidence module
+# (`git-objects.mjs`) that PR-1 requires to be committed. A build artifact is
+# `/lib/` at the repository root; a nested library directory is source.
+/lib/
+/dist/
+/coverage/
 *.tsbuildinfo
 
 # logs and local env

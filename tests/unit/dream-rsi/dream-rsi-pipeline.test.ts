@@ -35,11 +35,17 @@ const TASK: ProbeTask = {
   taskSignature: 'sig-1'
 };
 
-function freshTree(id = 'tree-e2e') {
+/**
+ * PR-4B (ADR 0004 §4.3-1): `taskId` is a parameter so a holdout tree can belong
+ * to its own task. Two trees of one task form ONE group, and the holdout split
+ * refuses to cut a group - reusing a single id for both sides of a
+ * selection/holdout pair would be the cross-task leak the contract forbids.
+ */
+function freshTree(id = 'tree-e2e', taskId = 'task-1') {
   return createDiscoveryTree({
     id,
     sessionId: 'session-1',
-    taskId: 'task-1',
+    taskId,
     rootPatchId: 'patch-root',
     clock: fixedClock()
   });
@@ -289,7 +295,9 @@ describe('dream-rsi online-to-offline pipeline', () => {
       publishAuthorized: true,
       holdoutTreeCount: 1
     });
-    const treeHoldout = freshTree('tree-e2e-holdout');
+    // PR-4B §4.3-1: the holdout tree is a different task, so the selection set
+    // and the validation set are genuinely disjoint groups.
+    const treeHoldout = freshTree('tree-e2e-holdout', 'task-e2e-holdout');
     probeNode(treeHoldout, 0, 'succeeded');
     treeHoldout.recordProbe('n0', { trajectoryId: 'traj-n0-h', score: 0.2 });
     treeHoldout.addNode({

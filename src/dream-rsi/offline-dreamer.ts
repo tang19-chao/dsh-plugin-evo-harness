@@ -572,8 +572,408 @@ function firstRepairableFailedNode(
 }
 
 // ---------------------------------------------------------------------------
-// Dream replay x JitRL: causal truncation and the synchronous replay hook
+// PR-4B (ADR 0004 §4): Dreamer independent holdout split
 // ---------------------------------------------------------------------------
+
+/**
+ * Group key for the holdout split (ADR 0004 §4.3-1).
+ *
+ * A discovery tree belongs to exactly one task. Grouping by `taskId` first is
+ * what makes the split a TASK split: every subtree of one task lands wholly in
+ * the selection set or wholly in the holdout, so a candidate can never be
+ * selected on one half of a task and validated on the other. `sessionId` is the
+ * fallback for snapshots that carry no task id, and `id` is the last resort so a
+ * single tree is always self-consistent.
+ *
+ * `testSetId` from the plan is deliberately NOT used here: it does not exist on
+ * `DiscoveryTreeSnapshot` (see src/types/contracts.ts:1042) and inventing it
+ * would mean reaching into `metadata` - a field the split must not depend on.
+ */
+export function holdoutGroupKey(tree: DiscoveryTreeSnapshot): string {
+  const taskId = typeof tree.taskId === 'string' ? tree.taskId.trim() : '';
+  if (taskId.length > 0) {
+    return 'task:' + taskId;
+  }
+  const sessionId = typeof tree.sessionId === 'string' ? tree.sessionId.trim() : '';
+  if (sessionId.length > 0) {
+    return 'session:' + sessionId;
+  }
+  return 'tree:' + tree.id;
+}
+
+/** Stable creation stamp used by the temporal ordering rule; non-finite folds to 0. */
+function holdoutStamp(tree: DiscoveryTreeSnapshot): number {
+  return Number.isFinite(tree.createdAt) ? tree.createdAt : 0;
+}
+
+/** Stable key ordering so the split is a pure function of its input. */
+function compareHoldoutGroups(left: HoldoutGroup, right: HoldoutGroup): number {
+  if (left.newest !== right.newest) {
+    return left.newest - right.newest;
+  }
+  if (left.oldest !== right.oldest) {
+    return left.oldest - right.oldest;
+  }
+  return left.key < right.key ? -1 : left.key > right.key ? 1 : 0;
+}
+
+interface HoldoutGroup {
+  readonly key: string;
+  readonly trees: readonly DiscoveryTreeSnapshot[];
+  readonly oldest: number;
+  readonly newest: number;
+  readonly size: number;
+}
+
+/** Group the pool by group key, keeping each group's trees in the caller's order. */
+function groupTreesForHoldout(
+  trees: readonly DiscoveryTreeSnapshot[]
+): readonly HoldoutGroup[] {
+  const buckets = new Map<string, DiscoveryTreeSnapshot[]>();
+  for (const tree of trees) {
+    const key = holdoutGroupKey(tree);
+    const bucket = buckets.get(key);
+    if (bucket === undefined) {
+      buckets.set(key, [tree]);
+    } else {
+      bucket.push(tree);
+    }
+  }
+  const groups: HoldoutGroup[] = [];
+  for (const [key, bucket] of buckets) {
+    let oldest = Number.POSITIVE_INFINITY;
+    let newest = Number.NEGATIVE_INFINITY;
+    for (const tree of bucket) {
+      const at = holdoutStamp(tree);
+      if (at < oldest) {
+        oldest = at;
+      }
+      if (at > newest) {
+        newest = at;
+      }
+    }
+    groups.push({
+      key,
+      trees: bucket,
+      oldest: Number.isFinite(oldest) ? oldest : 0,
+      newest: Number.isFinite(newest) ? newest : 0,
+      size: bucket.length
+    });
+  }
+  return groups.sort(compareHoldoutGroups);
+}
+
+/**
+ * Outcome of the pre-generation split. `status` is the machine-readable
+ * insufficient-evidence verdict from ADR 0004 §4.4; `ok` is the only status that
+ * permits a holdout validation to be attempted at all.
+ */
+export type DreamerSplitStatus =
+  | 'ok'
+  | 'no-holdout-configured'
+  | 'insufficient-selection-trees'
+  | 'insufficient-holdout-trees'
+  | 'insufficient-holdout-groups'
+  | 'insufficient-temporal-isolation';
+
+/** Diagnostics of one pre-generation split; travels with the shadow record. */
+export interface DreamerHoldoutSplit {
+  /** Shelf into which the split resolved (ADR 0004 §4.4 truth table). */
+  readonly status: DreamerSplitStatus;
+  /** Trees candidates may be generated from and selected on. */
+  readonly selectionTrees: readonly DiscoveryTreeSnapshot[];
+  /**
+   * Trees reserved for the winner-only validation pass.
+   *
+   * Empty on EVERY fail-closed verdict - including an undersized holdout
+   * (`insufficient-holdout-trees`, where `diagnostics.holdoutCount` still reports
+   * the supply that was refused) - so a caller cannot mistake a withheld set for a
+   * usable one.
+   */
+  readonly holdoutTrees: readonly DiscoveryTreeSnapshot[];
+  /** False for every status other than 'ok'. */
+  readonly hasSufficientEvidence: boolean;
+  readonly diagnostics: {
+    readonly totalTrees: number;
+    readonly selectionCount: number;
+    /**
+     * Trees the cut could actually supply for validation. Equal to
+     * `holdoutTrees.length` whenever the verdict is 'ok'; on a fail-closed verdict
+     * it reports the supply that was OBSERVED and refused (0 when no admissible
+     * cut exists), so an auditor can tell "the pool offered 3 of the 5 requested"
+     * from "the pool offered nothing" without re-running the split.
+     */
+    readonly holdoutCount: number;
+    readonly requestedHoldoutCount: number;
+    /**
+     * How far the request is from being met: `max(0, requested - holdoutCount)`.
+     *
+     * A non-zero value is exactly the "silent shrink" this configuration forbids,
+     * reported instead of performed: the verdict is 'insufficient-holdout-trees'
+     * and `holdoutTrees` is emptied, so nothing can ever be validated on a smaller
+     * set than the operator asked for.
+     */
+    readonly holdoutShortfall: number;
+    readonly selectionGroups: number;
+    readonly holdoutGroups: number;
+    /** Newest selection stamp; must not exceed `holdoutOldest` for a valid split. */
+    readonly selectionNewest: number;
+    /** Oldest holdout stamp; the temporal isolation witness. */
+    readonly holdoutOldest: number;
+    /**
+     * Whether the selection set meets the ADR's RECOMMENDED size (N_sel >= 2).
+     * Advisory only - see RECOMMENDED_MIN_SELECTION_TREES for why it is reported
+     * instead of enforced.
+     */
+    readonly selectionMeetsRecommendedMinimum: boolean;
+  };
+}
+
+/** Minimum holdout trees (ADR 0004 §4.4: N_hold >= 1). */
+export const MIN_HOLDOUT_TREES = 1;
+/** Minimum independent holdout groups (ADR 0004 §4.4: G_hold >= 1). */
+export const MIN_HOLDOUT_GROUPS = 1;
+/**
+ * The ADR's RECOMMENDED selection size (N_sel >= 2).
+ *
+ * Deliberately advisory, not a refusal floor. Two trees with distinct task ids
+ * are the smallest split that exercises the authorized positive control (1
+ * selection + 1 holdout), and that control is the evidence the C1.1 gate is
+ * reachable at all; refusing every 1-tree selection set would make the gate
+ * unprovable without changing the C1.1 contract. The hard refusal floors are the
+ * ones that make the split meaningless: an empty holdout, no independent holdout
+ * group, or an empty selection set.
+ *
+ * A caller that wants the recommendation enforced reads
+ * `split.diagnostics.selectionMeetsRecommendedMinimum` and decides for itself.
+ */
+export const RECOMMENDED_MIN_SELECTION_TREES = 2;
+
+/**
+ * Pre-generation split (ADR 0004 §4.1/§4.3/§4.4).
+ *
+ * Contract properties this function is responsible for:
+ *   1. **It runs before any generation.** It is a pure function of the pool, so
+ *      the caller can (and must) invoke it before `generatePolicies`. No summary
+ *      statistic of the holdout is returned for the generator to consume: only
+ *      counts, and counts are computed from the pool, not from the holdout's
+ *      scored content.
+ *   2. **Group isolation.** Whole groups move together; a task can never be split.
+ *   3. **Temporal isolation.** Groups are ordered oldest-first and the holdout is
+ *      taken from the newest end, so
+ *      `max(selection.createdAt) <= min(holdout.createdAt)` by construction.
+ *   4. **Insufficient evidence is a fail-closed verdict, not a silent shrink.**
+ *      When the request cannot be met the status names why and `hasSufficientEvidence`
+ *      is false; the dreamer then never publishes. The requested size is a FLOOR,
+ *      not a hint: a pool that can only supply fewer than `holdoutTreeCount` trees
+ *      is `insufficient-holdout-trees`, never `ok` with a smaller holdout.
+ *      Overshoot is allowed and is not a shrink - whole groups move together, so
+ *      the newest group may satisfy a request for fewer trees than it holds.
+ *
+ * `holdoutTreeCount === 0` means "no holdout configured": the whole pool is the
+ * selection set and the status says so, which keeps the pre-PR-4B path intact.
+ */
+export function splitDreamerHoldout(
+  trees: readonly DiscoveryTreeSnapshot[],
+  holdoutTreeCount: number
+): DreamerHoldoutSplit {
+  const requested = Math.max(0, Math.floor(finiteOr(holdoutTreeCount, 0)));
+  const groups = groupTreesForHoldout(trees);
+  const empty = {
+    totalTrees: trees.length,
+    selectionCount: trees.length,
+    holdoutCount: 0,
+    requestedHoldoutCount: requested,
+    holdoutShortfall: requested,
+    selectionGroups: groups.length,
+    holdoutGroups: 0,
+    selectionNewest: 0,
+    holdoutOldest: 0,
+    selectionMeetsRecommendedMinimum: trees.length >= RECOMMENDED_MIN_SELECTION_TREES
+  };
+  if (requested === 0) {
+    return {
+      status: 'no-holdout-configured',
+      selectionTrees: trees,
+      holdoutTrees: [],
+      hasSufficientEvidence: false,
+      diagnostics: {
+        ...empty,
+        selectionNewest: groups.reduce(
+          (max, group) => (max > group.newest ? max : group.newest),
+          0
+        )
+      }
+    };
+  }
+  // A holdout must be a DIFFERENT group from the selection set. With fewer than
+  // two groups the pool cannot be group-split at all, and no amount of choosing
+  // would help: report the group shortfall rather than blaming time.
+  if (groups.length < 2) {
+    return {
+      status: 'insufficient-holdout-groups',
+      selectionTrees: trees,
+      holdoutTrees: [],
+      hasSufficientEvidence: false,
+      diagnostics: {
+        ...empty,
+        selectionNewest: groups.reduce(
+          (max, group) => (max > group.newest ? max : group.newest),
+          0
+        )
+      }
+    };
+  }
+  // Choose the split as a CUT over the groups sorted by recency: the tail (newest
+  // groups) becomes the holdout, the head (older groups) the selection set.
+  //
+  // Taking whole groups gives group isolation. Taking the newest groups does NOT
+  // automatically give temporal isolation: if one task's trees span a wide window
+  // (a long-running task whose subtrees were recorded over hours), a newer
+  // group's `oldest` can precede an older group's `newest`, and the naive "last N
+  // groups" cut then puts a future tree into the selection set (ADR 0004 §4.3-2
+  // forbids exactly that: "严禁将未来的轨迹放入选择集去拟合过去").
+  //
+  // So the cut is validated rather than assumed: a cut is admissible only when
+  // `max(selection.createdAt) <= min(holdout.createdAt)`. Among admissible cuts we
+  // prefer the SMALLEST holdout that still covers the request (it keeps the most
+  // selection data); if none covers the request we keep the largest admissible one
+  // and let the truth table below report the shortfall; if none is admissible at
+  // all the split fails closed as `insufficient-temporal-isolation`.
+  let chosenHoldoutTrees: readonly DiscoveryTreeSnapshot[] = [];
+  let chosenSelectionTrees: readonly DiscoveryTreeSnapshot[] = trees;
+  for (let cut = 1; cut < groups.length; cut += 1) {
+    const tail = groups.slice(groups.length - cut);
+    const head = groups.slice(0, groups.length - cut);
+    const tailTrees: DiscoveryTreeSnapshot[] = [];
+    for (const group of tail) {
+      for (const tree of group.trees) {
+        tailTrees.push(tree);
+      }
+    }
+    if (tailTrees.length >= trees.length) {
+      continue;
+    }
+    const headNewest = head.reduce(
+      (max, group) => (max > group.newest ? max : group.newest),
+      0
+    );
+    const tailOldest = tail.reduce(
+      (min, group) => (min < group.oldest ? min : group.oldest),
+      Number.POSITIVE_INFINITY
+    );
+    if (!(headNewest <= tailOldest)) {
+      // A task straddles the cut: this cut would leak the future into selection.
+      continue;
+    }
+    const tailKeys = new Set(tail.map((group) => group.key));
+    chosenHoldoutTrees = tailTrees;
+    chosenSelectionTrees = trees.filter((tree) => !tailKeys.has(holdoutGroupKey(tree)));
+    if (tailTrees.length >= requested) {
+      break;
+    }
+  }
+  if (chosenHoldoutTrees.length === 0) {
+    // No cut isolates the groups in time. Fail closed: a statistically "valid"
+    // split that trains on the future is worse than no split at all.
+    return {
+      status: 'insufficient-temporal-isolation',
+      selectionTrees: trees,
+      holdoutTrees: [],
+      hasSufficientEvidence: false,
+      diagnostics: {
+        ...empty,
+        selectionNewest: groups.reduce(
+          (max, group) => (max > group.newest ? max : group.newest),
+          0
+        )
+      }
+    };
+  }
+  const holdoutKeys = new Set(chosenHoldoutTrees.map((tree) => holdoutGroupKey(tree)));
+  const holdoutGroups = groups.filter((group) => holdoutKeys.has(group.key));
+  const holdoutTrees = [...chosenHoldoutTrees];
+  const selectionTrees = [...chosenSelectionTrees];
+  const selectionGroups = groups.length - holdoutGroups.length;
+  const selectionNewest = selectionTrees.reduce(
+    (max, tree) => (max > holdoutStamp(tree) ? max : holdoutStamp(tree)),
+    0
+  );
+  const holdoutOldest = holdoutTrees.reduce(
+    (min, tree) => (min < holdoutStamp(tree) ? min : holdoutStamp(tree)),
+    Number.POSITIVE_INFINITY
+  );
+  const diagnostics = {
+    totalTrees: trees.length,
+    selectionCount: selectionTrees.length,
+    holdoutCount: holdoutTrees.length,
+    requestedHoldoutCount: requested,
+    holdoutShortfall: Math.max(0, requested - holdoutTrees.length),
+    selectionGroups,
+    holdoutGroups: holdoutGroups.length,
+    selectionNewest,
+    holdoutOldest: Number.isFinite(holdoutOldest) ? holdoutOldest : 0,
+    selectionMeetsRecommendedMinimum: selectionTrees.length >= RECOMMENDED_MIN_SELECTION_TREES
+  };
+  // §4.4 truth table. Evaluated in a fixed order so the reported status is the
+  // FIRST unmet HARD requirement rather than an incidental one. The hard floors
+  // are "the split is meaningless": the pool could not actually be divided.
+  // `selectionMeetsRecommendedMinimum` is reported separately because the ADR
+  // marks N_sel >= 2 as a recommendation (see RECOMMENDED_MIN_SELECTION_TREES).
+  //
+  // The holdout count has TWO hard floors and the higher one wins:
+  //   - MIN_HOLDOUT_TREES (N_hold >= 1, the ADR's non-emptiness floor), and
+  //   - the caller's explicit `requested` (the configured opt-in).
+  //
+  // The second floor is the runtime half of the config rule "never silently
+  // shrink" (src/config.ts validateHoldoutTreeCount rejects a request the
+  // configured pool bound cannot satisfy; the runtime pool can still be smaller
+  // than that bound). Without it, a request of 5 against a pool whose newest
+  // group holds 3 trees would hand back the largest admissible cut - 3 trees -
+  // and report `ok` / `hasSufficientEvidence: true` for a validation set 40%
+  // smaller than the operator asked for. The dreamer would then treat that
+  // undersized holdout as evidence. Fail closed instead, and keep the observed
+  // supply in `diagnostics.holdoutCount` / `diagnostics.holdoutShortfall` so the
+  // refusal is auditable rather than mysterious.
+  //
+  // Overshoot stays `ok`: whole groups move together, so a 2-tree group legitimately
+  // satisfies a request of 1. Only an undersized holdout is refused.
+  if (holdoutTrees.length < Math.max(MIN_HOLDOUT_TREES, requested)) {
+    return {
+      status: 'insufficient-holdout-trees',
+      selectionTrees,
+      holdoutTrees: [],
+      hasSufficientEvidence: false,
+      diagnostics
+    };
+  }
+  if (holdoutGroups.length < MIN_HOLDOUT_GROUPS) {
+    return {
+      status: 'insufficient-holdout-groups',
+      selectionTrees,
+      holdoutTrees: [],
+      hasSufficientEvidence: false,
+      diagnostics
+    };
+  }
+  if (selectionTrees.length === 0) {
+    return {
+      status: 'insufficient-selection-trees',
+      selectionTrees,
+      holdoutTrees: [],
+      hasSufficientEvidence: false,
+      diagnostics
+    };
+  }
+  return {
+    status: 'ok',
+    selectionTrees,
+    holdoutTrees,
+    hasSufficientEvidence: true,
+    diagnostics
+  };
+}
+
 
 /** Causal cutoff used by replay: a tree may only see experience from its past. */
 export function causalCutoffFor(tree: DiscoveryTreeSnapshot): number {
@@ -1554,10 +1954,23 @@ export interface OfflineDreamerOptions {
    */
   readonly shadowMode?: boolean;
   /**
-   * P6 PR5 (plan section 7.4): candidate generation/selection and final
-   * validation must not use the same trees. When > 0, the last N replayed trees
-   * (by the caller's order) are held out: candidates are selected on the
-   * remaining trees and the winner must also beat the baseline on the holdout.
+   * PR-4B (ADR 0004 §4): EXPLICIT opt-in size of the Dreamer holdout split.
+   *
+   * 0 (the default) keeps the pre-PR-4B path: no split, `validatedOnHoldout`
+   * stays undefined, and the G3 gate refuses publication with `holdout-missing`.
+   *
+   * When > 0 the split runs BEFORE candidate generation (see
+   * `splitDreamerHoldout`): whole task groups are carved out of the newest end of
+   * the pool, candidates are generated/selected on the remainder only, and the
+   * winning candidate must additionally beat the baseline on the held-out trees
+   * before `validatedOnHoldout` can become true.
+   *
+   * The value is a FLOOR, never a hint. A pool that cannot supply this many
+   * holdout trees (the runtime pool can be smaller than `maxTreePoolSize`, so the
+   * config-level `holdoutTreeCount < maxTreePoolSize` rule cannot see it) fails
+   * closed with `insufficient-holdout-trees`, `hasSufficientEvidence: false`,
+   * no `holdoutTrees`, and therefore no `validatedOnHoldout` and no publication.
+   * It is never silently reduced to whatever the pool could offer.
    */
   readonly holdoutTreeCount?: number;
   /**
@@ -1594,13 +2007,32 @@ export interface DreamShadowRecord {
   readonly comparisons: readonly CandidateComparison[];
   /** Trees used to generate/select candidates. */
   readonly selectionTreeIds: readonly string[];
-  /** Trees kept aside for validation; empty when no holdout was configured. */
+  /**
+   * Trees kept aside for validation; empty when no holdout was configured AND on
+   * every fail-closed split (the `split` block below says which, and
+   * `split.diagnostics.holdoutCount` reports the supply an undersized holdout was
+   * refused for).
+   */
   readonly holdoutTreeIds: readonly string[];
   /** Winner's hypervolume on the holdout, when a holdout was configured. */
   readonly holdoutHypervolume?: number;
   readonly baselineHypervolume?: number;
+  /**
+   * PR-4B (ADR 0004 §4.4): the pre-generation split verdict and its counts.
+   * Present on every report so "no holdout configured" is distinguishable from
+   * "the holdout was too small" (insufficient-evidence) and from an actual
+   * validated win.
+   */
+  readonly split: DreamerHoldoutSplitReport;
   /** Bound declaration: the gate only holds on this fixed historical replay. */
   readonly boundary: string;
+}
+
+/** The serializable subset of the split that travels on the shadow record. */
+export interface DreamerHoldoutSplitReport {
+  readonly status: DreamerSplitStatus;
+  readonly hasSufficientEvidence: boolean;
+  readonly diagnostics: DreamerHoldoutSplit['diagnostics'];
 }
 
 function isBetterEvaluation(
@@ -1712,6 +2144,9 @@ class OfflineDreamerImpl implements IOfflineDreamer {
     };
 
     if (trees.length < minTrees) {
+      // PR-4B: even the early exit reports the split verdict, computed from the
+      // (too small) pool, so the caller can see WHY there was nothing to dream.
+      const emptySplit = splitDreamerHoldout(trees, this.holdoutTreeCount);
       return {
         ranAt,
         baseline: emptyBaseline,
@@ -1729,11 +2164,36 @@ class OfflineDreamerImpl implements IOfflineDreamer {
           comparisons: [],
           selectionTreeIds: [],
           holdoutTreeIds: [],
+          split: {
+            status: emptySplit.status,
+            hasSufficientEvidence: emptySplit.hasSufficientEvidence,
+            diagnostics: emptySplit.diagnostics
+          },
           boundary: REPLAY_GATE_BOUNDARY
         },
         ignoredDimensions: JIT_IGNORED_DIMENSIONS
       };
     }
+
+    // PR-4B (ADR 0004 §4.1): the split happens BEFORE anything else looks at the
+    // pool - before the tree pool is fed, before the generator runs, before any
+    // hypervolume is computed. That ordering is the whole guarantee: a candidate
+    // that has already seen the holdout's statistics cannot be validated on it.
+    const split = splitDreamerHoldout(trees, this.holdoutTreeCount);
+    const selectionTrees = split.selectionTrees;
+    const holdoutTrees = split.holdoutTrees;
+    // `split.ok === false` is a fail-closed verdict: validation is impossible, so
+    // `validatedOnHoldout` stays undefined and G3 keeps refusing publication with
+    // holdout-missing unless the G2-style authorization also holds. The status
+    // travels on the shadow record and in the diagnostic line below.
+    //
+    // Both fields are consulted, not just the status: `ok` is the only shelf that
+    // permits validation, and `hasSufficientEvidence` is the same statement in
+    // boolean form. Reading both means a future status shelf that forgets to flip
+    // the boolean still cannot validate, and - specifically for the PR-4B repair -
+    // a request the pool cannot satisfy (`insufficient-holdout-trees`, e.g. 5
+    // requested from a pool that can only offer 3) never sets validatedOnHoldout.
+    const holdoutUsable = split.status === 'ok' && split.hasSufficientEvidence;
 
     const replayOptions: ReplayTreeOptions = {
       ...(this.experiences === undefined ? {} : { experiences: this.experiences }),
@@ -1750,7 +2210,23 @@ class OfflineDreamerImpl implements IOfflineDreamer {
     const requested =
       request.candidatePolicies.length > 0
         ? request.candidatePolicies
-        : await this.generator(baseline, this.policyCount, request);
+        : // The generator is handed a REQUEST WHOSE POOL IS THE SELECTION SET
+          // (ADR 0004 §4.1-2: "generatePolicies may only receive the selection
+          // trees; the holdout must not be passed, nor any summary statistic of
+          // it"). A generator that ignores its argument gains nothing, but one
+          // that reads `request.trees` now structurally cannot see the holdout.
+          //
+          // The condition is "was a holdout requested", not "did the split reserve
+          // one". On a fail-closed split `holdoutTrees` is empty, but the trees the
+          // cut set aside were still withheld for validation; handing them to the
+          // generator would let an undersized/failed split feed the newest trees
+          // into generation. When nothing was requested the original request object
+          // is passed through unchanged, keeping the pre-PR-4B path identical.
+          await this.generator(
+            baseline,
+            this.policyCount,
+            this.holdoutTreeCount > 0 ? { ...request, trees: selectionTrees } : request
+          );
 
     const candidates: MetaSearchPolicy[] = [];
     const seenIds = new Set<string>([baseline.id]);
@@ -1766,13 +2242,9 @@ class OfflineDreamerImpl implements IOfflineDreamer {
       candidates.push(candidate);
     }
 
-    // Plan section 7.4: candidate generation/selection and the final validation
-    // must not reuse the same trees. The holdout is the tail of the caller's
-    // order, so the split is deterministic and auditable rather than random.
-    const holdoutCount = Math.min(this.holdoutTreeCount, Math.max(0, trees.length - 1));
-    const selectionTrees =
-      holdoutCount > 0 ? trees.slice(0, trees.length - holdoutCount) : trees;
-    const holdoutTrees = holdoutCount > 0 ? trees.slice(trees.length - holdoutCount) : [];
+    // PR-4B (ADR 0004 §4.3): the split was already computed above, before
+    // generation. `split.ok` is the ONLY status that allows a holdout validation;
+    // every other status is a fail-closed insufficient-evidence verdict.
 
     const baselineRun = replayPolicy(selectionTrees, baseline, rhos, replayOptions);
     const candidateRuns = candidates.map((candidate) =>
@@ -1780,21 +2252,23 @@ class OfflineDreamerImpl implements IOfflineDreamer {
     );
     // A shared cost ceiling keeps the policies comparable: a candidate must not
     // look better only because it was scored against a different probe budget.
-    let ceiling = baselineRun.maxProbes;
+    //
+    // PR-4B INFORMATION-VISIBILITY FIX (ADR 0004 §4.1-2/§4.2): this ceiling is
+    // built ONLY from the selection runs. Before PR-4B the holdout baseline run
+    // was folded into the same ceiling, which leaked a statistic derived from the
+    // held-out trees into the numbers candidates were ranked on - precisely the
+    // "no summary statistic of the holdout may reach generation/selection" rule.
+    // The holdout pass now gets its own ceiling, computed from the runs it
+    // actually compares (baseline vs. winner on the SAME held-out trees).
+    let selectionCeiling = baselineRun.maxProbes;
     for (const run of candidateRuns) {
-      if (run.maxProbes > ceiling) {
-        ceiling = run.maxProbes;
+      if (run.maxProbes > selectionCeiling) {
+        selectionCeiling = run.maxProbes;
       }
     }
-    if (holdoutTrees.length > 0) {
-      const holdoutBaselineRun = replayPolicy(holdoutTrees, baseline, rhos, replayOptions);
-      if (holdoutBaselineRun.maxProbes > ceiling) {
-        ceiling = holdoutBaselineRun.maxProbes;
-      }
-    }
-    const baselineEvaluation = toPolicyEvaluation(baselineRun, ceiling);
+    const baselineEvaluation = toPolicyEvaluation(baselineRun, selectionCeiling);
     const candidateEvaluations = candidateRuns.map((run) =>
-      toPolicyEvaluation(run, ceiling)
+      toPolicyEvaluation(run, selectionCeiling)
     );
 
     let bestCandidate: { policy: MetaSearchPolicy; evaluation: PolicyEvaluation } | undefined;
@@ -1819,10 +2293,23 @@ class OfflineDreamerImpl implements IOfflineDreamer {
     // Plan section 7.4: a winner must also hold up on trees it was not selected
     // on. Without that, picking the best of several candidates on one batch and
     // calling it generalisation is exactly the defect this gate removes.
+    //
+    // PR-4B (ADR 0004 §4.2-2): only the WINNER is replayed on the holdout, never
+    // every candidate. Replaying all of them and taking the best would turn the
+    // holdout into a second selection set (multiple-comparison overfitting).
     let validatedOnHoldout: boolean | undefined;
     let holdoutHypervolume: number | undefined;
     let holdoutBaselineHypervolume: number | undefined;
-    if (improvedOnSelection && holdoutTrees.length > 0 && bestCandidate !== undefined) {
+    if (
+      holdoutUsable &&
+      improvedOnSelection &&
+      holdoutTrees.length > 0 &&
+      bestCandidate !== undefined
+    ) {
+      // PR-4B (ADR 0004 §4.2): the holdout pass is self-contained. Its cost
+      // ceiling is computed from the two runs it compares, so no selection-derived
+      // budget enters the validation numbers and no holdout-derived budget enters
+      // the selection numbers.
       const holdoutBaselineRun = replayPolicy(holdoutTrees, baseline, rhos, replayOptions);
       const holdoutWinnerRun = replayPolicy(
         holdoutTrees,
@@ -1830,11 +2317,15 @@ class OfflineDreamerImpl implements IOfflineDreamer {
         rhos,
         replayOptions
       );
+      const holdoutCeiling = Math.max(
+        holdoutBaselineRun.maxProbes,
+        holdoutWinnerRun.maxProbes
+      );
       holdoutBaselineHypervolume = toPolicyEvaluation(
         holdoutBaselineRun,
-        ceiling
+        holdoutCeiling
       ).hypervolume;
-      holdoutHypervolume = toPolicyEvaluation(holdoutWinnerRun, ceiling).hypervolume;
+      holdoutHypervolume = toPolicyEvaluation(holdoutWinnerRun, holdoutCeiling).hypervolume;
       validatedOnHoldout = holdoutHypervolume > holdoutBaselineHypervolume + this.epsilon;
     }
 
@@ -1912,6 +2403,14 @@ class OfflineDreamerImpl implements IOfflineDreamer {
       ...(holdoutBaselineHypervolume === undefined
         ? {}
         : { baselineHypervolume: holdoutBaselineHypervolume }),
+      // PR-4B (ADR 0004 §4.4): the split verdict and its counts travel with the
+      // record, so an auditor can tell "no holdout configured" from "the holdout
+      // was too small" from "the winner actually won there" without re-running.
+      split: {
+        status: split.status,
+        hasSufficientEvidence: split.hasSufficientEvidence,
+        diagnostics: split.diagnostics
+      },
       boundary: REPLAY_GATE_BOUNDARY
     };
 

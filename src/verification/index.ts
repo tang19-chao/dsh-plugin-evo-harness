@@ -51,3 +51,18 @@ export {
   type VerifyAndAttachInput,
   type VerifyAndAttachResult
 } from './attach';
+export {
+  ARTIFACT_DIGEST_SHAPE,
+  unregisterAuthenticatedQualityRecord,
+  isCompleteQualityBinding,
+  missingQualityBindingFields,
+  QUALITY_BINDING_FIELDS,
+  QUALITY_RECORD_DIGEST_VERSION,
+  clearQualityRecordRegistry,
+  computeQualityRecordDigest,
+  isAuthenticatedQualityRecord,
+  qualityProvenanceRegistry,
+  registerAuthenticatedQualityRecord,
+  type AuthenticatedQualityEntry,
+  type QualityProvenanceContext
+} from './quality-provenance';

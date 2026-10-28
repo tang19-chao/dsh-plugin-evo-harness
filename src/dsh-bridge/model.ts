@@ -48,6 +48,37 @@ import type {
   ModelResponse,
   TokenUsage
 } from '../types/contracts';
+import type { CountingSemantics } from '../ledger/types.js';
+
+/**
+ * Standard counting semantics for DSH / DeepSeek models (ADR-0004 §3.3).
+ */
+export const DEFAULT_DSH_COUNTING_SEMANTICS: CountingSemantics = Object.freeze({
+  inputIncludesCacheRead: true,
+  outputIncludesReasoning: true,
+  semanticTag: 'dsh-deepseek-v1'
+});
+
+/**
+ * Host model metadata and lossless raw usage bypass carrier (ADR-0004 §3.2).
+ * Delivered to Ledger bypass listener without altering frozen TokenUsage shape.
+ */
+export interface RawUsageCarrier {
+  /** Complete un-truncated DSH native telemetry */
+  readonly rawUsage?: DshUsage;
+
+  /** Explicit counting semantics */
+  readonly countingSemantics: CountingSemantics;
+
+  /** Terminal finish reason from model engine */
+  readonly finishReason?: DshFinishReason;
+
+  /** Exact wall-clock timestamp when terminal chunk arrived */
+  readonly completedAtMs: number;
+}
+
+/** Receiver for raw usage bypass before TokenUsage truncates (ADR-0004 §3.2) */
+export type RawUsageBypassListener = (carrier: RawUsageCarrier, callId: string) => void;
 
 // ---------------------------------------------------------------------------
 // Guarded host reads (a live Cordis proxy throws for undeclared services)
@@ -292,6 +323,10 @@ export interface DshModelAdapterOptions {
   readonly maxTemperature?: number;
   /** Receiver for non-fatal observations (a failed turn, an unreadable chunk). */
   readonly onDiagnostic?: (message: string) => void;
+  /** Optional lossless raw usage bypass listener (ADR-0004 §3.2) */
+  readonly onRawUsage?: RawUsageBypassListener;
+  /** Optional abort signal for cooperative cancellation */
+  readonly signal?: AbortSignal;
 }
 
 /** Result of one completed stream, before it is shaped into ModelResponse. */
@@ -300,6 +335,8 @@ export interface DshStreamOutcome {
   readonly reasoningText: string;
   readonly activeToolCallNames: readonly string[];
   readonly usage?: TokenUsage;
+  readonly rawUsage?: DshUsage;
+  readonly rawFinishReason?: DshFinishReason;
   readonly finishReason?: ModelResponse['finishReason'];
   readonly failureMessage?: string;
   /** Vendor/provider-neutral failure code from the terminal finish, when exposed. */
@@ -373,6 +410,8 @@ export async function drainDshStream(
   let failureCode: string | undefined = undefined;
   let failureKind: 'error' | 'aborted' | undefined = undefined;
   let sawFinish = false;
+  let lastRawUsage: DshUsage | undefined = undefined;
+  let lastRawReason: DshFinishReason | undefined = undefined;
 
   for await (const chunk of stream) {
     const type = chunkTypeOf(chunk);
@@ -402,15 +441,20 @@ export async function drainDshStream(
         break;
       }
       case 'usage': {
-        const mapped = usageToTokens(chunkUsage(chunk));
-        if (mapped !== undefined) {
-          usage = mapped;
+        const raw = chunkUsage(chunk);
+        if (raw !== undefined) {
+          lastRawUsage = raw;
+          const mapped = usageToTokens(raw);
+          if (mapped !== undefined) {
+            usage = mapped;
+          }
         }
         break;
       }
       case 'finish': {
         sawFinish = true;
         const reason = chunkReason(chunk);
+        lastRawReason = reason;
         finishReason = finishReasonOf(reason);
         if (reason !== undefined && (reason.kind === 'error' || reason.kind === 'aborted')) {
           failureMessage = describeDshFailure(reason);
@@ -443,6 +487,8 @@ export async function drainDshStream(
     reasoningText: reasoningParts.join(''),
     activeToolCallNames: toolNames,
     ...(usage === undefined ? {} : { usage }),
+    ...(lastRawUsage === undefined ? {} : { rawUsage: lastRawUsage }),
+    ...(lastRawReason === undefined ? {} : { rawFinishReason: lastRawReason }),
     ...(finishReason === undefined ? {} : { finishReason }),
     ...(failureMessage === undefined ? {} : { failureMessage }),
     ...(failureCode === undefined ? {} : { failureCode }),
@@ -499,15 +545,57 @@ export function createLlmModelAdapter(
           : options.maxTokens === undefined
             ? request.maxTokens
             : Math.min(request.maxTokens, options.maxTokens);
+      const callId =
+        (typeof request.metadata?.callId === 'string' && request.metadata.callId.length > 0
+          ? request.metadata.callId
+          : undefined) ?? ('call_' + Math.random().toString(36).slice(2) + '_' + Date.now());
+      const signal =
+        (request.metadata?.signal instanceof AbortSignal ? request.metadata.signal : undefined) ?? options.signal;
+
       const requestOptions: DshGenerateOptions = {
         provider: route.provider,
         model: route.model,
         messages,
         ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
         ...(temperature === undefined ? {} : { temperature }),
-        ...(maxTokens === undefined ? {} : { maxTokens })
+        ...(maxTokens === undefined ? {} : { maxTokens }),
+        ...(signal === undefined ? {} : { signal })
       };
-      const outcome = await drainDshStream(llm.stream(requestOptions), options);
+
+      let outcome: DshStreamOutcome;
+      try {
+        outcome = await drainDshStream(llm.stream(requestOptions), options);
+      } catch (err) {
+        if (options.onRawUsage) {
+          try {
+            options.onRawUsage(
+              {
+                rawUsage: undefined,
+                countingSemantics: DEFAULT_DSH_COUNTING_SEMANTICS,
+                finishReason: { kind: 'error', failure: err },
+                completedAtMs: Date.now()
+              },
+              callId
+            );
+          } catch {}
+        }
+        throw err;
+      }
+
+      if (options.onRawUsage) {
+        try {
+          options.onRawUsage(
+            {
+              rawUsage: outcome.rawUsage,
+              countingSemantics: DEFAULT_DSH_COUNTING_SEMANTICS,
+              finishReason: outcome.rawFinishReason,
+              completedAtMs: Date.now()
+            },
+            callId
+          );
+        } catch {}
+      }
+
       // A terminal error/aborted finish carries no usable deliverable, so it is
       // surfaced as a thrown error rather than an empty text response that the
       // failure taxonomy would have to classify as "no deliverable".
@@ -520,11 +608,14 @@ export function createLlmModelAdapter(
         ...(outcome.usage === undefined ? {} : { usage: outcome.usage }),
         model: route.model,
         metadata: {
+          callId,
           purpose: request.purpose,
           provider: route.provider,
           ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
           ...(outcome.reasoningText.length === 0 ? {} : { reasoningChars: outcome.reasoningText.length }),
-          ...(outcome.activeToolCallNames.length === 0 ? {} : { toolCallNames: outcome.activeToolCallNames })
+          ...(outcome.activeToolCallNames.length === 0 ? {} : { toolCallNames: outcome.activeToolCallNames }),
+          ...(outcome.rawUsage === undefined ? {} : { rawUsage: outcome.rawUsage }),
+          countingSemantics: DEFAULT_DSH_COUNTING_SEMANTICS
         }
       };
     }

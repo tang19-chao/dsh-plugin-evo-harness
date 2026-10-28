@@ -16,26 +16,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Main gate: typecheck, the documented CLIs, every suite, documentation counts.
+  # ---------------------------------------------------------------------------
   verify:
     name: Typecheck and test
     runs-on: ubuntu-latest
+    # A hung install/test must fail the gate instead of occupying a runner for
+    # GitHub's 6-hour default.
+    timeout-minutes: 30
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        # Pinned to the v4.4.0 commit: a moved tag must not silently change what
+        # code runs with a read token. (Same pinning policy for every action.)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Full history: `attest:verify` re-resolves the RECORDED commit (which
+          # may be older than the checked-out tip) and the recorded base, and a
+          # shallow clone would make a legitimate record unverifiable.
+          fetch-depth: 0
+          # CI only reads; never leave the token in .git/config where a later
+          # step (or a compromised dependency script) could push with it.
+          persist-credentials: false
 
       - name: Install pnpm 11.7.0
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
           version: '11.7.0'
 
       - name: Set up Node.js 22 with pnpm cache
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # PR-1: the content policy is read from the ATTESTED COMMIT
+      # (`git check-attr --source`), never from the worktree. A blob that is not
+      # plain LF text must be a declared `-text` exception in the committed
+      # .gitattributes, otherwise its checkout bytes - and any digest over them -
+      # are machine-dependent. This is the gate that would have caught ADR 0003's
+      # CRLF appendix before it was published.
+      - name: Check encoding and line-ending policy
+        run: node scripts/eval/check-encoding-policy.mjs
 
       - name: Typecheck
         run: pnpm exec tsc --noEmit
@@ -48,8 +73,171 @@ jobs:
       - name: Run default eval CLI
         run: node scripts/eval-jitrl.mjs --json
 
+      # PR-1: the historical negative result is ASSERTED, not merely printed.
+      # Before this, a drift away from the recorded -0.250 still exited 0.
+      - name: Assert the historical negative result
+        run: node scripts/eval/negative-result-diag.mjs --assert
+
+      # PR-1: re-derive the COMMITTED attestation artifact from the object
+      # database on this one runner. This answers "does the recorded evidence
+      # still describe its commit?" (content authority, recorded base ancestry,
+      # digest recipe, per-file blob/mode/bytes/encoding) and deliberately does
+      # NOT claim cross-OS equality: that is measured by the separate
+      # `fingerprint` / `fingerprint-parity` jobs, which recompute a FRESH
+      # manifest on ubuntu, macos and windows and compare the three. The two
+      # checks are complementary, not redundant: verify would still pass if the
+      # digest were wrong on every platform in the same way, and parity would
+      # still pass if the committed JSON were stale.
+      - name: Verify the recorded commit attestation
+        run: pnpm run attest:verify
+
       - name: Run tests
         run: pnpm exec vitest run --reporter=default --reporter=json --outputFile=test-results.json
 
       - name: Verify README test counts and docs hygiene
         run: pnpm run check:docs
+
+      # PR-1: `build` exiting 0 does not prove the bundle is importable. This
+      # builds AND imports lib/index.js, then asserts the public surface.
+      - name: Build and ESM-import smoke test
+        run: node scripts/eval/smoke-build.mjs
+
+  # ---------------------------------------------------------------------------
+  # PR-1 cross-OS fingerprint job.
+  #
+  # The entire point of hashing the OBJECT DATABASE instead of the worktree is
+  # that the digest is identical on every platform. That claim is worthless
+  # unless it is measured on every supported platform, so this job recomputes
+  # the same commit's attestation on Linux, macOS and Windows; the comparison
+  # job fails if the three records differ (see `compare-platform-digests.mjs`).
+  #
+  # The comparison is published as a job summary so a reviewer reading the PR
+  # sees the three digests side by side.
+  # ---------------------------------------------------------------------------
+  fingerprint:
+    name: Cross-OS fingerprint (${{ matrix.os }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The Windows leg also runs the PR-1 evidence tests, which check
+          # `--base HEAD~1`; a depth-1 checkout would make that legitimately fail
+          # through no fault of the code.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pnpm 11.7.0
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: '11.7.0'
+
+      - name: Set up Node.js 22 with pnpm cache
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Hash the COMMIT, never the checkout. The same commit id must produce the
+      # same composite/binding digest on all three operating systems; if it does
+      # not, the evidence is platform-dependent and cannot be published.
+      # No shell redirection of --json: it is already printed to the job log, and
+      # avoiding `>` sidesteps PowerShell's misleading default encodings on the
+      # Windows runner. The artifact is the file the script writes with --out.
+      - name: Compute commit attestation (raw blob bytes)
+        run: node scripts/eval/final-attestation.mjs --ref "${{ github.sha }}" --out attestation.json --json
+
+      - name: Publish this platform's digests
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const record = JSON.parse(fs.readFileSync(path.resolve("attestation.json"), "utf8"));
+            console.log([
+              "os=" + process.platform,
+              "arch=" + process.arch,
+              "commit=" + record.commit.commitId,
+              "tree=" + record.commit.treeId,
+              "files=" + record.fileCount,
+              "composite=" + record.compositeSha256,
+              "binding=" + record.bindingSha256
+            ].join(" "));
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+              "- `" + process.platform + "-" + process.arch + "`: composite `" + record.compositeSha256 +
+              "`, binding `" + record.bindingSha256 + "`, " + record.fileCount + " files\n");
+          '
+
+      # PR-1 previously exercised the attestation on Windows but left the Windows
+      # BUILD/IMPORT and evidence-test paths unmeasured, even though Windows was
+      # where `smoke-build` once produced a false failure. Cover them here so the
+      # matrix measures the claim instead of one happy path per OS.
+      - name: Windows - build and ESM-import smoke test
+        if: runner.os == 'Windows'
+        run: node scripts/eval/smoke-build.mjs
+
+      - name: Windows - PR-1 evidence gates and attestation tests
+        if: runner.os == 'Windows'
+        run: pnpm exec vitest run tests/unit/p62/commit-attestation.test.ts tests/unit/p62/evidence-gates.test.ts
+
+      - name: Record digest for the comparison job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: attestation-${{ matrix.os }}
+          path: attestation.json
+          retention-days: 7
+          # A missing record must fail here, not as a confusing "fewer than 3
+          # platforms" message in the comparison job.
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The claim "the digest is identical on Windows, Linux and macOS" is only
+  # evidence if something CHECKS it. This job downloads every platform's record
+  # and runs the shipped comparison rule (`scripts/eval/compare-platform-digests.mjs`),
+  # so the rule is the same code the unit suite tests - not an inline shell
+  # snippet that no test can reach.
+  # ---------------------------------------------------------------------------
+  fingerprint-parity:
+    name: Cross-OS fingerprint parity
+    needs: fingerprint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
+      - name: Download every platform's attestation
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: attestation-*
+          merge-multiple: false
+          # A dedicated directory keeps the comparison input to exactly the three
+          # records (the script scans subdirectories of its argument).
+          path: artifacts
+
+      - name: Compare digests across operating systems
+        run: |
+          node scripts/eval/compare-platform-digests.mjs artifacts --json \
+            | tee parity.json
+          {
+            echo "## Cross-OS fingerprint parity"
+            echo '```json'
+            cat parity.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

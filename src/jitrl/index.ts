@@ -65,9 +65,12 @@ import {
   learningFacingFilterOptions,
   projectNeighborsBySlotKind,
   runDecisionKernel,
+  selectTrackAtomically,
   type EffectivePolicyConfig,
-  type EffectivePolicyConfigProvider
+  type EffectivePolicyConfigProvider,
+  type DualTrackConsumptionOptions
 } from './decision-kernel';
+import { isAuthenticatedQualityRecord } from '../verification';
 import { policyPriorLogit } from './logit-sources';
 import { abstractMetaState } from './state-abstraction';
 import {
@@ -128,6 +131,8 @@ export interface JitRlFactoryOptions {
   ) => number | undefined;
   /** Diagnostic sink; every notice is also kept in diagnostics(). */
   readonly onDiagnostic?: (diagnostic: JitRlDiagnostic) => void;
+  /** C2b (ADR 0004 §8): Dual-track consumption options */
+  readonly dualTrack?: DualTrackConsumptionOptions;
 }
 
 /** Extra storage wired in after construction (persistence is resolved async). */
@@ -301,7 +306,14 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
     }
   };
 
-  const optimizer = createStoreOptimizer({ store, config: jitrl, halfLifeMs, now, rng });
+  const optimizer = createStoreOptimizer({
+    store,
+    config: jitrl,
+    halfLifeMs,
+    now,
+    rng,
+    ...(options.dualTrack === undefined ? {} : { dualTrack: options.dualTrack })
+  });
 
   let logitSource: Promise<AutoLogitSource> | undefined;
   const getLogitSource = (): Promise<AutoLogitSource> => {
@@ -457,6 +469,7 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
         readonly decisionMode?: DecisionMode;
         readonly actionKeyVocabulary?: ActionKeyVocabulary;
       };
+      readonly dualTrack?: DualTrackConsumptionOptions;
     } = {}): JitReplayHook {
       // t12/R3b2 (t11 high finding): the defaults are resolved ONCE, in front of
       // the caller's value - `caller ?? default`, field by field. The t10
@@ -482,10 +495,24 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
       return createJitReplayHook({
         config: jitrl,
         ...(replayOptions.driftRho === undefined ? {} : { driftRho: replayOptions.driftRho }),
+        ...(replayOptions.dualTrack === undefined ? (options.dualTrack === undefined ? {} : { dualTrack: options.dualTrack }) : { dualTrack: replayOptions.dualTrack }),
         replayDeclarations
       });
     },
     createHostAdvisor(advisorOptions = {}): HostAdvisor {
+      // C2b F1 (ADR 0004 §2.4): the L3 advisor keeps PROCESS-track consumption in
+      // this increment (quality advice fusion is a later, separately gated step),
+      // but the track selection is EXPLICIT and diagnosed - never a silent
+      // hardcoded filter. A host that enables quality consumption sees exactly
+      // what L3 consumed.
+      if (options.dualTrack?.enableQualityTrackConsumption === true) {
+        emit({
+          level: 'info',
+          code: 'jitrl_l3_track',
+          message:
+            'L3 advisor consumes learningTrack=process only (quality consumption for L3 is not enabled; dualTrack governs L1/L2/replay)'
+        });
+      }
       return createHostAdvisor({
         config: jitrl,
         // P6.2 PR-A / F1: the L3 advisor is a learning consumer - its advice
@@ -502,8 +529,11 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
             store.query({
               ...query,
               ...learningFacingFilterOptions(),
-              // P6.2 t7/V3: the L3 advisor estimates the production (process)
-              // track; a task-quality record must never shape its advice.
+              // P6.2 t7/V3 + C2b F1: the L3 advisor estimates the production
+              // (process) track in this increment - an ATOMIC track choice at the
+              // query level: process only, diagnosed above. A task-quality record
+              // must never shape its advice until the L3 fusion step is
+              // specifically enabled and reviewed.
               learningTrack: PRODUCTION_LEARNING_TRACK
             })
         },
@@ -586,6 +616,7 @@ export function createStoreOptimizer(options: {
   readonly halfLifeMs: number;
   readonly now: () => number;
   readonly rng: () => number;
+  readonly dualTrack?: DualTrackConsumptionOptions;
 }): JitRl['optimizer'] {
   return {
     async decide<T>(
@@ -594,6 +625,105 @@ export function createStoreOptimizer(options: {
       candidates: readonly JitCandidate<T>[],
       decideOptions: { readonly guidanceFilter?: GuidanceMode; readonly rng?: () => number } = {}
     ): Promise<JitDecision<T>> {
+      if (options.dualTrack?.enableQualityTrackConsumption === true) {
+        const processK = options.dualTrack.processK ?? options.config.k;
+        const qualityK = options.dualTrack.qualityK ?? Math.min(8, options.config.k);
+
+        const processNeighbors = await options.store.query({
+          level,
+          state,
+          k: processK,
+          similarityThreshold: options.config.similarityThreshold,
+          ...(decideOptions.guidanceFilter === undefined
+            ? {}
+            : { guidanceFilter: decideOptions.guidanceFilter }),
+          ...learningFacingFilterOptions(),
+          learningTrack: 'process'
+        });
+
+        const rawQualityNeighbors = await options.store.query({
+          level,
+          state,
+          k: qualityK,
+          similarityThreshold: options.config.similarityThreshold,
+          ...(decideOptions.guidanceFilter === undefined
+            ? {}
+            : { guidanceFilter: decideOptions.guidanceFilter }),
+          ...learningFacingFilterOptions(),
+          learningTrack: 'task-quality'
+        });
+        // Only host-authenticated quality records enter the quality
+        // neighbourhood. A stale/foreign quality-labelled record must not poison
+        // an otherwise valid quality set; if NOTHING survives authentication and
+        // quality-labelled records existed, fail closed to the process track.
+        const qualityNeighbors = rawQualityNeighbors.filter(
+          (neighbor) =>
+            isAuthenticatedQualityRecord(neighbor.record) && neighbor.record.learningEligible !== false
+        );
+        // F2 (C2b review): P0 fires only when quality-labelled records are VISIBLE
+        // to this decision's query and NONE of them authenticates. One stale or
+        // foreign record beside valid ones must not close the track; it is simply
+        // excluded from the neighbourhood above.
+        const hasUntrustedQuality =
+          rawQualityNeighbors.length > 0 && qualityNeighbors.length === 0;
+
+        const processDecision = decide(level, state, candidates, {
+          neighbors: processNeighbors,
+          k: processK,
+          similarityThreshold: options.config.similarityThreshold,
+          beta: options.config.beta,
+          selection: options.config.selection,
+          lambda: options.config.exploration.lambda,
+          alpha: options.config.exploration.alpha,
+          unseenFallback: options.config.unseenFallback,
+          now: options.now(),
+          halfLifeMs: options.halfLifeMs,
+          rng: decideOptions.rng ?? options.rng
+        });
+
+        const qualityDecision =
+          qualityNeighbors.length > 0
+            ? decide(level, state, candidates, {
+                neighbors: qualityNeighbors,
+                k: qualityK,
+                similarityThreshold: options.config.similarityThreshold,
+                beta: options.config.beta,
+                selection: options.config.selection,
+                lambda: options.config.exploration.lambda,
+                alpha: options.config.exploration.alpha,
+                unseenFallback: options.config.unseenFallback,
+                now: options.now(),
+                halfLifeMs: options.halfLifeMs,
+                rng: decideOptions.rng ?? options.rng
+              })
+            : undefined;
+
+        const selectionResult = selectTrackAtomically(candidates, processDecision, qualityDecision, {
+          minQualityEffectiveSamples: options.dualTrack.minQualityEffectiveSamples,
+          qualityUntrusted: hasUntrustedQuality
+        });
+
+        const chosenDecision = selectionResult.winningDecision;
+        return {
+          ...chosenDecision,
+          rationale:
+            chosenDecision.rationale +
+            '; track=' +
+            selectionResult.winningTrack +
+            ' (' +
+            selectionResult.verdict.selectionReason +
+            ')' +
+            // C2b review F2: keep the arbitration audit trail in the rationale so
+            // a kept prior / process fallback is distinguishable from a silent
+            // process-only path.
+            (hasUntrustedQuality ? '; qualityUntrusted=true' : ''),
+          // C2b F1/F5: the atomic track verdict rides the decision (narrow
+          // structural extension of JitDecision; consumers that never read it
+          // keep the baseline shape).
+          trackSelection: selectionResult.verdict
+        } as JitDecision<T> & { readonly trackSelection?: typeof selectionResult.verdict };
+      }
+
       const neighbors = await options.store.query({
         level,
         state,
@@ -603,9 +733,6 @@ export function createStoreOptimizer(options: {
           ? {}
           : { guidanceFilter: decideOptions.guidanceFilter }),
         ...learningFacingFilterOptions(),
-        // P6.2 t7/V3 (ADR 0002 5.2a-4): the L2 neighbourhood is a PROCESS
-        // estimate - it keeps undeclared records (the pre-existing eligibility
-        // path) but never a task-quality record.
         learningTrack: PRODUCTION_LEARNING_TRACK
       });
       return decide(level, state, candidates, {
@@ -782,6 +909,7 @@ export interface JitReplayHookFactoryOptions {
     readonly decisionMode?: DecisionMode;
     readonly actionKeyVocabulary?: ActionKeyVocabulary;
   };
+  readonly dualTrack?: DualTrackConsumptionOptions;
 }
 
 /**
@@ -877,22 +1005,20 @@ export function createJitReplayHook(options: JitReplayHookFactoryOptions): JitRe
         (declaredMode === undefined || entry.decisionMode === declaredMode) &&
         (declaredVocabulary === undefined ||
           entry.actionKeyVocabulary === declaredVocabulary);
+      const enableDualTrack = options.dualTrack?.enableQualityTrackConsumption === true;
       const replaySnapshot = (
         Array.isArray(input.experiences) ? input.experiences : []
       ).filter(
         (entry) =>
-          isOnLearningTrack(entry, PRODUCTION_LEARNING_TRACK) &&
+          (enableDualTrack || isOnLearningTrack(entry, PRODUCTION_LEARNING_TRACK)) &&
           declaredFilter(entry)
       );
       const kernel = runDecisionKernel({
         level: 'meta',
         state,
         candidates,
-        // P6.2 t7/V3 (ADR 0002 5.2a-4): replay is a PROCESS-track consumer -
-        // the snapshot is pre-filtered here (the kernel's own filter stays
-        // untouched, R6) so a task-quality record never enters the replayed
-        // neighbourhood, exactly like the online L1/L2/L3 filters.
         records: replaySnapshot,
+        dualTrack: options.dualTrack,
         config: {
           beta: finiteNumber(jit.beta) && jit.beta >= 0 ? jit.beta : 0,
           k: Math.max(1, Math.trunc(finiteNumber(jit.k) ? jit.k : config.k)),
@@ -968,12 +1094,19 @@ export function createJitReplayHook(options: JitReplayHookFactoryOptions): JitRe
           );
         }
       }
+      // C2b F7 (ADR 0004 §2.4): the M3 fresh count is a PROCESS-track count.
+      // Dual-track widens the REPLAY neighbourhood, never the freshness
+      // denominator: a task-quality record in the snapshot is excluded here so
+      // sparse trusted evidence cannot end the drift penalty early.
+      const processOnlySnapshot = enableDualTrack
+        ? replaySnapshot.filter((entry) => entry.learningTrack !== 'task-quality')
+        : replaySnapshot;
       const support = freshPolicySupport(
         // P6.2 t7/V3: the M3 fresh count is a PROCESS-track count (same
         // pre-filter as the replay kernel above; the shared filter helper in
         // decision-kernel stays untouched, R6). t10/R3b: the declared
         // mode/vocabulary partition applies identically.
-        replaySnapshot,
+        processOnlySnapshot,
         {
           level: 'meta',
           bucket: state.bucket,
@@ -1164,6 +1297,7 @@ export * from './logit-adjuster';
 export * from './logit-sources';
 export * from './step-evaluator';
 export * from './backfill';
+export * from './decision-kernel';
 export * from './jit-active-policy';
 export * from './host-advisor';
 export * from './stores/memory.store';

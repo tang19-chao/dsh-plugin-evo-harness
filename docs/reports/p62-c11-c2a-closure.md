@@ -24,15 +24,28 @@
 
 ## 1. 最终绑定指纹与工作树构成
 
-### 1.1 Git 基线与 Diff 指纹
+> **口径废止声明（rev.3 集成轮 t11，2026-10-27）**
+> 本节的三个指纹（`846c85ee…`、`bd6fad15…`、`13c4c3cf…`）全部取自**工作树字节**。
+> 该口径已被 PR-1 废止：本仓 `core.autocrlf=true`（对象库 LF / 检出 CRLF），
+> 工作树摘要因此**依赖检出平台**，在 LF 环境下无法复现——本轮已在 ADR 0003 附录上实测到
+> 14/15 个文件摘要不匹配（见 `work/t1-baseline-audit.md` §5 F-1）。
+>
+> **本节的数字作为该轮的历史证据原样保留，不重算、不覆盖**（重算等于篡改历史）。
+> 需要复现历史时请用**同一口径**（工作树字节）在 `core.autocrlf=true` 的 Windows 检出上进行。
+>
+> **现行口径**为 `git cat-file` 原始 blob 字节 / blob id，产出
+> `{commitId, treeId, compositeSha256, bindingSha256}`，可用 `--verify` 重算；
+> 现行值见 `docs/reports/final-attestation.json` 与 `docs/P62_STATUS.md` §0.1。
+
+### 1.1 Git 基线与 Diff 指纹（历史快照，工作树口径）
 
 | 维度 | 指纹 / 散列值 | 说明 |
 | --- | --- | --- |
-| **基线 HEAD** | `9ea9b7edacb199884df2020df879f4e59ed66d73` | `9ea9b7e feat(p6.2): close C0+C1 release contract and safe defaults` |
-| **代码面 Tracked Diff (SHA-1，排除自指终态文档与收口报告)** | `846c85ee0c06471226cfc0150e7d84e912d9a323` | `git diff -- . ':(exclude)docs/P62_STATUS.md' ':(exclude)docs/reports/**' \| git hash-object --stdin`（口径明确为排除 `docs/P62_STATUS.md` 与 `docs/reports/**` 等自指终态文档的代码/测试/脚本面修改，杜绝自指哈希回填悖论） |
-| **代码面 Tracked Diff SHA-256** | `bd6fad155a6418a38856cfdd5e96c41fce11969f1ea0bc335b0c4699251d34b5` | 排除自指文档后代码面 diff 字节流的标准 SHA-256 |
-| **代码面 Tracked Diff 字节大小** | `96,795 bytes` | 11 个已跟踪修改代码/配置/测试文件（+1660 / -75 lines；二进制流为 96,795 字节；PowerShell 行数组 LF 拼装表现为 94,540 字节，差额 2,255 字节为 Windows 换行符差） |
-| **全仓代码面组合指纹** | `13c4c3cff2c59183dc49416e242a0231bfbda1adb6ff7057a96b5e4b2ee693be` | `src/`+`tests/`+`scripts/` 共 206 个代码文件（可由 `node scripts/eval/final-attestation.mjs` 确定性复算；规则为相对 POSIX 路径无 `./`、单文件 SHA256、行格式 `${path}:${sha256}`、Unicode 代码点排序、LF 连接无尾 LF，产出机器可读清单 `docs/reports/final-attestation.json`） |
+| **基线 HEAD** | `9ea9b7edacb199884df2020df879f4e59ed66d73` | `9ea9b7e feat(p6.2): close C0+C1 release contract and safe defaults`（**历史基线**；rev.3 轮实际基线为 `84a3d82…`） |
+| **代码面 Tracked Diff (SHA-1，排除自指终态文档与收口报告)** — 历史快照 | `846c85ee0c06471226cfc0150e7d84e912d9a323` | `git diff -- . ':(exclude)docs/P62_STATUS.md' ':(exclude)docs/reports/**' \| git hash-object --stdin`（工作树口径，跨平台不可复现） |
+| **代码面 Tracked Diff SHA-256** — 历史快照 | `bd6fad155a6418a38856cfdd5e96c41fce11969f1ea0bc335b0c4699251d34b5` | 同上；「二进制流 96,795 / PowerShell LF 拼装 94,540」的差额正是该口径缺陷的自述 |
+| **代码面 Tracked Diff 字节大小** — 历史快照 | `96,795 bytes` | 11 个已跟踪修改文件（+1660 / -75 lines），**工作树**字节数 |
+| **全仓代码面组合指纹** — 历史快照 | `13c4c3cff2c59183dc49416e242a0231bfbda1adb6ff7057a96b5e4b2ee693be` | 当时 `src/`+`tests/`+`scripts/` 206 个文件，**工作树字节**口径；**请勿用它复算当前代码** |
 
 ### 1.2 工作树核心修改与新增产物明细（代码/测试/脚本面）
 

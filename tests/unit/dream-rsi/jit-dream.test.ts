@@ -116,11 +116,14 @@ interface TreeParts {
 }
 
 /** Discovery tree with a fixed root id ('root') and a deterministic creation time. */
-function createTree(options: { id: string; createdAt: number }): TreeParts {
+function createTree(options: { id: string; createdAt: number; taskId?: string }): TreeParts {
   const tree = createDiscoveryTree({
     id: options.id,
     sessionId: 'session-1',
-    taskId: 'task-1',
+    // PR-4B (ADR 0004 §4.3-1): a holdout tree must belong to its own task; the
+    // split never cuts a task group, so two sibling holdout/selection trees that
+    // shared one task id could not be legally split.
+    taskId: options.taskId ?? 'task-1',
     rootPatchId: 'patch-root',
     createdAt: options.createdAt,
     idFactory: () => 'root',
@@ -159,8 +162,8 @@ function createTree(options: { id: string; createdAt: number }): TreeParts {
  * makes the replayed policy early-stop after one candidate probe instead of
  * crawling down the low-value branch. That is why the true optimum is beta=2.
  */
-function acceptanceTree(id = 'tree-acceptance'): DiscoveryTreeSnapshot {
-  const tree = createTree({ id, createdAt: 900 });
+function acceptanceTree(id = 'tree-acceptance', taskId = 'task-acceptance'): DiscoveryTreeSnapshot {
+  const tree = createTree({ id, createdAt: 900, taskId });
   tree.addNode({
     id: 'X',
     parentId: 'root',
@@ -966,7 +969,12 @@ describe('dual-loop hot-swap', () => {
     });
     const authRoundOne = await authDreamer.replay(
       dreamRequest({
-        trees: [acceptanceTree(), acceptanceTree('tree-acceptance-holdout')],
+        // PR-4B §4.3-1: the holdout tree gets its own task id (and the newest
+        // createdAt) so the split is a legal task-level, temporally ordered cut.
+        trees: [
+          acceptanceTree(),
+          acceptanceTree('tree-acceptance-holdout', 'task-acceptance-holdout')
+        ],
         candidatePolicies: [
           policy({ id: 'pi-0::dream-1', version: 2, jit: { ...ACCEPTANCE_JIT, beta: 0.5, lambda: 0.02 } }),
           policy({ id: 'pi-0::dream-2', version: 2, jit: { ...ACCEPTANCE_JIT, beta: 1, lambda: 0.05 } }),
@@ -989,7 +997,10 @@ describe('dual-loop hot-swap', () => {
     expect(secondBaseline.version).toBe(2);
     const authRoundTwo = await authDreamer.replay(
       dreamRequest({
-        trees: [acceptanceTree(), acceptanceTree('tree-acceptance-holdout-2')],
+        trees: [
+          acceptanceTree(),
+          acceptanceTree('tree-acceptance-holdout-2', 'task-acceptance-holdout-2')
+        ],
         baselinePolicy: secondBaseline,
         candidatePolicies: [
           policy({ id: 'pi-0::dream-4', version: 3, jit: { ...ACCEPTANCE_JIT, beta: 0.5, lambda: 0.02 } }),

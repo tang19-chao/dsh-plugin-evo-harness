@@ -11,16 +11,45 @@
 
 ## 0. 基线与环境
 
+> **口径更新（rev.3 集成轮 t11，2026-10-27）**
+> 本节的 `13c4c3cf…` 与 `846c85ee…` 是 **P6.2 第二轮当时的历史快照**，其**采集口径已被 PR-1 废止**：
+> 那批摘要对**工作树字节**取哈希，而本仓 `core.autocrlf=true`（对象库 LF / 检出 CRLF），
+> 因此同一提交在 Windows 与 Linux 检出上会得到**两个不同摘要**，在 CI 的 LF 环境下**无法复现**
+> （事故记录见 ADR 0003 附录 14/15 个文件摘要与其 §5 F-1 发现）。
+>
+> **现行口径**：正式指纹一律取自 `git cat-file` 的**原始 blob 字节**或 blob id，
+> 由 `scripts/eval/final-attestation.mjs` 产出 `{commitId, treeId, compositeSha256, bindingSha256}`，
+> 可用 `--verify` 重算；现行值见 `docs/reports/final-attestation.json`。
+>
+> **本表下方保留旧值的唯一目的是历史可追溯**。它们**不**被重算覆盖（那会篡改历史证据），
+> 也**不得**作为当前基线引用。
+
 | 项 | 值 |
 | --- | --- |
-| **契约基线 HEAD** | `9ea9b7edacb199884df2020df879f4e59ed66d73`（`9ea9b7e feat(p6.2): close C0+C1 release contract and safe defaults`；本轮全程工作树交付，**未 commit/push**） |
+| **契约基线 HEAD** | `9ea9b7edacb199884df2020df879f4e59ed66d73`（`9ea9b7e feat(p6.2): close C0+C1 release contract and safe defaults`；**历史值**——rev.3 实施轮的实际基线为 `84a3d828ed2a27eef765c8b9c4950da4a9ee7287`，见 §0.1） |
 | **契约文档** | ADR 0002（accepted，C0+C1 冻结）+ ADR 0003（accepted，rev.3 冻结版，sha256 `79ad12fe7ad9…`） |
 | **验证环境** | win32/x64，Node `v22.23.1`，pnpm `11.7.0` |
-| **代码面 diff 指纹 (tracked，排除自指终态文档与收口报告)** | SHA-1 blob: `846c85ee0c06471226cfc0150e7d84e912d9a323`；SHA-256: `bd6fad155a6418a38856cfdd5e96c41fce11969f1ea0bc335b0c4699251d34b5`（96,795 字节，11 files modified；口径明确为 `git diff -- . ':(exclude)docs/P62_STATUS.md' ':(exclude)docs/reports/**'`，即排除本状态表与收口报告等自指终态文档的代码/测试/脚本面修改，杜绝自指哈希回填悖论；二进制原始流为 96,795 字节，若经 PowerShell 行数组 LF 拼装则为 94,540 字节，差额 2,255 字节为 Windows 换行符差；建议使用 `node scripts/eval/final-attestation.mjs` 获取跨平台二进制标准值） |
-| **代码全库组合指纹** | `13c4c3cff2c59183dc49416e242a0231bfbda1adb6ff7057a96b5e4b2ee693be`（`src/`+`tests/`+`scripts/` 共 206 个代码文件；可由 `node scripts/eval/final-attestation.mjs` 确定性复算；规则为相对 POSIX 路径无 `./`、单文件 SHA256、行格式 `${path}:${sha256}`、Unicode 代码点排序、LF 连接无末尾 LF，产出机器可读清单 `docs/reports/final-attestation.json`） |
-| **运行口径（Vitest 全量）** | `pnpm test` = **86 文件 / 1666 测试**（unit 74/1509 + e2e 12/157，全绿通过） |
-| **收口证据报告** | `docs/reports/p62-c11-c2a-closure.md`（本版终态收口报告）及 `docs/reports/p62-release-closure.md`（保留作为首轮历史快照） |
+| **代码面 diff 指纹 (tracked) — 历史快照，口径已废止** | SHA-1 blob: `846c85ee0c06471226cfc0150e7d84e912d9a323`；SHA-256: `bd6fad155a6418a38856cfdd5e96c41fce11969f1ea0bc335b0c4699251d34b5`（96,795 字节，11 files modified；**取自工作树二进制流，不可跨平台复现**；正文中「若经 PowerShell 行数组 LF 拼装则为 94,540 字节」那段正是该口径缺陷的自述） |
+| **代码全库组合指纹 — 历史快照，口径已废止** | `13c4c3cff2c59183dc49416e242a0231bfbda1adb6ff7057a96b5e4b2ee693be`（当时 `src/`+`tests/`+`scripts/` 206 个代码文件，**工作树字节口径**；**不要用它复算当前代码**——文件数与字节口径均已变，见 §0.1） |
+| **运行口径（Vitest 全量）— rev.3 集成实测** | `pnpm test` = **95 文件 / 1878 测试**（unit 82/1719 + e2e 13/159，全绿通过）；历史值 86/1666 保留于 §0 上文 |
+| **收口证据报告** | `docs/reports/p62-c11-c2a-closure.md`（历史收口报告，其指纹同为历史快照）+ `docs/reports/pr4a-five-arm-eval-report.md`（rev.3 实验报告） |
 | **历史版本标记** | 本版正式取代上一版（首轮 t3 集成版）；历史状态与评审结论完整归档，零倒退、零回写 |
+
+### 0.1 rev.3 轮（PR-1…PR-4B）的现行证据锚点
+
+| 项 | 现行值（win32/x64，blob 字节口径） |
+| --- | --- |
+| 代码基线 commit | `84a3d828ed2a27eef765c8b9c4950da4a9ee7287`（未 commit/push，工作树交付） |
+| 根树 tree id | `bc25da6a5014223c4e50322c05a61e4e0295663c` |
+| 被摘要文件数 | 206（`src/` + `tests/` + `scripts/`，取自 `HEAD` 的**已提交**树） |
+| `compositeSha256` | `4d90720eaedda8b48d43fe190bc0f67e6e562da2fc41994bf73a9025500fae3b` |
+| `bindingSha256` | `f73714075a39cf83d88b6ce28edeac25b36c6bd8763cb759dba12bf01815ee51` |
+| 复算 / 重验 | `node scripts/eval/final-attestation.mjs` / `--verify docs/reports/final-attestation.json` |
+
+> 注：本轮把大量实现与测试写在**未跟踪**文件里，而指纹口径按设计只读**已提交树**，
+> 故 `compositeSha256` 覆盖的仍是基线提交的 206 个文件，**不含**本轮新增文件。
+> 这是口径的刻意选择（证据必须描述提交，不得依赖检出），不是遗漏；
+> 提交后重跑 `pnpm run attest` 即会纳入。
 
 ---
 

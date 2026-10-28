@@ -1,0 +1,70 @@
+# Line-ending and encoding policy.
+#
+# WHY THIS FILE EXISTS (PR-1)
+# ---------------------------
+# Before this file, the repository had no normalisation policy and relied on
+# each developer's `core.autocrlf`. That made byte-level evidence
+# unreproducible: ADR 0003's appendix records 15 file digests, 14 of which are
+# CRLF worktree digests that cannot be recomputed on an LF checkout
+# (see `work/t1-baseline-audit.md` §5 F-1).
+#
+# PR-1 answers this in two layers:
+#   1. EVIDENCE is taken from the object database (`git cat-file blob`), which
+#      is LF-normalised regardless of checkout settings. That is what makes
+#      digests cross-platform (see `scripts/eval/lib/git-objects.mjs`).
+#   2. This file states the intended repository content policy explicitly, so
+#      a checkout does not silently differ from the committed bytes.
+#
+# DELIBERATELY NARROW: this is NOT a blanket `* text=auto` renormalisation.
+# A repo-wide renormalise would rewrite every historical blob, invalidate every
+# existing digest and create a mass diff with no review value. Only the paths
+# below are declared, and each declaration is justified.
+#
+# ADDING A RULE: state the reason in a comment above it. If a file genuinely
+# needs CRLF or a BOM preserved byte-for-byte, mark it `-text` so git never
+# converts it and the fixture stays a true binary-equivalent artefact.
+
+# --- Source, tests, scripts, docs: normalise to LF on commit ---------------
+# These are the only files that enter the PR-1 composite digest, so pinning
+# them to LF is what keeps `path:sha256` lines identical on every platform.
+*.ts    text eol=lf
+*.mts   text eol=lf
+*.cts   text eol=lf
+*.mjs   text eol=lf
+*.cjs   text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# --- Shell / CI entry points: LF is mandatory -----------------------------
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# --- Windows-only scripts: CRLF is the correct working-tree form ----------
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# --- Binary-equivalent: never convert, never diff as text -----------------
+# Byte-exact fixtures (any future golden files, archives, images, fonts).
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.docx  binary
+*.xlsx  binary
+
+# --- Explicit BOM / CRLF fixtures ----------------------------------------
+# `-text` means "no conversion in either direction": the bytes in the worktree
+# are the bytes in the object database, so a BOM or CRLF fixture survives.
+# Add such fixtures under `tests/fixtures/encoding/` and list them here.
+tests/fixtures/encoding/** -text

@@ -148,6 +148,11 @@ import { createDiscoveryTree } from '${'../../src/dream-rsi/discovery-tree.ts'}'
 import { createDefaultPolicy } from '${'../../src/dream-rsi/active-policy.ts'}';;
 import { createJitWiredDreamer } from '${'../../src/index.ts'}';;
 import { parseEvoHarnessConfig } from '${'../../src/config.ts'}';;
+import {
+  MIN_HOLDOUT_TREES,
+  holdoutGroupKey,
+  splitDreamerHoldout
+} from '${'../../src/dream-rsi/offline-dreamer.ts'}';;
 import { abstractMetaState } from '${'../../src/jitrl/state-abstraction.ts'}';
 import {
   artifactDigestOf,
@@ -2242,6 +2247,240 @@ const PROBES = [
         reward: withTrust.reward,
         trustedSource: { withSet: true, withoutSet: false },
         weightsHash: contractWeightsHash()
+      };
+    }
+  },
+  {
+    id: 'PR4B-holdout-split-group-and-temporal-isolation',
+    section: 'ADR-0004 §4.1/§4.3',
+    fn: async () => {
+      // Group isolation: task A owns two trees that a naive "last N by caller
+      // order" split would cut apart. A group split must move all of A together.
+      const aOld = makeDeepTree('pr4b-a-old');
+      const bOnly = makeDeepTree('pr4b-b-only');
+      const aNew = makeDeepTree('pr4b-a-new');
+      // Note: makeDeepTree derives taskId from the id, so give A's trees ONE task.
+      const pool = [
+        { ...bOnly, taskId: 'task-pr4b-b' },
+        { ...aOld, taskId: 'task-pr4b-a' },
+        { ...aNew, taskId: 'task-pr4b-a' }
+      ];
+      const split = splitDreamerHoldout(pool, 1);
+      assert(split.status === 'ok', 'a satisfiable pool must split (got ' + split.status + ')');
+      const holdoutGroups = new Set(split.holdoutTrees.map(holdoutGroupKey));
+      const selectionGroups = new Set(split.selectionTrees.map(holdoutGroupKey));
+      for (const group of holdoutGroups) {
+        assert(
+          !selectionGroups.has(group),
+          'group ' + group + ' must not be split across the two sets'
+        );
+      }
+      const selectionNewest = Math.max(...split.selectionTrees.map((t) => t.createdAt));
+      const holdoutOldest = Math.min(...split.holdoutTrees.map((t) => t.createdAt));
+      assert(
+        selectionNewest <= holdoutOldest,
+        'selection must never contain a tree newer than the oldest holdout tree'
+      );
+      assert(
+        split.diagnostics.selectionNewest <= split.diagnostics.holdoutOldest,
+        'the reported witnesses must agree with the actual sets'
+      );
+      assert(split.hasSufficientEvidence === true, 'an ok split is sufficient evidence');
+      return {
+        status: split.status,
+        selection: split.selectionTrees.map((t) => t.id),
+        holdout: split.holdoutTrees.map((t) => t.id),
+        selectionNewest,
+        holdoutOldest,
+        minHoldoutTrees: MIN_HOLDOUT_TREES
+      };
+    }
+  },
+  {
+    id: 'PR4B-insufficient-evidence-withholds-publication',
+    section: 'ADR-0004 §4.4 (G3)',
+    fn: async () => {
+      // An AUTHORIZED dreamer whose pool cannot supply a holdout must still refuse:
+      // nothing was validated, so validatedOnHoldout stays undefined and G3 holds.
+      const applied = [];
+      const dreamer = createOfflineDreamer({
+        now: () => T0,
+        holdoutTreeCount: 1,
+        publishAuthorized: true,
+        applyPolicy: (p) => {
+          applied.push(p);
+        }
+      });
+      const base = {
+        ...createDefaultPolicy({ id: 'pi-pr4b-base', version: 1 }, () => T0),
+        maxWidth: 4,
+        maxDepth: 1
+      };
+      const candidate = {
+        ...createDefaultPolicy({ id: 'pi-pr4b-deep', version: 2 }, () => T0),
+        maxWidth: 1,
+        maxDepth: 4
+      };
+      // Force ONE group: both trees share a task id, so no group cut is possible.
+      const sameTask = [
+        { ...makeDeepTree('pr4b-one-a'), taskId: 'task-pr4b-shared' },
+        { ...makeDeepTree('pr4b-one-b'), taskId: 'task-pr4b-shared' }
+      ];
+      const report = await dreamer.replay({
+        trees: sameTask,
+        baselinePolicy: base,
+        candidatePolicies: [candidate]
+      });
+      assert(
+        report.shadow.split.status === 'insufficient-holdout-groups',
+        'a single-group pool must report insufficient-holdout-groups (got ' +
+          report.shadow.split.status + ')'
+      );
+      assert(
+        report.shadow.split.hasSufficientEvidence === false,
+        'insufficient evidence must be reported as such'
+      );
+      assert(report.improved === true, 'the candidate still improves on the selection trees');
+      assert(report.publication.publish === false, 'publication must stay refused');
+      assert(report.shadow.published === false, 'shadow.published must stay false');
+      assert(applied.length === 0, 'no applyPolicy call may happen');
+      assert(
+        report.shadow.holdoutTreeIds.length === 0,
+        'no tree may be attributed to a holdout that does not exist'
+      );
+      assert(
+        report.shadow.holdoutHypervolume === undefined,
+        'no holdout hypervolume may be reported when validation did not run'
+      );
+      return {
+        splitStatus: report.shadow.split.status,
+        improved: report.improved,
+        publish: report.publication.publish,
+        reason: report.publication.reason,
+        applied: applied.length
+      };
+    }
+  },
+  {
+    id: 'PR4B-opt-in-default-off-and-no-permission-widening',
+    section: 'ADR-0004 §4.1 (default-off)',
+    fn: async () => {
+      // Default-off: a config that says nothing gets holdoutTreeCount 0, so the
+      // dreamer performs no split and publication is refused with holdout-missing.
+      // Default-off: a config that says nothing gets holdoutTreeCount 0, so the
+      // dreamer performs no split and publication is refused with holdout-missing.
+      const defaultConfig = parseEvoHarnessConfig({});
+      assert(
+        defaultConfig.dreamRsi.holdoutTreeCount === 0,
+        'the default assembly must not opt into a holdout'
+      );
+      const applied = [];
+      const defaultDreamer = createOfflineDreamer({
+        now: () => T0,
+        holdoutTreeCount: defaultConfig.dreamRsi.holdoutTreeCount,
+        publishAuthorized: true,
+        applyPolicy: (p) => {
+          applied.push(p);
+        }
+      });
+      const report = await defaultDreamer.replay({
+        trees: [
+          makeDeepTree('pr4b-def-a'),
+          makeDeepTree('pr4b-def-b'),
+          makeDeepTree('pr4b-def-c')
+        ],
+        baselinePolicy: {
+          ...createDefaultPolicy({ id: 'pi-def-base', version: 1 }, () => T0),
+          maxWidth: 4,
+          maxDepth: 1
+        },
+        candidatePolicies: [
+          {
+            ...createDefaultPolicy({ id: 'pi-def-deep', version: 2 }, () => T0),
+            maxWidth: 1,
+            maxDepth: 4
+          }
+        ]
+      });
+      assert(
+        report.shadow.split.status === 'no-holdout-configured',
+        'count 0 must report no-holdout-configured (got ' + report.shadow.split.status + ')'
+      );
+      assert(report.publication.publish === false, 'default-off must refuse publication');
+      assert(applied.length === 0, 'default-off must not apply');
+      assert(
+        report.publication.reason.includes('holdout-missing'),
+        'default-off must refuse with holdout-missing'
+      );
+      // Opt-in must not widen any permission: the holdout is validation-set data.
+      const optedIn = parseEvoHarnessConfig({ dreamRsi: { holdoutTreeCount: 2 } });
+      assert(optedIn.dreamRsi.holdoutTreeCount === 2, 'an explicit opt-in is accepted');
+      const profile = resolveExecutionProfile({ mode: optedIn.execution.mode });
+      assert(profile.permissions.publish.allowed === false, 'publish stays denied');
+      assert(profile.permissions.patch.allowed === false, 'patch stays denied');
+      assert(profile.permissions.memory.allowed === false, 'memory stays denied');
+      return {
+        defaultCount: defaultConfig.dreamRsi.holdoutTreeCount,
+        defaultStatus: report.shadow.split.status,
+        defaultReason: report.publication.reason,
+        optInCount: optedIn.dreamRsi.holdoutTreeCount,
+        permissions: {
+          publish: profile.permissions.publish.allowed,
+          patch: profile.permissions.patch.allowed,
+          memory: profile.permissions.memory.allowed
+        }
+      };
+    }
+  },
+  {
+    id: 'PR4B-idle-fallback-removed',
+    section: 'ADR-0004 §4.5-2 (captain R3)',
+    fn: async () => {
+      // The idle entrance must not be able to bypass the orchestrator. Read the
+      // REAL entrypoint bytes, strip comments so the explanatory text mentioning
+      // the removed fallback cannot mask a reintroduction.
+      const source = readFileSync('src/index.ts', 'utf8');
+      const stripComments = (text) => {
+        const out = [];
+        let index = 0;
+        while (index < text.length) {
+          const blockStart = text.indexOf('/*', index);
+          const lineStart = text.indexOf('//', index);
+          if (blockStart >= 0 && (lineStart < 0 || blockStart < lineStart)) {
+            const blockEnd = text.indexOf('*/', blockStart + 2);
+            out.push(text.slice(index, blockStart));
+            index = blockEnd < 0 ? text.length : blockEnd + 2;
+            continue;
+          }
+          if (lineStart >= 0) {
+            // Keep the character before the comment so a URL's '//' is not lost.
+            const lineEnd = text.indexOf(String.fromCharCode(10), lineStart);
+            out.push(text.slice(index, lineStart));
+            index = lineEnd < 0 ? text.length : lineEnd;
+            continue;
+          }
+          out.push(text.slice(index));
+          break;
+        }
+        return out.join('');
+      };
+      const code = stripComments(source);
+      assert(
+        !code.includes('deps.dreamer.replay'),
+        'the direct dreamer replay fallback must be gone from src/index.ts'
+      );
+      assert(
+        code.includes('orchestrator.triggerDream'),
+        'the idle entrance must still go through orchestrator.triggerDream'
+      );
+      assert(
+        typeof EvoHarnessOrchestratorImpl.prototype.triggerDream === 'function',
+        'triggerDream stays the single idle entrance'
+      );
+      return {
+        directFallbackPresent: code.includes('deps.dreamer.replay'),
+        orchestratorTriggerPresent: true,
+        commentStripped: true
       };
     }
   },

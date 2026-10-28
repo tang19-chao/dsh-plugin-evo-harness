@@ -222,7 +222,13 @@ export function runCancelledIncurredScenario(
   const settleResult = manager.settle({
     callId,
     reservationId: reserveResult.reservationId,
-    outcome: 'cancelled',
+    // ADR-0004 §5.1 (t7): a LOCAL cancellation only abandons the wait — the
+    // provider may still be generating and billing, so its seat must stay held
+    // until termination is confirmed. The legacy bare `'cancelled'` outcome
+    // therefore no longer releases a seat (see `REMOTE_TERMINATED_OUTCOMES`).
+    // This scenario's intent — "cancelled call, spend incurred, seat returned" —
+    // is expressed by the CONFIRMED variant.
+    outcome: 'aborted_confirmed',
     usage: CANCELLED_INCURRED_USAGE_PAYLOAD,
     rateCard: OPENAI_STYLE_RATE_CARD,
     releaseSeat: true

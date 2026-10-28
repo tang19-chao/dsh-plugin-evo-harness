@@ -47,7 +47,14 @@ import { DEFAULT_EVO_HARNESS_CONFIG } from '../config';
 import {
   EXPERIENCE_SCHEMA_VERSION
 } from './experience-store';
-import { CURRENT_REWARD_VERSION } from './experience-store';
+import { CURRENT_REWARD_VERSION, isOnLearningTrack, PRODUCTION_LEARNING_TRACK } from './experience-store';
+import { isAuthenticatedQualityRecord } from '../verification';
+import {
+  DEFAULT_MIN_EFFECTIVE_SAMPLES,
+  conservativeAdvantage,
+  type ActionValueEstimate
+} from './value-estimator';
+import { decideReplacement, type ReplacementVerdict } from './replacement-policy';
 import { isLearningEligibleRecord } from './reward-contract';
 import type {
   AbstractState,
@@ -870,7 +877,49 @@ export type NeighborProjection<T> = (
  * One decision, fully specified. Online and replay differ only in `records`
  * (current snapshot vs causally truncated snapshot) and in the seed they pass.
  */
+
+/**
+ * 双轨检索与选轨配置选项 (ADR 0004 §8)
+ */
+export interface DualTrackConsumptionOptions {
+  /** 是否开启可信质量轨消费，生产环境必须默认 false */
+  readonly enableQualityTrackConsumption?: boolean;
+  /** 质量轨最小有效样本量门槛，默认复用生产保守门 DEFAULT_MIN_EFFECTIVE_SAMPLES */
+  readonly minQualityEffectiveSamples?: number;
+  /** 质量轨检索数量，默认 8 */
+  readonly qualityK?: number;
+  /** 过程轨检索数量，默认 16 */
+  readonly processK?: number;
+}
+
+/**
+ * 原子选轨裁决结果 (ADR 0004 §8)
+ */
+export interface AtomicTrackSelectionVerdict<TAction> {
+  /** 最终选定的动作 */
+  readonly selectedAction: TAction;
+  /** 获胜的轨道来源 */
+  readonly winningTrack: 'task-quality' | 'process' | 'prior-default';
+  /** 裁决判定原因码 */
+  readonly selectionReason:
+    | 'quality-selected'
+    | 'quality-insufficient-action-evidence'
+    | 'quality-untrusted'
+    | 'process-evidenced-replacement'
+    | 'executed-exploration'
+    | 'implicit-zero-advantage'
+    | 'exploration-budget'
+    | 'min-support'
+    | 'fallback-default';
+  /** 过程轨估计快照（供审计） */
+  readonly processReport?: unknown;
+  /** 质量轨估计快照（供审计） */
+  readonly qualityReport?: unknown;
+}
+
 export interface DecisionKernelContext<T> {
+  /** C2b: Options for dual-track separate retrieval and atomic selection */
+  readonly dualTrack?: DualTrackConsumptionOptions;
   readonly level: JitLevel;
   /** State abstraction of the decision point; the caller builds it. */
   readonly state: AbstractState;
@@ -911,6 +960,8 @@ export interface DecisionFilterTrace {
 
 /** Result of the pure kernel: the decision plus everything parity compares. */
 export interface DecisionKernelResult<T> {
+  /** C2b: verdict from atomic track selection, present when dualTrack is configured */
+  readonly trackSelection?: AtomicTrackSelectionVerdict<JitCandidate<T>>;
   readonly level: JitLevel;
   readonly stateValue: number;
   readonly neighborCount: number;
@@ -935,6 +986,282 @@ export interface DecisionKernelResult<T> {
  * randomness and it comes from `rng`/`seed`; no clock is read unless `now` was
  * supplied by the caller.
  */
+
+function toTrackAuditReport<T>(decision: JitDecision<T>): Record<string, unknown> {
+  return {
+    stateValue: decision.stateValue,
+    neighborCount: decision.neighborCount,
+    chosenActionKey: decision.chosen.candidate.actionKey,
+    chosenQ: decision.chosen.q,
+    chosenAdvantage: decision.chosen.advantage,
+    chosenSupport: decision.chosen.support,
+    chosenNEff: decision.chosen.nEff
+  };
+}
+
+interface EvaluatedTrackReplacement<T> {
+  readonly verdict: ReplacementVerdict;
+  readonly proposedIndex: number;
+  readonly priorIndex: number;
+  readonly challengerCandidate: JitCandidate<T>;
+  readonly priorCandidate: JitCandidate<T>;
+  readonly challengerEstimate: ActionValueEstimate;
+  readonly priorEstimate: ActionValueEstimate;
+  readonly report: Record<string, unknown>;
+}
+
+/**
+ * C2b (ADR 0004 §3.3): 两轨共用生产通用保守替换门判定。
+ * 严格复用 decideReplacement(prior, challenger, exploration)，两轨等价执行
+ * implicit-zero/noop/prior 证据与探索预算规则。
+ */
+function evaluateTrackReplacement<T>(
+  candidates: readonly JitCandidate<T>[],
+  decision: JitDecision<T>,
+  priorIndex: number,
+  challengerIsNoop?: boolean,
+  explorationAllowance?: number
+): EvaluatedTrackReplacement<T> {
+  const chosenKey = decision.chosen.candidate.actionKey;
+  const rawProposedIndex = candidates.findIndex((c) => c.actionKey === chosenKey);
+  const priorCandidate = (candidates[priorIndex] ?? candidates[0]) as JitCandidate<T>;
+  const proposedIndex = rawProposedIndex >= 0 ? rawProposedIndex : priorIndex;
+  const challengerCandidate = (candidates[proposedIndex] ?? priorCandidate) as JitCandidate<T>;
+
+  const proposedAdjustment = rawProposedIndex >= 0 ? decision.adjustments[rawProposedIndex] : undefined;
+  const priorAdjustment = decision.adjustments[priorIndex];
+
+  const challengerEstimate: ActionValueEstimate = {
+    actionKey: challengerCandidate.actionKey,
+    q: proposedAdjustment?.q ?? null,
+    support: proposedAdjustment?.support ?? 0,
+    ...(proposedAdjustment?.nEff === undefined ? {} : { nEff: proposedAdjustment.nEff }),
+    explored: proposedAdjustment?.explored ?? false,
+    advantage: proposedAdjustment?.advantage ?? 0
+  };
+
+  const priorEstimate: ActionValueEstimate = {
+    actionKey: priorCandidate.actionKey,
+    q: priorAdjustment?.q ?? null,
+    support: priorAdjustment?.support ?? 0,
+    ...(priorAdjustment?.nEff === undefined ? {} : { nEff: priorAdjustment.nEff }),
+    explored: priorAdjustment?.explored ?? false,
+    advantage: priorAdjustment?.advantage ?? 0
+  };
+
+  const verdict = decideReplacement({
+    proposedIndex,
+    priorIndex,
+    challenger: challengerEstimate,
+    prior: priorEstimate,
+    challengerIsNoop: challengerIsNoop ?? false,
+    explorationAllowance: explorationAllowance ?? 0
+  });
+
+  return {
+    verdict,
+    proposedIndex,
+    priorIndex,
+    challengerCandidate,
+    priorCandidate,
+    challengerEstimate,
+    priorEstimate,
+    report: {
+      ...toTrackAuditReport(decision),
+      replacementVerdict: verdict.kind,
+      ...(verdict.gateReason ? { gateReason: verdict.gateReason } : {}),
+      challengerReport: verdict.challenger
+    }
+  };
+}
+
+/**
+ * C2b (ADR 0004 §3.4): 原子选轨仲裁状态机。
+ * 先选轨、后估值、两轨等价复用生产通用保守替换门。
+ */
+/**
+ * Return the winning decision with `chosen` aligned to the action the atomic
+ * arbitration actually selected.
+ *
+ * C2b review F5: `selectedAction` and `decision.chosen` must describe the SAME
+ * execution. Returning a decision whose argmax is a different candidate (the
+ * pre-arbitration argmax) lets every downstream consumer - L1 slot weights, the
+ * replay projection, the decision ledger - disagree with the verdict. When no
+ * adjustment carries the selected key the decision is returned unchanged (a
+ * candidate set that cannot represent the executed action is a caller contract
+ * violation).
+ */
+function alignDecisionChosen<T>(
+  decision: JitDecision<T>,
+  selectedAction: JitCandidate<T>
+): JitDecision<T> {
+  if (decision.chosen.candidate.actionKey === selectedAction.actionKey) {
+    return decision;
+  }
+  const chosen = decision.adjustments.find(
+    (adjustment) => adjustment.candidate.actionKey === selectedAction.actionKey
+  );
+  return chosen === undefined ? decision : { ...decision, chosen };
+}
+
+/**
+ * C2b (ADR 0004 §3.4): 原子选轨仲裁状态机。
+ * 先选轨、后估值、两轨等价复用生产通用保守替换门。
+ *
+ * Invariants enforced here (C2b independent review):
+ * - F5: the returned decision's `chosen` IS `verdict.selectedAction`, and a kept
+ *   prior is reported as track `prior-default` on EVERY path.
+ * - F6: sufficient quality evidence for the prior candidate is authoritative; the
+ *   process track can never override it.
+ * - F8 / ADR P2: the quality track has NO exploration budget. Thin quality
+ *   evidence falls back to the process track instead of executing an
+ *   under-evidenced "exploration" on the trusted track.
+ */
+export function selectTrackAtomically<T>(
+  candidates: readonly JitCandidate<T>[],
+  processDecision: JitDecision<T>,
+  qualityDecision: JitDecision<T> | undefined,
+  options: {
+    readonly minQualityEffectiveSamples?: number;
+    readonly qualityUntrusted?: boolean;
+    readonly explorationAllowance?: number;
+    readonly priorIndex?: number;
+    readonly challengerIsNoop?: boolean;
+  } = {}
+): {
+  readonly winningTrack: 'task-quality' | 'process' | 'prior-default';
+  readonly winningDecision: JitDecision<T>;
+  readonly verdict: AtomicTrackSelectionVerdict<JitCandidate<T>>;
+} {
+  const minEff = options.minQualityEffectiveSamples ?? DEFAULT_MIN_EFFECTIVE_SAMPLES;
+  const priorIndex =
+    options.priorIndex ??
+    candidates.reduce(
+      (best, entry, index, all) =>
+        entry.baseLogit > (all[best]?.baseLogit ?? Number.NEGATIVE_INFINITY) ? index : best,
+      0
+    );
+  const priorCandidate = (candidates[priorIndex] ?? candidates[0]) as JitCandidate<T>;
+
+  // The process track is judged first: it is the fallback and the only track
+  // allowed to spend an exploration allowance.
+  const processEval = evaluateTrackReplacement(
+    candidates,
+    processDecision,
+    priorIndex,
+    options.challengerIsNoop,
+    options.explorationAllowance
+  );
+  // F5: kept-prior (the conservative gate kept the prior over a challenger) is
+  // reported as track 'prior-default'. A no-deviation process execution is the
+  // process track running its own evidenced choice -> 'process'.
+  const processKeptPrior = processEval.verdict.kind === 'kept-prior';
+  const processTrack: 'process' | 'prior-default' = processKeptPrior
+    ? 'prior-default'
+    : 'process';
+  const processAction = processKeptPrior ? priorCandidate : processEval.challengerCandidate;
+  const processFallback = (
+    selectionReason: AtomicTrackSelectionVerdict<JitCandidate<T>>['selectionReason'],
+    qualityReport: unknown
+  ): {
+    readonly winningTrack: 'process' | 'prior-default';
+    readonly winningDecision: JitDecision<T>;
+    readonly verdict: AtomicTrackSelectionVerdict<JitCandidate<T>>;
+  } => ({
+    winningTrack: processTrack,
+    winningDecision: alignDecisionChosen(processDecision, processAction),
+    verdict: {
+      selectedAction: processAction,
+      winningTrack: processTrack,
+      selectionReason,
+      processReport: processEval.report,
+      qualityReport
+    }
+  });
+
+  // P0: 认证或契约不满足 -> 质量轨不参与候选；保留审计，不自动改标 process
+  // (ADR 0004 §3.4). A kept prior is still reported as prior-default (F5).
+  if (options.qualityUntrusted === true || qualityDecision === undefined) {
+    const reason = options.qualityUntrusted === true
+      ? 'quality-untrusted'
+      : processEval.verdict.kind === 'executed-proposed'
+        ? 'process-evidenced-replacement'
+        : processEval.verdict.kind === 'executed-exploration'
+          ? 'executed-exploration'
+          : processEval.verdict.gateReason ?? 'fallback-default';
+    return processFallback(reason, {
+      status: options.qualityUntrusted === true ? 'untrusted-or-missing' : 'quality-track-absent'
+    });
+  }
+
+  // Quality track: NO exploration budget (F8/P2). The allowance that may exist
+  // for the process track is never transferred to the trusted track.
+  const qualityEval = evaluateTrackReplacement(
+    candidates,
+    qualityDecision,
+    priorIndex,
+    options.challengerIsNoop,
+    0
+  );
+  const qualityPriorNEff = qualityEval.priorEstimate.nEff ?? 0;
+  const qualityPriorSufficient =
+    qualityEval.priorEstimate.q !== null &&
+    qualityEval.priorEstimate.support > 0 &&
+    Number.isFinite(qualityPriorNEff) &&
+    qualityPriorNEff >= minEff;
+  const qualityReport = {
+    ...qualityEval.report,
+    priorEvidenceSufficient: qualityPriorSufficient,
+    priorNEff: qualityPriorNEff,
+    priorSupport: qualityEval.priorEstimate.support,
+    minQualityEffectiveSamples: minEff,
+    executedActionKey: (candidates[qualityEval.verdict.executedIndex] ?? priorCandidate).actionKey
+  };
+
+  const challengerNEff = qualityEval.verdict.challenger.nEff ?? 0;
+  const challengerMeetsQualityBar =
+    challengerNEff >= minEff && qualityEval.verdict.challenger.hasReplacementEvidence === true;
+
+  // P1: 质量证据满足候选门槛 -> 整体选用质量轨 (challenger replacement).
+  if (
+    qualityEval.verdict.kind === 'executed-proposed' &&
+    qualityEval.proposedIndex !== priorIndex &&
+    challengerMeetsQualityBar
+  ) {
+    return {
+      winningTrack: 'task-quality',
+      winningDecision: alignDecisionChosen(qualityDecision, qualityEval.challengerCandidate),
+      verdict: {
+        selectedAction: qualityEval.challengerCandidate,
+        winningTrack: 'task-quality',
+        selectionReason: 'quality-selected',
+        processReport: toTrackAuditReport(processDecision),
+        qualityReport
+      }
+    };
+  }
+
+  // P1-prior (F6): 质量 prior 证据充分 -> 保留 prior。可信质量证据已经对本决策点
+  // 的 prior 动作给出充分样本，过程轨没有资格用一个代理信号把它替换掉。
+  if (qualityEval.verdict.executedIndex === priorIndex && qualityPriorSufficient) {
+    return {
+      winningTrack: 'task-quality',
+      winningDecision: alignDecisionChosen(qualityDecision, priorCandidate),
+      verdict: {
+        selectedAction: priorCandidate,
+        winningTrack: 'task-quality',
+        selectionReason: 'quality-selected',
+        processReport: toTrackAuditReport(processDecision),
+        qualityReport: { ...qualityReport, keptPrior: true }
+      }
+    };
+  }
+
+  // P2: 质量证据不足 -> 整个决策点回退过程轨；禁止质量轨否决/修剪过程轨动作
+  // (ADR 0004 §3.4)。过程轨的保守门仍然决定最终执行动作。
+  return processFallback('quality-insufficient-action-evidence', qualityReport);
+}
+
 export function runDecisionKernel<T>(
   context: DecisionKernelContext<T>
 ): DecisionKernelResult<T> {
@@ -942,6 +1269,7 @@ export function runDecisionKernel<T>(
   if (state.level !== level) {
     throw new RangeError('decision kernel: level must match state.level');
   }
+  const isDualTrack = context.dualTrack?.enableQualityTrackConsumption === true;
   const records = Array.isArray(context.records) ? context.records : [];
   const filterOptions: ExperienceFilterOptions = {
     level,
@@ -952,10 +1280,121 @@ export function runDecisionKernel<T>(
       ? {}
       : { minimumExperienceSchemaVersion: context.minimumExperienceSchemaVersion }),
     ...(context.learningEligibleOnly === undefined
-      ? {}
+      ? (isDualTrack ? { learningEligibleOnly: true } : {})
       : { learningEligibleOnly: context.learningEligibleOnly })
   };
   const visible = filterExperienceSnapshot(records, filterOptions);
+
+  const seed = context.seed === undefined || !Number.isFinite(context.seed)
+    ? null
+    : Math.floor(context.seed) >>> 0;
+  const rng = context.rng ?? (seed === null ? Math.random : createSeededRandom(seed));
+
+  if (isDualTrack) {
+    const processK = context.dualTrack?.processK ?? config.k;
+    const qualityK = context.dualTrack?.qualityK ?? Math.min(8, config.k);
+
+    const processRecords = visible.filter((r) => r.learningTrack !== 'task-quality');
+    // F2 (C2b review): the P0 authentication verdict is scoped to the records
+    // VISIBLE at this decision point (level/bucket/guidance/causal cutoff/
+    // learning eligibility already applied by filterExperienceSnapshot). A stale
+    // or foreign quality-labelled record outside this decision's neighbourhood
+    // must not permanently close the track: P0 fires only when visible quality
+    // records exist AND none of them authenticates.
+    const visibleQualityRecords = visible.filter((r) => r.learningTrack === 'task-quality');
+    const qualityRecords = visibleQualityRecords.filter(
+      (r) => isAuthenticatedQualityRecord(r) && r.learningEligible !== false
+    );
+    const hasUntrustedQuality =
+      visibleQualityRecords.length > 0 && qualityRecords.length === 0;
+
+    const processNeighbors = retrieveNeighbors(processRecords, state, {
+      k: processK,
+      similarityThreshold: config.similarityThreshold,
+      level,
+      ...(context.guidance === undefined ? {} : { guidanceFilter: context.guidance }),
+      ...(config.before === undefined ? {} : { before: config.before }),
+      ...(context.now === undefined ? {} : { now: context.now }),
+      halfLifeMs: config.halfLifeMs,
+      ...(config.policyId === undefined ? {} : { policyId: config.policyId }),
+      ...(config.driftRho === undefined ? {} : { driftRho: config.driftRho })
+    });
+
+    const qualityNeighbors = retrieveNeighbors(qualityRecords, state, {
+      k: qualityK,
+      similarityThreshold: config.similarityThreshold,
+      level,
+      ...(context.guidance === undefined ? {} : { guidanceFilter: context.guidance }),
+      ...(config.before === undefined ? {} : { before: config.before }),
+      ...(context.now === undefined ? {} : { now: context.now }),
+      halfLifeMs: config.halfLifeMs,
+      ...(config.policyId === undefined ? {} : { policyId: config.policyId }),
+      ...(config.driftRho === undefined ? {} : { driftRho: config.driftRho })
+    });
+
+    const projectedProcess =
+      context.projectNeighbors === undefined
+        ? processNeighbors
+        : context.projectNeighbors(processNeighbors, candidates);
+
+    const projectedQuality =
+      context.projectNeighbors === undefined
+        ? qualityNeighbors
+        : context.projectNeighbors(qualityNeighbors, candidates);
+
+    const processDecision = composeDecision(level, state, projectedProcess, candidates, {
+      beta: config.beta,
+      selection: config.selection,
+      lambda: config.lambda,
+      alpha: config.alpha,
+      unseenFallback: config.unseenFallback,
+      rng
+    });
+
+    const qualityDecision =
+      projectedQuality.length > 0
+        ? composeDecision(level, state, projectedQuality, candidates, {
+            beta: config.beta,
+            selection: config.selection,
+            lambda: config.lambda,
+            alpha: config.alpha,
+            unseenFallback: config.unseenFallback,
+            rng
+          })
+        : undefined;
+
+    const selectionResult = selectTrackAtomically(candidates, processDecision, qualityDecision, {
+      minQualityEffectiveSamples: context.dualTrack?.minQualityEffectiveSamples,
+      qualityUntrusted: hasUntrustedQuality
+    });
+
+    const winningDecision = selectionResult.winningDecision;
+    const winningNeighbors =
+      selectionResult.winningTrack === 'task-quality' ? projectedQuality : projectedProcess;
+
+    return {
+      level,
+      stateValue: winningDecision.stateValue,
+      neighborCount: winningDecision.neighborCount,
+      neighbors: winningNeighbors,
+      decision: winningDecision,
+      trackSelection: selectionResult.verdict,
+      filters: {
+        records: records.length,
+        kept: visible.length,
+        level,
+        bucket: state.bucket,
+        guidance: context.guidance ?? null,
+        before: config.before ?? null,
+        excludeLegacy: context.excludeLegacy === true,
+        learningEligibleOnly: filterOptions.learningEligibleOnly === true
+      },
+      slotWeights: slotWeightsFromDecision(winningDecision, candidates),
+      policyVersion: context.policyVersion ?? null,
+      seed,
+      ignored: POLICY_IGNORED_DIMENSIONS
+    };
+  }
 
   const neighbors = retrieveNeighbors(visible, state, {
     k: config.k,
@@ -972,11 +1411,6 @@ export function runDecisionKernel<T>(
     context.projectNeighbors === undefined
       ? neighbors
       : context.projectNeighbors(neighbors, candidates);
-
-  const seed = context.seed === undefined || !Number.isFinite(context.seed)
-    ? null
-    : Math.floor(context.seed) >>> 0;
-  const rng = context.rng ?? (seed === null ? Math.random : createSeededRandom(seed));
 
   const decision = composeDecision(level, state, projected, candidates, {
     beta: config.beta,

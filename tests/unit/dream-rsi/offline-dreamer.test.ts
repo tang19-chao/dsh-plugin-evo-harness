@@ -76,12 +76,18 @@ function narrowPolicy(overrides: Partial<MetaSearchPolicy> = {}): MetaSearchPoli
  * Four shallow siblings plus a deeper branch that holds the best recorded
  * outcome (every score stays below the default early-stop threshold): this
  * distinguishes a wide-shallow policy from a narrow-deep one.
+ *
+ * PR-4B (ADR 0004 §4.3-1): `taskId` is a parameter, not a constant. A holdout
+ * tree MUST belong to its own task - two trees of one task are one group and the
+ * split refuses to cut a group, so reusing 'task-1' for both sides of a
+ * selection/holdout pair would be exactly the cross-task leak the contract
+ * forbids (and would make the authorized positive control unreachable).
  */
-function deepTree(id = 'tree-deep'): DiscoveryTreeSnapshot {
+function deepTree(id = 'tree-deep', taskId = 'task-1'): DiscoveryTreeSnapshot {
   const tree = createDiscoveryTree({
     id,
     sessionId: 'session-1',
-    taskId: 'task-1',
+    taskId,
     rootPatchId: 'patch-root',
     clock: fixedClock()
   });
@@ -551,7 +557,9 @@ describe('offline dreamer monotonic replay', () => {
     });
     const authorizedReport = await authorizedDreamer.replay(
       dreamRequest({
-        trees: [deepTree('tree-select'), deepTree('tree-holdout')],
+        // PR-4B §4.3-1: distinct task ids, so the two trees are two groups and
+        // the split is a legal task-level split rather than a self-leak.
+        trees: [deepTree('tree-select', 'task-select'), deepTree('tree-holdout', 'task-holdout')],
         baselinePolicy: shallowPolicy(),
         candidatePolicies: [makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4, version: 2 })]
       })
@@ -597,7 +605,8 @@ describe('offline dreamer monotonic replay', () => {
     });
     const authorizedReport = await authorizedDreamer.replay(
       dreamRequest({
-        trees: [deepTree('tree-sel'), deepTree('tree-hold')],
+        // PR-4B §4.3-1: distinct task ids keep the two trees in separate groups.
+        trees: [deepTree('tree-sel', 'task-sel'), deepTree('tree-hold', 'task-hold')],
         baselinePolicy: shallowPolicy(),
         candidatePolicies: [makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4, version: 2 })]
       })

@@ -62,6 +62,9 @@
  */
 
 import { TrajectoryCollector, toTrajectoryError } from '../cordis-seams/trajectory-collector';
+import type { LedgerPhase, ModelRateCard, CountingSemantics } from '../ledger/types.js';
+import { LedgerReservationManager } from '../ledger/reservation-manager.js';
+import { dshUsageToProviderPayload, RawDshUsageLike } from '../ledger/pricing.js';
 import type {
   BranchExecutor,
   EightSurfacePatch,
@@ -271,6 +274,12 @@ export interface AgentLoopAdapters {
   readonly onDiagnostic?: (message: string) => void;
   /** Trajectory id factory; injectable so tests are deterministic. */
   readonly createTrajectoryId?: () => string;
+  /** Optional Ledger reservation manager for real cost metering & limits (PR-3A) */
+  readonly ledgerManager?: LedgerReservationManager;
+  /** Phase context for ledger reservation, defaults to 'probe' */
+  readonly ledgerPhase?: LedgerPhase;
+  /** Optional rate card for ledger reservations */
+  readonly ledgerRateCard?: ModelRateCard;
 }
 
 /** Executor plus the recorded identity of what it can do. */
@@ -650,10 +659,82 @@ export function createAgentLoopExecutor(
         });
         emit({ kind: 'model', stepIndex: modelStep.index, iteration: 0, at: modelStep.at, text: modelStep.text });
 
+        let singleCallId: string | undefined;
+        let singleResId: string | undefined;
+        if (adapters.ledgerManager !== undefined) {
+          singleCallId = 'call_' + context.branchId + '_0_' + String(now());
+          const reserveRes = adapters.ledgerManager.reserve({
+            callId: singleCallId,
+            phase: adapters.ledgerPhase ?? 'probe',
+            pool: 'general',
+            estimatedCostMicros: 10_000,
+            requiresSeat: true,
+            sessionId: context.sessionId,
+            operationId: context.sessionId,
+            attempt: 1,
+            rateCard: adapters.ledgerRateCard
+          });
+          if (!reserveRes.granted) {
+            const message = 'ledger budget reservation failed: ' + (reserveRes.rejectionReason ?? 'insufficient_budget');
+            collector.recordFailureSignal({ kind: 'budget_exhausted', message, repairable: false });
+            return settle('failed', { name: 'EvoHarnessLedgerError', message });
+          }
+          singleResId = reserveRes.reservationId;
+        }
+
         const startedAt = now();
-        const response = await guarded(completeFn({ purpose: 'probe', messages }));
+        let response: ModelResponse;
+        try {
+          response = await guarded(
+            completeFn({
+              purpose: 'probe',
+              messages,
+              ...(singleCallId === undefined
+                ? {}
+                : { metadata: { callId: singleCallId, signal: controller.signal } })
+            })
+          );
+        } catch (callError) {
+          if (adapters.ledgerManager !== undefined && singleCallId !== undefined && singleResId !== undefined) {
+            const outcome = timedOut ? 'timed_out' : cancelled ? 'cancelled' : 'failed';
+            try {
+              adapters.ledgerManager.settle({
+                callId: singleCallId,
+                reservationId: singleResId,
+                outcome,
+                rateCard: adapters.ledgerRateCard,
+                releaseSeat: true
+              });
+            } catch {}
+          }
+          throw callError;
+        }
+
         const durationMs = Math.max(0, now() - startedAt);
         usage.current = addUsage(usage.current, response.usage);
+
+        if (adapters.ledgerManager !== undefined && singleCallId !== undefined && singleResId !== undefined) {
+          const rawUsage = response.metadata?.rawUsage as RawDshUsageLike | undefined;
+          const countingSemantics = response.metadata?.countingSemantics as CountingSemantics | undefined;
+          const usagePayload = dshUsageToProviderPayload(rawUsage, countingSemantics);
+          const outcome = timedOut
+            ? 'timed_out'
+            : cancelled
+              ? 'cancelled'
+              : response.finishReason === 'error'
+                ? 'failed'
+                : 'succeeded';
+          try {
+            adapters.ledgerManager.settle({
+              callId: singleCallId,
+              reservationId: singleResId,
+              outcome,
+              usage: usagePayload,
+              rateCard: adapters.ledgerRateCard,
+              releaseSeat: true
+            });
+          } catch {}
+        }
 
         const interrupted = settleInterrupted();
         if (interrupted !== undefined) {
@@ -733,29 +814,100 @@ export function createAgentLoopExecutor(
             text: modelStep.text
           });
 
+          let loopCallId: string | undefined;
+          let loopResId: string | undefined;
+          if (adapters.ledgerManager !== undefined) {
+            loopCallId = 'call_' + context.branchId + '_' + String(iteration) + '_' + String(now());
+            const reserveRes = adapters.ledgerManager.reserve({
+              callId: loopCallId,
+              phase: adapters.ledgerPhase ?? 'probe',
+              pool: 'general',
+              estimatedCostMicros: 10_000,
+              requiresSeat: true,
+              sessionId: context.sessionId,
+              operationId: context.sessionId,
+              attempt: iteration + 1,
+              rateCard: adapters.ledgerRateCard
+            });
+            if (!reserveRes.granted) {
+              const message = 'ledger budget reservation failed: ' + (reserveRes.rejectionReason ?? 'insufficient_budget');
+              collector.recordFailureSignal({ kind: 'budget_exhausted', message, repairable: false });
+              return settle('failed', { name: 'EvoHarnessLedgerError', message });
+            }
+            loopResId = reserveRes.reservationId;
+          }
+
           const modelStartedAt = now();
-          const rawDecision = await guarded(
-            planNext({
-              purpose: 'probe',
-              stepIndex: modelStep.index,
-              iteration,
-              messages,
-              transcript,
-              toolCatalog: catalog,
-              toolGuidance: guidance,
-              maxStepsPerProbe: maxSteps,
-              signal: controller.signal
-            })
-          );
+          let rawDecision: unknown;
+          try {
+            rawDecision = await guarded(
+              planNext({
+                purpose: 'probe',
+                stepIndex: modelStep.index,
+                iteration,
+                messages,
+                transcript,
+                toolCatalog: catalog,
+                toolGuidance: guidance,
+                maxStepsPerProbe: maxSteps,
+                signal: controller.signal
+              })
+            );
+          } catch (modelError) {
+            if (adapters.ledgerManager !== undefined && loopCallId !== undefined && loopResId !== undefined) {
+              const outcome = timedOut ? 'timed_out' : cancelled ? 'cancelled' : 'failed';
+              try {
+                adapters.ledgerManager.settle({
+                  callId: loopCallId,
+                  reservationId: loopResId,
+                  outcome,
+                  rateCard: adapters.ledgerRateCard,
+                  releaseSeat: true
+                });
+              } catch {}
+            }
+            throw modelError;
+          }
           const modelDurationMs = Math.max(0, now() - modelStartedAt);
 
           const interruptedAfterModel = settleInterrupted();
           if (interruptedAfterModel !== undefined) {
+            if (adapters.ledgerManager !== undefined && loopCallId !== undefined && loopResId !== undefined) {
+              const outcome = timedOut ? 'timed_out' : cancelled ? 'cancelled' : 'failed';
+              try {
+                adapters.ledgerManager.settle({
+                  callId: loopCallId,
+                  reservationId: loopResId,
+                  outcome,
+                  rateCard: adapters.ledgerRateCard,
+                  releaseSeat: true
+                });
+              } catch {}
+            }
             return interruptedAfterModel;
           }
 
           const decision = assertDecision(rawDecision);
           usage.current = addUsage(usage.current, decision.usage);
+
+          if (adapters.ledgerManager !== undefined && loopCallId !== undefined && loopResId !== undefined) {
+            const outcome = timedOut
+              ? 'timed_out'
+              : cancelled
+                ? 'cancelled'
+                : (decision.kind === 'final' && decision.finishReason === 'error')
+                  ? 'failed'
+                  : 'succeeded';
+            try {
+              adapters.ledgerManager.settle({
+                callId: loopCallId,
+                reservationId: loopResId,
+                outcome,
+                rateCard: adapters.ledgerRateCard,
+                releaseSeat: true
+              });
+            } catch {}
+          }
 
           if (decision.kind === 'final') {
             deliverableText = decision.text;

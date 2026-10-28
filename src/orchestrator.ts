@@ -125,7 +125,12 @@ import {
   readVerificationView,
   verificationRewardMarks,
   verificationSourceDescription,
+  isCompleteQualityBinding,
+  qualityProvenanceRegistry,
+  registerAuthenticatedQualityRecord,
+  unregisterAuthenticatedQualityRecord,
   verifyAndAttach,
+  type QualityProvenanceContext,
   type HostVerificationSeam,
   type VerificationDisposition,
   type VerificationRunSummary,
@@ -138,6 +143,21 @@ import type {
   DreamReplayReportWithShadow,
   IFailureTaxonomy
 } from './dream-rsi';
+
+/**
+ * C2b F11: narrow a recorder-derived verification context to a COMPLETE host
+ * binding, or undefined.
+ *
+ * Returns the context unchanged when every binding member is present and the
+ * artifact digest is the exact host-recomputed shape (sha256:<64 lowercase
+ * hex>); undefined otherwise. The recorder never fabricates placeholders, so a
+ * partial verification simply yields no registrable binding.
+ */
+function completeQualityBindingContext(
+  candidate: QualityProvenanceContext
+): QualityProvenanceContext | undefined {
+  return isCompleteQualityBinding(candidate) ? candidate : undefined;
+}
 
 /** Ordered lifecycle stages recorded for every run. */
 export const EVO_HARNESS_STAGES = [
@@ -921,6 +941,14 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
    * process actually ran.
    */
   private readonly appendedExperienceKeys: Set<string> = new Set();
+  /**
+   * C2b F4: quality records whose pre-commit registration must be ROLLED BACK
+   * if the append fails or the batch is discarded. Register-then-commit means a
+   * failed append could otherwise leave a never-persisted record trusted in the
+   * process-global registry; the rollback list is consumed by the recorder's
+   * commit step (register-on-success).
+   */
+  private readonly unregisteredQualityRecords: ExperienceRecord[] = [];
   /**
    * P6.2 PR-B / F4-5: the EXPLICIT, revocable exploration budget.
    *
@@ -2434,9 +2462,33 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         learningEligible: eligible && outcomeEligible
       } as const;
 
+      const isTaskQualityRecord = learningTrack === 'task-quality' && eligible && outcomeEligible;
+      // C2b F11 (ADR 0004 §2.2/§2.3 + ADR 0003 T3/T4): a quality record is only
+      // registrable with a COMPLETE host binding - every binding member present
+      // and an artifact digest of the exact host-recomputed shape
+      // sha256:<64 lowercase hex>. A partial context is undefined here, and
+      // register() throws on it, so an unverifiable verdict can never mint a
+      // trusted quality record.
+      const qualityBindingContext = isTaskQualityRecord
+        ? completeQualityBindingContext(
+            {
+              artifactDigest: verificationDisposition?.artifactDigest,
+              verifierId: verificationDisposition?.verifierId,
+              verifierVersion: verificationDisposition?.verifierVersion,
+              verificationId: verificationDisposition?.verificationId,
+              testSetId: verificationDisposition?.testSetId,
+              envId: verificationDisposition?.envId,
+              runId: input.runId,
+              sessionId: input.sessionId,
+              trajectoryId: probe.trajectory.id,
+              taskId: input.task?.id,
+              role: probe.trajectory.role
+            }
+          )
+        : undefined;
       // L1: this executed action's own record, in the L1 candidate key vocabulary
       // and with the guidance provenance of the slot that actually ran it.
-      records.push({
+      const l1Record: ExperienceRecord = {
         id: 'online-' + this.newId(),
         level: 'meta',
         state: probe.l1State,
@@ -2451,13 +2503,17 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         ...association,
         createdAt,
         redacted: true
-      });
+      };
+      if (qualityBindingContext !== undefined) {
+        registerAuthenticatedQualityRecord(l1Record, qualityBindingContext);
+      }
+      records.push(l1Record);
 
       // L2: ONLY when this exact proposal was chosen by the L2 decision AND
       // actually executed. The node/trajectory pair is the one that ran, never
       // the run's final winner (plan section 6.2).
       if (probe.selection !== undefined) {
-        records.push({
+        const l2Record: ExperienceRecord = {
           id: 'online-' + this.newId(),
           level: 'proposal',
           state: probe.selection.state,
@@ -2472,7 +2528,11 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           ...association,
           createdAt,
           redacted: true
-        });
+        };
+        if (qualityBindingContext !== undefined) {
+          registerAuthenticatedQualityRecord(l2Record, qualityBindingContext);
+        }
+        records.push(l2Record);
       }
     }
 
@@ -2503,6 +2563,18 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           String(deduped.length) +
           ' scored record(s) were discarded instead of appended'
       );
+      // C2b F4: a discarded batch must not leave pre-commit registrations
+      // trusted in the registry - the record was never persisted.
+      for (const record of deduped) {
+        if (record.learningTrack !== 'task-quality') {
+          continue;
+        }
+        const recordRunId = record.runId;
+        if (recordRunId === undefined || recordRunId.length === 0) {
+          continue;
+        }
+        unregisterAuthenticatedQualityRecord(record.id, recordRunId);
+      }
       return 0;
     }
 
@@ -2584,11 +2656,43 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         ]
       }
     });
+    // C2b F4: remember which pending quality registrations belong to this
+    // append batch. Registration happens only AFTER the store commit succeeds;
+    // a failed or discarded append leaves nothing trusted in the registry
+    // (pending-commit semantics: register-on-success).
+    const pendingQualityRegistrations: Array<{
+      readonly record: ExperienceRecord;
+      readonly context: QualityProvenanceContext;
+    }> = [];
+    for (const record of deduped) {
+      if (record.learningTrack !== 'task-quality') {
+        continue;
+      }
+      const recordRunId = record.runId;
+      if (recordRunId === undefined || recordRunId.length === 0) {
+        continue;
+      }
+      const entry = qualityProvenanceRegistry.getEntry(record.id, recordRunId);
+      if (entry === undefined) {
+        continue;
+      }
+      pendingQualityRegistrations.push({ record, context: entry.context });
+      // Roll back the pre-commit registration: until the append succeeds the
+      // record is NOT trusted evidence (register-on-success semantics).
+      this.unregisteredQualityRecords.push(record);
+      unregisterAuthenticatedQualityRecord(record.id, recordRunId);
+    }
     try {
       await kernel.store.append(deduped);
     } catch (error) {
       input.diagnostics.push('record_experience failed: ' + errorMessage(error));
       return 0;
+    }
+    // Commit succeeded: (re-)register every quality record that shipped. The
+    // pre-commit entries were rolled back above, so this is the single point
+    // where the batch becomes trusted.
+    for (const pending of pendingQualityRegistrations) {
+      registerAuthenticatedQualityRecord(pending.record, pending.context);
     }
     return deduped.length;
   }

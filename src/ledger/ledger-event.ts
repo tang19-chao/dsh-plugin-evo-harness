@@ -28,12 +28,7 @@ export function generateEventId(callId: string, phase: LedgerPhase): string {
  * Invariant checker: determine whether an outcome mandates audit-only treatment.
  */
 export function isMandatoryAuditOnlyOutcome(outcome: ExecutionOutcome): boolean {
-  return (
-    outcome === 'cancelled' ||
-    outcome === 'timed_out' ||
-    outcome === 'infrastructure_error' ||
-    outcome === 'failed'
-  );
+  return outcome !== 'succeeded';
 }
 
 /**
