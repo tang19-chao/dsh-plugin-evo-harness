@@ -1,4 +1,4 @@
-# P62_STATUS — P6.2 发布收口状态表（C1.1 + C2a + C3 第二轮，t12 终态集成版）
+# P62_STATUS — P6.2 发布收口状态表（C1.1 + C2a + C3 第二轮，t12 终态集成版；2026-10-28 rev.4 P0 修复批增补）
 
 > 本表是 P6.2 第二轮（`p62-c11-c2a-closure`）的终态发布状态页，与 ADR 0002（`docs/adr/0002-p62-release-contract-and-default-safe-shape.md`，C0+C1 契约冻结）及 ADR 0003（`docs/adr/0003-publish-verification-and-cost-contract.md`，accepted，rev.3 冻结版）配套。
 > 本版为 **t12 终态集成版**：整合已通过独立验证与评审的 C1.1、C2a、C3 契约成果，以及 t14（持久化反例）、t15/t16（appliedJit 虚假热替换修复）、t17/t19（C3 零成本与重复预留修复）、t18/t20（C2a 审计来源注册表加固）、t21（离线测试接入与 README 计数同步）全部闭环事实。
@@ -31,7 +31,7 @@
 | **验证环境** | win32/x64，Node `v22.23.1`，pnpm `11.7.0` |
 | **代码面 diff 指纹 (tracked) — 历史快照，口径已废止** | SHA-1 blob: `846c85ee0c06471226cfc0150e7d84e912d9a323`；SHA-256: `bd6fad155a6418a38856cfdd5e96c41fce11969f1ea0bc335b0c4699251d34b5`（96,795 字节，11 files modified；**取自工作树二进制流，不可跨平台复现**；正文中「若经 PowerShell 行数组 LF 拼装则为 94,540 字节」那段正是该口径缺陷的自述） |
 | **代码全库组合指纹 — 历史快照，口径已废止** | `13c4c3cff2c59183dc49416e242a0231bfbda1adb6ff7057a96b5e4b2ee693be`（当时 `src/`+`tests/`+`scripts/` 206 个代码文件，**工作树字节口径**；**不要用它复算当前代码**——文件数与字节口径均已变，见 §0.1） |
-| **运行口径（Vitest 全量）— rev.3 集成实测** | `pnpm test` = **95 文件 / 1878 测试**（unit 82/1719 + e2e 13/159，全绿通过）；历史值 86/1666 保留于 §0 上文 |
+| **运行口径（Vitest 全量）— rev.4 集成实测（2026-10-28 P0 修复批）** | `pnpm test` = **97 文件 / 1979 测试**（unit 84/1820 + e2e 13/159，全绿通过）；历史：rev.3 集成实测 95/1878（unit 82/1719）、首轮 86/1666，均保留不回写 |
 | **收口证据报告** | `docs/reports/p62-c11-c2a-closure.md`（历史收口报告，其指纹同为历史快照）+ `docs/reports/pr4a-five-arm-eval-report.md`（rev.3 实验报告） |
 | **历史版本标记** | 本版正式取代上一版（首轮 t3 集成版）；历史状态与评审结论完整归档，零倒退、零回写 |
 
@@ -80,7 +80,7 @@
 
 ## 2. 全量门禁结果（七门禁 + 专项）
 
-当前最终字节在 win32/x64 环境串行复跑全部门禁，全数以 **exit code 0** 通过：
+下表为 **t12 终态集成轮（2026-10-27）** 的串行复跑记录（历史，保留不回写）；**rev.4（2026-10-28 P0 修复批）的现行实测见 §2.1**：
 
 | # | 门禁命令 | 通过标准 | 实测结果 | 关键见证输出 |
 |---|---|---|---|---|
@@ -96,6 +96,44 @@
 - Ledger 契约专项：`tests/unit/ledger` 3 文件 36 测试全绿（pricing 10、reservation-manager 14、offline-fixtures 12）；
 - C2a 可信验证专项：`tests/unit/verification` + `tests/e2e/c2a-trusted-verification.test.ts` 5 文件 62 测试全绿；
 - C1.1 发布边界专项：`tests/unit/jitrl/runtime-control.test.ts` + `tests/unit/p62/release-contract.test.ts` + `tests/unit/dream-rsi` 9 文件 249 测试全绿。
+
+### 2.1 rev.4（2026-10-28 P0 修复批，win32/x64 实测，六门禁 + 专项全绿）
+
+| 项 | 实测结果 |
+| --- | --- |
+| `pnpm run typecheck` | exit 0（`tsc --noEmit` 0 error） |
+| `pnpm run check:encoding` | exit 0（314 tracked blobs 全 LF 或 3 个显式 `-text` 例外） |
+| `pnpm test` / `pnpm run check:docs` | exit 0（**97 files / 1979 tests 全绿**，README 计数机械精确匹配 `SUCCESS`） |
+| `pnpm run build` + `pnpm run check:build-smoke` | exit 0（`lib/index.js` 1003883B，ESM，68 named exports） |
+| `pnpm run check:negative-result` | exit 0（A1..A6 PASS，历史负结果 −0.250 完整保留） |
+| `node scripts/eval/guarded-regression.mjs --json` | exit 0，`{total:37, passed:37, failed:0}`（33→37：+4 由 PR-1 并行批追加；该门禁无 package script，按 ADR 0002 门禁 #7 规范命令直跑） |
+| `tests/unit/p62` 专项 | 5 文件 / 176 测试全绿（evidence-gates 43 + commit-attestation 48 + pr4a-artifact-verifier 13 + 其余 2 套件合计 72） |
+| `node --test` 双套件（parity / attestation） | 51/51 exit 0（parity 闭集与目标校验 31 项 + attestation 目标与自指边界 20 项） |
+| **PR-4A 产物校验器（当前有效计数）** | **`node scripts/eval/verify-pr4a-artifacts.mjs` = 691/691，exit 0，warnings=[]**（683 为 t3 前基线、688 为 t3 轮中间值，**现行以 691 为准**） |
+| 夹具泄漏边界（P0-A 修复实证） | 全量 Vitest（含 p62 夹具）多轮复跑后 refs 恒 9、worktrees 恒 1、`pr1-policy-commit-*` 恒 0——修复前每次运行净增 3 个永久 refs 的泄漏机制已消除 |
+
+**F1 可携性边界（如实保留，不声称跨 LF 直接可携）**：PR-4A `executedSources` 为 raw-byte 硬校验（生成时工作树原始字节）。历史产物于 Windows/`core.autocrlf=true` 生成，在 LF 检出复验仍会 exit 1——但已具备具名诊断 `provenance-executed-sources-eol-divergent`（WARN + `eolOnly` 分类）与文件头 / `--help` 的 CHECKOUT BYTE SPEC（可携规约 `git -c core.autocrlf=false checkout -- .`，生成与校验同规约）。
+
+### 2.2 rev.4 CI 接线与本地复验（2026-10-28，win32/x64，本批）
+
+§2.1 是 P0 修复批的**本地验证**时点；本小节记录其后 CI/package 接线与在同一工作树上的复验（**远端结果不在本小节断言**，只由推送后的 Actions 运行产生）。
+
+| 项 | 实测结果 |
+| --- | --- |
+| `.github/workflows/ci.yml` `fingerprint-parity` | 比较调用新增 `--expect-commit "${{ github.sha }}"`：三平台记录不再只能互相印证 |
+| 同上步骤的失败语义（承重修复） | 旧体 `node … \| tee parity.json` 在默认 shell（`bash -e`，无 `pipefail`）下返回 `tee` 的退出码，规则失败被记为绿灯；现为 `shell: bash` + `${PIPESTATUS[0]}` 显式回传，`tee` 与失败时仍写 job summary 均保留。本地合成产物实测：目标匹配 → 0，目标不匹配 → 1，三平台 composite 不一致 → 1；同一失败用例在旧体下 → 0 |
+| `fingerprint`（三平台生成侧） | `final-attestation.mjs --ref "${{ github.sha }}" --expect-commit "${{ github.sha }}" …`：每个平台先自证记录即本次 revision |
+| 新 job `guarded-regression` | `pnpm run guarded-regression` + `node --test` parity/attestation 双套件；独立 job（非 `verify` 的 `needs`），探针红即该 job 失败，不让 parity 证据被 skip |
+| `package.json` | 新增 `"guarded-regression": "node scripts/eval/guarded-regression.mjs --json"`；README 命令表与 Packaging status 同步 |
+| `pnpm run typecheck` / `check:encoding` / `check:docs` | 全部 exit 0（check:docs：README 97/1979、84/1820、13/159 机械匹配 `SUCCESS`） |
+| `pnpm test`（全量 Vitest，本批复跑） | **97 文件 / 1979 测试全绿**，exit 0 |
+| `pnpm run build` + `check:build-smoke` | exit 0（`lib/index.js` 1003883B、ESM、68 named exports） |
+| `pnpm run check:negative-result` | exit 0（A1..A6 PASS） |
+| `pnpm run guarded-regression`（新 script 直跑） | exit 0，`{total:37, passed:37, failed:0}` |
+| `node --test` 双套件 | **51 pass / 0 fail / 0 skipped**，exit 0 |
+| `node scripts/eval/verify-pr4a-artifacts.mjs` | **691/691，failed=0**，exit 0 |
+| 夹具/临时对象边界 | worktrees 恒 1、`pr1-policy-commit-*` 恒 0、分支数不增长 |
+| `attest:verify` 目标门禁 | **刻意不接**：记录无法覆盖包含自身的提交，`--strict` / `--expect-commit github.sha` 在证据提交上必然为红（SELF-REFERENCE BOUNDARY）；需 ADR 后再落地（见 §4 本批条目） |
 
 ---
 
@@ -128,3 +166,19 @@
 - **2026-10-27 t12（终态集成）**：整合全量成果，生成 `docs/reports/p62-c11-c2a-closure.md`，更新本状态表，复跑七门禁全部 exit 0，绑定当前 HEAD `9ea9b7e` 与 diff 指纹 `846c85ee…`。
 - **2026-10-27 t24（指纹口径与 r4 消除空转）**：消除 `offline-fixtures.test.ts` r4 边界测试空转；明确代码面 diff 指纹排除 `P62_STATUS.md` 自指终态文档口径；统一表述为 11 个场景函数与 12 个 offline-fixtures it。
 - **2026-10-27 t25（可复现指纹清单与 attestation 重写）**：落地 `scripts/eval/final-attestation.mjs`，消除不可复现旧组合指纹 `c631c281…`，新生成 206 文件确定性组合指纹 `13c4c3cf…`；固化代码面 tracked diff 排除 `P62_STATUS.md` 与 `docs/reports/**` 规约（SHA-1 `846c85ee…` / 96,795B / 11 files）；产出机器可读清单 `docs/reports/final-attestation.json`。
+- **2026-10-28 rev.4（P0 修复批：t2/t3/t4/t10/t14 实现 + t5/t13 验证 + t7/t8/t11/t15 独立审核）**：
+  - **P0-A 临时仓库夹具**：删除「`worktree add --detach HEAD` + `checkout -b <uuid>` + `commit --allow-empty`」的假绿泄漏机制（空提交 tree==HEAD tree，且每次运行净增 3 个 `pr1-policy-commit-*` 永久 refs），改为 frozen 基线 `84a3d828…` 上私有 clone（`--shared --no-checkout`、私有 index、只读 `GIT_ALTERNATE_OBJECT_DIRECTORIES`）合成的真实提交夹具；清理语义升级为可断言（refs/worktree 计数 before==after）。
+  - **P0-B PR-4A 证据可携性**：MISSING/CLEAN/DIRTY 三态确定语义；t7 三项 findings（伪造 executedSources 绕过、dirty 未绑 codeBaseline、可携性回退无诊断）经 t14 修复、t15 独立复审 **verdict=pass**（变异测试证明新断言承重）。当前有效计数 **691/691 exit 0**（见 §2.1）；F1 为 (b) 语义，LF 检出边界如实保留。
+  - **P0-C parity/attestation 目标校验**：三平台闭集、`--expect-commit` / `--strict` / `verify-ref-conflict`、SELF-REFERENCE BOUNDARY（记录不覆盖包含自身的提交；`--verify` 通过 ≠ HEAD 已 attested；目标 SHA 永不伪造/回填）；`compare-platform-digests.d.mts` 公开声明同步（t10/t11 pass）。新增 `node:test` 双套件 51 项。
+  - **README 计数统一同步（本任务 t9）**：97 files / **1979** tests（unit 84/**1820**、e2e 13/159），由 `check:docs` 机械匹配验证。
+  - **边界**：本轮全部为本地验证修改；未生成 attestation、未 commit、未 push；`release_authorized` / `actually_applied` 恒 ✗ 不变。
+- **2026-10-28 rev.4 剩余授权事项（未授权前不得自行执行）**：
+  1. **CI / package script 变更授权**：`.github/workflows/ci.yml` 的 fingerprint-parity job（:236 附近）尚未传 `--expect-commit "${{ github.sha }}"`——远端门禁目前仍不能排除「三平台一致指向错误 commit」（t4 验收条款 4 留作集成授权；t8 复核同结论）；guarded-regression 如需纳入 pnpm 门禁链，需授权新增 package script。
+  2. **目标提交生成 attestation**：现行 `docs/reports/final-attestation.json` 描述基线提交 `84a3d828…`；含该记录自身的提交按 SELF-REFERENCE BOUNDARY 永不可自证——需在修复批提交落定后的目标提交上重跑 `pnpm run attest` 重生成（本轮未生成、未伪造）。
+  3. **推送后三平台 parity 实测**：三 OS 断言需在 GitHub Actions ubuntu/macos/windows 实际产出三份记录并 `--expect-commit <推送 SHA>` 比对（本地无法替代；HEAD `0410d78` 远端 CI=failure、fingerprint/parity=skipped 的历史事实未变，不因本地绿而改写）。
+  4. **后续批次**：修订方案 P1–P6 未开始。
+- **2026-10-28 rev.4 CI 接线轮（本批；用户明确授权后执行）**：
+  - **CI / package 接线（随本提交落地）**：`fingerprint-parity` 接 `--expect-commit "${{ github.sha }}"` 并修复同一 pipe 的失败语义（旧体返回 `tee` 退出码 = 假绿）；`fingerprint` 生成侧同接 `--expect-commit`；新增独立 `guarded-regression` job（`pnpm run guarded-regression` + `node --test` 双套件）；`package.json` 新增 `guarded-regression` script 并同步 README。详见 §2.2。
+  - **目标提交 attestation**：`docs/reports/final-attestation.json` 在本批代码提交上以 `--expect-commit <代码提交 SHA>` 重新生成、`--verify --expect-commit <同一 SHA>` 复验后**单独提交**；记录不覆盖包含自身的提交（证据提交不被其自身 attestation 覆盖）。
+  - **推送与远端实测**：两个提交推送至 `origin/main`（**不 force、不改写历史**）；三平台（ubuntu/macos/windows）parity 的远端结果以该次 GitHub Actions 运行日志为准——**本表不预先断言远端结果**。
+  - **未闭环（需 ADR，未擅自改变契约）**：`verify` job 的目标门禁（要求记录描述证据提交的父提交/目标 revision）。自指边界使 `--strict` / `--expect-commit github.sha` 在此处恒红，故本轮只接 parity 与 guarded-regression，不在 `verify` 上加目标参数。

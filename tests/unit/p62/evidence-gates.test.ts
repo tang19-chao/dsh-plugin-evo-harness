@@ -10,9 +10,23 @@
  *   - `final-attestation.mjs --verify`  a recorded attestation re-checks
  *   - `compare-platform-digests.mjs`    the cross-OS parity rule itself
  *
+ * FIXTURES NEVER MUTATE THIS REPOSITORY
+ * -------------------------------------
+ * The policy-commit fixture used to `git checkout -b pr1-policy-commit-<uuid>`
+ * inside a `git worktree` of THIS repository and then `git commit --allow-empty`
+ * so that something existed to name. Two defects in one: the commit carried no
+ * policy (its tree was identical to HEAD's, so the gate was asked about a commit
+ * that does not contain what it claims) and every run left a permanent branch in
+ * `.git` - three of them per `vitest run`, never cleaned up. The fixture below
+ * instead builds a REAL policy commit on the frozen pre-policy baseline inside a
+ * private `--shared` clone with a private index: no branch, no worktree
+ * registration and no objects written into this repository. `afterAll` asserts
+ * that count of `refs/heads/pr1-policy-commit-*` and of registered worktrees is
+ * unchanged, so a future fixture cannot silently start leaking again.
+ *
  * Offline: local git, local esbuild, no network, no model, no paid API.
  */
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -52,12 +66,17 @@ function makeRepo(files: Record<string, Buffer>, attributes?: string): string {
 }
 
 /** Run a CLI and capture the exit status instead of throwing. */
-function run(file: string, args: readonly string[]): { status: number; stdout: string; stderr: string } {
+function run(
+  file: string,
+  args: readonly string[],
+  options: { env?: NodeJS.ProcessEnv } = {}
+): { status: number; stdout: string; stderr: string } {
   try {
     const stdout = execFileSync(process.execPath, [file, ...args], {
       cwd: repoRoot,
       encoding: 'utf8',
-      maxBuffer: 64 * 1024 * 1024
+      maxBuffer: 64 * 1024 * 1024,
+      env: options.env ?? process.env
     });
     return { status: 0, stdout, stderr: '' };
   } catch (error) {
@@ -76,10 +95,11 @@ function gitEnv(): NodeJS.ProcessEnv {
   delete env.GIT_DIR;
   delete env.GIT_WORK_TREE;
   delete env.GIT_INDEX_FILE;
+  delete env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
   return env;
 }
 
-/** Temp repos/worktrees this suite creates, removed in `afterAll`. */
+/** Temp repositories this suite creates, removed in `afterAll`. */
 const cleanupDirs: string[] = [];
 
 /** Register a throw-away directory for removal in `afterAll`. */
@@ -88,53 +108,244 @@ function track(dir: string): string {
   return dir;
 }
 
+/** Repository state a fixture must never grow; see `afterAll` below. */
+interface RepoState {
+  policyBranches: number;
+  worktrees: number;
+}
+
+/**
+ * Count the two pieces of repository state a fixture can leak.
+ *
+ * A previous version of this suite created one branch per policy-commit fixture
+ * (`pr1-policy-commit-<uuid>`) because an `--allow-empty` commit needs a branch
+ * to advance; those branches are permanent and nothing deleted them, so every
+ * suite run added three refs to `.git`. Counting them before and after the
+ * suite turns that leak into a visible test failure instead of a slow
+ * accumulation that nobody notices.
+ */
+function measureRepoState(): RepoState {
+  const branches = execFileSync('git', ['for-each-ref', '--format=%(refname)', 'refs/heads/pr1-policy-commit-*'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: gitEnv()
+  })
+    .split('\n')
+    .filter((line) => line.length > 0).length;
+  const worktrees = execFileSync('git', ['worktree', 'list', '--porcelain'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    env: gitEnv()
+  })
+    .split('\n')
+    .filter((line) => line.startsWith('worktree ')).length;
+  return { policyBranches: branches, worktrees };
+}
+
+let repoStateBefore: RepoState | undefined;
+
+beforeAll(() => {
+  repoStateBefore = measureRepoState();
+});
+
 afterAll(() => {
-  // Newest first: a worktree registered later may hold the newest admin state,
-  // and `git worktree remove` on a stale sibling is what leaves leaks behind.
-  // Bare clones and plain temp dirs are removed by the rmSync fallback.
+  // Newest first: a worktree registered later may hold the newest admin state.
+  // Only a directory this repository ACTUALLY registered as a worktree needs
+  // `git worktree remove`; calling it for a plain temp dir prints
+  // `fatal: ... is not a worktree` for every cleanup, which buries real gate
+  // output, so plain directories are removed with rmSync only. Both paths are
+  // silent, and both run when a test failed too (`afterAll` is a hook, not part
+  // of the passing path), which is what makes the failure-path cleanup real.
+  let registered = new Set<string>();
+  try {
+    registered = new Set(
+      execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: repoRoot, encoding: 'utf8', env: gitEnv() })
+        .split('\n')
+        .filter((line) => line.startsWith('worktree '))
+        .map((line) => path.resolve(line.slice('worktree '.length).trim()))
+    );
+  } catch {
+    // No worktree registry to clean: the rmSync path below still runs.
+  }
   for (const dir of cleanupDirs.slice().reverse()) {
-    try {
-      execFileSync('git', ['worktree', 'remove', '--force', dir], { cwd: repoRoot, encoding: 'utf8', env: gitEnv() });
-    } catch {
+    if (registered.has(path.resolve(dir))) {
       try {
-        fs.rmSync(dir, { recursive: true, force: true });
+        execFileSync('git', ['worktree', 'remove', '--force', dir], {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          env: gitEnv(),
+          stdio: 'ignore'
+        });
+        continue;
       } catch {
-        // A leftover temp dir must not turn a green suite red.
+        // Fall through to rmSync: a half-removed worktree must still not leak.
       }
     }
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // A leftover temp dir must not turn a green suite red.
+    }
+  }
+  // Cleanup is part of the contract, not a courtesy: assert the counts the suite
+  // started with, so a future fixture cannot quietly reintroduce the leak.
+  if (repoStateBefore !== undefined) {
+    expect(measureRepoState(), 'this suite must not add pr1-policy-commit-* refs or worktree registrations').toEqual(
+      repoStateBefore
+    );
   }
 });
 
 describe('PR-1 encoding-policy gate', () => {
-  // The frozen baseline commit (84a3d82) predates .gitattributes: the policy
-  // file is still untracked in this working tree. The COMMIT-BOUND gate
-  // therefore reports `attributes-missing` on HEAD - the honest answer - and
-  // the passing-direction assertions below inspect a commit that DOES contain
-  // the policy instead of asserting a false pass on the baseline.
-  function commitPolicyOntoTempBranch(): string {
-    const staging = fs.mkdtempSync(path.join(os.tmpdir(), 'pr1-policy-commit-'));
-    cleanupDirs.push(staging);
-    execFileSync('git', ['worktree', 'add', '-q', '--detach', staging, 'HEAD'], {
+  /** The frozen commit that predates the policy: `git ls-tree <baseline> .gitattributes` is empty. */
+  const POLICY_BASELINE = '84a3d828ed2a27eef765c8b9c4950da4a9ee7287';
+
+  /** How many blobs the baseline tree holds: the policy commit has exactly one more. */
+  function baselineBlobCount(): number {
+    return execFileSync('git', ['ls-tree', '-r', POLICY_BASELINE], { cwd: repoRoot, encoding: 'utf8', env: gitEnv() })
+      .split('\n')
+      .filter((line) => /^\d{6} blob /.test(line)).length;
+  }
+
+  interface PolicyCommitFixture {
+    /** The synthesized commit: baseline + the current `.gitattributes`. */
+    commitId: string;
+    /** Private clone that owns the fixture commit; the only place it resolves. */
+    cloneDir: string;
+    /** The clone's object directory, for a read-only alternate. */
+    objectDir: string;
+  }
+
+  /**
+   * Build a REAL policy commit on top of the frozen pre-policy baseline.
+   *
+   * WHY NOT the old `worktree add --detach HEAD` + `git commit` fixture:
+   *   - `HEAD` already contains `.gitattributes` (it arrived in the rev3
+   *     commit), so `git add .gitattributes` there is a no-op and `git commit`
+   *     fails with `nothing to commit, working tree clean`. The fixture that
+   *     lived here worked around that with `--allow-empty`, i.e. it asserted the
+   *     gate against a commit whose tree did NOT contain the policy - the exact
+   *     false pass the gate exists to prevent;
+   *   - `checkout -b pr1-policy-commit-<uuid>` then left a permanent branch
+   *     behind on every run, because the branch name was the only thing holding
+   *     the empty commit alive. Nothing deleted those branches.
+   *
+   * This builder instead synthesizes the commit honestly: parent is the frozen
+   * pre-policy baseline, tree is the baseline tree plus the policy blob (added
+   * through a PRIVATE index), and `commit-tree` writes it into a private
+   * `--shared` clone. No branch, no worktree registration, and no object is
+   * written into this repository - test (f) in the first case below proves that
+   * by requiring the commit to be unresolvable here.
+   */
+  function commitPolicyOntoBaseline(): PolicyCommitFixture {
+    const cloneDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'pr1-policy-commit-')));
+    // `--shared` borrows this repository's object database read-only instead of
+    // copying it; `--no-checkout` means there is no worktree to clean up at all.
+    execFileSync('git', ['clone', '-q', '--shared', '--no-checkout', repoRoot, cloneDir], {
       cwd: repoRoot,
       encoding: 'utf8',
       env: gitEnv()
     });
-    fs.copyFileSync(path.join(repoRoot, '.gitattributes'), path.join(staging, '.gitattributes'));
-    // Untracked teammates' files (PR-2/3/4A artifacts) must not enter this commit.
-    execFileSync('git', ['add', '.gitattributes'], { cwd: staging, encoding: 'utf8', env: gitEnv() });
-    execFileSync('git', ['-c', 'user.email=[EMAIL]', '-c', 'user.name=PR-1 gate', 'commit', '-q', '-m', 'gate: commit the policy'], {
-      cwd: staging,
+    // A private index: the fixture must not read or write this repository's index.
+    const fixtureEnv: NodeJS.ProcessEnv = { ...gitEnv(), GIT_INDEX_FILE: path.join(cloneDir, '.git', 'policy-index') };
+    // `hash-object -w` writes into the repository `cwd` names - the clone, never
+    // this repository. The policy bytes are this checkout's committed policy.
+    const blobId = execFileSync('git', ['hash-object', '-w', '--', path.join(repoRoot, '.gitattributes')], {
+      cwd: cloneDir,
       encoding: 'utf8',
-      env: gitEnv()
+      env: fixtureEnv
+    }).trim();
+    execFileSync('git', ['read-tree', `${POLICY_BASELINE}^{tree}`], { cwd: cloneDir, encoding: 'utf8', env: fixtureEnv });
+    execFileSync('git', ['update-index', '--add', '--cacheinfo', `100644,${blobId},.gitattributes`], {
+      cwd: cloneDir,
+      encoding: 'utf8',
+      env: fixtureEnv
     });
-    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: staging, encoding: 'utf8', env: gitEnv() }).trim();
+    const treeId = execFileSync('git', ['write-tree'], { cwd: cloneDir, encoding: 'utf8', env: fixtureEnv }).trim();
+    // Fixed identity and dates keep the id stable between runs. Nothing asserts
+    // that stability; it only makes a failure message comparable across runs.
+    const commitId = execFileSync(
+      'git',
+      [
+        '-c',
+        'user.email=pr1@example.invalid',
+        '-c',
+        'user.name=PR-1 gate fixture',
+        'commit-tree',
+        treeId,
+        '-p',
+        POLICY_BASELINE,
+        '-m',
+        'gate: commit the content policy onto the pre-policy baseline'
+      ],
+      {
+        cwd: cloneDir,
+        encoding: 'utf8',
+        env: {
+          ...gitEnv(),
+          GIT_AUTHOR_DATE: '2026-01-01T00:00:00+0000',
+          GIT_COMMITTER_DATE: '2026-01-01T00:00:00+0000'
+        }
+      }
+    ).trim();
+    return { commitId, cloneDir, objectDir: path.join(cloneDir, '.git', 'objects') };
   }
 
+  /** Built once per suite: one clone, reused by the cases that need the fixture. */
+  let policyCommitFixture: PolicyCommitFixture | undefined;
+  function policyCommit(): PolicyCommitFixture {
+    policyCommitFixture ??= commitPolicyOntoBaseline();
+    return policyCommitFixture;
+  }
+
+  it('names a REAL policy commit on the frozen pre-policy baseline, not an empty one', () => {
+    const { commitId, cloneDir } = policyCommit();
+    const gitIn = (args: readonly string[]): string =>
+      execFileSync('git', args.slice(), { cwd: cloneDir, encoding: 'utf8', env: gitEnv() }).trim();
+
+    // (a) the parent is the frozen pre-policy baseline, and that parent really
+    //     has no policy file - so the commit under test is where it arrives.
+    expect(gitIn(['rev-parse', `${commitId}^`])).toBe(POLICY_BASELINE);
+    expect(gitIn(['ls-tree', '--name-only', POLICY_BASELINE, '--', '.gitattributes'])).toBe('');
+
+    // (b) the tree CHANGED. An empty commit would have tree == parent tree and
+    //     would be evidence of nothing; this is the assertion that outlaws it.
+    expect(gitIn(['rev-parse', `${commitId}^{tree}`])).not.toBe(gitIn(['rev-parse', `${POLICY_BASELINE}^{tree}`]));
+
+    // (c) the commit carries exactly the policy file: untracked teammates'
+    //     files (PR-2/3/4A artifacts) must not be swept into the fixture.
+    expect(gitIn(['diff-tree', '--no-commit-id', '--name-only', '-r', commitId])).toBe('.gitattributes');
+
+    // (d) the committed bytes are the policy this checkout actually declares.
+    const worktreePolicyBlob = execFileSync('git', ['hash-object', '--', path.join(repoRoot, '.gitattributes')], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: gitEnv()
+    }).trim();
+    expect(gitIn(['rev-parse', `${commitId}:.gitattributes`])).toBe(worktreePolicyBlob);
+    expect(worktreePolicyBlob).toBe(
+      execFileSync('git', ['rev-parse', 'HEAD:.gitattributes'], { cwd: repoRoot, encoding: 'utf8', env: gitEnv() }).trim()
+    );
+
+    // (e) nothing points at it, here or in the clone: the fixture is anonymous,
+    //     so no ref is left behind for a later `git branch` to trip over.
+    expect(gitIn(['for-each-ref', '--points-at', commitId, '--format=%(refname)'])).toBe('');
+
+    // (f) the fixture wrote NO object into this repository: the commit resolves
+    //     in the clone and nowhere else.
+    expect(() =>
+      execFileSync('git', ['cat-file', '-e', commitId], { cwd: repoRoot, stdio: 'ignore', env: gitEnv() })
+    ).toThrow();
+  });
+
   it('passes on a commit that contains the policy, and names that commit', () => {
-    const commitId = commitPolicyOntoTempBranch();
-    const result = checkEncodingPolicy({ ref: commitId });
+    const { commitId, cloneDir } = policyCommit();
+    const result = checkEncodingPolicy({ ref: commitId, cwd: cloneDir });
     expect(result.commitId).toBe(commitId);
     expect(result.attributesPresent).toBe(true);
+    // Exact, not a lower bound: the fixture commit is the baseline tree plus one
+    // blob, so a tree that is not the policy commit's tree cannot pass here.
+    expect(result.checked).toBe(baselineBlobCount() + 1);
     expect(result.checked).toBeGreaterThan(100);
     expect(result.violations).toEqual([]);
   });
@@ -146,8 +357,7 @@ describe('PR-1 encoding-policy gate', () => {
     // A locally present, uncommitted .gitattributes does NOT change the verdict:
     // the same call against the baseline commit in a repo whose worktree copy
     // is absent must give the same answer.
-    const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'pr1-policy-bare-'));
-    cleanupDirs.push(bare);
+    const bare = track(fs.mkdtempSync(path.join(os.tmpdir(), 'pr1-policy-bare-')));
     execFileSync('git', ['clone', '-q', '--bare', '--no-hardlinks', repoRoot, bare], {
       cwd: repoRoot,
       encoding: 'utf8',
@@ -157,6 +367,43 @@ describe('PR-1 encoding-policy gate', () => {
     expect(fromBare.attributesPresent).toBe(false);
     expect(fromBare.violations.map((violation) => violation.kind)).toContain('attributes-missing');
   }, 120_000);
+
+  it('distinguishes the tracked state from the untracked state on IDENTICAL policy bytes', () => {
+    // Acceptance: the tracked and untracked states must both be covered, and the
+    // difference between them must be the COMMIT - not the file's contents.
+    // The same policy text and the same CRLF blob are used in both fixtures, so
+    // only one variable changes: whether the commit contains `.gitattributes`.
+    const policyText = 'src/*.txt -text\n';
+    const crlf = Buffer.from('one\r\ntwo\r\n', 'utf8');
+
+    // State A - UNTRACKED: the bytes exist on disk, the commit does not have them.
+    const untracked = makeRepo({ 'src/crlf.txt': crlf });
+    fs.writeFileSync(path.join(untracked, '.gitattributes'), policyText, 'utf8');
+    expect(
+      execFileSync('git', ['status', '--porcelain', '--', '.gitattributes'], { cwd: untracked, encoding: 'utf8', env: gitEnv() }).trim()
+    ).toBe('?? .gitattributes');
+    const untrackedResult = checkEncodingPolicy({ cwd: untracked });
+    expect(untrackedResult.attributesPresent).toBe(false);
+    expect(untrackedResult.declaredRules).toEqual([]);
+    expect(untrackedResult.violations.map((violation) => violation.kind).sort()).toEqual([
+      'attributes-missing',
+      'undeclared-non-lf-blob'
+    ]);
+
+    // State B - TRACKED: byte-identical policy text, this time in the commit.
+    const tracked = makeRepo({ 'src/crlf.txt': crlf }, policyText);
+    expect(
+      execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: tracked, encoding: 'utf8', env: gitEnv() }).trim()
+    ).toBe(''); // clean tree: the policy is committed, not merely present
+    expect(
+      execFileSync('git', ['rev-parse', 'HEAD:.gitattributes'], { cwd: tracked, encoding: 'utf8', env: gitEnv() }).trim()
+    ).toBe(execFileSync('git', ['hash-object', '.gitattributes'], { cwd: tracked, encoding: 'utf8', env: gitEnv() }).trim());
+    const trackedResult = checkEncodingPolicy({ cwd: tracked });
+    expect(trackedResult.attributesPresent).toBe(true);
+    expect(trackedResult.declaredRules).toEqual(['src/*.txt -text']);
+    expect(trackedResult.violations).toEqual([]);
+    expect(trackedResult.exceptions).toHaveLength(1);
+  });
 
   it('reads the policy from the commit: an untracked .gitattributes cannot create or cure a violation', () => {
     // FALSE PASS direction: the commit has NO policy file; a worktree copy
@@ -248,11 +495,16 @@ describe('PR-1 encoding-policy gate', () => {
   it('exits 0 through the CLI for a policy-complete commit, and 1 for the policy-less baseline', () => {
     // The CLI path matters: gate outcomes must be visible to CI, not only to an
     // in-process caller. `--ref` exists precisely so CI can name the commit.
-    const commitId = commitPolicyOntoTempBranch();
-    expect(run(POLICY_CLI, ['--ref', commitId]).status).toBe(0);
+    const { commitId, objectDir } = policyCommit();
+    // The fixture commit lives in a private clone, so the CLI (which always
+    // inspects this repository's root) is pointed at that object directory as a
+    // READ-ONLY alternate. Nothing is written here; the commit is simply
+    // resolvable for the duration of this call.
+    const fixtureEnv: NodeJS.ProcessEnv = { ...gitEnv(), GIT_ALTERNATE_OBJECT_DIRECTORIES: objectDir };
+    expect(run(POLICY_CLI, ['--ref', commitId], { env: fixtureEnv }).status).toBe(0);
     // The frozen baseline predates .gitattributes, so its honest verdict is a
     // failure that names the defect.
-    const baseline = run(POLICY_CLI, ['--ref', '84a3d828ed2a27eef765c8b9c4950da4a9ee7287']);
+    const baseline = run(POLICY_CLI, ['--ref', POLICY_BASELINE]);
     expect(baseline.status).toBe(1);
     expect(baseline.stdout + baseline.stderr).toContain('attributes-missing');
     // A broken fixture is still asserted through the in-process API.
@@ -261,13 +513,15 @@ describe('PR-1 encoding-policy gate', () => {
   }, 120_000);
 
   it('emits machine-readable JSON for CI', () => {
-    const commitId = commitPolicyOntoTempBranch();
-    const result = run(POLICY_CLI, ['--json', '--ref', commitId]);
-    expect(result.status).toBe(0);
+    const { commitId, objectDir } = policyCommit();
+    const result = run(POLICY_CLI, ['--json', '--ref', commitId], {
+      env: { ...gitEnv(), GIT_ALTERNATE_OBJECT_DIRECTORIES: objectDir }
+    });
+    expect(result.status, result.stderr).toBe(0);
     const parsed = JSON.parse(result.stdout);
     expect(parsed.ok).toBe(true);
     expect(parsed.attributesPresent).toBe(true);
-    expect(parsed.checked).toBeGreaterThan(100);
+    expect(parsed.checked).toBe(baselineBlobCount() + 1);
     expect(parsed.commitId).toBe(commitId);
   });
 });

@@ -40,6 +40,7 @@
     "check:encoding": "node scripts/eval/check-encoding-policy.mjs",
     "check:build-smoke": "node scripts/eval/smoke-build.mjs",
     "check:negative-result": "node scripts/eval/negative-result-diag.mjs --assert",
+    "guarded-regression": "node scripts/eval/guarded-regression.mjs --json",
     "attest": "node scripts/eval/final-attestation.mjs --ref HEAD --out docs/reports/final-attestation.json",
     "attest:verify": "node scripts/eval/final-attestation.mjs --verify docs/reports/final-attestation.json",
     "bench:jitrl": "node scripts/bench-jitrl-query.mjs",

@@ -103,6 +103,54 @@ jobs:
         run: node scripts/eval/smoke-build.mjs
 
   # ---------------------------------------------------------------------------
+  # P0 (rev.4) evidence gates that no other job runs.
+  #
+  #   - `pnpm run guarded-regression` is ADR 0002 gate #7 (release-surface,
+  #     isolation and trusted-source probes). It was a documented gate that CI
+  #     never executed; wiring the package script makes the documented command
+  #     and the CI command the same string.
+  #   - the two `*.node-test.mjs` suites are deliberately OUTSIDE Vitest's glob
+  #     (they run with plain `node --test`, so a third party can execute them
+  #     with no dev dependencies). That is exactly why they need their own step:
+  #     otherwise the parity `--expect-commit` rule and the attestation
+  #     target/self-reference rules would be exercised on no runner at all.
+  #
+  # Deliberately NOT a `needs:` of `fingerprint`: a red probe must show up as
+  # this job failing, not as the cross-OS evidence being skipped.
+  # ---------------------------------------------------------------------------
+  guarded-regression:
+    name: Guarded regression and evidence rules
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm 11.7.0
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: '11.7.0'
+
+      - name: Set up Node.js 22 with pnpm cache
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: "Run guarded regression probes (ADR 0002 gate #7)"
+        run: pnpm run guarded-regression
+
+      # Both fixtures are self-contained (`os.tmpdir()` git repositories or
+      # synthetic JSON directories), so this needs no repository history.
+      - name: Run the parity and attestation node:test suites
+        run: node --test scripts/eval/compare-platform-digests.node-test.mjs scripts/eval/final-attestation.node-test.mjs
+
+  # ---------------------------------------------------------------------------
   # PR-1 cross-OS fingerprint job.
   #
   # The entire point of hashing the OBJECT DATABASE instead of the worktree is
@@ -154,7 +202,13 @@ jobs:
       # avoiding `>` sidesteps PowerShell's misleading default encodings on the
       # Windows runner. The artifact is the file the script writes with --out.
       - name: Compute commit attestation (raw blob bytes)
-        run: node scripts/eval/final-attestation.mjs --ref "${{ github.sha }}" --out attestation.json --json
+        # `--ref` already resolves the pushed revision, and `--expect-commit`
+        # makes the target EXPLICIT: this platform must refuse to publish a
+        # record for anything but the revision the workflow was triggered on.
+        # The generated record is compared against `--expect-commit` again in
+        # `fingerprint-parity`, so a wrong-commit artifact cannot slip through
+        # as "three platforms agree".
+        run: node scripts/eval/final-attestation.mjs --ref "${{ github.sha }}" --expect-commit "${{ github.sha }}" --out attestation.json --json
 
       - name: Publish this platform's digests
         shell: bash
@@ -232,12 +286,28 @@ jobs:
           path: artifacts
 
       - name: Compare digests across operating systems
+        # `--expect-commit "${{ github.sha }}"` is what turns "the three records
+        # agree" into "the three records agree on the revision this run was
+        # triggered for": without it, three consistent records of the WRONG
+        # commit (a stale artifact set) would pass.
+        #
+        # `shell: bash` gives the step `-o pipefail`, but that would abort before
+        # the summary below is published; the explicit `PIPESTATUS[0]` capture
+        # keeps BOTH properties - the JSON is always in the job summary, and the
+        # rule's exit code (not `tee`'s) decides the job. The default shell would
+        # report `tee`'s status, so a mismatch would have been published as a
+        # green job.
+        shell: bash
         run: |
+          set +e
           node scripts/eval/compare-platform-digests.mjs artifacts --json \
+            --expect-commit "${{ github.sha }}" \
             | tee parity.json
+          status=${PIPESTATUS[0]}
           {
             echo "## Cross-OS fingerprint parity"
             echo '```json'
             cat parity.json
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

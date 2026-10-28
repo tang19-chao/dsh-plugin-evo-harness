@@ -243,3 +243,68 @@ tests/unit/integration/p5-wiring.test.ts
 tests/unit/integration/p5-host-tool-wiring.test.ts # H2/F1
 tests/e2e/jitrl-ablation.test.ts
 ```
+
+---
+
+## 10. 附：2026-10-28 P0 修复批（rev.4）回链
+
+> 本节为 P0 修复批（AgentTeams `rev4-p0-remediation`）的集成回链；§1–§9 记录的 JitRL P4/P5 轮内容保持历史原样，不回写。
+
+### 三项 P0 修复（全部本地验证、独立审核 pass；未 commit / 未 push）
+
+- **P0-A p62 临时仓库夹具**（`tests/unit/p62/evidence-gates.test.ts`、`commit-attestation.test.ts`）：删除「`worktree add --detach HEAD` + `checkout -b <uuid>` + `commit --allow-empty`」的假绿泄漏机制——空提交 tree==HEAD tree（被问的提交根本不含策略），且每次运行净增 3 个 `pr1-policy-commit-*` 永久 refs；改为 frozen 基线 `84a3d828…` 上私有 clone（`--shared --no-checkout` + 私有 index + 只读 `GIT_ALTERNATE_OBJECT_DIRECTORIES`）合成的真实提交夹具，清理语义升级为可断言（refs / worktree 计数 before==after）。修复后全量 Vitest 多轮复跑 refs 恒 9、worktrees 恒 1、`pr1-policy-commit-*` 恒 0。
+- **P0-B PR-4A 证据可携性**（`scripts/eval/verify-pr4a-artifacts.mjs`，专属测试 8→13）：MISSING / CLEAN / DIRTY 三态确定且可诊断；t7 三项 findings（伪造 executedSources 可绕过、dirty 未绑 codeBaseline、可携性回退无诊断）经 t14 修复、t15 独立复审 **verdict=pass**（变异测试证明新增断言承重，非陪跑）。**当前有效计数 691/691 exit 0（warnings=[]）**——683 为 t3 前基线、688 为 t3 轮中间值，均非现行。F1 边界如实保留：raw-byte 历史产物在 LF 检出复验仍会失败，但已具备具名 `provenance-executed-sources-eol-divergent` WARN（含 `eolOnly` 分类）与文件头 / `--help` 的 CHECKOUT BYTE SPEC，**不声称跨 LF 直接可携**。
+- **P0-C parity / attestation 目标校验**（`scripts/eval/compare-platform-digests.mjs`、`final-attestation.mjs`、新增 `node:test` 双套件 51 项、`compare-platform-digests.d.mts` 声明同步）：三平台闭集（恰 ubuntu/macos/windows 各一，命名约定不得混用）、`--expect-commit` / `--strict` / `verify-ref-conflict`、SELF-REFERENCE BOUNDARY（记录不覆盖包含自身的提交；`--verify` 通过 ≠ HEAD 已 attested；目标 SHA 永不伪造/回填）。t8 / t11 独立审核 pass。
+
+### 本地门禁终态（2026-10-28，win32/x64）
+
+typecheck / check:encoding / **check:docs（README 97 files / 1979 tests 机械匹配 SUCCESS）** / build + build-smoke / negative-result（A1..A6 PASS）/ guarded-regression **37/37**（无 package script，按 ADR 0002 门禁 #7 规范命令直跑）全 exit 0；`tests/unit/p62` 5 文件 176 测试全绿；README 计数由本批 integration（t9）统一同步（此前 t12 同步至 97/1974 后 t14 又 +5 测试，最终按 t15 复审实测 97/1979、unit 84/1820 落定）。
+
+### 剩余授权事项（本轮未执行，未授权前不得自行执行）
+
+1. **CI / package script 变更授权**：`.github/workflows/ci.yml` 的 fingerprint-parity job 尚未传 `--expect-commit "${{ github.sha }}"`——远端门禁目前仍不能排除「三平台一致指向错误 commit」；guarded-regression 如需纳入 pnpm 门禁链需新增 package script。
+2. **目标提交生成 attestation**：现行 `docs/reports/final-attestation.json` 描述基线 `84a3d828…`；含记录自身的提交按 SELF-REFERENCE BOUNDARY 永不可自证——需在修复批提交落定后的目标提交上重跑 `pnpm run attest` 重生成。
+3. **推送后三平台 parity 实测**：需 GitHub Actions ubuntu/macos/windows 实际产出三份记录并 `--expect-commit <推送 SHA>` 比对（本地无法替代；HEAD `0410d78` 远端 CI=failure、fingerprint/parity=skipped 的历史事实未变）。
+4. **后续批次**：修订方案 P1–P6 未开始。
+
+**边界声明**：本轮全部为本地验证修改；**本地绿 ≠ 远端绿**；未生成/伪造任何 attestation 或远端 CI 结果；未 commit、未 push。
+
+---
+
+## 11. 附：P0 CI 接线、目标提交 attestation 与推送（2026-10-28，rev.4 集成第二段）
+
+> 本节仅追加，不回写 §1–§10。§10「剩余授权事项」1–3 在本段获得用户明确授权后执行；**远端结果只能由推送后的 GitHub Actions 运行产生**，本节不预先断言。
+
+### 11.1 CI / package 接线（`.github/workflows/ci.yml`、`package.json`）
+
+1. **`fingerprint-parity` 目标校验**：比较调用改为 `node scripts/eval/compare-platform-digests.mjs artifacts --json --expect-commit "${{ github.sha }}"`。此前三平台记录只能互相印证——三份一致但同指向错误 commit 的陈旧 artifact 目录会被判绿。
+2. **同一步的失败语义修复（承重，非装饰）**：原步骤体 `node … | tee parity.json` 走默认 shell（`bash -e`，**不含 `pipefail`**；GitHub 文档明载 `-o pipefail` 仅在显式 `shell: bash` 时附加），管道退出码取 `tee`，所以规则失败会被记为绿灯。现为 `shell: bash` + `set +e` + `status=${PIPESTATUS[0]}` + `exit "$status"`：`tee`（日志输出、失败时仍写 job summary）全部保留，退出码改由规则本身决定。本地以合成三平台产物实测同一命令：目标匹配 → 0；目标不匹配 → 1；三平台 composite 不一致 → 1；旧步骤体在同一失败用例下 → 0。
+3. **`fingerprint` 生成侧显式目标**：`final-attestation.mjs --ref "${{ github.sha }}" --expect-commit "${{ github.sha }}" --out attestation.json --json`——每个平台先自我保证「将要发布的记录就是本次 revision」。
+4. **新增 `guarded-regression` job**（独立 job，刻意不作为 `verify` 的 `needs`）：`pnpm run guarded-regression`（ADR 0002 门禁 #7）与 `node --test scripts/eval/compare-platform-digests.node-test.mjs scripts/eval/final-attestation.node-test.mjs`。不设 `needs` 的目的：探针红必须表现为该 job 失败，而不是让三平台 parity 证据被 skip。
+5. **`package.json` 新增 `guarded-regression` script**：`node scripts/eval/guarded-regression.mjs --json`；README 命令表与「Packaging status」同步（文档命令与门禁命令为同一字符串）。
+
+### 11.2 attestation 严格门禁与 SELF-REFERENCE BOUNDARY（未擅自改变契约）
+
+`verify` job 的 `pnpm run attest:verify` 保持**无目标参数**的自洽校验。记录只能描述生成它的提交，而证据提交自身包含该记录，因此 `--strict`（要求记录描述 HEAD）或 `--expect-commit github.sha` 在证据提交上**必然为红**（自指边界）；在代码提交上同样为红（记录仍指向旧基线）。故本轮**不**给 `verify` job 接目标门禁；「记录须描述证据提交的父提交」这类规则是新契约，需 ADR 后另行落地（见 §11.4）。
+
+### 11.3 本地复验（2026-10-28，win32/x64，本批工作树）
+
+| 门禁 | 实测 |
+| --- | --- |
+| `pnpm run typecheck` | exit 0 |
+| `pnpm run check:encoding` | exit 0（314 tracked blobs；3 个显式 `-text` 例外） |
+| `pnpm test`（全量 Vitest） | **97 files / 1979 tests 全绿**（unit 84/1820 + e2e 13/159），exit 0 |
+| `pnpm run check:docs` | SUCCESS（README 97/1979、84/1820、13/159 机械匹配） |
+| `pnpm run build` + `pnpm run check:build-smoke` | exit 0（`lib/index.js` 1003883B、ESM、68 named exports） |
+| `pnpm run check:negative-result` | exit 0（A1..A6 PASS，历史 −0.250 保留） |
+| `pnpm run guarded-regression`（新 script） | exit 0，`{total:37, passed:37, failed:0}` |
+| `node --test` parity/attestation 双套件 | **51 pass / 0 fail / 0 skipped**，exit 0 |
+| `node scripts/eval/verify-pr4a-artifacts.mjs` | **691/691，failed=0**，exit 0（F1 可携性边界不变） |
+| 夹具泄漏边界 | worktrees 恒 1、`pr1-policy-commit-*` 恒 0、分支数不增长 |
+| `pnpm run attest:verify`（旧记录） | exit 0，并**如实打印**「HEAD 不是记录提交」（自洽 ≠ 目标已 attested） |
+
+### 11.4 边界与未闭环项
+
+- **未被本轮覆盖**：`verify` job 的目标门禁（需 ADR，见 §11.2）；PR-4A 产物校验器在 LF 检出的可携性（F1，仍不声称跨 LF 直接可携）。
+- **本节不作断言**：三平台 parity 是否在远端通过，只能以推送后的 Actions 运行日志为准（run URL、各 job 状态与目标 SHA 见推送轮报告）；**本地绿 ≠ 远端绿**。
+- **提交与 attestation**：本段全部修改进入一个非 merge 提交；`docs/reports/final-attestation.json` 在该提交上以 `--expect-commit <该提交 SHA>` 重新生成并**单独提交**（记录不覆盖包含自身的提交，证据提交不被自己的 attestation 覆盖）。

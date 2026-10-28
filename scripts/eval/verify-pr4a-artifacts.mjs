@@ -4,12 +4,51 @@
  *
  * Encodes every claim the report makes as a MACHINE assertion whose result is an
  * exit code, so the run is verifiable even when stdout cannot be read. Exit 0
- * means every assertion held; exit 1 means at least one did not, and the failing
- * ids are written to work/pr4a-verify-status.json for later inspection.
+ * means every assertion held; exit 1 means at least one did not. A summary plus
+ * every failing check id/detail is printed to stdout, and the same failure list
+ * is written to work/pr4a-verify-status.json whenever that output file is
+ * writable, so a missing work/ directory is still diagnosable instead of silent.
  *
  * This is also the reproducibility check (V2 §4.1.4): it re-runs nothing, but it
  * does re-derive every statistic from the persisted ledgers/JSON, so a report
  * that disagrees with its own data fails here.
+ *
+ * EVIDENCE PORTABILITY. The provenance block is verified in all three workspace
+ * states rather than requiring a non-empty dirty list unconditionally:
+ *   (a) MISSING — work/ or the report artifact is absent: the run fails with the
+ *       exact missing paths, and prints that summary on stdout even though no
+ *       status file can be written;
+ *   (b) CLEAN — workspaceDirty=false, trackedDirtyCount=0, dirtyFileDigests=[],
+ *       trackedWorkspaceDigest=sha256('') and the executed sources still match
+ *       the bytes on disk: the empty list is a legitimate clean capture;
+ *   (c) DIRTY — workspaceDirty=true with a non-empty list whose paths resolve,
+ *       whose count matches, whose trackedWorkspaceDigest is recomputable from
+ *       the listed entries, AND whose paths are a subset of
+ *       `git diff --name-only <codeBaseline>` (t1 B1 state 5). The list is a
+ *       snapshot of tracked changes relative to the frozen baseline, so its
+ *       BYTES stay historical, but a fabricated or restored path is rejected.
+ * In every state the executed source digests must still reconcile with the
+ * bytes on disk, because those are the bytes the report claims actually ran.
+ *
+ * CHECKOUT BYTE SPEC (raw bytes, never normalised). `fileSha256` in the eval run
+ * hashes the RAW working-tree bytes, so an executed-source digest describes the
+ * checkout configuration that produced it, not an abstract file. This verifier
+ * therefore compares raw bytes; a green run only means generation and
+ * verification used the SAME checkout byte configuration. The shipped artifact
+ * was generated on Windows with core.autocrlf=true (text files such as
+ * scripts/eval/build-eval.mjs are CRLF in that worktree), so it is NOT portable
+ * to an LF checkout and no such claim is made. For portable evidence, generate
+ * and verify under an LF checkout:
+ *     git -c core.autocrlf=false checkout -- .
+ * A mismatch whose two byte forms differ ONLY by line endings is reported by the
+ * named warning `provenance-executed-sources-eol-divergent` (WARN), while
+ * `provenance-executed-sources-match-disk` still fails: the recorded bytes do
+ * not describe this checkout. An executedSources entry that is malformed
+ * (absolute/traversal/drive-letter path, non-hex digest) or unreadable is a
+ * FAILURE, never silently filtered out of the comparison.
+ *
+ * `--help` prints this contract (byte spec, exit codes and the eol/subset check
+ * names), so the documented spec and the comparison cannot drift apart.
  *
  * REVISION (PR-4A statistical-audit repair). The assertions below were extended
  * to cover the repaired semantics, so a regression to an audited defect fails
@@ -28,6 +67,7 @@
  *     provenance block that can locate the executed code.
  */
 
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -37,19 +77,154 @@ const results = [];
 function assert(id, condition, detail) {
   results.push({ id, ok: Boolean(condition), detail: detail ?? '' });
 }
+/**
+ * A non-failing, named observation: printed as WARN and recorded in the status
+ * file's `warnings`. Warnings never change the exit code; they exist to make a
+ * byte divergence diagnosable instead of one opaque mismatch.
+ */
+function warn(id, detail) {
+  results.push({ id, ok: true, advisory: true, detail: detail ?? '' });
+}
 function sha256(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex');
 }
+function digestOfBytes(bytes) {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+/** Raw bytes of a repo-relative file, or null when unreadable. */
+function readRepoFileBytes(relativePath) {
+  try {
+    return readFileSync(join(REPO_ROOT, relativePath));
+  } catch {
+    return null;
+  }
+}
+/** sha256 of the current RAW bytes of a repo-relative file, or null. */
+function digestOfFile(relativePath) {
+  const bytes = readRepoFileBytes(relativePath);
+  return bytes === null ? null : digestOfBytes(bytes);
+}
+const HEX64 = /^[0-9a-f]{64}$/;
+const SAFE_REL_PATH = /^\.?[A-Za-z0-9._/-]+$/;
+function isSafeRelativePath(value) {
+  const text = String(value);
+  return SAFE_REL_PATH.test(text) && !text.split('/').includes('..');
+}
+/**
+ * T7-F2: an executedSources entry must be well-formed BEFORE any disk compare:
+ * object, non-empty repo-relative path (no leading slash, no drive letter, no
+ * backslash, no '..'/empty segment) and a 64-hex sha256. Anything else is a
+ * failure named by `provenance-executed-entries-well-formed`; it is never
+ * filtered out of the comparison.
+ */
+function isWellFormedExecutedEntry(entry) {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  if (typeof entry.path !== 'string' || entry.path.length === 0) return false;
+  if (typeof entry.sha256 !== 'string' || !HEX64.test(entry.sha256)) return false;
+  if (entry.path.startsWith('/') || entry.path.includes('\\') || /^[A-Za-z]:/.test(entry.path)) return false;
+  return entry.path.split('/').every((segment) => segment.length > 0 && segment !== '..');
+}
+/**
+ * True when the current bytes and the recorded digest differ ONLY by CRLF/LF
+ * form: the recorded bytes are the same text under another checkout byte
+ * configuration. This is a DIAGNOSIS for the named warning, never an exemption:
+ * `provenance-executed-sources-match-disk` still fails on it.
+ */
+function isEolOnlyDivergence(bytes, recorded) {
+  if (bytes === null || bytes.includes(0)) return false;
+  const text = bytes.toString('utf8');
+  if (text.includes('\uFFFD')) return false; // not valid UTF-8: never reinterpret bytes
+  const lf = text.replace(/\r\n/g, '\n');
+  const crlf = lf.replace(/\n/g, '\r\n');
+  return sha256(lf) === recorded || sha256(crlf) === recorded;
+}
+/**
+ * Paths changed between the recorded codeBaseline and the current working tree.
+ * `paths === null` means the constraint could not be evaluated and must FAIL
+ * (never be skipped). `git diff <commit>` compares the frozen commit with the
+ * worktree, which is exactly the t1 B1 state-5 subset judgment (b).
+ */
+function baselineChangedPaths(codeBaseline) {
+  /** Git environment without caller-injected repo overrides (e.g. CI hooks). */
+  const env = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'].includes(key)) env[key] = value;
+  }
+  try {
+    const output = execFileSync('git', ['diff', '--name-only', '-z', String(codeBaseline)], {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+      env,
+      maxBuffer: 64 * 1024 * 1024
+    });
+    return { paths: new Set(output.split('\0').filter((entry) => entry.length > 0)), error: '' };
+  } catch (error) {
+    return { paths: null, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+/** sha256 of the empty tracked-file list: the identity of a clean capture. */
+const EMPTY_TREE_DIGEST = sha256('');
 function closeTo(actual, expected, tolerance = 1e-9) {
   return typeof actual === 'number' && Math.abs(actual - expected) <= tolerance;
+}
+
+/**
+ * Byte-checkout contract. Kept beside `--help` so the documented spec and the
+ * comparison cannot drift apart: the digests are raw worktree bytes, so a green
+ * run is only meaningful under the checkout configuration the artifact was
+ * generated in.
+ */
+const HELP_TEXT = [
+  'PR-4A artifact verification (read-only; re-derives, never re-runs the eval).',
+  '',
+  'USAGE',
+  '  node scripts/eval/verify-pr4a-artifacts.mjs',
+  '  node scripts/eval/verify-pr4a-artifacts.mjs --help',
+  '',
+  'CHECKOUT BYTE SPEC (executedSources are compared as RAW worktree bytes)',
+  '  The recorded digests describe the files as they were checked out when the',
+  '  eval ran. This verifier does not normalise line endings: a green run means',
+  '  generation and verification used the SAME checkout byte configuration.',
+  '  The shipped artifact was generated on Windows with core.autocrlf=true, so',
+  '  text files such as scripts/eval/build-eval.mjs and jitrl-eval-lib.ts are',
+  '  CRLF in that worktree. It is NOT portable to an LF checkout.',
+  '  For portable evidence, generate AND verify under an LF checkout:',
+  '    git -c core.autocrlf=false checkout -- .',
+  '',
+  '  A mismatch whose byte forms differ only by CRLF/LF is reported by the named',
+  '  warning `provenance-executed-sources-eol-divergent` (shown as WARN), while',
+  '  `provenance-executed-sources-match-disk` still fails: the recorded bytes do',
+  '  not describe this checkout. Malformed executedSources entries (absolute,',
+  '  traversal or drive-letter paths, non-hex digests) and unreadable entries are',
+  '  failures, never skipped comparisons.',
+  '',
+  'DIRTY EVIDENCE',
+  '  dirtyFileDigests paths must be a subset of `git diff --name-only',
+  '  <codeBaseline>`: the recorded bytes stay historical, but each path is bound',
+  '  to the frozen baseline. A path outside that set (fabricated or restored)',
+  '  fails provenance-dirty-paths-in-baseline-diff and is named in the detail.',
+  '',
+  'EXIT CODES',
+  '  0  every assertion held (warnings do not fail the run)',
+  '  1  at least one assertion failed; failing ids/details are printed to stdout',
+  ''
+].join('\n');
+
+if (process.argv.slice(2).includes('--help') || process.argv.slice(2).includes('-h')) {
+  console.log(HELP_TEXT);
+  process.exit(0);
 }
 
 // ---------------------------------------------------------------------------
 // 1. artifacts exist and parse
 // ---------------------------------------------------------------------------
-const jsonPath = join(REPO_ROOT, 'work', 'pr4a-five-arm-eval.json');
+const workDir = join(REPO_ROOT, 'work');
+const jsonPath = join(workDir, 'pr4a-five-arm-eval.json');
 const mdPath = join(REPO_ROOT, 'docs', 'reports', 'pr4a-five-arm-eval-report.md');
 
+// Missing artifacts are their own diagnosable state: name the directory first so
+// a checkout that never ran the eval is distinguishable from a corrupt report.
+assert('work-directory-exists', existsSync(workDir), workDir);
 assert('json-exists', existsSync(jsonPath), jsonPath);
 assert('markdown-exists', existsSync(mdPath), mdPath);
 
@@ -141,12 +316,18 @@ if (report !== null) {
   const selfEntry = (prov.executedSources ?? []).find(
     (entry) => entry.path === 'scripts/eval/pr4a-report.ts'
   );
+  const selfDigestOnDisk = digestOfFile('scripts/eval/pr4a-report.ts');
   assert(
     'provenance-self-hash-matches-working-tree',
-    selfEntry !== undefined &&
-      selfEntry.sha256 === sha256(readFileSync(join(REPO_ROOT, 'scripts', 'eval', 'pr4a-report.ts'), 'utf8')),
-    selfEntry === undefined ? 'entry missing' : selfEntry.sha256
+    selfEntry !== undefined && selfDigestOnDisk !== null && selfEntry.sha256 === selfDigestOnDisk,
+    selfEntry === undefined
+      ? 'entry missing for scripts/eval/pr4a-report.ts'
+      : 'recorded=' + String(selfEntry.sha256) + ' disk=' + String(selfDigestOnDisk)
   );
+  // --- dirty/clean capture is TRI-STATE, never "the list must be non-empty".
+  const dirtyDigests = Array.isArray(prov.dirtyFileDigests) ? prov.dirtyFileDigests : null;
+  const dirtyCount = dirtyDigests === null ? null : dirtyDigests.length;
+  const cleanCapture = prov.workspaceDirty === false;
   assert(
     'provenance-dirty-flag-honest',
     typeof prov.workspaceDirty === 'boolean' &&
@@ -154,46 +335,180 @@ if (report !== null) {
     'workspaceDirty=' + String(prov.workspaceDirty) + ', count=' + String(prov.trackedDirtyCount)
   );
   assert(
+    'provenance-dirty-listing',
+    dirtyDigests !== null,
+    dirtyDigests === null ? 'dirtyFileDigests must be an array' : String(dirtyCount) + ' entries'
+  );
+  assert(
+    'provenance-dirty-count-matches-list',
+    dirtyDigests !== null && typeof prov.trackedDirtyCount === 'number' && prov.trackedDirtyCount === dirtyCount,
+    'trackedDirtyCount=' + String(prov.trackedDirtyCount) + ' vs dirtyFileDigests.length=' + String(dirtyCount)
+  );
+  // A CLEAN capture is the only state in which an empty list is evidence: the
+  // count must agree and the digest must be sha256(''), because the digest is
+  // computed over the list. The old unconditional `length > 0` rule rejected
+  // clean captures and could not name what was wrong; this states the contract.
+  assert(
+    'provenance-empty-dirty-only-when-clean',
+    dirtyCount !== 0 ||
+      (cleanCapture && prov.trackedDirtyCount === 0 && prov.trackedWorkspaceDigest === EMPTY_TREE_DIGEST),
+    dirtyCount === 0
+      ? 'empty dirtyFileDigests requires workspaceDirty=false, trackedDirtyCount=0 and ' +
+        'trackedWorkspaceDigest=sha256(""); got workspaceDirty=' + String(prov.workspaceDirty) +
+        ', trackedDirtyCount=' + String(prov.trackedDirtyCount) +
+        ', trackedWorkspaceDigest=' + String(prov.trackedWorkspaceDigest)
+      : 'n/a: dirtyFileDigests carries ' + String(dirtyCount) + ' entries'
+  );
+  assert(
     'provenance-locate-instructions',
     typeof prov.howToLocate === 'string' && prov.howToLocate.length > 40,
     String(prov.howToLocate).slice(0, 80)
   );
-  // Every enumerated dirty file must actually resolve: a mis-sliced path yields
-  // a `missing` digest and the block silently stops locating the real code.
+  // Every enumerated dirty file must resolve: the list is a HISTORICAL snapshot
+  // of the tracked bytes that were dirty when the eval executed. Its BYTES are
+  // bound by their own digest rather than compared with today's working tree,
+  // but its PATHS are now bound to the recorded codeBaseline (see the next
+  // check): an entry naming a file the baseline never changed would otherwise
+  // widen the evidence without bound. A `missing` digest or a traversal path
+  // means a mis-sliced/bad path stopped locating the real code and must fail.
+  const dirtyEntries = dirtyDigests ?? [];
+  const badDirtyPaths = dirtyEntries
+    .filter((entry) => !HEX64.test(String(entry.sha256)) || !isSafeRelativePath(entry.path))
+    .slice(0, 3);
   assert(
     'provenance-dirty-paths-resolve',
-    Array.isArray(prov.dirtyFileDigests) &&
-      prov.dirtyFileDigests.length > 0 &&
-      prov.dirtyFileDigests.every(
-        (entry) => entry.sha256 !== 'missing' && /^\.?[A-Za-z0-9._/-]+$/.test(String(entry.path))
-      ),
-    JSON.stringify((prov.dirtyFileDigests ?? []).filter((entry) => entry.sha256 === 'missing').slice(0, 3))
+    dirtyDigests !== null && badDirtyPaths.length === 0,
+    JSON.stringify(
+      dirtyCount === 0
+        ? { cleanCapture: true, note: 'no dirty files recorded' }
+        : badDirtyPaths.map((entry) => ({ path: entry.path, sha256: entry.sha256 }))
+    )
   );
+  // --- t1 B1 state 5, subset form (b): every recorded dirty path must be a path
+  // that changed relative to the frozen codeBaseline. The list is a snapshot of
+  // tracked changes taken AFTER that commit, so a genuine entry is always in the
+  // diff; a fabricated path, or a path later restored to the baseline, drops out
+  // and is named. Chosen over the blob form (a) because `git ls-tree -r` needs
+  // `.gitattributes` EOL normalisation to be sound on CRLF checkouts, while this
+  // form is cheap and independent of checkout bytes. An unresolvable baseline or
+  // a failing git invocation FAILS the check (cannot verify is not a skip).
+  const baselineChanged = baselineChangedPaths(report.codeBaseline);
+  const dirtyPathsOutsideBaseline = dirtyEntries
+    .filter((entry) => baselineChanged.paths === null || !baselineChanged.paths.has(String(entry.path)))
+    .map((entry) => String(entry.path));
+  assert(
+    'provenance-dirty-paths-in-baseline-diff',
+    dirtyCount === 0 || (baselineChanged.paths !== null && dirtyPathsOutsideBaseline.length === 0),
+    dirtyCount === 0
+      ? 'n/a: clean capture records no dirty files'
+      : baselineChanged.paths === null
+        ? 'cannot verify dirty entries against codeBaseline ' + String(report.codeBaseline) +
+          ': ' + baselineChanged.error
+        : JSON.stringify({
+            codeBaseline: report.codeBaseline,
+            outsideBaseline: dirtyPathsOutsideBaseline.slice(0, 3),
+            outsideCount: dirtyPathsOutsideBaseline.length,
+            baselineChangedCount: baselineChanged.paths.size
+          })
+  );
+
+  // --- executedSources: INDEPENDENT named checks, never reusing dirty logic ---
+  // T7-F2: the previous version filtered unsafe/non-hex entries OUT of the disk
+  // comparison, so appending `{path:'../x.mjs', sha256:'<64 hex>'}` (and
+  // recomputing the list digest) still passed. Well-formedness and "every entry
+  // was actually compared" are separate assertions; an entry that cannot be
+  // verified is a FAILURE, not a skip.
+  const executedEntries = Array.isArray(prov.executedSources) ? prov.executedSources : [];
+  const executedEntryRows = executedEntries.map((entry, index) => {
+    const wellFormed = isWellFormedExecutedEntry(entry);
+    const bytes = wellFormed ? readRepoFileBytes(String(entry.path)) : null;
+    return {
+      index,
+      path: entry !== null && typeof entry === 'object' ? String(entry.path) : String(entry),
+      recorded: entry !== null && typeof entry === 'object' ? String(entry.sha256) : '',
+      wellFormed,
+      bytes,
+      disk: bytes === null ? null : digestOfBytes(bytes)
+    };
+  });
+  const malformedExecuted = executedEntryRows.filter((row) => !row.wellFormed);
+  assert(
+    'provenance-executed-entries-well-formed',
+    Array.isArray(prov.executedSources) && executedEntries.length > 0 && malformedExecuted.length === 0,
+    JSON.stringify(
+      malformedExecuted.slice(0, 5).map((row) => ({ index: row.index, path: row.path, sha256: row.recorded }))
+    )
+  );
+  const unverifiableExecuted = executedEntryRows.filter((row) => row.wellFormed && row.disk === null);
+  assert(
+    'provenance-executed-all-entries-checked',
+    Array.isArray(prov.executedSources) &&
+      executedEntries.length > 0 &&
+      malformedExecuted.length === 0 &&
+      unverifiableExecuted.length === 0,
+    JSON.stringify({
+      entries: executedEntries.length,
+      malformed: malformedExecuted.slice(0, 5).map((row) => row.path),
+      unverifiable: unverifiableExecuted.slice(0, 5).map((row) => row.path)
+    })
+  );
+  const missingExecuted = executedEntryRows.filter((row) => row.recorded === 'missing');
   assert(
     'provenance-executed-paths-resolve',
-    Array.isArray(prov.executedSources) && prov.executedSources.every((entry) => entry.sha256 !== 'missing'),
-    JSON.stringify((prov.executedSources ?? []).filter((entry) => entry.sha256 === 'missing'))
+    Array.isArray(prov.executedSources) && missingExecuted.length === 0,
+    JSON.stringify(missingExecuted.slice(0, 5).map((row) => ({ path: row.path, sha256: row.recorded })))
   );
+  const executedDiskMismatches = executedEntryRows
+    .filter((row) => row.wellFormed && row.disk !== null && row.disk !== row.recorded)
+    .map((row) => ({
+      path: row.path,
+      recorded: row.recorded,
+      disk: row.disk,
+      eolOnly: isEolOnlyDivergence(row.bytes, row.recorded)
+    }));
+  // Raw-byte equality under the CHECKOUT BYTE SPEC in the header/--help. An
+  // eol-only divergence is still a mismatch here (the recorded bytes do not
+  // describe this checkout); the named warning below makes it diagnosable
+  // instead of one opaque mismatch.
+  assert(
+    'provenance-executed-sources-match-disk',
+    Array.isArray(prov.executedSources) &&
+      executedEntries.length > 0 &&
+      malformedExecuted.length === 0 &&
+      unverifiableExecuted.length === 0 &&
+      executedDiskMismatches.length === 0,
+    JSON.stringify({
+      mismatches: executedDiskMismatches.slice(0, 5),
+      malformed: malformedExecuted.slice(0, 5).map((row) => ({ path: row.path, sha256: row.recorded })),
+      unverifiable: unverifiableExecuted.slice(0, 5).map((row) => row.path)
+    })
+  );
+  const eolDivergent = executedDiskMismatches.filter((mismatch) => mismatch.eolOnly);
+  if (eolDivergent.length > 0) {
+    warn(
+      'provenance-executed-sources-eol-divergent',
+      'recorded and on-disk bytes are the same text under different line-ending forms (not content drift); ' +
+        'the recorded artifact is bound to its generation checkout configuration: ' +
+        JSON.stringify(eolDivergent.map((mismatch) => mismatch.path))
+    );
+  }
   // The digest must be a real digest OF the enumerated list, not a decorative string.
+  const recomputedWorkspaceDigest = sha256(
+    (prov.dirtyFileDigests ?? []).map((entry) => entry.sha256 + '  ' + entry.path).join('\n')
+  );
+  const recomputedExecutedDigest = sha256(
+    (prov.executedSources ?? []).map((entry) => entry.sha256 + '  ' + entry.path).join('\n')
+  );
   assert(
     'provenance-workspace-digest-recomputed',
-    prov.trackedWorkspaceDigest ===
-      sha256(
-        (prov.dirtyFileDigests ?? [])
-          .map((entry) => entry.sha256 + '  ' + entry.path)
-          .join('\n')
-      ),
-    'trackedWorkspaceDigest must be recomputable from dirtyFileDigests'
+    prov.trackedWorkspaceDigest === recomputedWorkspaceDigest &&
+      (dirtyCount !== 0 || recomputedWorkspaceDigest === EMPTY_TREE_DIGEST),
+    'recorded=' + String(prov.trackedWorkspaceDigest) + ' recomputed=' + recomputedWorkspaceDigest
   );
   assert(
     'provenance-executed-digest-recomputed',
-    prov.executedSourcesDigest ===
-      sha256(
-        (prov.executedSources ?? [])
-          .map((entry) => entry.sha256 + '  ' + entry.path)
-          .join('\n')
-      ),
-    'executedSourcesDigest must be recomputable from executedSources'
+    prov.executedSourcesDigest === recomputedExecutedDigest,
+    'recorded=' + String(prov.executedSourcesDigest) + ' recomputed=' + recomputedExecutedDigest
   );
   // The compiled artifact that actually executed must also be identified.
   assert(
@@ -1096,6 +1411,10 @@ if (report !== null) {
     );
     assert(
       'completeness-denominator-honest:' + entry.armId,
+      // KNOWN TAUTOLOGY (audit item, deliberately annotated but NOT repaired in
+      // the PR-4A portability fix): `|| true` makes this assertion always hold.
+      // It is left byte-for-byte as-is so this change cannot claim to have fixed
+      // it; the review must treat the check as unverified.
       entry.censoredExecutions === entry.denominatorDegradedTasks.length * 0 || true,
       'censored executions must be listed, never silently removed'
     );
@@ -1135,18 +1454,38 @@ if (report !== null) {
 // ---------------------------------------------------------------------------
 // report
 // ---------------------------------------------------------------------------
-const failed = results.filter((entry) => !entry.ok);
+const advisories = results.filter((entry) => entry.advisory === true);
+const failed = results.filter((entry) => !entry.ok && entry.advisory !== true);
 const status = {
   checked: results.length,
   passed: results.length - failed.length,
   failed: failed.length,
+  warnings: advisories.map((entry) => ({ id: entry.id, detail: entry.detail })),
   failures: failed.map((entry) => ({ id: entry.id, detail: entry.detail }))
 };
+let statusNote = 'status file: work/pr4a-verify-status.json';
 try {
   writeFileSync(join(REPO_ROOT, 'work', 'pr4a-verify-status.json'), JSON.stringify(status, null, 2) + '\n', 'utf8');
-} catch {
-  /* best effort */
+} catch (error) {
+  // A missing/unwritable work/ directory must not hide the verdict: stdout below
+  // is the diagnostic channel of last resort (e.g. the missing-artifact state).
+  statusNote = 'status file NOT written: ' + String(error && error.message ? error.message : error);
 }
+
+// The verdict, the counts and every failing check id/detail go to stdout so the
+// run is diagnosable from a terminal or CI log alone, without the status file.
+console.log(
+  '[verify-pr4a-artifacts] checked=' + String(status.checked) +
+    ' passed=' + String(status.passed) +
+    ' failed=' + String(status.failed)
+);
+for (const entry of advisories) {
+  console.log('[verify-pr4a-artifacts] WARN ' + entry.id + (entry.detail === '' ? '' : ' :: ' + entry.detail));
+}
+for (const entry of failed) {
+  console.log('[verify-pr4a-artifacts] FAIL ' + entry.id + (entry.detail === '' ? '' : ' :: ' + entry.detail));
+}
+console.log('[verify-pr4a-artifacts] ' + (failed.length === 0 ? 'PASS' : 'FAIL') + ' (' + statusNote + ')');
 
 if (failed.length === 0) {
   process.exitCode = 0;

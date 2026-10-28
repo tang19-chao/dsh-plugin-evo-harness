@@ -98,9 +98,10 @@ transpiles on the fly.
 | `pnpm run check:encoding` | `node scripts/eval/check-encoding-policy.mjs` | Every tracked blob must be LF text or a declared `-text` exception |
 | `pnpm run check:build-smoke` | `node scripts/eval/smoke-build.mjs` | Builds the bundle and imports it as ESM, asserting the public surface |
 | `pnpm run check:negative-result` | `node scripts/eval/negative-result-diag.mjs --assert` | Fails if the recorded historical negative result (−0.250) drifts |
+| `pnpm run guarded-regression` | `node scripts/eval/guarded-regression.mjs --json` | ADR 0002 gate #7: release-surface, isolation and trusted-source probes over synthetic fixtures |
 | `pnpm run verify` | `pnpm run typecheck && pnpm run test` | The full gate: typecheck, then every suite |
 
-A green checkout currently reports `96` test files and `1963` passing tests for `pnpm run test`
+A green checkout currently reports `97` test files and `1979` passing tests for `pnpm run test`
 (see [Testing](#testing) for the breakdown). This package is `private` and is not published to
 any registry, so there are no publication steps.
 
@@ -369,9 +370,9 @@ cross-session promotion, and the offline dream trigger and model wiring.
 
 | Command | Scope | Suites at the time of writing |
 | :--- | :--- | :--- |
-| `pnpm run test:unit` | `tests/unit` | 83 files, 1804 tests |
+| `pnpm run test:unit` | `tests/unit` | 84 files, 1820 tests |
 | `pnpm run test:e2e` | `tests/e2e` | 13 files, 159 tests |
-| `pnpm run test` | everything | 96 files, 1963 tests |
+| `pnpm run test` | everything | 97 files, 1979 tests |
 | `pnpm run verify` | typecheck + everything | the gate to run before a change lands |
 
 Individual files can be run the usual Vitest way, for example
@@ -460,8 +461,12 @@ Stated plainly, because they matter when you evaluate this plugin:
   surrogate score are documented heuristics; the offline dreamer is the only component with a
   monotonic non-regression guarantee (a candidate policy must strictly beat `pi^0`).
 - **Packaging status.** The package is `private`, version `0.1.0`, and is not published to a
-  registry. CI runs `tsc --noEmit`, the full Vitest suite, and mechanical docs hygiene verification on push and pull requests to
-  `main` (`.github/workflows/ci.yml`); no status badge is shown. The package is licensed under the
+  registry. On push and pull requests to `main` (`.github/workflows/ci.yml`) CI runs `tsc --noEmit`,
+  the full Vitest suite, mechanical docs hygiene verification, the guarded-regression probes
+  (ADR 0002 gate #7) together with the `node --test` parity/attestation suites, and a three-OS
+  (Linux/macOS/Windows) fingerprint matrix whose parity job requires
+  `--expect-commit "${{ github.sha }}"`, so "the three platforms agree" is checked against the
+  revision the run was triggered for rather than only against each other; no status badge is shown. The package is licensed under the
   [Apache-2.0 License](LICENSE) (with copyright attribution pending author confirmation). See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## Design document

@@ -196,27 +196,83 @@ describe('PR-1 §2: raw blob bytes, never the worktree', () => {
     }
   });
 
-  it('would differ from a worktree hash when core.autocrlf converts line endings', () => {
-    // This is the regression PR-1 exists to prevent: if the checkout converts
-    // LF to CRLF, hashing the worktree yields a different digest than hashing
-    // the blob. Asserted conditionally so the suite stays honest on an LF
-    // checkout - the point is that the EVIDENCE path never depends on it.
-    const autocrlf = (() => {
-      try {
-        return git(repoRoot, ['config', '--get', 'core.autocrlf']);
-      } catch {
-        return '';
-      }
-    })();
+  it('would differ from a worktree hash when the policy converts line endings', () => {
+    // This is the regression PR-1 exists to prevent: a checkout that converts
+    // line endings produces a different digest from the committed blob.
+    //
+    // The divergence is constructed HERE (`*.log text eol=crlf` makes git write
+    // CRLF into the worktree while the blob stays LF) instead of being observed
+    // on this repository's own checkout. The old version of this test only ran
+    // when the host had `core.autocrlf=true` AND the file was not normalised -
+    // and since `.gitattributes` now pins `*.ts` to `eol=lf`, the interesting
+    // branch became unreachable, i.e. the test silently stopped testing the
+    // defect on the very machine that used to exhibit it. A fixture that makes
+    // the bytes differ by construction is honest on every platform.
+    const dir = makeRepo({ 'src/a.log': Buffer.from('one\r\ntwo\r\n', 'utf8') }, '*.log text eol=crlf\n');
+    // Force a fresh checkout: the bytes below are what the POLICY produces, not
+    // what happened to be on disk when the fixture was written.
+    git(dir, ['rm', '-q', '--cached', '-r', '.']);
+    git(dir, ['reset', '-q', '--hard']);
+
+    const commit = resolveCommit('HEAD', dir);
+    const entry = listTreeBlobs(commit, dir, ['src']).find((candidate) => candidate.path === 'src/a.log');
+    if (entry === undefined) {
+      throw new Error('fixture file not found in tree: src/a.log');
+    }
+    const blobBytes = readBlobBytes(entry.blobId, dir);
+    const worktreeBytes = fs.readFileSync(path.join(dir, 'src', 'a.log'));
+
+    // Different on disk ... (2 CRLF pairs in the checkout, none in the blob)
+    expect(worktreeBytes.filter((byte) => byte === 0x0d)).toHaveLength(2);
+    expect(blobBytes.filter((byte) => byte === 0x0d)).toHaveLength(0);
+    expect(worktreeBytes.length).not.toBe(blobBytes.length);
+
+    // ... same digest, because the digest reads the object database. A manifest
+    // that hashed the checkout would equal `worktreeSha` instead.
+    const manifest = buildCanonicalManifest(commit, dir, ['src']);
+    const recorded = manifest.files.find((file) => file.path === 'src/a.log');
+    expect(recorded?.sha256).toBe(sha256Bytes(blobBytes));
+    expect(recorded?.sha256).not.toBe(sha256Bytes(worktreeBytes));
+  });
+
+  it('the committed policy makes this checkout deterministic: an LF-declared file IS the blob', () => {
+    // Mirror statement of the fixture above, applied to the real repository: the
+    // committed policy says `*.ts text eol=lf`, which makes the checkout of a
+    // `.ts` file LF on every host - so here the checkout and the blob must be
+    // byte-identical. The earlier revision of the suite could not state either
+    // direction: it decided "is the policy committed?" with
+    // `git cat-file -e HEAD:.gitattributes === ''`, and that helper THROWS when
+    // the path is absent, so its `false` branch was dead code on every machine.
+    const commit = head();
     const entry = fileEntry('src/index.ts');
     const blobBytes = readBlobBytes(entry.blobId, repoRoot);
-    if (autocrlf !== 'true') {
-      expect(['false', '', 'input']).toContain(autocrlf);
+
+    // The evidence is the blob, always (asserted independently of the checkout).
+    const manifest = buildCanonicalManifest(commit, repoRoot, ['src']);
+    const recorded = manifest.files.find((file) => file.path === 'src/index.ts');
+    expect(recorded?.sha256).toBe(sha256Bytes(blobBytes));
+
+    // The determinism claim is read from the COMMIT, not from host config.
+    const attributes = readAttributes(['src/index.ts'], repoRoot, commit.commitId).get('src/index.ts');
+    expect(attributes?.text).toBe('set');
+    expect(attributes?.eol).toBe('lf');
+
+    // A locally edited copy is a legitimate development state; the policy claim
+    // is about a clean checkout. Everything above still holds when it is dirty.
+    const dirty = (() => {
+      try {
+        git(repoRoot, ['diff', '--quiet', 'HEAD', '--', 'src/index.ts']);
+        return false;
+      } catch {
+        return true;
+      }
+    })();
+    if (dirty) {
       return;
     }
-    const worktreeBytes = fs.readFileSync(path.join(repoRoot, 'src/index.ts'));
-    expect(worktreeBytes.length).not.toBe(blobBytes.length);
-    expect(sha256Bytes(worktreeBytes)).not.toBe(sha256Bytes(blobBytes));
+    const worktreeBytes = fs.readFileSync(path.join(repoRoot, 'src', 'index.ts'));
+    expect(worktreeBytes.filter((byte) => byte === 0x0d)).toHaveLength(0);
+    expect(worktreeBytes.equals(blobBytes)).toBe(true);
   });
 
   it('produces the SAME manifest digest from two independent temp checkouts', () => {
