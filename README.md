@@ -94,14 +94,15 @@ transpiles on the fly.
 | `pnpm run test` | `vitest run` | Every unit and end-to-end suite |
 | `pnpm run test:unit` | `vitest run tests/unit` | Unit suites only |
 | `pnpm run test:e2e` | `vitest run tests/e2e` | End-to-end suites only |
-| `pnpm run check:docs` | `node scripts/verify-readme-counts.mjs` | Mechanically validates README test counts against test results and repo hygiene |
+| `pnpm run check:docs` | `node scripts/verify-readme-counts.mjs` | Mechanically validates README test counts against test results and repo hygiene; refuses reports with failed or pending tests and verifies the Configuration reference against the real defaults (one row per leaf, see [Configuration reference](#configuration-reference)) |
 | `pnpm run check:encoding` | `node scripts/eval/check-encoding-policy.mjs` | Every tracked blob must be LF text or a declared `-text` exception |
 | `pnpm run check:build-smoke` | `node scripts/eval/smoke-build.mjs` | Builds the bundle and imports it as ESM, asserting the public surface |
 | `pnpm run check:negative-result` | `node scripts/eval/negative-result-diag.mjs --assert` | Fails if the recorded historical negative result (−0.250) drifts |
 | `pnpm run guarded-regression` | `node scripts/eval/guarded-regression.mjs --json` | ADR 0002 gate #7: release-surface, isolation and trusted-source probes over synthetic fixtures |
+| `pnpm run check:mutation` | `node scripts/eval/mutation-gate.mjs --run` | ADR 0005 D5: reintroduces four pinned defects inside a throwaway copy and requires the pinned test **names** to go red — a surviving mutant fails the gate |
 | `pnpm run verify` | `pnpm run typecheck && pnpm run test` | The full gate: typecheck, then every suite |
 
-A green checkout currently reports `97` test files and `1979` passing tests for `pnpm run test`
+A green checkout currently reports `103` test files and `2094` passing tests for `pnpm run test`
 (see [Testing](#testing) for the breakdown). This package is `private` and is not published to
 any registry, so there are no publication steps.
 
@@ -234,53 +235,108 @@ aborted mid-flight.
 
 ## Configuration reference
 
-Defaults are the frozen values in [src/config.ts](src/config.ts) `DEFAULT_EVO_HARNESS_CONFIG`; the
-section below matches ARCHITECTURE.md section 6.2. Validation is strict: unknown keys,
-wrong types, out-of-range numbers, duplicate surfaces and unnormalized surrogate weights are
-rejected with a `ConfigValidationError` carrying every issue (`unknown_key`, `invalid_type`,
-`out_of_range`, `invalid_enum`, `duplicate_value`, `weights_not_normalized`, ...), so a typo in
-`cordis.yml` fails fast instead of silently disabling a safety feature.
+Defaults are the frozen values in [src/config.ts](src/config.ts) `DEFAULT_EVO_HARNESS_CONFIG` (plus the
+`modelRoute` fields from `MODEL_ROUTE_DEFAULTS`, which live outside that object); the section below matches
+ARCHITECTURE.md section 6.2. The table below is one row per default leaf: the gate `pnpm run check:docs`
+walks the real defaults at run time (75 `DEFAULT_EVO_HARNESS_CONFIG` leaves + 3 `modelRoute` fields = 78;
+arrays count as one leaf, suffixed `[]` exactly like the implementation path) and fails on a missing row,
+a stale row or a drifted Default column, so this table cannot silently rot.
+Validation is strict: unknown keys, wrong types, out-of-range numbers, duplicate surfaces and unnormalized
+surrogate weights are rejected with a `ConfigValidationError` carrying every issue (`unknown_key`,
+`invalid_type`, `out_of_range`, `invalid_enum`, `duplicate_value`, `weights_not_normalized`, ...), so a typo
+in `cordis.yml` fails fast instead of silently disabling a safety feature.
 
 | Option | Default | Meaning |
 | :--- | :--- | :--- |
-| `schemaVersion` | `1` | Config schema version; a breaking change needs a new contract round |
-| `enabled` | `true` | Mount the plugin |
-| `triggerMode` | `"auto_fallback"` | `auto_fallback` (failure events only), `always` (failures + `turn/end completed`), or `slash_command` (`/evo` only) |
-| `modelRoute.provider` | `"qodercn"` | Provider route on the second-level settings page (volatile) |
-| `modelRoute.model` | `"dfmodel"` | Model id on the second-level settings page (volatile) |
-| `modelRoute.reasoningEffort` | `"max"` | `high` \| `max` \| `low` (volatile) |
-| `enabledSurfaces` | all eight | Surfaces eligible for patching, in mounting order |
-| `probe.maxConcurrentProbes` | `4` | Concurrent isolated probes (1-16) |
-| `probe.probeTimeoutMs` | `120000` | Per-probe timeout in ms (1000-600000) |
-| `memoryBridge.mcpServerTarget` | `"auto"` | `auto` sniffs every mounted MCP server, or a concrete server id such as `mem0` |
-| `memoryBridge.driverHint` | `"auto"` | Force a driver: `graph_entity`, `vector_fact`, `temporal_graph`, `markdown_note`, `lingshu_mdcg`, `custom_mapped` |
-| `memoryBridge.enableGovernancePolyfill` | `true` | Client-side CCG validation, virtual namespace isolation, negative firewall |
+| `enabled` | `true` | Mount the plugin at all |
+| `enabledSurfaces[]` | `["system_prompt","guardrails","memory","tool_guidance","skills","scripts","subagents","plugins"]` | Surfaces eligible for patching, in mounting order |
+| `execution.applyWinningPatch` | `false` | PERMANENT winning-patch mount after probing; only legal together with `execution.mode: guarded-active` (rejected fail-closed in every other mode) |
+| `execution.mode` | `"shadow"` | Declared execution mode: `shadow` (record suggestions with zero side effects), `baseline`, `guarded-active` (enables the patch layer's evidence-gated channel) or `off` |
+| `logging.includeTrajectorySummaries` | `false` | Include trajectory summaries in log output |
+| `logging.level` | `"info"` | `debug` / `info` / `warn` / `error` / `silent` |
+| `memoryBridge.customMapping.commitToolName` | `"my_custom_upsert"` | Commit tool name used when `customMapping.enabled` is true |
 | `memoryBridge.customMapping.enabled` | `false` | Use explicit tool-name mapping for an unknown backend |
 | `memoryBridge.customMapping.recallToolName` | `"my_custom_search"` | Recall tool name used when `customMapping.enabled` is true |
-| `memoryBridge.customMapping.commitToolName` | `"my_custom_upsert"` | Commit tool name used when `customMapping.enabled` is true |
-| `memoryBridge.requestTimeoutMs` | `10000` | MCP request timeout in ms |
-| `memoryBridge.recallLimit` | `6` | Maximum lessons recalled per task |
-| `memoryBridge.namespacePrefix` | `"harness2"` | Prefix for the deterministic scope namespaces |
-| `memoryBridge.requireEvidence` | `true` | Reject lessons without probe contrast evidence |
+| `memoryBridge.driverHint` | `"auto"` | Force a driver: `graph_entity`, `vector_fact`, `temporal_graph`, `markdown_note`, `lingshu_mdcg`, `custom_mapped` |
+| `memoryBridge.enableGovernancePolyfill` | `true` | Client-side CCG validation, virtual namespace isolation, negative firewall |
 | `memoryBridge.enableNegativeFirewall` | `true` | Keep negative lessons out of the recommendation channel |
-| `memoryBridge.promoteOnComposeSuccess` | `true` | Promote a winning lesson out of branch scope after composition |
-| `dreamRsi.maxOnlineRolloutBudget` | `8` | Hard upper bound on candidate rollouts per task; `plan_grid` may only reduce it |
-| `dreamRsi.enableAsymmetricGuidance` | `true` | Domain slots may read memory; invariant slots are guidance-free |
-| `dreamRsi.offlineDreamTriggerEveryNTasks` | `10` | Completed tasks between offline dream replays |
+| `memoryBridge.mcpServerTarget` | `"auto"` | `auto` sniffs every mounted MCP server, or a concrete server id such as `mem0` |
+| `memoryBridge.namespacePrefix` | `"harness2"` | Prefix for the deterministic scope namespaces |
+| `memoryBridge.promoteOnComposeSuccess` | `false` | Promote a winning lesson out of branch scope after composition; explicit opt-in since P6.2 C1, because the promotion path writes to the real global namespace |
+| `memoryBridge.recallLimit` | `6` | Maximum lessons recalled per task |
+| `memoryBridge.requestTimeoutMs` | `10000` | MCP request timeout in ms |
+| `memoryBridge.requireEvidence` | `true` | Reject lessons without probe contrast evidence |
+| `modelRoute.model` | `"dfmodel"` | Second-level settings page model id (host-only group; see below) |
+| `modelRoute.provider` | `"qodercn"` | Second-level settings page provider route (host-only group; see below) |
+| `modelRoute.reasoningEffort` | `"max"` | `high` \| `max` \| `low` on the second-level settings page (host-only group; see below) |
+| `probe.maxConcurrentProbes` | `4` | Concurrent isolated probes (1-16) |
+| `probe.probeTimeoutMs` | `120000` | Per-probe timeout in ms (1000-600000) |
+| `schemaVersion` | `1` | Config schema version; a breaking change needs a new contract round |
+| `triggerMode` | `"auto_fallback"` | `auto_fallback` (failure events only), `always` (failures + `turn/end completed`), or `slash_command` (`/evo` only) |
 | `dreamRsi.candidatePoliciesCount` | `6` | Candidate meta-policies generated per dream |
-| `dreamRsi.rhoPreferences` | `[0, 0.25, 0.5, 0.75, 1]` | Strictly ascending budget preferences for Pareto replay |
-| `dreamRsi.surrogateWeights` | `{selection 0.4, adoption 0.3, efficiency 0.2, toolErrorPenalty 0.1}` | Surrogate reward weights; must sum to 1 |
+| `dreamRsi.earlyStopThreshold` | `0.8` | Early-stop threshold used by the active policy |
+| `dreamRsi.enableAsymmetricGuidance` | `true` | Domain slots may read memory; invariant slots are guidance-free |
+| `dreamRsi.holdoutTreeCount` | `0` | PR-4B explicit holdout opt-in: trees carved out of the pool for validation; `0` = no holdout (`validatedOnHoldout` stays undefined); must stay below `maxTreePoolSize` |
+| `dreamRsi.maxDepth` | `3` | Hard upper bound on tree depth for `plan_grid` |
+| `dreamRsi.maxOnlineRolloutBudget` | `8` | Hard upper bound on candidate rollouts per task; `plan_grid` may only reduce it |
+| `dreamRsi.maxRecoverySlots` | `1` | Recovery slots allowed per batch (at most one) |
 | `dreamRsi.maxTreePoolSize` | `200` | Historical discovery trees kept for replay |
 | `dreamRsi.maxWidth` | `4` | Hard upper bound on tree width for `plan_grid` |
-| `dreamRsi.maxDepth` | `3` | Hard upper bound on tree depth for `plan_grid` |
-| `dreamRsi.maxRecoverySlots` | `1` | Recovery slots allowed per batch (at most one) |
-| `dreamRsi.earlyStopThreshold` | `0.8` | Early-stop threshold used by the active policy |
 | `dreamRsi.minMemoryConfidenceForSkip` | `0.75` | Memory confidence at which probing may be skipped |
-| `logging.level` | `"info"` | `debug` / `info` / `warn` / `error` / `silent` |
-| `logging.includeTrajectorySummaries` | `false` | Include trajectory summaries in log output |
+| `dreamRsi.offlineDreamTriggerEveryNTasks` | `10` | Completed tasks between offline dream replays |
+| `dreamRsi.rhoPreferences[]` | `[0,0.25,0.5,0.75,1]` | Strictly ascending budget preferences for Pareto replay |
+| `dreamRsi.surrogateWeights.adoption` | `0.3` | Surrogate reward weight (adoption ratio); the four weights must sum to 1 |
+| `dreamRsi.surrogateWeights.efficiency` | `0.2` | Surrogate reward weight (step efficiency); the four weights must sum to 1 |
+| `dreamRsi.surrogateWeights.selection` | `0.4` | Surrogate reward weight (selection); the four weights must sum to 1 |
+| `dreamRsi.surrogateWeights.toolErrorPenalty` | `0.1` | Surrogate reward weight (tool-error penalty); the four weights must sum to 1 |
+| `jitrl.augmentFromMemory` | `true` | Augment the candidate set with memory-only actions |
+| `jitrl.beta` | `1` | KL temperature multiplying the normalized advantage |
+| `jitrl.candidateCount` | `3` | K candidates requested from proposers (proposal level) |
+| `jitrl.dream.candidateJitBetas[]` | `[0.5,1,2]` | Candidate beta grid drawn from when generating policies; non-empty, every entry finite and >= 0 |
+| `jitrl.dream.candidateJitLambdas[]` | `[0.02,0.05,0.1]` | Candidate lambda grid drawn from when generating policies; non-empty, every entry in [0, 1] |
+| `jitrl.dream.driftRho` | `0.7` | Down-weight factor for stale-policy experience after a hot swap, in [0, 1] |
+| `jitrl.dream.hyperparamPerturbation` | `true` | Perturb the JitRL hyperparameters when generating candidate policies |
+| `jitrl.enabled` | `true` | Master switch of the JitRL dual loop |
+| `jitrl.exploration.alpha` | `5` | Optimism bonus added on top of the state value when exploring |
+| `jitrl.exploration.lambda` | `0.05` | Probability of optimistic exploration for an action without support |
+| `jitrl.gamma` | `0.5` | Return discount along step/tree paths |
+| `jitrl.hostAdvisor.adviseThreshold` | `-0.5` | Mean neighbour return below which the advisor suggests an alternative |
+| `jitrl.hostAdvisor.enabled` | `false` | L3 host tool-call advisor switch (experimental) |
+| `jitrl.hostAdvisor.gateThreshold` | `-0.8` | Mean neighbour return below which `gate` mode requests user confirmation (it never automatically denies) |
+| `jitrl.hostAdvisor.minSupport` | `5` | Minimum neighbour support before the advisor acts |
+| `jitrl.hostAdvisor.mode` | `"advisory"` | `advisory` annotates decisions; `gate` requests user confirmation and never automatically denies |
+| `jitrl.k` | `10` | Nearest-neighbour count (paper robust range 8-14) |
+| `jitrl.levels[]` | `["meta","proposal"]` | Active JitRL layers; `host_tool` is experimental |
+| `jitrl.logitSource` | `"auto"` | Candidate logit source: `auto` \| `verbalized` \| `token` |
+| `jitrl.minSupportForStrongPrior` | `3` | Minimum neighbour support before the prior dominates |
+| `jitrl.privacy.redactSecrets` | `true` | Redact secrets from persisted states and summaries |
+| `jitrl.privacy.storeRawText` | `false` | Store raw task/observation text alongside abstract states |
+| `jitrl.reward.clip[]` | `[-3,3]` | `[min, max]` clip applied to fused rewards; `clip[0]` must be strictly smaller than `clip[1]` |
+| `jitrl.reward.llmEvaluator` | `true` | Enable the LLM step judge (purpose `evaluate_steps`) |
+| `jitrl.reward.weights.llm` | `0.4` | Step-reward weight (LLM judge); the five weights must sum to 1 |
+| `jitrl.reward.weights.surrogate` | `0.3` | Step-reward weight (surrogate score); the five weights must sum to 1 |
+| `jitrl.reward.weights.tool` | `0.2` | Step-reward weight (tool signal); the five weights must sum to 1 |
+| `jitrl.reward.weights.turn` | `0.1` | Step-reward weight (turn signal); the five weights must sum to 1 |
+| `jitrl.reward.weights.user` | `0` | Step-reward weight (user signal); the five weights must sum to 1 |
+| `jitrl.selection` | `"argmax"` | Candidate selection rule: `argmax` \| `sample` |
+| `jitrl.similarityThreshold` | `0.3` | Minimum Jaccard similarity for a neighbour |
+| `jitrl.store.driver` | `"jsonl"` | Storage driver; only the append-only JSONL store ships in Phase 1 |
+| `jitrl.store.halfLifeDays` | `30` | Half-life in days used by compaction; `0` disables half-life decay |
+| `jitrl.store.maxPerBucket` | `200` | Per-bucket record cap enforced by compaction |
+| `jitrl.store.mirrorToMemoryBridge` | `false` | Also mirror appended experience records into the host memory bridge |
+| `jitrl.surfaceActions` | `false` | L1 action-space opt-in: one candidate per slotKind × focusSurface (up to 4 × 8 = 32) instead of one per slotKind |
+| `jitrl.unseenFallback` | `"baseline"` | Value of unseen actions: `baseline` (Q = V) or `zero` (paper) |
 
-Two optional keys have no default and may be omitted: `memoryBridge.customMapping.pruneToolName` and
-the free-form `metadata` bags accepted by the internal APIs.
+`modelRoute` applicability: `provider` / `model` / `reasoningEffort` are the **second-level settings page /
+`cordis.patch.yml` modelRoute group** — a host-specific group that `splitModelRoute` lifts out of the raw
+plugin section before the frozen `EvoHarnessConfig` validation runs ([src/host-triggers.ts](src/host-triggers.ts),
+[src/dsh-bridge/model-config.ts](src/dsh-bridge/model-config.ts)). They are **not** a root key of
+`EvoHarnessConfig`: writing `modelRoute:` directly at the top level of this plugin's config section is
+consumed by the host glue, and writing it inside a programmatic `EvoHarnessConfig` section is rejected as
+`unknown_key`. Every field is `.volatile()`, so the settings UI can rewrite it without a restart.
+
+One optional key has no default and may be omitted: `memoryBridge.customMapping.pruneToolName` (plus the
+free-form `metadata` bags accepted by the internal APIs).
 
 ## How it works
 
@@ -370,16 +426,30 @@ cross-session promotion, and the offline dream trigger and model wiring.
 
 | Command | Scope | Suites at the time of writing |
 | :--- | :--- | :--- |
-| `pnpm run test:unit` | `tests/unit` | 84 files, 1820 tests |
+| `pnpm run test:unit` | `tests/unit` | 90 files, 1935 tests |
 | `pnpm run test:e2e` | `tests/e2e` | 13 files, 159 tests |
-| `pnpm run test` | everything | 97 files, 1979 tests |
+| `pnpm run test` | everything | 103 files, 2094 tests |
 | `pnpm run verify` | typecheck + everything | the gate to run before a change lands |
 
 Individual files can be run the usual Vitest way, for example
 `pnpm exec vitest run tests/unit/harness2`.
 
+The P1 evidence-and-atomic-config batch (ADR 0005) added these suites, all inside the counts above:
+`tests/unit/config/plugin-options-shape.test.ts` (the plugin-options shape counterexamples C-1…C-12
+against the real `apply()`), `tests/unit/config/model-route-effort.test.ts`,
+`tests/unit/config/readme-default-leaves.test.ts` (the Configuration reference against the real
+defaults), `tests/unit/seams/status-observability.test.ts` and
+`tests/unit/seams/status-observability-contract.test.ts` (the collect-or-omit counter rule) and
+`tests/unit/eval/mutation-gate.test.ts` (the anchors/CI contract of the mutation gate). The gate
+scripts themselves are `scripts/verify-readme-counts.mjs` (extended: it also refuses reports with
+failed or pending tests and checks the Configuration reference), `scripts/eval/check-attestation-target.mjs`
+and `scripts/eval/mutation-gate.mjs`.
+
 Because `check:docs` compares the counts above against the live suite, it must be re-run as the
-release gate whenever tests are added, removed or renamed.
+release gate whenever tests are added, removed or renamed. It also refuses to mint any count from a
+report that carries failed or pending tests, and it verifies the Configuration reference against the
+real defaults at run time, so a config key added to `src/config.ts` without a documentation row fails
+the same gate.
 
 ### Evidence and attestation
 
@@ -402,6 +472,33 @@ pnpm run attest:verify     # recompute it from the object database and fail on a
 
 Two commits that carry identical content share a `compositeSha256` and differ in `bindingSha256`;
 that separation is asserted by `tests/unit/p62/commit-attestation.test.ts`.
+
+**Which revision does the record cover?** A record can only describe the commit it was generated
+*from*, so the question is decided per commit, not assumed (ADR 0005 D1). CI runs this as its own
+job, `attestation-target`:
+
+```bash
+node scripts/eval/check-attestation-target.mjs --json
+```
+
+For an **ordinary commit** the canonical record must be self-consistent with the commit it names
+*and* that commit must be an ancestor of `HEAD`; the gate does not claim `HEAD` is attested and does
+not invent a parent binding. A commit that declares the git trailer `Attestation-Target: first-parent`
+is an **evidence commit**: it must contain only the updated record (record-only), must not be a merge
+and must not be stacked on another evidence commit, and its recorded `commit.commitId` must equal
+`HEAD^1`. The target is derived mechanically from the topology the commit declares. An
+unconditional `--strict` would be red on every commit and an unconditional `HEAD^1` would be a lax
+guess; both alternatives were prototype-refuted before this gate was written.
+
+**Line endings and evidence portability.** The record always stores the **raw worktree bytes** it
+saw, and nothing ever rewrites those historical digests. The PR-4A artifact verifier therefore
+classifies each executed source under the versioned rule `eol-equiv-v1`: a digest that matches only
+after the one sanctioned CRLF↔LF transform of the same text is reported as the named
+`eol-equivalent` **pass** classification (carrying the rule version, separate from raw matches),
+while a genuine content, BOM, binary or invalid-UTF-8 difference stays a failure. The retained
+`provenance-executed-sources-eol-divergent` warning now fires only in the mixed state — some entries
+line-ending-equivalent while other executed sources genuinely drift — so neither a false red nor a
+silent swallow is possible. `.gitattributes` still governs what is *committed* (below).
 
 `.gitattributes` declares the content policy: everything is committed as LF text unless a path is an
 explicit `-text` exception (`tests/fixtures/encoding/**` holds the CRLF, BOM and binary fixtures).
@@ -463,10 +560,15 @@ Stated plainly, because they matter when you evaluate this plugin:
 - **Packaging status.** The package is `private`, version `0.1.0`, and is not published to a
   registry. On push and pull requests to `main` (`.github/workflows/ci.yml`) CI runs `tsc --noEmit`,
   the full Vitest suite, mechanical docs hygiene verification, the guarded-regression probes
-  (ADR 0002 gate #7) together with the `node --test` parity/attestation suites, and a three-OS
+  (ADR 0002 gate #7) together with the `node --test` parity/attestation suites, the attestation-target
+  binding gate (ADR 0005 D1, its own job), the four-mutant mutation gate (ADR 0005 D5, its own job)
+  and a three-OS
   (Linux/macOS/Windows) fingerprint matrix whose parity job requires
   `--expect-commit "${{ github.sha }}"`, so "the three platforms agree" is checked against the
-  revision the run was triggered for rather than only against each other; no status badge is shown. The package is licensed under the
+  revision the run was triggered for rather than only against each other; no status badge is shown. A
+  separate `node24-compat` job installs Node 24 explicitly and prints `node -v` before running the
+  unit suites — Node 24 support is **measured only there, on a push**, never asserted locally (the
+  development machine ships Node 22, and every count on this page is a Node 22 measurement). The package is licensed under the
   [Apache-2.0 License](LICENSE) (with copyright attribution pending author confirmation). See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## Design document

@@ -265,7 +265,7 @@ typecheck / check:encoding / **check:docs（README 97 files / 1979 tests 机械�
 1. **CI / package script 变更授权**：`.github/workflows/ci.yml` 的 fingerprint-parity job 尚未传 `--expect-commit "${{ github.sha }}"`——远端门禁目前仍不能排除「三平台一致指向错误 commit」；guarded-regression 如需纳入 pnpm 门禁链需新增 package script。
 2. **目标提交生成 attestation**：现行 `docs/reports/final-attestation.json` 描述基线 `84a3d828…`；含记录自身的提交按 SELF-REFERENCE BOUNDARY 永不可自证——需在修复批提交落定后的目标提交上重跑 `pnpm run attest` 重生成。
 3. **推送后三平台 parity 实测**：需 GitHub Actions ubuntu/macos/windows 实际产出三份记录并 `--expect-commit <推送 SHA>` 比对（本地无法替代；HEAD `0410d78` 远端 CI=failure、fingerprint/parity=skipped 的历史事实未变）。
-4. **后续批次**：修订方案 P1–P6 未开始。
+4. **后续批次**：修订方案 P1–P6——**P1（证据提交目标门禁 + 配置原子入口 + 可观测性 + 配置文档 + mutation/Node24 门禁 + PR-4A 换行可携性）已于 2026-10-29 在本地完成并通过逐项独立审核（见 §12）；P2–P6 仍未开始**。
 
 **边界声明**：本轮全部为本地验证修改；**本地绿 ≠ 远端绿**；未生成/伪造任何 attestation 或远端 CI 结果；未 commit、未 push。
 
@@ -287,6 +287,8 @@ typecheck / check:encoding / **check:docs（README 97 files / 1979 tests 机械�
 
 `verify` job 的 `pnpm run attest:verify` 保持**无目标参数**的自洽校验。记录只能描述生成它的提交，而证据提交自身包含该记录，因此 `--strict`（要求记录描述 HEAD）或 `--expect-commit github.sha` 在证据提交上**必然为红**（自指边界）；在代码提交上同样为红（记录仍指向旧基线）。故本轮**不**给 `verify` job 接目标门禁；「记录须描述证据提交的父提交」这类规则是新契约，需 ADR 后另行落地（见 §11.4）。
 
+> **后续（2026-10-29 P1 批，见 §12.4）**：该新契约已由 ADR 0005 D1 裁定并落地为独立的 `attestation-target` job。`verify` 与 `attest:verify` 本身语义未变（仍不带目标参数），本段的历史结论因此不再表示「未覆盖」，只是被更精确的机械规则取代。
+
 ### 11.3 本地复验（2026-10-28，win32/x64，本批工作树）
 
 | 门禁 | 实测 |
@@ -305,6 +307,77 @@ typecheck / check:encoding / **check:docs（README 97 files / 1979 tests 机械�
 
 ### 11.4 边界与未闭环项
 
-- **未被本轮覆盖**：`verify` job 的目标门禁（需 ADR，见 §11.2）；PR-4A 产物校验器在 LF 检出的可携性（F1，仍不声称跨 LF 直接可携）。
+- **未被本轮覆盖 → 均已由 2026-10-29 P1 批覆盖（见 §12，全部本地实测、独立审核 pass）**：
+  - `verify` job 的目标门禁：ADR 0005 D1 改判为独立 `attestation-target` job（ordinary / evidence 提交分类 + trailer 三方绑定），`verify` / `attest:verify` 语义不变；
+  - PR-4A 产物校验器在 LF 检出的可携性（F1）：升级为版本化规则 `eol-equiv-v1`（等价命中判具名 PASS 且与 raw match 分开计数，真实漂移仍 FAIL；历史 raw 摘要永不回写）。
 - **本节不作断言**：三平台 parity 是否在远端通过，只能以推送后的 Actions 运行日志为准（run URL、各 job 状态与目标 SHA 见推送轮报告）；**本地绿 ≠ 远端绿**。
 - **提交与 attestation**：本段全部修改进入一个非 merge 提交；`docs/reports/final-attestation.json` 在该提交上以 `--expect-commit <该提交 SHA>` 重新生成并**单独提交**（记录不覆盖包含自身的提交，证据提交不被自己的 attestation 覆盖）。
+
+---
+
+## 12. 附：2026-10-29 P1 批（证据与配置原子批）集成交付回链
+
+> 本节仅追加，不回写 §1–§11。团队 `p1-and-evidence-closure`；契约依据 `docs/adr/0005-p1-evidence-and-atomic-config-contract.md`。状态页对应 `docs/P62_STATUS.md` §5（数字与结论以该处为准）。
+> **边界声明（本轮）：全部为本地工作树交付；未 commit、未 push、未生成或重生成任何 attestation、未跑远端 CI、未实测 Node24。本地绿 ≠ 远端绿。**
+
+### 12.1 交付摘要（契约 t1 + 六类实现 + 两份文档）
+
+| 类别 | 交付 | 专属证据 |
+| --- | --- | --- |
+| ADR 0005（D1–D6） | `docs/adr/0005-p1-evidence-and-atomic-config-contract.md` | T0–T8 原型穷举、tsc 正反例 |
+| 证据目标门禁（t2） | `scripts/eval/check-attestation-target.mjs`（新）+ `final-attestation.mjs` 两个导出（语义零改）+ `node:test` 追加套件 + CI `attestation-target` job | 79/79 node:test；真实仓 ordinary PASS 零写入 |
+| PR-4A 换行可携（t3） | `verify-pr4a-artifacts.mjs` 的 `eol-equiv-v1` + 四分类（raw / eol-equivalent / drift / unreadable）；**21 用例**（t18 前 19，+2 条计数/混合态回归） | 691/691 raw match；双向等价与真漂移判别实测 |
+| 配置原子入口（t4） | `src/index.ts`（`OPTION_KEYS` 26 + 编译期 witness、混合形态具名拒绝、`{}` 不再吞 `ctx.config`、effort 类型收紧）；`plugin-options-shape.test.ts`（新） | 27 用例（C-1…C-12 真实 `apply()`） |
+| 可观测性（t5/t7） | `host-triggers.ts` / `contracts.ts` / `dsh-hook-host-adapter.ts` / `index.ts`：flat hostAdvisor 状态 + route effort 运行期校验；`model-route-effort.test.ts`、`status-observability.test.ts`（新） | 15 + 12 用例；未采集 ≠ 0 |
+| 文档门禁（t6/t17） | `verify-readme-counts.mjs`（78 叶 + failed/pending 拒绝）+ README 配置参考；计数按**同一次**全量运行同步 | 10 用例 + `check:docs` 双模式 |
+| mutation/Node24（t8） | `mutation-gate.mjs`（新）+ 31 用例 + CI `mutation-gate`/`node24-compat` + `package.json` 仅加 `check:mutation` | 4/4 KILLED |
+| 集成收口（t16） | README（命令表 + Evidence 段 + Packaging status）、`docs/P62_STATUS.md` §5、本节 | §12.2 四门禁 |
+
+### 12.2 本地实测（t9 独立验证 + t17 计数；全部 exit 0）
+
+- `typecheck`；**`pnpm test` = 103 files / 2094 tests 全绿**（unit 90/1935 + e2e 13/159；截至 2026-10-29 t20 提交前复验时点——t16 集成时点为 2092/1933，t18 新增 2 个用例后按当前字节修订，旧值仅作历史）；`check:docs` 双模式 SUCCESS 且 78/78 叶；`check:encoding` 317 blobs；`check:build-smoke`（1007959B / 70 exports）；`check:negative-result`（A1..A6 PASS）；`guarded-regression` 37/37；**`check:mutation` 4/4 KILLED**；`node --test` 79/79；`check-attestation-target` ordinary PASS 且零写入；`attest:verify` OK（记录 `675acf79…` 未变）；PR-4A 691/691；目标化回归 12 files/324 tests（t18 前为 322）。
+- **非空转独立反证（t9 自建）**：配置探针 16/16；四项未采集计数缺失 vs 实测零值存在；四个自改 README 副本分别触发 missing/stale/default-mismatch；自建临时仓 9 场景复现 T1 PASS 与 T2–T8 全部具名红；PR-4A A/B 双跑证明双向等价判 PASS、真实漂移仍 FAIL 且混合态 WARN 触发。
+- **边界事实**：refs 9→9、worktrees 1→1、stash 0→0；验证前后 8 个关键文件 sha256 逐一致；历史负结果与 PR-4A 历史产物 mtime/内容未动；attestation 记录未重生成。
+
+### 12.3 独立审核（t10–t15，全部 verdict=pass）
+
+`docs/reports/t10-attestation-target-gate-review.md`、`t11-pr4a-eol-portability-review.md`、`t12-config-atomic-entry-review.md`、`t13-observability-and-route-review.md`、`t14-config-docs-gate-review.md`、`t15-mutation-node24-review.md`——六份均为本轮新增未跟踪产物，`check:encoding` 全部 exit 0。t13 系在 t5 无 output 台账记录的情况下**从工作树直接核验** t5 语义。
+
+### 12.4 两处历史挂起的现行结论
+
+1. **目标门禁**：ADR 0005 D1 落地为独立 `attestation-target` job（ordinary = 记录自洽 + 祖先约束；evidence = trailer + record-only + 非合并 + 不叠加 + 记录 == `HEAD^1`）。恒红 `--strict` 与宽松 `HEAD^1` 均被原型实测否决；`verify`/`attest:verify` 语义不变。
+2. **LF/CRLF 口径**：ADR 0005 D2 的 `eol-equiv-v1`——历史 raw 摘要永不回写；仅 CRLF↔LF 一种换算下的匹配判具名 `eol-equivalent` PASS（与 raw match 分开计数）；内容/BOM/二进制/非法 UTF-8 仍 FAIL；旧 `eol-divergent` WARN 只在混合态触发。§11.4 的「F1 不声称可携」由此升级为**受控可携**。
+
+### 12.5 授权事项（本轮未执行，未授权前不得自行执行）
+
+1. **commit / push**：本轮零提交、零推送、零分支、零远端动作。
+2. **目标提交 attestation**：需在 P1 代码提交落定后重跑 `pnpm run attest`，并按 ADR 0005 D1 以 evidence 提交（trailer + record-only + 记录 == `HEAD^1`）单独提交；本轮**未生成、未伪造**。
+3. **Node24 实测**：本机仅 `v22.23.1`；Node24 支持只能由推送后的 `node24-compat` job 日志证明，本文件所有数字均为 Node 22 实测。
+4. **mutation gate 与远端 CI**：`mutation-gate`、`attestation-target`、`node24-compat` 及三平台 parity 的远端结果一律以推送后 Actions 日志为准。
+5. **P2–P6**：未开始。
+
+### 12.6 登记的非阻塞观察（原观察保留；t11 O1 与 t13 O1 已闭环，见 §12.7）
+
+`contracts.ts` 的 `skipped` 注释措辞与实测累加点不符（t13 O1，建议一行注释修复，属 t5 文件、不在本批 integration 写范围）——**已闭环（见 §12.7，t19 修复）**，原文字保留；`mapHostAdvisorStatus` 的 `{...stats}` 原样转发（t13 O2，建议按键白名单，**仍开放**）；`check:docs` 未断言 `unit + e2e == total`（t14 O2，**仍开放**）；PR-4A 摘要段重复推入断言使等价命中时计数 +1（t11 O1，退出码不受影响、无假绿）——**已闭环（见 §12.7，t18 修复）**，原文字保留；`{config:null}` 语义未定义（t12 O2，**仍开放**）；M3 红数 3 与注册 2 的口径（t15 O1，第 3 条为 extraRed 观察，已在 §12.2 口径注明）。README 命令表缺 `check:mutation` 一条已在 t16 补齐。
+
+### 12.7 P1 批后续收口（t18/t19 闭环）与仍开放残余（2026-10-29，t24 追加）
+
+> 本节只追加，不回写 §12.1–§12.6。t21 最终发布审核的 F1 要求在此登记：§12.6 中两个记为未修的 low 观察已在 t18/t19 收口，其原观察文字保留在 §12.6（该处状态已改为「已闭环」并回指本节）。
+
+**已闭环**
+
+| 观察 | 收口任务 | 证据 |
+| --- | --- | --- |
+| t11 O1（low）：等价命中时 `checked/passed` 虚增 1，且混合态下同一 id 同时进入 failures 与 passed | **t18** | 删除报告段对 `provenance-executed-sources-eol-equivalent` 的第二次 `results.push`（全文仅剩 1 处 assert），断言语义收窄为「仅描述等价命中本身」，真实 drift 仍由 `provenance-executed-sources-match-disk` 独立失败。证据：t20 §6.2 自建夹具 A/C 对照（checked 643 vs 642、passed 627 vs 626、failed 不变）、混合态 exit 1 且等价 id 不入 failures、checked=passed+failed（14/14）；t21 §7 真实 LF 检出实测 **checked=692 / passed=692 / failed=0**、`eolEquivalents=2`、混合态仅 match-disk；专属套件 21/21；真实工作树 691/691（`eolEquivalents=[]`） |
+| t13 O1（low）：`contracts.ts` 的 `skipped` 注释称跳过「never reached the eligibility decision」，与实测累加点相反 | **t19** | `src/types/contracts.ts` 注释重写为「判定之前的跳过 + 部分资格判定之后的 out-of-scope / 无名工具路径（已计入 `considered`）」，并声明与 outcome 计数每 dispatch 互斥。证据：t20 §6.2/§6.3 逐点核对 5 个累加点（adapter 1096/1099/1120/1173/1177，其中 1099/1120/1177 在 `considered += 1`（880 行）之后）；t21 探针 34/34 复跑；类型面零改动、tsc exit 0 |
+
+**仍开放（如实登记，未修，不误称已修）**
+
+| 残余 | 归属 | 现状 |
+| --- | --- | --- |
+| t13 O2（low）：`mapHostAdvisorStatus` 以 `{...stats}` 原样转发，额外适配器字段可进入公开 status | t5 文件（`src/host-triggers.ts`） | **未修**；真实 hook 适配器只返回 7 个计数，现状无泄漏；建议按键白名单加固 |
+| t20 新登记（low/info）：t19 新注释把判定前跳过写成「advisor off or the runtime gate closed」，但 advisor 未挂载（`advisor === undefined`）时本适配器根本不计数 | t5 文件（`src/types/contracts.ts` 注释） | **未修**；可观测到的判定前跳过只有运行时闸门（`/evo jit off`）一种；建议一行措辞收敛。附注：t19 未在台账留下 output 记录，本条结论来自 t20/t21 对工作树与代码的独立核对 |
+| t12 O2（info）：`{config: null}` 语义未在 ADR 0005 定义（回落宿主配置，无安全降级） | ADR 0005 / t4 入口 | **未修**；登记项 |
+| t14 O2（info）：`check:docs` 未断言 `unit + e2e == total`，未来出现第三类测试目录时不会报红 | `scripts/verify-readme-counts.mjs` | **未修**；登记项 |
+
+其余 info 级残余（t10 O1–O5、t12 O1、t14 O1、t15 O2–O7）与 t11/t13/t14 的完整观察列表分别保留在 `docs/reports/t10…t15` 六份审核报告与 `docs/reports/t21-final-p1-release-review.md` §7，本文件不重复展开、也不声称已修。

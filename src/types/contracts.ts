@@ -1871,6 +1871,54 @@ export type HostAdvisorDecision =
   | HostAdvisorNoopDecision;
 
 /**
+ * Machine-readable L3 host-advisor observability counters (ADR 0005 section
+ * 3.7): the public contract between the adapter-side source (t5, the real hook
+ * adapter's `hostAdvisorStats()`) and the plugin status mapping (t7, the
+ * entrypoint's `hostAdvisor` status block).
+ *
+ * "NOT COLLECTED" ≠ "ZERO OCCURRENCES": a counter the source never measured is
+ * OMITTED — the key is absent, so JSON serialization drops it too — while `0`
+ * is a real measurement that no occurrence happened. An entrypoint must never
+ * substitute `0` for a missing source (F-15): map a missing stats source to an
+ * absent field, never to zero.
+ *
+ * Every count must come from a real event point in the adapter/collector and
+ * is never derived from another counter:
+ *   - `considered`            — dispatches that reached the advice-eligibility
+ *                               decision (the adapter's `advisorInScope` entry);
+ *   - `excludedByDeclaration` — dispatches rejected by a DECLARED rule (a
+ *                               trusted invariant registration, a
+ *                               guidance_free declaration, or the host's
+ *                               configured advisor scope);
+ *   - `scopeUnknownSkipped`   — dispatches whose identity could not be proven
+ *                               (D1 strict default; payload-free, ADR 0001
+ *                               section 2.3);
+ *   - `advisory` / `ask` / `noop` — advisor decision outcomes;
+ *   - `skipped`               — dispatches whose advice channel produced no
+ *                               advisor evaluation. This includes skips BEFORE
+ *                               the eligibility decision (advisor off or the
+ *                               runtime gate closed) AND — after a partial
+ *                               eligibility run — the out-of-scope and
+ *                               nameless-dispatch paths, which were already
+ *                               counted as `considered` but never reached the
+ *                               advisor. `skipped` and the outcome counters
+ *                               (`advisory`/`ask`/`noop`) are mutually
+ *                               exclusive per dispatch.
+ *
+ * Payload-free by construction (ADR 0001 section 2.3): counters only — never
+ * tool arguments, payload bodies or rendered advice text.
+ */
+export interface HostAdvisorObservabilityCounters {
+  readonly advisory?: number;
+  readonly ask?: number;
+  readonly noop?: number;
+  readonly skipped?: number;
+  readonly scopeUnknownSkipped?: number;
+  readonly considered?: number;
+  readonly excludedByDeclaration?: number;
+}
+
+/**
  * One aggregated JitRL statistic row mirrored to the memory bridge: per
  * (bucket, actionKey, level) sample count, mean return and variance. Raw
  * records are never mirrored; the aggregate is the only outbound shape.

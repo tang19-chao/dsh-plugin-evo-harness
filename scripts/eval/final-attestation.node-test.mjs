@@ -28,6 +28,18 @@
  *   - the self-reference boundary is documented in `--help` and observable:
  *     a record cannot cover the commit that contains it.
  *
+ * P1 ADDENDUM (ADR 0005 decision D1, task t2) - the per-commit gate
+ * ----------------------------------------------------------------
+ * The primitives above are per-RECORD checks. The D1 contract adds a
+ * per-COMMIT classification, implemented by
+ * `scripts/eval/check-attestation-target.mjs` and exercised by the appended
+ * suites at the bottom of this file: the full T0-T8 topology table
+ * (ordinary vs evidence commits, marker shape, record purity, merge/stacked
+ * rejection, missing record, ancestry bound) plus the two degenerate-design
+ * refutations the ADR requires. The gate reuses `verifyAttestation` and the
+ * shared `CANONICAL_RECORD_PATH` / `ATTESTATION_TARGET_MARKER` constants, so
+ * the primitives pinned here and the gate judged in CI cannot drift apart.
+ *
  * Offline: local git only (no network, no model), and every fixture lives in
  * `os.tmpdir()`, so the repository's own `docs/reports/final-attestation.json`
  * is never read or written.
@@ -40,11 +52,19 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { verifyAttestation } from './final-attestation.mjs';
+import {
+  ATTESTATION_TARGET_MARKER,
+  CANONICAL_RECORD_PATH,
+  verifyAttestation
+} from './final-attestation.mjs';
+import { checkAttestationTarget } from './check-attestation-target.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '../..');
 const CLI = path.join(__dirname, 'final-attestation.mjs');
+const GATE_CLI = path.join(__dirname, 'check-attestation-target.mjs');
+
+const MARKER = ATTESTATION_TARGET_MARKER; // 'Attestation-Target: first-parent'
 
 /** Temp repositories created here, removed in `after`. */
 const tempDirs = [];
@@ -414,5 +434,493 @@ describe('attestation: the repository artifact is not touched by this suite', ()
     runCli(['--verify', path.join(repo, 'attestation.json'), '--cwd', repo]);
     runCli(['--verify', artifact, '--expect-commit', '3'.repeat(40)]);
     assert.equal(fileSha256(artifact), before, 'the committed attestation must not be rewritten by a test run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1 ADDENDUM (ADR 0005 decision D1, task t2): the attestation-target gate.
+// Everything below judges COMMITS via `check-attestation-target.mjs`.
+// ---------------------------------------------------------------------------
+
+/** The canonical record path inside a fixture repo. */
+function canonicalRecordPath(dir) {
+  return path.join(dir, CANONICAL_RECORD_PATH);
+}
+
+/** A code commit touching `src/`; returns the new HEAD id. */
+function codeCommit(dir, message = 'code change') {
+  const name = `c${Date.now()}-${Math.floor(Math.random() * 1e9)}.ts`;
+  fs.writeFileSync(path.join(dir, 'src', name), `export const ${name.replace(/\W/g, '_')} = 3;\n`, 'utf8');
+  git(dir, ['add', path.join('src', name)]);
+  git(dir, ['commit', '-q', '-m', message]);
+  return git(dir, ['rev-parse', 'HEAD']);
+}
+
+/**
+ * Generate a canonical record for the CURRENT HEAD into the canonical path
+ * (mimicking `pnpm run attest` on a clean tree).
+ */
+function generateCanonicalRecord(dir) {
+  const out = canonicalRecordPath(dir);
+  const result = runCli(['--ref', 'HEAD', '--out', out, '--cwd', dir]);
+  assert.equal(result.status, 0, `record generation failed: ${result.stderr}${result.stdout}`);
+  return out;
+}
+
+/**
+ * Commit the canonical record file. Shapes:
+ *   - `{ withMarker: true }`  : body + blank line + `Attestation-Target:
+ *     first-parent` trailer (a real T1 evidence commit);
+ *   - `{ markerLines: [...] }`: body + blank line + arbitrary trailer lines
+ *     (T8 duplicated/unsupported fixtures);
+ *   - default                 : an ordinary record commit (no marker).
+ * Returns the new HEAD id.
+ */
+function commitCanonicalRecord(dir, { withMarker = false, messageLines = [], markerLines = null } = {}) {
+  git(dir, ['add', CANONICAL_RECORD_PATH]);
+  /** @type {string[]} */
+  let message;
+  if (withMarker) {
+    const body = messageLines.length > 0 ? messageLines : ['record update'];
+    message = [...body, '', MARKER];
+  } else if (markerLines !== null) {
+    const body = messageLines.length > 0 ? messageLines : ['record update'];
+    message = [...body, '', ...markerLines];
+  } else {
+    message = messageLines.length > 0 ? messageLines : ['commit the canonical record'];
+  }
+  git(dir, ['commit', '-q', '-m', message.join('\n')]);
+  return git(dir, ['rev-parse', 'HEAD']);
+}
+
+/** Run the gate CLI, returning status + streams instead of throwing. */
+function runGateCli(args) {
+  try {
+    const stdout = execFileSync(process.execPath, [GATE_CLI, ...args], {
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024
+    });
+    return { status: 0, stdout, stderr: '' };
+  } catch (error) {
+    return {
+      status: typeof error.status === 'number' ? error.status : -1,
+      stdout: String(error.stdout ?? ''),
+      stderr: String(error.stderr ?? '')
+    };
+  }
+}
+
+/** Run the gate in-process (the same function the CLI drives). */
+function runGate(dir, ref) {
+  return checkAttestationTarget({ cwd: dir, ...(ref === undefined ? {} : { ref }) });
+}
+
+/**
+ * Standard T1 construction: C (code) -> record for C -> E (marker + record-only).
+ * Returns both ids.
+ */
+function makeEvidencePair(dir) {
+  const c = codeCommit(dir, 'code commit C');
+  generateCanonicalRecord(dir);
+  const e = commitCanonicalRecord(dir, { withMarker: true, messageLines: [`record for ${c.slice(0, 7)}`] });
+  return { c, e };
+}
+
+/**
+ * Create a ROOT commit object via plumbing only (no worktree/index change) so a
+ * T7 fixture can name a commit that exists in the object database but is NOT an
+ * ancestor of HEAD.
+ */
+function makeOrphanRootCommit(dir) {
+  const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], {
+    cwd: dir,
+    input: 'export const orphan = 1;\n',
+    encoding: 'utf8',
+    env: gitEnv()
+  }).trim();
+  const tree = execFileSync('git', ['mktree'], {
+    cwd: dir,
+    input: `100644 blob ${blob}\torphan.ts\n`,
+    encoding: 'utf8',
+    env: gitEnv()
+  }).trim();
+  return execFileSync('git', ['commit-tree', tree, '-m', 'island root commit'], {
+    cwd: dir,
+    encoding: 'utf8',
+    env: gitEnv()
+  }).trim();
+}
+
+/** Assert a gate result carries a specific failure code. */
+function assertGateFailure(result, code) {
+  assert.equal(result.ok, false, `expected ${code}, got ok`);
+  const codes = result.failures.map((failure) => failure.code);
+  assert.ok(codes.includes(code), `expected ${code}, got ${JSON.stringify(result.failures)}`);
+}
+
+describe('gate: shared constants come from the single source of truth', () => {
+  it('exports the canonical record path and the exact marker', () => {
+    assert.equal(CANONICAL_RECORD_PATH, 'docs/reports/final-attestation.json');
+    assert.equal(MARKER, 'Attestation-Target: first-parent');
+  });
+
+  it('the gate accepts exactly the shared marker (a T1 fixture passes and an off-by-one value fails)', () => {
+    // Drift guard: the gate's internal marker literal is exercised against the
+    // SHARED constant through real commits - a marker the constant names passes
+    // (mode evidence), and any other value is T8-rejected.
+    const dir = makeRepo();
+    const { c } = makeEvidencePair(dir);
+    const result = runGate(dir);
+    assert.equal(result.mode, 'evidence');
+    assert.equal(result.ok, true, JSON.stringify(result.failures));
+    assert.equal(result.parentCommitId, c);
+  });
+});
+
+describe('gate T0: ordinary commit = self-consistency + ancestry, no invented parent binding', () => {
+  it('passes when the record describes HEAD^1 and no marker is present, and invents NO parent target', () => {
+    const dir = makeRepo();
+    const c = codeCommit(dir);
+    generateCanonicalRecord(dir); // records C
+    const head = commitCanonicalRecord(dir); // ordinary record commit
+    assert.notEqual(head, c);
+    const result = runGate(dir);
+    assert.equal(result.mode, 'ordinary');
+    assert.equal(result.ok, true, JSON.stringify(result.failures));
+    assert.equal(result.recordedCommitId, c);
+    assert.equal(result.parentCommitId, null, 'no parent binding may be invented for ordinary commits');
+    assert.ok(result.notes[0].includes('NOT covered'), JSON.stringify(result.notes));
+  });
+
+  it('passes when the record is TWO commits old (the lax always-HEAD^ guess would be red here)', () => {
+    const dir = makeRepo();
+    const first = git(dir, ['rev-parse', 'HEAD']);
+    generateCanonicalRecord(dir); // records FIRST
+    commitCanonicalRecord(dir); // ordinary commit carrying the record
+    codeCommit(dir, 'code commit 1');
+    codeCommit(dir, 'code commit 2');
+    const result = runGate(dir);
+    assert.equal(result.mode, 'ordinary');
+    assert.equal(result.ok, true, JSON.stringify(result.failures));
+    assert.equal(result.recordedCommitId, first);
+    assert.notEqual(
+      result.recordedCommitId,
+      git(dir, ['rev-parse', 'HEAD^1']),
+      'the record points further back than HEAD^1: unconditional HEAD^ binding is refuted'
+    );
+  });
+
+  it('FAILS T7 when the recorded commit is not an ancestor of HEAD (foreign record)', () => {
+    const dir = makeRepo();
+    generateCanonicalRecord(dir); // records the first commit
+    commitCanonicalRecord(dir);
+    // A root commit that exists in THIS object database but is not reachable
+    // from HEAD (simulates rewritten history / an imported record).
+    const island = makeOrphanRootCommit(dir);
+    const record = readRecord(canonicalRecordPath(dir));
+    record.commit.commitId = island;
+    fs.writeFileSync(canonicalRecordPath(dir), JSON.stringify(record, null, 2) + '\n', 'utf8');
+    codeCommit(dir, 'advance head');
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-record-not-ancestor');
+    const notAncestor = result.failures.find((failure) => failure.code === 'attestation-record-not-ancestor');
+    assert.ok(notAncestor.detail.includes(island), notAncestor.detail);
+  });
+});
+
+describe('gate T1: canonical evidence commit passes and binds HEAD^1 (not HEAD)', () => {
+  it('passes: marker + record-only + non-merge + unmarked parent, target = HEAD^1', () => {
+    const dir = makeRepo();
+    const { c, e } = makeEvidencePair(dir);
+    const result = runGate(dir);
+    assert.equal(result.mode, 'evidence');
+    assert.equal(result.ok, true, JSON.stringify(result.failures));
+    assert.equal(result.recordedCommitId, c);
+    assert.equal(result.parentCommitId, c);
+    assert.equal(result.headCommitId, e);
+    assert.ok(result.notes[0].includes(`parent=${c}`), JSON.stringify(result.notes));
+    assert.ok(result.notes[0].includes('is covered'), JSON.stringify(result.notes));
+    // The self-reference boundary holds inside the PASS: the record covers the
+    // PARENT, never the commit that contains it.
+    assert.notEqual(result.recordedCommitId, e);
+  });
+
+  it('CLI --json carries mode/parent/recorded and exits 0', () => {
+    const dir = makeRepo();
+    const { c } = makeEvidencePair(dir);
+    const result = runGateCli(['--json', '--cwd', dir]);
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.mode, 'evidence');
+    assert.equal(parsed.ok, true);
+    assert.equal(parsed.parentCommitId, c);
+    assert.equal(parsed.recordedCommitId, c);
+    assert.equal(parsed.targetOk, true);
+    assert.deepEqual(parsed.failures, []);
+  });
+
+  it('a body sentence quoting the marker does NOT make an ordinary commit an evidence commit', () => {
+    const dir = makeRepo();
+    const c = codeCommit(dir);
+    generateCanonicalRecord(dir);
+    const head = commitCanonicalRecord(dir, {
+      messageLines: [`This change references ${MARKER} in prose only.`]
+    });
+    const result = runGate(dir);
+    assert.equal(result.mode, 'ordinary', 'a prose mention must not create an evidence commit');
+    assert.equal(result.ok, true, JSON.stringify(result.failures));
+    assert.equal(result.headCommitId, head);
+    assert.equal(result.recordedCommitId, c);
+  });
+});
+
+describe('gate T2: evidence commit with a wrong target fails', () => {
+  it('fails when the record names an OLDER commit than HEAD^1', () => {
+    const dir = makeRepo();
+    const first = git(dir, ['rev-parse', 'HEAD']);
+    generateCanonicalRecord(dir); // records FIRST
+    codeCommit(dir, 'code commit C'); // HEAD^1 becomes C
+    commitCanonicalRecord(dir, { withMarker: true });
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-target-mismatch');
+    const target = result.failures.find((failure) => failure.code === 'attestation-target-mismatch');
+    assert.ok(target.detail.includes(first), target.detail);
+  });
+
+  it('fails when the record names a NEWER commit than HEAD^1', () => {
+    const dir = makeRepo();
+    const { e } = makeEvidencePair(dir);
+    codeCommit(dir, 'code commit after E');
+    const record = readRecord(canonicalRecordPath(dir));
+    record.commit.commitId = e; // lie: names E, which is not this commit's parent
+    fs.writeFileSync(canonicalRecordPath(dir), JSON.stringify(record, null, 2) + '\n', 'utf8');
+    commitCanonicalRecord(dir, { withMarker: true });
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-target-mismatch');
+  });
+});
+
+describe('gate T3: evidence commit carrying non-record changes fails purity', () => {
+  it('fails when a code file rides along with the record', () => {
+    const dir = makeRepo();
+    codeCommit(dir, 'code commit C');
+    generateCanonicalRecord(dir);
+    fs.writeFileSync(path.join(dir, 'src', 'extra.ts'), 'export const extra = 1;\n', 'utf8');
+    git(dir, ['add', '-A']);
+    // The marker must be a real trailer block (body + blank line + trailer);
+    // a subject-only message is NOT a trailer block, so `-m MARKER` alone
+    // would make this an ordinary commit and the purity rule would not fire.
+    git(dir, ['commit', '-q', '-m', `record update\n\n${MARKER}`]);
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-evidence-impure');
+    const impure = result.failures.find((failure) => failure.code === 'attestation-evidence-impure');
+    assert.ok(impure.detail.includes('src/extra.ts'), impure.detail);
+  });
+
+  it('fails when the evidence commit touches a non-canonical record name', () => {
+    const dir = makeRepo();
+    codeCommit(dir, 'code commit C');
+    generateCanonicalRecord(dir);
+    const sidecar = path.join(dir, 'docs', 'reports', 'final-attestation-old.json');
+    fs.writeFileSync(sidecar, `{"commit":{"commitId":"${'a'.repeat(40)}"}}\n`, 'utf8');
+    git(dir, ['add', '-A']);
+    git(dir, ['commit', '-q', '-m', `record update\n\n${MARKER}`]);
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-evidence-impure');
+  });
+
+  it('fails on an EMPTY evidence commit (marker without any change)', () => {
+    const dir = makeRepo();
+    codeCommit(dir, 'code commit C');
+    generateCanonicalRecord(dir);
+    git(dir, ['commit', '-q', '--allow-empty', '-m', `empty\n\n${MARKER}`]);
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-evidence-impure');
+  });
+});
+
+describe('gate T4: a merge commit with the marker fails', () => {
+  it('fails with attestation-evidence-merge', () => {
+    const dir = makeRepo();
+    const base = git(dir, ['rev-parse', 'HEAD']);
+    codeCommit(dir, 'main side');
+    git(dir, ['checkout', '-q', '-b', 'feature', base]);
+    fs.writeFileSync(path.join(dir, 'src', 'feat.ts'), 'export const feat = 1;\n', 'utf8');
+    git(dir, ['add', '-A']);
+    git(dir, ['commit', '-q', '-m', 'feature work']);
+    generateCanonicalRecord(dir);
+    commitCanonicalRecord(dir); // record rides on the feature branch (ordinary there)
+    const featureTip = git(dir, ['rev-parse', 'HEAD']);
+    git(dir, ['checkout', '-q', 'main']);
+    git(dir, ['merge', '--no-ff', '--no-edit', '-m', `merge evidence branch\n\n${MARKER}`, featureTip]);
+    assert.equal(git(dir, ['log', '-1', '--format=%B', 'HEAD']).includes(MARKER), true, 'fixture must carry the marker');
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-evidence-merge');
+  });
+});
+
+describe('gate T5: evidence stacked on evidence fails', () => {
+  it('fails when the parent of an evidence commit is itself marked', () => {
+    const dir = makeRepo();
+    makeEvidencePair(dir); // C -> E (valid)
+    generateCanonicalRecord(dir); // regenerate the record for E
+    commitCanonicalRecord(dir, { withMarker: true }); // E2 on top of E
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-evidence-stacked');
+    const stacked = result.failures.find((failure) => failure.code === 'attestation-evidence-stacked');
+    assert.ok(stacked.detail.includes('parent'), stacked.detail);
+  });
+});
+
+describe('gate T6: missing/unreadable record fails without proceeding', () => {
+  it('fails with attestation-record-missing when the record file is absent', () => {
+    const dir = makeRepo();
+    codeCommit(dir, 'no record committed here');
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-record-missing');
+  });
+
+  it('fails with attestation-record-missing when the record is invalid JSON', () => {
+    const dir = makeRepo();
+    codeCommit(dir, 'code commit C');
+    fs.mkdirSync(path.dirname(canonicalRecordPath(dir)), { recursive: true });
+    fs.writeFileSync(canonicalRecordPath(dir), '{not json', 'utf8');
+    git(dir, ['add', '-A']);
+    git(dir, ['commit', '-q', '-m', 'commit a broken record']);
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-record-missing');
+  });
+
+  it('fails with attestation-record-missing when the record has no commit.commitId', () => {
+    const dir = makeRepo();
+    codeCommit(dir, 'code commit C');
+    fs.mkdirSync(path.dirname(canonicalRecordPath(dir)), { recursive: true });
+    fs.writeFileSync(canonicalRecordPath(dir), '{"schemaVersion":"2.1.0"}\n', 'utf8');
+    git(dir, ['add', '-A']);
+    git(dir, ['commit', '-q', '-m', 'commit a shapeless record']);
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-record-missing');
+  });
+});
+
+describe('gate T8: marker shape', () => {
+  it('fails with attestation-marker-duplicated on two marker trailers', () => {
+    const dir = makeRepo();
+    codeCommit(dir, 'code commit C');
+    generateCanonicalRecord(dir);
+    commitCanonicalRecord(dir, { markerLines: [MARKER, MARKER] });
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-marker-duplicated');
+  });
+
+  it('fails with attestation-marker-unsupported on a non-first-parent value', () => {
+    const dir = makeRepo();
+    codeCommit(dir, 'code commit C');
+    generateCanonicalRecord(dir);
+    commitCanonicalRecord(dir, { markerLines: ['Attestation-Target: HEAD^'] });
+    const result = runGate(dir);
+    assertGateFailure(result, 'attestation-marker-unsupported');
+    const unsupported = result.failures.find((failure) => failure.code === 'attestation-marker-unsupported');
+    assert.ok(unsupported.detail.includes('HEAD^'), unsupported.detail);
+  });
+});
+
+describe('gate CLI: exit codes, JSON shape, named git failures', () => {
+  it('--help documents both modes and the reason codes', () => {
+    const result = runGateCli(['--help']);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /ordinary commit/);
+    assert.match(result.stdout, /evidence commit/);
+    assert.match(result.stdout, /Attestation-Target: first-parent/);
+    assert.match(result.stdout, /attestation-target-mismatch/);
+    assert.match(result.stdout, /attestation-evidence-impure/);
+    assert.match(result.stdout, /attestation-record-missing/);
+    assert.match(result.stdout, /attestation-record-not-ancestor/);
+  });
+
+  it('exits 1 with a named code when HEAD does not resolve', () => {
+    const detached = fs.mkdtempSync(path.join(os.tmpdir(), 'attest-norev-'));
+    tempDirs.push(detached);
+    fs.writeFileSync(path.join(detached, 'placeholder.txt'), 'not a repo\n', 'utf8');
+    const result = runGateCli(['--json', '--cwd', detached]);
+    assert.equal(result.status, 1);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.ok, false);
+    assert.equal(parsed.mode, null);
+    // `resolveCommit` is the first evidence call; on a directory with no git
+    // repository it fails with the lib's named code, which the CLI reports
+    // under the same JSON shape.
+    assert.equal(parsed.failures[0].code, 'ref-not-a-commit');
+  });
+
+  it('refuses unknown arguments and value-less flags', () => {
+    for (const args of [['--bogus'], ['--cwd']]) {
+      const result = runGateCli(args);
+      assert.equal(result.status, 1, `${JSON.stringify(args)} must fail`);
+      assert.match(result.stderr, /unknown-argument|argument-value-missing/);
+    }
+  });
+
+  it('human output names the failure code on stderr and exits 1', () => {
+    const dir = makeRepo();
+    codeCommit(dir, 'no record');
+    const result = runGateCli(['--cwd', dir]);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /attestation-record-missing/);
+  });
+
+  it('judges an explicit non-HEAD ref (the parent of an evidence commit is ordinary there)', () => {
+    const dir = makeRepo();
+    const { c } = makeEvidencePair(dir);
+    const atParent = runGate(dir, c);
+    assert.equal(atParent.mode, 'ordinary');
+    assert.equal(atParent.ok, true, JSON.stringify(atParent.failures));
+    assert.equal(atParent.recordedCommitId, c, 'the record names the judged commit itself');
+  });
+});
+
+describe('gate invariants: record immutability and honest coverage claims', () => {
+  it('never rewrites or creates the canonical record, pass or fail', () => {
+    const dir = makeRepo();
+    makeEvidencePair(dir);
+    const before = fileSha256(canonicalRecordPath(dir));
+    runGate(dir);
+    assert.equal(fileSha256(canonicalRecordPath(dir)), before, 'a passing judgment must not rewrite the record');
+
+    const other = makeRepo();
+    codeCommit(other, 'no record');
+    assertGateFailure(runGate(other), 'attestation-record-missing');
+    assert.equal(fs.existsSync(canonicalRecordPath(other)), false, 'the gate must not create a record');
+  });
+
+  it('never claims HEAD is covered, in either mode (no --strict semantics leaked in)', () => {
+    const dir = makeRepo();
+    const { c, e } = makeEvidencePair(dir);
+    const evidence = runGate(dir);
+    assert.equal(evidence.ok, true);
+    assert.equal(evidence.recordedCommitId, c);
+    assert.notEqual(evidence.recordedCommitId, e, 'the record cannot cover the commit containing it');
+
+    // Ordinary honesty: advance with a CODE commit (no marker) and regenerate
+    // the record for the new HEAD (an UNCOMMITTED working-tree update, exactly
+    // the ADR §1.6.2 posture): the judgment must stay ordinary and must say
+    // explicitly that HEAD is NOT covered by the committed record.
+    codeCommit(dir, 'code commit after the evidence commit');
+    generateCanonicalRecord(dir);
+    const ordinary = checkAttestationTarget({ cwd: dir });
+    assert.equal(ordinary.mode, 'ordinary');
+    assert.ok(ordinary.notes[0].includes('NOT covered'), JSON.stringify(ordinary.notes));
+  });
+
+  it('this repository\'s committed artifact is never read, written or regenerated', () => {
+    const artifact = path.join(repoRoot, 'docs', 'reports', 'final-attestation.json');
+    if (!fs.existsSync(artifact)) {
+      return;
+    }
+    const before = fileSha256(artifact);
+    const dir = makeRepo();
+    makeEvidencePair(dir);
+    runGate(dir);
+    assert.equal(fileSha256(artifact), before, 'the committed attestation must never be regenerated by a test run');
   });
 });

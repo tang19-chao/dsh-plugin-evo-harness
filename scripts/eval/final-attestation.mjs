@@ -39,6 +39,14 @@
  *      the revision I mean?" answerable instead of assumed. Re-verifying an old
  *      record proves only that the record is internally consistent with its own
  *      commit; without a target check, a stale record verifies green forever.
+ *   8. gate-constrained record path - `CANONICAL_RECORD_PATH` names the ONE
+ *      record the attestation-target gate (ADR 0005 decision D1) constrains.
+ *      It is exported so `scripts/eval/check-attestation-target.mjs` reuses
+ *      this module's constant instead of copying the path (single source of
+ *      truth), and it is the default `--out` of generate mode, so "what
+ *      `pnpm run attest` writes" and "what the gate reads" agree by
+ *      construction. A record stored under any other name carries no gate
+ *      meaning (ADR 0005 §1.2/§1.6.5).
  *
  * SELF-REFERENCE BOUNDARY (why a record cannot cover its own commit)
  * ------------------------------------------------------------------
@@ -101,6 +109,30 @@ const rootDir = path.resolve(__dirname, '../..');
 
 /** Roots that enter the digest. Kept here so CLI, tests and CI agree. */
 export const ATTESTED_ROOTS = Object.freeze(['src', 'tests', 'scripts']);
+
+/**
+ * The ONE record the attestation-target gate (ADR 0005 decision D1) constrains,
+ * POSIX-relative to the repository root.
+ *
+ * Exported as the single source of truth for `check-attestation-target.mjs`,
+ * which must not write its own copy of the path. It intentionally equals the
+ * generate-mode `--out` default, so the record `pnpm run attest` produces is
+ * the record the gate reads. Records under any other name are NOT attestation
+ * evidence for gate purposes (ADR 0005 §1.2 canonical-path rule).
+ *
+ * @type {'docs/reports/final-attestation.json'}
+ */
+export const CANONICAL_RECORD_PATH = 'docs/reports/final-attestation.json';
+
+/**
+ * The only marker value the evidence-commit rule accepts (ADR 0005 §1.2/D1).
+ *
+ * Exported for the same reason: the checker and the tests must compare against
+ * this constant, never against a hand-typed string that could drift.
+ *
+ * @type {'first-parent'}
+ */
+export const ATTESTATION_TARGET_MARKER = 'Attestation-Target: first-parent';
 
 const COMMIT_HEX = /^[0-9a-f]{40}$/;
 

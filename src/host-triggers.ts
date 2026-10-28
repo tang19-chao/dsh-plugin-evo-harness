@@ -35,7 +35,12 @@
  * a listener failure. Every handler here is therefore total: it never throws,
  * and an asynchronous callback failure is reported through `onDiagnostic`.
  */
-import type { FailureSignal, TriggerMode } from './types/contracts';
+import type {
+  FailureSignal,
+  HostAdvisorObservabilityCounters,
+  TriggerMode
+} from './types/contracts';
+import { MODEL_ROUTE_EFFORTS } from './dsh-bridge/model-config';
 
 /** The session append feed; the only failure carrier among session events. */
 export const DSH_SESSION_EVENT = 'session/event';
@@ -116,6 +121,58 @@ export interface SessionEventClassification {
   readonly completed?: DshCompletedTurnEvent;
   /** Why the event was ignored; recorded for diagnostics only. */
   readonly ignored?: string;
+}
+
+/**
+ * t5 → t7 status-mapping contract (ADR 0005 section 3.7): the entrypoint's L3
+ * `hostAdvisor` status block is the fixed config shape plus the adapter-side
+ * observability counters, with the "NOT COLLECTED ≠ ZERO" rule baked in.
+ *
+ * Mapping rule for t7 (`src/index.ts`, second writer):
+ *   - When the adapter exposes `hostAdvisorStats()` (the real hook adapter),
+ *     spread its snapshot verbatim: every counter is present and numeric (0 =
+ *     a measured zero).
+ *   - When it does NOT, the counter fields must stay ABSENT — never defaulted
+ *     to 0 (F-15). `HostAdvisorObservabilityCounters`' optional fields plus
+ *     JSON serialization drop absent keys automatically, which is exactly the
+ *     desired wire shape.
+ *
+ * The fixed fields here are the ones the entrypoint already owns; only the
+ * counters follow the collect-or-omit rule.
+ */
+export interface DshHostAdvisorStatusMapping {
+  readonly enabled: boolean;
+  readonly mode: 'advisory' | 'gate';
+  readonly attached: boolean;
+  readonly runtimeEnabled: boolean;
+  readonly diagnostics: readonly string[];
+  readonly counters: HostAdvisorObservabilityCounters;
+}
+
+/**
+ * Pure t5-provided helper for the t7 wiring: merge the fixed status fields with
+ * an adapter stats source that may be absent.
+ *
+ * - `stats` present  -> counters are the source's own numbers, verbatim.
+ * - `stats` absent   -> counters stay ABSENT (an empty object, so JSON drops
+ *   every counter key instead of reporting fabricated zeros).
+ *
+ * No payload ever flows through this function: counters only.
+ */
+export function mapHostAdvisorStatus(
+  fixed: {
+    readonly enabled: boolean;
+    readonly mode: 'advisory' | 'gate';
+    readonly attached: boolean;
+    readonly runtimeEnabled: boolean;
+    readonly diagnostics: readonly string[];
+  },
+  stats?: HostAdvisorObservabilityCounters
+): DshHostAdvisorStatusMapping {
+  return {
+    ...fixed,
+    counters: stats === undefined ? {} : { ...stats }
+  };
 }
 
 /** Idle-dream wiring. Both halves are optional and independently gated. */
@@ -754,6 +811,71 @@ export function unwrapConfigValues(value: unknown): unknown {
  * the group is removed before that validation runs and is passed to the model
  * adapter instead.
  */
+
+/**
+ * Named rejection of an out-of-enum `modelRoute.reasoningEffort` (ADR 0005
+ * section 3.6 / F-16).
+ *
+ * A silent fallback to the default effort would be a silent config drop: the
+ * host wrote a route this plugin would never actually call. The error is
+ * payload-safe by construction — it names the offending value (one short
+ * config string the integrator typed themselves) and the allowed enum, and
+ * nothing else.
+ */
+export class ModelRouteEffortError extends Error {
+  /** Stable machine-readable code; tests and hosts match on this. */
+  readonly code = 'model-route-effort-invalid' as const;
+  /** The rejected reasoningEffort value. */
+  readonly value: string;
+  /** The allowed efforts, from the dsh-bridge single source. */
+  readonly allowed: readonly string[];
+
+  constructor(value: string, allowed: readonly string[]) {
+    super(
+      'model-route-effort-invalid: modelRoute.reasoningEffort="' +
+        value +
+        '" is not one of the supported efforts [' +
+        allowed.join(', ') +
+        ']; the route would never be called with this effort, so the plugin refuses to mount instead of silently falling back to the default'
+    );
+    this.name = 'ModelRouteEffortError';
+    this.value = value;
+    this.allowed = [...allowed];
+  }
+}
+
+/**
+ * Runtime single-source check for one `modelRoute.reasoningEffort` value.
+ *
+ * Consumes ONLY the existing `MODEL_ROUTE_EFFORTS` enum (no second copy of the
+ * vocabulary). A value that is PRESENT but out of enum throws
+ * {@link ModelRouteEffortError} instead of silently falling back to the default
+ * (a silent fallback is a silent config drop). Absent-like values —
+ * `undefined`, `null` and the empty string — fall through so
+ * `resolveModelRouteConfig` keeps its documented per-field default behavior:
+ * an ABSENT field is a default, a PRESENT-but-invalid field is a config error.
+ */
+export function assertModelRouteEffort(value: unknown): void {
+  if (value === undefined || value === null) {
+    return;
+  }
+  if (typeof value === 'string') {
+    if (value.length === 0) {
+      return;
+    }
+    if (!(MODEL_ROUTE_EFFORTS as readonly string[]).includes(value)) {
+      throw new ModelRouteEffortError(value, MODEL_ROUTE_EFFORTS);
+    }
+    return;
+  }
+  // Present but not a string (number/boolean/object): never a valid effort.
+  // String() only; the raw value is never JSON-rendered into the message.
+  throw new ModelRouteEffortError(
+    typeof value === 'object' ? '[object]' : String(value),
+    MODEL_ROUTE_EFFORTS
+  );
+}
+
 export function splitModelRoute(section: unknown): {
   readonly config: Record<string, unknown> | undefined;
   readonly modelRoute: Record<string, unknown> | undefined;
@@ -771,6 +893,9 @@ export function splitModelRoute(section: unknown): {
       continue;
     }
     rest[key] = record[key];
+  }
+  if (modelRoute !== undefined && Object.prototype.hasOwnProperty.call(modelRoute, 'reasoningEffort')) {
+    assertModelRouteEffort(modelRoute['reasoningEffort']);
   }
   return { config: rest, modelRoute };
 }

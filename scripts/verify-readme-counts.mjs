@@ -1,9 +1,50 @@
 #!/usr/bin/env node
+/**
+ * Mechanical README/docs hygiene gate (PR-1, extended by the P1 docs contract,
+ * ADR 0005 §4 decision D4).
+ *
+ * The gate refuses (exit 1) when:
+ *   1. LICENSE / CHANGELOG / README is missing or malformed;
+ *   2. the README test-count claims disagree with the Vitest report consumed by
+ *      this run (root `test-results.json`, `--report <path>`, or a fresh
+ *      temporary Vitest run written to the OS temp dir);
+ *   3. the consumed report carries FAILING tests (`numFailedTests > 0`) or
+ *      PENDING/SKIPPED tests (`numPendingTests > 0`) — the README wording is
+ *      "passing tests", so a failing run must never be able to mint green
+ *      documentation counts. This check runs BEFORE the count comparison, so a
+ *      report with failures can never produce a count-only green light.
+ *   4. the Configuration reference does not document EVERY default leaf: the
+ *      gate bundles `src/config.ts` and `src/dsh-bridge/model-config.ts` with
+ *      esbuild, walks the REAL `DEFAULT_EVO_HARNESS_CONFIG` (arrays count as
+ *      ONE leaf and are suffixed `[]`, matching the documented paths) plus the
+ *      three `MODEL_ROUTE_DEFAULTS` fields, and fails on any missing, stale or
+ *      drifted row. The leaf set is never hard-coded — the count is printed as
+ *      an observation, the traversal is the criterion.
+ *
+ * CLI:
+ *   node scripts/verify-readme-counts.mjs               full gate (CI mode)
+ *   node scripts/verify-readme-counts.mjs --report p    consume an existing
+ *                                                       report file (NOT deleted)
+ *   node scripts/verify-readme-counts.mjs --readme p    verify a different README
+ *   node scripts/verify-readme-counts.mjs --docs-only   skip report/count checks,
+ *                                                       verify leaves only
+ *   node scripts/verify-readme-counts.mjs --dump-leaves print the traversed leaf
+ *                                                       paths as JSON and exit 0
+ *
+ * Cleanup invariants: the temporary Vitest report (when generated) and the
+ * temporary esbuild bundle (always, work/ is a scratch dir) are deleted on
+ * exit — success, failure, SIGINT or SIGTERM. A root `test-results.json` that
+ * was consumed is deleted as before. External `--report` files are never
+ * deleted.
+ *
+ * Exit codes: 0 = every check passed, 1 = any check failed.
+ */
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -16,15 +57,29 @@ const tempReportFile = path.join(
   os.tmpdir(),
   `dsh-evo-test-results-${process.pid}-${Date.now()}.json`
 );
+const workDir = path.join(rootDir, 'work');
+const bundleStamp = `${process.pid}-${Date.now()}`;
+const tempBundleEntry = path.join(workDir, `docs-verify-entry-${bundleStamp}.mjs`);
+const tempBundleOut = path.join(workDir, `docs-verify-config-${bundleStamp}.mjs`);
 
 let tempReportCreated = false;
 let rootReportConsumed = false;
+let tempBundleCreated = false;
 
 function cleanup() {
   if (tempReportCreated && fs.existsSync(tempReportFile)) {
     try {
       fs.unlinkSync(tempReportFile);
     } catch {}
+  }
+  if (tempBundleCreated) {
+    for (const file of [tempBundleEntry, tempBundleOut]) {
+      if (fs.existsSync(file)) {
+        try {
+          fs.unlinkSync(file);
+        } catch {}
+      }
+    }
   }
   if (rootReportConsumed && fs.existsSync(rootTestResultsPath)) {
     try {
@@ -49,7 +104,215 @@ process.on('SIGTERM', () => {
   process.exit(1);
 });
 
-function main() {
+/**
+ * Recursive leaf walk over a frozen config object. Arrays count as ONE leaf
+ * (documented with a `[]` suffix, matching the reference table), plain objects
+ * recurse with dot-joined paths, everything else is a leaf. This is the single
+ * definition of "a documented leaf" shared by the gate and the README table.
+ */
+export function collectDefaultLeaves(value, prefix = '', out = []) {
+  if (Array.isArray(value)) {
+    out.push(prefix + '[]');
+    return out;
+  }
+  if (typeof value === 'object' && value !== null) {
+    for (const key of Object.keys(value)) {
+      collectDefaultLeaves(value[key], prefix ? prefix + '.' + key : key, out);
+    }
+    return out;
+  }
+  out.push(prefix);
+  return out;
+}
+
+function normalizeDefaultText(text) {
+  return text.replace(/\s+/g, '');
+}
+
+/**
+ * Parse the Configuration reference section of a README: every table row whose
+ * first cell is a backticked path and whose second cell is a backticked value
+ * becomes `{ path, defaultValueText }`. Separator and header rows never match
+ * because they carry no backticks. Prose mentions of a key are not rows.
+ */
+export function extractReadmeLeafRows(readmeContent) {
+  const sectionStart = readmeContent.indexOf('## Configuration reference');
+  if (sectionStart === -1) {
+    return [];
+  }
+  const nextHeading = readmeContent.indexOf('\n## ', sectionStart + 1);
+  const section =
+    nextHeading === -1 ? readmeContent.slice(sectionStart) : readmeContent.slice(sectionStart, nextHeading);
+  const rowRegex = /^\|\s*`([^`]+)`\s*\|\s*`([^`]*)`\s*\|/;
+  const rows = [];
+  for (const line of section.split(/\r?\n/)) {
+    const match = rowRegex.exec(line);
+    if (match === null) {
+      continue;
+    }
+    rows.push({ path: match[1].trim(), defaultValueText: match[2].trim() });
+  }
+  return rows;
+}
+
+/**
+ * Build a tiny esbuild bundle that re-exports the REAL frozen defaults
+ * (`DEFAULT_EVO_HARNESS_CONFIG` from src/config.ts and `MODEL_ROUTE_DEFAULTS`
+ * from src/dsh-bridge/model-config.ts) and import it. The gate therefore reads
+ * the same source the runtime reads — a hand-copied defaults table in this
+ * script could drift silently, which is exactly what this gate exists to
+ * prevent.
+ */
+async function loadRealDefaults() {
+  const require = createRequire(import.meta.url);
+  const esbuild = require('esbuild');
+  fs.mkdirSync(workDir, { recursive: true });
+  const configSource = path.join(rootDir, 'src', 'config.ts').split(path.sep).join('/');
+  const modelConfigSource = path
+    .join(rootDir, 'src', 'dsh-bridge', 'model-config.ts')
+    .split(path.sep)
+    .join('/');
+  fs.writeFileSync(
+    tempBundleEntry,
+    'import { DEFAULT_EVO_HARNESS_CONFIG } from ' +
+      JSON.stringify(configSource) +
+      ';\n' +
+      'import { MODEL_ROUTE_DEFAULTS } from ' +
+      JSON.stringify(modelConfigSource) +
+      ';\n' +
+      'export { DEFAULT_EVO_HARNESS_CONFIG, MODEL_ROUTE_DEFAULTS };\n',
+    'utf8'
+  );
+  esbuild.buildSync({
+    entryPoints: [tempBundleEntry],
+    bundle: true,
+    format: 'esm',
+    platform: 'node',
+    target: 'node20',
+    outfile: tempBundleOut,
+    logLevel: 'silent'
+  });
+  tempBundleCreated = true;
+  const bundleUrl = pathToFileURL(tempBundleOut).href;
+  return import(bundleUrl);
+}
+
+/**
+ * Compare the traversed default leaves against the README reference rows.
+ * Returns { ok, expectedCount, rowCount, missing, stale, mismatches } where
+ * `missing` are documented-leaf paths absent from the README, `stale` are rows
+ * that name no real leaf, and `mismatches` are rows whose Default column does
+ * not equal the real default (whitespace-insensitive JSON literal comparison).
+ */
+export function verifyDocsLeaves(readmeContent, defaults, modelRouteDefaults) {
+  const expected = new Map();
+  for (const leafPath of collectDefaultLeaves(defaults)) {
+    if (leafPath !== '') {
+      expected.set(leafPath, JSON.stringify(defaultsAtPath(defaults, leafPath)));
+    }
+  }
+  for (const key of Object.keys(modelRouteDefaults)) {
+    expected.set('modelRoute.' + key, JSON.stringify(modelRouteDefaults[key]));
+  }
+
+  const rows = extractReadmeLeafRows(readmeContent);
+  const rowPaths = new Set(rows.map((row) => row.path));
+
+  const missing = [...expected.keys()].filter((leafPath) => !rowPaths.has(leafPath)).sort();
+  const stale = rows
+    .map((row) => row.path)
+    .filter((leafPath) => !expected.has(leafPath))
+    .sort();
+  const mismatches = rows
+    .filter((row) => expected.has(row.path))
+    .map((row) => ({
+      path: row.path,
+      expected: expected.get(row.path),
+      actual: normalizeDefaultText(row.defaultValueText)
+    }))
+    .filter((row) => row.expected !== row.actual)
+    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+
+  return {
+    ok: missing.length === 0 && stale.length === 0 && mismatches.length === 0,
+    expectedCount: expected.size,
+    rowCount: rows.length,
+    missing,
+    stale,
+    mismatches
+  };
+}
+
+/** Resolve a dot/`[]`-suffixed leaf path back to its value (for comparison). */
+function defaultsAtPath(defaults, leafPath) {
+  const segments = leafPath.split('.');
+  let current = defaults;
+  for (const segment of segments) {
+    if (segment.endsWith('[]')) {
+      current = current[segment.slice(0, -2)];
+    } else {
+      current = current[segment];
+    }
+  }
+  return current;
+}
+
+/**
+ * Collect the full names of assertions whose status is one of `statuses`, for
+ * printing when the failed/pending gate fires.
+ */
+function collectAssertionNames(testReport, statuses) {
+  const wanted = new Set(statuses);
+  const names = [];
+  for (const file of testReport.testResults || []) {
+    for (const assertion of file.assertionResults || []) {
+      if (wanted.has(assertion.status)) {
+        const where = typeof file.name === 'string' ? ' [' + file.name.replace(/\\/g, '/') + ']' : '';
+        names.push(String(assertion.fullName || assertion.title || 'unnamed test') + where);
+      }
+    }
+  }
+  return names;
+}
+
+function parseCli(argv) {
+  const options = { report: undefined, readme: undefined, docsOnly: false, dumpLeaves: false };
+  for (let index = 2; index < argv.length; index += 1) {
+    const flag = argv[index];
+    if (flag === '--report') {
+      options.report = argv[index + 1];
+      index += 1;
+    } else if (flag === '--readme') {
+      options.readme = argv[index + 1];
+      index += 1;
+    } else if (flag === '--docs-only') {
+      options.docsOnly = true;
+    } else if (flag === '--dump-leaves') {
+      options.dumpLeaves = true;
+    } else {
+      throw new Error('Unknown flag: ' + flag);
+    }
+  }
+  return options;
+}
+
+async function main() {
+  const options = parseCli(process.argv);
+
+  if (options.dumpLeaves) {
+    const defaults = await loadRealDefaults();
+    const defaultLeaves = collectDefaultLeaves(defaults.DEFAULT_EVO_HARNESS_CONFIG).filter((p) => p !== '');
+    const modelRouteLeaves = Object.keys(defaults.MODEL_ROUTE_DEFAULTS).map((key) => 'modelRoute.' + key);
+    console.log(
+      JSON.stringify(
+        { defaultLeaves, modelRouteLeaves, defaultLeafCount: defaultLeaves.length, modelRouteLeafCount: modelRouteLeaves.length },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
   console.log('[docs-verify] Starting documentation and repository hygiene verification...');
 
   // 1. Check LICENSE
@@ -81,140 +344,212 @@ function main() {
   console.log('[docs-verify] ✓ CHANGELOG.md exists.');
 
   // 3. Read README
-  if (!fs.existsSync(readmePath)) {
+  const activeReadmePath = options.readme ?? readmePath;
+  if (!fs.existsSync(activeReadmePath)) {
     console.error('[docs-verify] ERROR: README.md file is missing!');
     process.exitCode = 1;
     return;
   }
-  const readmeContent = fs.readFileSync(readmePath, 'utf8');
+  const readmeContent = fs.readFileSync(activeReadmePath, 'utf8');
 
-  // 4. Parse README numbers
-  const summaryRegex = /reports\s+`(\d+)`\s+test files and\s+`(\d+)`\s+passing tests for\s+`pnpm run test`/i;
-  const summaryMatch = readmeContent.match(summaryRegex);
-  if (!summaryMatch) {
-    console.error('[docs-verify] ERROR: Could not find test count summary in README.md!');
-    process.exitCode = 1;
-    return;
-  }
-  const readmeSummaryFiles = parseInt(summaryMatch[1], 10);
-  const readmeSummaryTests = parseInt(summaryMatch[2], 10);
+  let testReport = null;
+  if (!options.docsOnly) {
+    // 4. Get actual test counts from Vitest (root file, --report file, or a
+    //    fresh temporary run). A report that carries failing or pending tests
+    //    is refused BEFORE the count comparison: the README claims "passing
+    //    tests", so a failing run must never mint a green count check.
+    if (options.report !== undefined) {
+      console.log(`[docs-verify] Reading provided test report: ${options.report}`);
+      testReport = JSON.parse(fs.readFileSync(options.report, 'utf8'));
+    } else if (fs.existsSync(rootTestResultsPath)) {
+      console.log(`[docs-verify] Reading existing test report: ${rootTestResultsPath}`);
+      testReport = JSON.parse(fs.readFileSync(rootTestResultsPath, 'utf8'));
+      rootReportConsumed = true;
+    } else {
+      console.log(`[docs-verify] test-results.json not in root; generating test report in temporary location...`);
+      const normalizedTemp = tempReportFile.replace(/\\/g, '/');
+      execSync(`pnpm exec vitest run --reporter=json --outputFile="${normalizedTemp}"`, {
+        cwd: rootDir,
+        stdio: 'inherit'
+      });
+      testReport = JSON.parse(fs.readFileSync(tempReportFile, 'utf8'));
+      tempReportCreated = true;
+    }
 
-  const unitRegex = /\|\s*`pnpm run test:unit`\s*\|\s*`tests\/unit`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i;
-  const unitMatch = readmeContent.match(unitRegex);
-  if (!unitMatch) {
-    console.error('[docs-verify] ERROR: Could not find pnpm run test:unit entry in README.md table!');
-    process.exitCode = 1;
-    return;
-  }
-  const readmeUnitFiles = parseInt(unitMatch[1], 10);
-  const readmeUnitTests = parseInt(unitMatch[2], 10);
+    const failedNames = collectAssertionNames(testReport, ['failed']);
+    const pendingNames = collectAssertionNames(testReport, ['pending', 'skipped', 'todo']);
+    const numFailed =
+      typeof testReport.numFailedTests === 'number' ? testReport.numFailedTests : failedNames.length;
+    const numPending =
+      typeof testReport.numPendingTests === 'number' ? testReport.numPendingTests : pendingNames.length;
 
-  const e2eRegex = /\|\s*`pnpm run test:e2e`\s*\|\s*`tests\/e2e`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i;
-  const e2eMatch = readmeContent.match(e2eRegex);
-  if (!e2eMatch) {
-    console.error('[docs-verify] ERROR: Could not find pnpm run test:e2e entry in README.md table!');
-    process.exitCode = 1;
-    return;
-  }
-  const readmeE2eFiles = parseInt(e2eMatch[1], 10);
-  const readmeE2eTests = parseInt(e2eMatch[2], 10);
+    if (numFailed > 0 || failedNames.length > 0) {
+      console.error(
+        `[docs-verify] FAIL: the consumed report carries ${numFailed} failed test(s). Refusing to verify README counts against a failing run.`
+      );
+      for (const name of failedNames) {
+        console.error('  - failed: ' + name);
+      }
+      process.exitCode = 1;
+      return;
+    }
+    if (numPending > 0 || pendingNames.length > 0) {
+      console.error(
+        `[docs-verify] FAIL: the consumed report carries ${numPending} pending/skipped test(s). Refusing to verify README counts against an incomplete run.`
+      );
+      for (const name of pendingNames) {
+        console.error('  - pending: ' + name);
+      }
+      process.exitCode = 1;
+      return;
+    }
+    console.log('[docs-verify] ✓ Report carries zero failed and zero pending tests.');
 
-  const totalRegex = /\|\s*`pnpm run test`\s*\|\s*everything\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i;
-  const totalMatch = readmeContent.match(totalRegex);
-  if (!totalMatch) {
-    console.error('[docs-verify] ERROR: Could not find pnpm run test (total) entry in README.md table!');
-    process.exitCode = 1;
-    return;
-  }
-  const readmeTotalFiles = parseInt(totalMatch[1], 10);
-  const readmeTotalTests = parseInt(totalMatch[2], 10);
+    // 5. Parse README numbers
+    const summaryRegex = /reports\s+`(\d+)`\s+test files and\s+`(\d+)`\s+passing tests for\s+`pnpm run test`/i;
+    const summaryMatch = readmeContent.match(summaryRegex);
+    if (!summaryMatch) {
+      console.error('[docs-verify] ERROR: Could not find test count summary in README.md!');
+      process.exitCode = 1;
+      return;
+    }
+    const readmeSummaryFiles = parseInt(summaryMatch[1], 10);
+    const readmeSummaryTests = parseInt(summaryMatch[2], 10);
 
-  console.log('[docs-verify] Parsed README metrics:');
-  console.log(`  - Summary: ${readmeSummaryFiles} files, ${readmeSummaryTests} tests`);
-  console.log(`  - Unit:    ${readmeUnitFiles} files, ${readmeUnitTests} tests`);
-  console.log(`  - E2E:     ${readmeE2eFiles} files, ${readmeE2eTests} tests`);
-  console.log(`  - Total:   ${readmeTotalFiles} files, ${readmeTotalTests} tests`);
+    const unitRegex = /\|\s*`pnpm run test:unit`\s*\|\s*`tests\/unit`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i;
+    const unitMatch = readmeContent.match(unitRegex);
+    if (!unitMatch) {
+      console.error('[docs-verify] ERROR: Could not find pnpm run test:unit entry in README.md table!');
+      process.exitCode = 1;
+      return;
+    }
+    const readmeUnitFiles = parseInt(unitMatch[1], 10);
+    const readmeUnitTests = parseInt(unitMatch[2], 10);
 
-  // 5. Get actual test counts from Vitest
-  let testReport;
-  if (fs.existsSync(rootTestResultsPath)) {
-    console.log(`[docs-verify] Reading existing test report: ${rootTestResultsPath}`);
-    testReport = JSON.parse(fs.readFileSync(rootTestResultsPath, 'utf8'));
-    rootReportConsumed = true;
-  } else {
-    console.log(`[docs-verify] test-results.json not in root; generating test report in temporary location...`);
-    const normalizedTemp = tempReportFile.replace(/\\/g, '/');
-    execSync(`pnpm exec vitest run --reporter=json --outputFile="${normalizedTemp}"`, {
-      cwd: rootDir,
-      stdio: 'inherit'
+    const e2eRegex = /\|\s*`pnpm run test:e2e`\s*\|\s*`tests\/e2e`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i;
+    const e2eMatch = readmeContent.match(e2eRegex);
+    if (!e2eMatch) {
+      console.error('[docs-verify] ERROR: Could not find pnpm run test:e2e entry in README.md table!');
+      process.exitCode = 1;
+      return;
+    }
+    const readmeE2eFiles = parseInt(e2eMatch[1], 10);
+    const readmeE2eTests = parseInt(e2eMatch[2], 10);
+
+    const totalRegex = /\|\s*`pnpm run test`\s*\|\s*everything\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i;
+    const totalMatch = readmeContent.match(totalRegex);
+    if (!totalMatch) {
+      console.error('[docs-verify] ERROR: Could not find pnpm run test (total) entry in README.md table!');
+      process.exitCode = 1;
+      return;
+    }
+    const readmeTotalFiles = parseInt(totalMatch[1], 10);
+    const readmeTotalTests = parseInt(totalMatch[2], 10);
+
+    console.log('[docs-verify] Parsed README metrics:');
+    console.log(`  - Summary: ${readmeSummaryFiles} files, ${readmeSummaryTests} tests`);
+    console.log(`  - Unit:    ${readmeUnitFiles} files, ${readmeUnitTests} tests`);
+    console.log(`  - E2E:     ${readmeE2eFiles} files, ${readmeE2eTests} tests`);
+    console.log(`  - Total:   ${readmeTotalFiles} files, ${readmeTotalTests} tests`);
+
+    const testResults = testReport.testResults || [];
+    const actualTotalFiles = testResults.length;
+    const actualTotalTests = testReport.numTotalTests ?? testResults.reduce((acc, f) => acc + (f.assertionResults?.length || 0), 0);
+
+    const unitFiles = testResults.filter((f) => {
+      const norm = f.name.replace(/\\/g, '/');
+      return norm.includes('/tests/unit/');
     });
-    testReport = JSON.parse(fs.readFileSync(tempReportFile, 'utf8'));
-    tempReportCreated = true;
+    const actualUnitFiles = unitFiles.length;
+    const actualUnitTests = unitFiles.reduce((acc, f) => acc + (f.assertionResults?.length || 0), 0);
+
+    const e2eFiles = testResults.filter((f) => {
+      const norm = f.name.replace(/\\/g, '/');
+      return norm.includes('/tests/e2e/');
+    });
+    const actualE2eFiles = e2eFiles.length;
+    const actualE2eTests = e2eFiles.reduce((acc, f) => acc + (f.assertionResults?.length || 0), 0);
+
+    console.log('[docs-verify] Actual Vitest run metrics:');
+    console.log(`  - Unit:    ${actualUnitFiles} files, ${actualUnitTests} tests`);
+    console.log(`  - E2E:     ${actualE2eFiles} files, ${actualE2eTests} tests`);
+    console.log(`  - Total:   ${actualTotalFiles} files, ${actualTotalTests} tests`);
+
+    const errors = [];
+    if (readmeSummaryFiles !== actualTotalFiles) {
+      errors.push(`Summary test files mismatch: README has ${readmeSummaryFiles}, Vitest has ${actualTotalFiles}`);
+    }
+    if (readmeSummaryTests !== actualTotalTests) {
+      errors.push(`Summary passing tests mismatch: README has ${readmeSummaryTests}, Vitest has ${actualTotalTests}`);
+    }
+    if (readmeUnitFiles !== actualUnitFiles) {
+      errors.push(`Table unit test files mismatch: README has ${readmeUnitFiles}, Vitest has ${actualUnitFiles}`);
+    }
+    if (readmeUnitTests !== actualUnitTests) {
+      errors.push(`Table unit tests mismatch: README has ${readmeUnitTests}, Vitest has ${actualUnitTests}`);
+    }
+    if (readmeE2eFiles !== actualE2eFiles) {
+      errors.push(`Table e2e test files mismatch: README has ${readmeE2eFiles}, Vitest has ${actualE2eFiles}`);
+    }
+    if (readmeE2eTests !== actualE2eTests) {
+      errors.push(`Table e2e tests mismatch: README has ${readmeE2eTests}, Vitest has ${actualE2eTests}`);
+    }
+    if (readmeTotalFiles !== actualTotalFiles) {
+      errors.push(`Table total test files mismatch: README has ${readmeTotalFiles}, Vitest has ${actualTotalFiles}`);
+    }
+    if (readmeTotalTests !== actualTotalTests) {
+      errors.push(`Table total tests mismatch: README has ${readmeTotalTests}, Vitest has ${actualTotalTests}`);
+    }
+
+    if (errors.length > 0) {
+      console.error('[docs-verify] FAIL: Found discrepancies between README.md and test results:');
+      for (const err of errors) {
+        console.error(`  - ${err}`);
+      }
+      process.exitCode = 1;
+      // Do not return: the configuration-reference check below still runs, so
+      // one invocation reports every documentation defect class at once.
+    } else {
+      console.log('[docs-verify] SUCCESS: All README.md test counts match Vitest results exactly!');
+    }
+  } else {
+    console.log('[docs-verify] --docs-only: skipping test-report/count checks (config-reference verification only).');
   }
 
-  const testResults = testReport.testResults || [];
-  const actualTotalFiles = testResults.length;
-  const actualTotalTests = testReport.numTotalTests ?? testResults.reduce((acc, f) => acc + (f.assertionResults?.length || 0), 0);
-
-  const unitFiles = testResults.filter((f) => {
-    const norm = f.name.replace(/\\/g, '/');
-    return norm.includes('/tests/unit/');
-  });
-  const actualUnitFiles = unitFiles.length;
-  const actualUnitTests = unitFiles.reduce((acc, f) => acc + (f.assertionResults?.length || 0), 0);
-
-  const e2eFiles = testResults.filter((f) => {
-    const norm = f.name.replace(/\\/g, '/');
-    return norm.includes('/tests/e2e/');
-  });
-  const actualE2eFiles = e2eFiles.length;
-  const actualE2eTests = e2eFiles.reduce((acc, f) => acc + (f.assertionResults?.length || 0), 0);
-
-  console.log('[docs-verify] Actual Vitest run metrics:');
-  console.log(`  - Unit:    ${actualUnitFiles} files, ${actualUnitTests} tests`);
-  console.log(`  - E2E:     ${actualE2eFiles} files, ${actualE2eTests} tests`);
-  console.log(`  - Total:   ${actualTotalFiles} files, ${actualTotalTests} tests`);
-
-  const errors = [];
-  if (readmeSummaryFiles !== actualTotalFiles) {
-    errors.push(`Summary test files mismatch: README has ${readmeSummaryFiles}, Vitest has ${actualTotalFiles}`);
-  }
-  if (readmeSummaryTests !== actualTotalTests) {
-    errors.push(`Summary passing tests mismatch: README has ${readmeSummaryTests}, Vitest has ${actualTotalTests}`);
-  }
-  if (readmeUnitFiles !== actualUnitFiles) {
-    errors.push(`Table unit test files mismatch: README has ${readmeUnitFiles}, Vitest has ${actualUnitFiles}`);
-  }
-  if (readmeUnitTests !== actualUnitTests) {
-    errors.push(`Table unit tests mismatch: README has ${readmeUnitTests}, Vitest has ${actualUnitTests}`);
-  }
-  if (readmeE2eFiles !== actualE2eFiles) {
-    errors.push(`Table e2e test files mismatch: README has ${readmeE2eFiles}, Vitest has ${actualE2eFiles}`);
-  }
-  if (readmeE2eTests !== actualE2eTests) {
-    errors.push(`Table e2e tests mismatch: README has ${readmeE2eTests}, Vitest has ${actualE2eTests}`);
-  }
-  if (readmeTotalFiles !== actualTotalFiles) {
-    errors.push(`Table total test files mismatch: README has ${readmeTotalFiles}, Vitest has ${actualTotalFiles}`);
-  }
-  if (readmeTotalTests !== actualTotalTests) {
-    errors.push(`Table total tests mismatch: README has ${readmeTotalTests}, Vitest has ${actualTotalTests}`);
-  }
-
-  if (errors.length > 0) {
-    console.error('[docs-verify] FAIL: Found discrepancies between README.md and test results:');
-    for (const err of errors) {
-      console.error(`  - ${err}`);
+  // 6. Configuration-reference completeness (ADR 0005 §4 D4): walk the REAL
+  //    defaults, never a hand-copied table, and fail on missing, stale or
+  //    drifted rows.
+  const defaults = await loadRealDefaults();
+  const leafResult = verifyDocsLeaves(readmeContent, defaults.DEFAULT_EVO_HARNESS_CONFIG, defaults.MODEL_ROUTE_DEFAULTS);
+  console.log(
+    `[docs-verify] Config reference coverage: ${leafResult.rowCount} documented row(s) vs ${leafResult.expectedCount} expected default leaf path(s) (arrays count as one leaf with a \`[]\` suffix).`
+  );
+  if (!leafResult.ok) {
+    console.error('[docs-verify] FAIL: Configuration reference does not match the real defaults:');
+    for (const missingPath of leafResult.missing) {
+      console.error(`  - missing-leaf: ${missingPath} is a default leaf but has no reference row`);
+    }
+    for (const stalePath of leafResult.stale) {
+      console.error(`  - stale-leaf: ${stalePath} is documented but is not a real default leaf`);
+    }
+    for (const mismatch of leafResult.mismatches) {
+      console.error(
+        `  - default-mismatch: ${mismatch.path} documents \`${mismatch.actual}\` but the real default is \`${mismatch.expected}\``
+      );
     }
     process.exitCode = 1;
     return;
   }
-
-  console.log('[docs-verify] SUCCESS: All README.md test counts match Vitest results exactly!');
+  console.log('[docs-verify] ✓ Configuration reference documents every default leaf with the correct default value.');
+  if (process.exitCode === 1) {
+    console.error('[docs-verify] FAIL: see the discrepancy report above (counts and/or configuration reference).');
+  } else {
+    console.log('[docs-verify] SUCCESS: documentation gate fully green.');
+  }
 }
 
 try {
-  main();
+  await main();
 } catch (err) {
   console.error('[docs-verify] Unexpected error during verification:', err);
   process.exitCode = 1;

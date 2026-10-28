@@ -25,14 +25,18 @@
  * a specific id + detail naming the offending entry.
  *
  * T7 repairs covered here:
- *   - F1 (checkout bytes): a recorded CRLF digest placed on disk as LF bytes must
- *     produce the named `provenance-executed-sources-eol-divergent` warning (and
- *     still fail `provenance-executed-sources-match-disk`, because the recorded
- *     bytes do not describe this checkout). NOTE: this diagnosis recognises the
- *     two byte forms of the SAME text under ONE checkout configuration; it is
- *     NOT a portability guarantee across different `core.autocrlf` checkouts.
- *     The documented spec (header + `--help`) is `git -c core.autocrlf=false
- *     checkout` for both generation and verification.
+ *   - F1 (checkout bytes, SUPERSEDED by ADR 0005 D2 `eol-equiv-v1`): the
+ *     recorded digests stay the generation-time RAW byte facts, and the
+ *     verifier applies a VERSIONED verification-side equivalence rule: an
+ *     executed source whose bytes differ from the record ONLY by the
+ *     line-ending form of the same text (CRLF -> LF or its exact inverse) is an
+ *     explicit, separately named PASS classification
+ *     `provenance-executed-sources-eol-equivalent` — never merged into the
+ *     raw-match count. Real content drift, BOM added/removed, binary and
+ *     invalid-UTF-8 bytes still FAIL `provenance-executed-sources-match-disk`.
+ *     The old warning id `provenance-executed-sources-eol-divergent` is
+ *     retained (not deleted) and fires only in the MIXED state: some entries
+ *     hit equivalence while OTHER executed sources genuinely drift.
  *   - F2 (anchor bypass): traversal/absolute/drive-letter/non-hex entries must
  *     fail `provenance-executed-entries-well-formed` with the entry named; an
  *     unreadable entry must fail `provenance-executed-all-entries-checked`
@@ -59,8 +63,11 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '
 const VERIFIER = join(REPO_ROOT, 'scripts', 'eval', 'verify-pr4a-artifacts.mjs');
 
 /** sha256 over the UTF-8 text, exactly as the verifier computes list digests. */
-function sha256(text: string): string {
-  return createHash('sha256').update(text, 'utf8').digest('hex');
+function sha256(text: string): string;
+/** sha256 over raw bytes (eol-equiv-v1 fixtures record raw byte forms). */
+function sha256(bytes: Buffer): string;
+function sha256(textOrBytes: string | Buffer): string {
+  return createHash('sha256').update(textOrBytes).digest('hex');
 }
 
 /** A syntactically valid 64-hex digest used where the bytes are irrelevant. */
@@ -302,6 +309,28 @@ function provenanceFailures(root: string): StatusFailure[] {
   return (readStatus(root)?.failures ?? []).filter((failure) => failure.id.startsWith('provenance-'));
 }
 
+/**
+ * The status file's named eol-equivalence classification (ADR 0005 D2): the
+ * executedSources entries whose recorded raw-byte digest matches the same text
+ * under the other line-ending form. Empty when there are no equivalence hits.
+ */
+function readEolEquivalents(root: string): Array<{ path: string; rule: string; kind: string }> {
+  const raw = JSON.parse(readFileSync(join(root, 'work', 'pr4a-verify-status.json'), 'utf8')) as {
+    eolEquivalents?: Array<{ path: string; rule: string; kind: string }>;
+  };
+  return raw.eolEquivalents ?? [];
+}
+
+/**
+ * Write raw bytes to a repo-relative fixture path without UTF-8 round-tripping,
+ * so binary and invalid-UTF-8 fixtures keep their exact bytes.
+ */
+function writeFileSyncBinary(root: string, relativePath: string, bytes: Buffer): void {
+  const full = join(root, ...relativePath.split('/'));
+  mkdirSync(dirname(full), { recursive: true });
+  writeFileSync(full, bytes);
+}
+
 describe('PR-4A artifact verifier — workspace evidence semantics', () => {
   it('MISSING work/: exit 1 with named ids/details on stdout, no status file, no work/ creation', () => {
     const root = makeRoot();
@@ -455,13 +484,14 @@ describe('PR-4A artifact verifier — workspace evidence semantics', () => {
     expect(run.stdout).toContain('FAIL provenance-dirty-paths-resolve');
   });
 
-  it('EOL-only divergence at a recorded CRLF source gets a named warning, not one opaque mismatch', () => {
+  it('eol-equiv-v1 BOTH directions: a recorded CRLF digest with LF disk bytes is a named equivalence PASS (T7-F1, CRLF record / LF disk)', () => {
     const root = makeRoot();
     const provenance = buildCleanProvenance(root);
     const eolModule = 'scripts/eval/build-eval.mjs';
     const diskText = readFileSync(join(root, eolModule), 'utf8');
     // The recorded digest describes the CRLF form; the fixture keeps LF bytes on
-    // disk. That is exactly the cross-checkout shape T7-F1 measured.
+    // disk (CRLF record / LF disk). Under eol-equiv-v1 this is an EXPLICIT pass
+    // classification, not a failure.
     const crlfDigest = sha256(diskText.replace(/\n/g, '\r\n'));
     provenance.executedSources = provenance.executedSources.map((entry) =>
       entry.path === eolModule ? { ...entry, sha256: crlfDigest } : entry
@@ -470,26 +500,266 @@ describe('PR-4A artifact verifier — workspace evidence semantics', () => {
     writeArtifact(root, provenance);
     const run = runVerifier(root);
 
-    // Named eol diagnosis on stdout and in the status file.
+    const status = readStatus(root);
+    // Named equivalence classification, carrying the rule version, and the run
+    // does NOT fail on the provenance contract.
+    const equivalence = status?.failures.find(
+      (failure) => failure.id === 'provenance-executed-sources-eol-equivalent'
+    );
+    expect(equivalence).toBeUndefined();
+    expect(run.stdout).toContain('eol-equiv-v1');
+    expect(provenanceFailures(root)).toEqual([]);
+    expect(run.stdout).not.toContain('FAIL provenance-');
+    // The classification detail names the path, the kind and the rule version
+    // (visible via the match-disk detail's eolEquivalent list).
+    const matchDisk = status?.failures.find((failure) => failure.id === 'provenance-executed-sources-match-disk');
+    expect(matchDisk).toBeUndefined();
+    // The equivalence detail is printed as part of the match-disk assertion's
+    // JSON when it PASSES? No: assert() records detail always. Read it directly.
+    const equivalentEntry = (status?.passed ?? 0) > 0;
+    expect(equivalentEntry).toBe(true);
+  });
+
+  it('eol-equiv-v1: the equivalence PASS carries the rule version, the path list and kind eol-equivalent in its named classification', () => {
+    const root = makeRoot();
+    const provenance = buildCleanProvenance(root);
+    const eolModule = 'scripts/eval/build-eval.mjs';
+    const diskText = readFileSync(join(root, eolModule), 'utf8');
+    const crlfDigest = sha256(diskText.replace(/\n/g, '\r\n'));
+    provenance.executedSources = provenance.executedSources.map((entry) =>
+      entry.path === eolModule ? { ...entry, sha256: crlfDigest } : entry
+    );
+    provenance.executedSourcesDigest = digestOfList(provenance.executedSources);
+    writeArtifact(root, provenance);
+    runVerifier(root);
+
+    // The named classification is recorded in the status file's
+    // `eolEquivalents` key (with the rule version and pass kind) and echoed on
+    // stdout — never merged into the raw-match count, never a failure.
+    const equivalents = readEolEquivalents(root);
+    expect(equivalents).toHaveLength(1);
+    expect(equivalents[0]).toEqual({ path: eolModule, rule: 'eol-equiv-v1', kind: 'eol-equivalent' });
+    expect(readStatus(root)?.passed).toBeGreaterThan(0);
+  });
+
+  it('t18 counting regression: an equivalence hit is counted EXACTLY ONCE (no duplicate push, checked/passed not inflated)', () => {
+    const root = makeRoot();
+    const provenance = buildCleanProvenance(root);
+    const eolModule = 'scripts/eval/build-eval.mjs';
+    const diskText = readFileSync(join(root, eolModule), 'utf8');
+    const crlfDigest = sha256(diskText.replace(/\n/g, '\r\n'));
+    provenance.executedSources = provenance.executedSources.map((entry) =>
+      entry.path === eolModule ? { ...entry, sha256: crlfDigest } : entry
+    );
+    provenance.executedSourcesDigest = digestOfList(provenance.executedSources);
+    writeArtifact(root, provenance);
+    const withEquivalence = runVerifier(root);
+
+    // The same fixture WITHOUT the equivalence hit: identical checks except the
+    // recorded digest is the raw one. The two runs must differ by EXACTLY one
+    // checked/passed check — the single equivalence classification — proving no
+    // duplicate push inflates the counters.
+    const plainRoot = makeRoot();
+    writeArtifact(plainRoot, buildCleanProvenance(plainRoot));
+    const withoutEquivalence = runVerifier(plainRoot);
+
+    const withStatus = readStatus(root);
+    const withoutStatus = readStatus(plainRoot);
+    expect(withStatus?.checked).toBe((withoutStatus?.checked ?? 0) + 1);
+    expect(withStatus?.passed).toBe((withoutStatus?.passed ?? 0) + 1);
+    expect(withStatus?.failed).toBe(withoutStatus?.failed);
+    // And the equivalence classification itself appears as its own single check.
+    const stdoutIds = (withEquivalence.stdout.match(/\[verify-pr4a-artifacts\] EOL-EQUIVALENT \(eol-equiv-v1\)/g) ?? []);
+    expect(stdoutIds).toHaveLength(1);
+    void withoutEquivalence;
+  });
+
+  it('t18 mixed-state regression: the same id is NEVER in both passed and failed; equivalence stays a pass while drift fails the run', () => {
+    const root = makeRoot();
+    const provenance = buildCleanProvenance(root);
+    const eolModule = 'scripts/eval/build-eval.mjs';
+    const driftModule = 'scripts/eval/pr4a-build.mjs';
+    // One entry hits equivalence, another genuinely drifts.
+    const crlfDigest = sha256(readFileSync(join(root, eolModule), 'utf8').replace(/\n/g, '\r\n'));
+    provenance.executedSources = provenance.executedSources.map((entry) =>
+      entry.path === eolModule ? { ...entry, sha256: crlfDigest } : entry
+    );
+    writeRepoFile(root, driftModule, '// genuinely mutated after the evidence run\n');
+    provenance.executedSourcesDigest = digestOfList(provenance.executedSources);
+    writeArtifact(root, provenance);
+    const run = runVerifier(root);
+
+    // Genuine drift still fails the COMMAND.
+    expect(run.status).toBe(1);
+    const status = readStatus(root);
+    const failures = status?.failures ?? [];
+    // The equivalence classification is NOT among the failures (it must not be
+    // flipped to failed by ANOTHER entry's drift).
+    expect(failures.some((failure) => failure.id === 'provenance-executed-sources-eol-equivalent')).toBe(false);
+    // The same id must not appear twice in the results ledger (once failed, once
+    // forced-passed): count occurrences of the id across the whole status file.
+    const raw = JSON.parse(readFileSync(join(root, 'work', 'pr4a-verify-status.json'), 'utf8')) as {
+      eolEquivalents: Array<{ path: string }>;
+    };
+    // The classification is still recorded as the named eol-equivalent hit...
+    expect(raw.eolEquivalents.map((entry) => entry.path)).toContain(eolModule);
+    // ...match-disk fails with ONLY the drifted entry...
+    const mismatch = failures.find((failure) => failure.id === 'provenance-executed-sources-match-disk');
+    expect(mismatch).toBeDefined();
+    const detail = JSON.parse(mismatch?.detail ?? '{}') as {
+      mismatches: Array<{ path: string; eolOnly: boolean }>;
+      eolEquivalent?: string[];
+    };
+    expect(detail.mismatches).toHaveLength(1);
+    const driftedEntry = detail.mismatches[0];
+    expect(driftedEntry?.path).toBe(driftModule);
+    expect(driftedEntry?.eolOnly).toBe(false);
+    expect(detail.eolEquivalent).toContain(eolModule);
+    // ...and the mixed-state counting stays self-consistent: failed counts each
+    // failing check once, and the retained eol-divergent diagnostic is advisory.
+    expect(status?.warnings?.some((warning) => warning.id === 'provenance-executed-sources-eol-divergent')).toBe(true);
+    expect(failures.some((failure) => failure.id === 'provenance-executed-sources-eol-divergent')).toBe(false);
+    expect(status?.checked).toBe(status!['passed'] + status!['failed']);
+    expect(run.stdout).toContain('FAIL provenance-executed-sources-match-disk');
+  });
+
+  it('eol-equiv-v1 BOTH directions: a recorded LF digest with CRLF disk bytes is an equivalence PASS too (LF record / CRLF disk)', () => {
+    const root = makeRoot();
+    const provenance = buildCleanProvenance(root);
+    const eolModule = 'scripts/eval/build-eval.mjs';
+    // The recorded digest describes the LF form; the fixture writes CRLF bytes
+    // on disk (LF record / CRLF disk) — the exact inverse direction.
+    const lfDigest = sha256(readFileSync(join(root, eolModule), 'utf8'));
+    provenance.executedSources = provenance.executedSources.map((entry) =>
+      entry.path === eolModule ? { ...entry, sha256: lfDigest } : entry
+    );
+    provenance.executedSourcesDigest = digestOfList(provenance.executedSources);
+    writeRepoFile(root, eolModule, readFileSync(join(root, eolModule), 'utf8').replace(/\n/g, '\r\n'));
+    writeArtifact(root, provenance);
+    const run = runVerifier(root);
+
+    expect(provenanceFailures(root)).toEqual([]);
+    expect(run.stdout).not.toContain('FAIL provenance-');
+    expect(readEolEquivalents(root)).toEqual([{ path: eolModule, rule: 'eol-equiv-v1', kind: 'eol-equivalent' }]);
+  });
+
+  it('eol-equiv-v1: mixed state — equivalence hit PLUS genuine drift — keeps match-disk RED and fires the retained eol-divergent WARN', () => {
+    const root = makeRoot();
+    const provenance = buildCleanProvenance(root);
+    const eolModule = 'scripts/eval/build-eval.mjs';
+    const driftModule = 'scripts/eval/pr4a-build.mjs';
+    // One entry hits the equivalence rule (CRLF record / LF disk)...
+    const crlfDigest = sha256(readFileSync(join(root, eolModule), 'utf8').replace(/\n/g, '\r\n'));
+    provenance.executedSources = provenance.executedSources.map((entry) =>
+      entry.path === eolModule ? { ...entry, sha256: crlfDigest } : entry
+    );
+    // ...while another genuinely drifts (content change, not line endings).
+    writeRepoFile(root, driftModule, '// genuinely mutated after the evidence run\n');
+    provenance.executedSourcesDigest = digestOfList(provenance.executedSources);
+    writeArtifact(root, provenance);
+    const run = runVerifier(root);
+
+    const failures = provenanceFailures(root);
+    const mismatch = failures.find((failure) => failure.id === 'provenance-executed-sources-match-disk');
+    expect(mismatch).toBeDefined();
+    const detail = JSON.parse(mismatch?.detail ?? '{}') as {
+      rule?: string;
+      mismatches: Array<{ path: string; eolOnly: boolean }>;
+      eolEquivalent?: string[];
+    };
+    expect(detail.rule).toBe('eol-equiv-v1');
+    expect(detail.mismatches.some((entry) => entry.path === driftModule && entry.eolOnly === false)).toBe(true);
+    expect(detail.eolEquivalent).toContain(eolModule);
+    // The retained warning id fires ONLY in this mixed state, and it is an
+    // advisory (WARN), never a failure.
     expect(run.stdout).toContain('WARN provenance-executed-sources-eol-divergent');
     expect(run.stdout).toContain(eolModule);
     const status = readStatus(root);
     expect(status?.warnings?.some((warning) => warning.id === 'provenance-executed-sources-eol-divergent')).toBe(true);
-    // Raw bytes still differ: the recorded evidence does not describe this
-    // checkout, so the failure stays — now with a precise reason.
-    const mismatch = status?.failures.find((failure) => failure.id === 'provenance-executed-sources-match-disk');
-    expect(mismatch).toBeDefined();
-    const detail = JSON.parse(mismatch?.detail ?? '{}') as {
-      mismatches: Array<{ path: string; eolOnly: boolean }>;
-    };
-    const divergent = detail.mismatches.find((entry) => entry.path === eolModule);
-    expect(divergent?.eolOnly).toBe(true);
-    expect(status?.failures.some((failure) => failure.id === 'provenance-executed-all-entries-checked')).toBe(false);
-    // NOTE: this diagnosis recognises the two byte forms of the SAME text under
-    // ONE checkout byte configuration. It is NOT a portability guarantee across
-    // different core.autocrlf checkouts: generating or verifying under another
-    // configuration still changes raw bytes. The documented spec is
-    // `git -c core.autocrlf=false checkout` for generation AND verification.
+    expect(failures.some((failure) => failure.id === 'provenance-executed-sources-eol-divergent')).toBe(false);
+  });
+
+  it('eol-equiv-v1 does NOT swallow non-EOL byte differences: BOM, lone content change and binary bytes stay FAIL', () => {
+    for (const scenario of ['bom', 'content', 'binary'] as const) {
+      const root = makeRoot();
+      const provenance = buildCleanProvenance(root);
+      const target = 'scripts/eval/build-eval.mjs';
+      const original = readFileSync(join(root, target), 'utf8');
+      // Record the post-scenario disk form first, then place the OTHER bytes on
+      // disk, so ONLY the named byte difference explains the failure.
+      let recordedText = original;
+      let diskText = original;
+      if (scenario === 'bom') {
+        recordedText = '\uFEFF' + original; // record carries a BOM, disk does not
+      } else if (scenario === 'content') {
+        recordedText = original.replace('fixture: eval bundler', 'fixture: eval bundler CHANGED');
+      } else {
+        diskText = original + '\u0000\u0001\u0002'; // disk becomes binary
+      }
+      provenance.executedSources = provenance.executedSources.map((entry) =>
+        entry.path === target ? { ...entry, sha256: sha256(Buffer.from(recordedText, 'utf8')) } : entry
+      );
+      provenance.executedSourcesDigest = digestOfList(provenance.executedSources);
+      if (scenario === 'bom') {
+        writeRepoFile(root, target, original); // disk: no BOM
+      } else if (scenario === 'content') {
+        writeRepoFile(root, target, original); // disk: original text
+      } else {
+        writeFileSyncBinary(root, target, Buffer.from(diskText, 'latin1'));
+      }
+      writeArtifact(root, provenance);
+      runVerifier(root);
+
+      const failures = provenanceFailures(root);
+      const mismatch = failures.find((failure) => failure.id === 'provenance-executed-sources-match-disk');
+      expect(mismatch, `scenario=${scenario}`).toBeDefined();
+      const detail = JSON.parse(mismatch?.detail ?? '{}') as {
+        mismatches: Array<{ path: string; eolOnly: boolean }>;
+      };
+      const drifted = detail.mismatches.find((entry) => entry.path === target);
+      expect(drifted, `scenario=${scenario}`).toBeDefined();
+      expect(drifted?.eolOnly, `scenario=${scenario}`).toBe(false);
+      // No equivalence classification may appear for a drifted entry.
+      expect(failures.some((failure) => failure.id === 'provenance-executed-sources-eol-equivalent'), `scenario=${scenario}`).toBe(false);
+    }
+  });
+
+  it('eol-equiv-v1: invalid-UTF-8 disk bytes never enter the equivalence judgement (still drift)', () => {
+    const root = makeRoot();
+    const provenance = buildCleanProvenance(root);
+    const target = 'scripts/eval/build-eval.mjs';
+    // Record the LF form; the disk carries an invalid UTF-8 sequence (a lone
+    // 0xFF byte), which must never be "normalised" into a match.
+    provenance.executedSources = provenance.executedSources.map((entry) =>
+      entry.path === target ? { ...entry, sha256: sha256(Buffer.from(readFileSync(join(root, target), 'utf8'), 'utf8')) } : entry
+    );
+    provenance.executedSourcesDigest = digestOfList(provenance.executedSources);
+    writeFileSyncBinary(root, target, Buffer.from([0x2f, 0x2f, 0x20, 0xff, 0x0a]));
+    writeArtifact(root, provenance);
+    runVerifier(root);
+
+    const failures = provenanceFailures(root);
+    expect(failures.some((failure) => failure.id === 'provenance-executed-sources-match-disk')).toBe(true);
+    expect(failures.some((failure) => failure.id === 'provenance-executed-sources-eol-equivalent')).toBe(false);
+  });
+
+  it('eol-equiv-v1 keeps every other provenance guard intact: list digest recomputation, well-formedness, tri-state dirty capture', () => {
+    const root = makeRoot();
+    const provenance = buildCleanProvenance(root);
+    // Swap one entry's digest for the OTHER line-ending form WITHOUT updating
+    // the list digest: the anti-collusion recomputation must still fail.
+    const eolModule = 'scripts/eval/build-eval.mjs';
+    const crlfDigest = sha256(readFileSync(join(root, eolModule), 'utf8').replace(/\n/g, '\r\n'));
+    provenance.executedSources = provenance.executedSources.map((entry) =>
+      entry.path === eolModule ? { ...entry, sha256: crlfDigest } : entry
+    );
+    // executedSourcesDigest deliberately left as the ORIGINAL list digest.
+    writeArtifact(root, provenance);
+    runVerifier(root);
+
+    const failures = provenanceFailures(root);
+    expect(failures.some((failure) => failure.id === 'provenance-executed-digest-recomputed')).toBe(true);
+    expect(failures.some((failure) => failure.id === 'provenance-executed-sources-eol-equivalent')).toBe(false);
   });
 
   it('REJECTS malformed executedSources entries with a named check instead of filtering them out of the comparison', () => {
@@ -555,7 +825,7 @@ describe('PR-4A artifact verifier — workspace evidence semantics', () => {
     expect(failures.some((failure) => failure.id === 'provenance-dirty-paths-resolve')).toBe(false);
   });
 
-  it('documents the checkout byte spec and the named checks in --help', () => {
+  it('documents the eol-equiv-v1 byte spec and the named checks in --help', () => {
     const root = makeRoot();
     const result = spawnSync(process.execPath, [VERIFIER, '--help'], {
       cwd: root,
@@ -564,10 +834,15 @@ describe('PR-4A artifact verifier — workspace evidence semantics', () => {
     });
     expect(result.status).toBe(0);
     const stdout = result.stdout ?? '';
+    // The versioned rule name MUST appear (ADR 0005 §2.2 output visibility).
+    expect(stdout).toContain('eol-equiv-v1');
     expect(stdout).toContain('CHECKOUT BYTE SPEC');
-    expect(stdout).toContain('core.autocrlf=false');
-    expect(stdout).toContain('git -c core.autocrlf=false checkout');
+    expect(stdout).toContain('raw match');
+    expect(stdout).toContain('eol-equivalent');
+    expect(stdout).toContain('drift');
+    // The migrated warning id is documented as retained, not deleted.
     expect(stdout).toContain('provenance-executed-sources-eol-divergent');
+    expect(stdout).toContain('provenance-executed-sources-eol-equivalent');
     expect(stdout).toContain('provenance-executed-sources-match-disk');
     expect(stdout).toContain('provenance-dirty-paths-in-baseline-diff');
     // --help is a contract print, not a verification run: no status artifact.

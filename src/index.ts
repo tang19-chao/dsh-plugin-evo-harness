@@ -68,6 +68,7 @@ import {
   createModelConfigFragment,
   createModelRouteSchema,
   MODEL_ROUTE_DEFAULTS,
+  MODEL_ROUTE_EFFORTS,
   resolveDshCollaborators,
   resolveModelRouteConfig,
   type DshCollaborators
@@ -77,6 +78,8 @@ import {
   DSH_AGENT_STATUS,
   DSH_SESSION_EVENT,
   LEGACY_TRIGGER_EVENTS,
+  assertModelRouteEffort,
+  mapHostAdvisorStatus,
   registerDshTriggers,
   splitModelRoute,
   unwrapConfigValues,
@@ -144,6 +147,7 @@ import type {
   DreamReplayReport,
   EvoHarnessRunRequest,
   ExperienceRecord,
+  HostAdvisorObservabilityCounters,
   IActivePolicy,
   IExperienceStore,
   IOfflineDreamer,
@@ -177,6 +181,19 @@ export const DEFAULT_AUTO_FALLBACK_EVENTS = [
  * never registered unless the caller asks for them by name.
  */
 export const LEGACY_AUTO_FALLBACK_EVENTS = LEGACY_TRIGGER_EVENTS;
+
+/**
+ * Reasoning efforts a model route may declare (ADR 0005 section 3.6).
+ *
+ * Single source of truth: `MODEL_ROUTE_EFFORTS` from src/dsh-bridge. The
+ * programmatic injection path `options.route.reasoningEffort` is typed with this
+ * union by the entrypoint repair, so an out-of-enum literal cannot be written
+ * from TypeScript. The RUNTIME rejection of an out-of-enum value that arrives
+ * from JavaScript (or from the host `modelRoute` group, whose reader still
+ * returns `string`) belongs to the host-group validation and to the state
+ * wiring follow-up; a type cannot police a value that was never type-checked.
+ */
+export type EvoHarnessModelRouteEffort = (typeof MODEL_ROUTE_EFFORTS)[number];
 
 /** Configured provider/model/reasoningEffort for the optional second page. */
 export type EvoHarnessModelRoute = {
@@ -312,8 +329,18 @@ export interface EvoHarnessPluginOptions {
    * directly and do not need a host context.
    */
   readonly resolveDshCollaborators?: boolean;
-  /** Override the route explicitly (provider/model/reasoningEffort). */
-  readonly route?: { provider?: string; model?: string; reasoningEffort?: string };
+  /**
+   * Override the route explicitly (provider/model/reasoningEffort).
+   *
+   * ADR 0005 section 3.6: `reasoningEffort` is narrowed from the previously
+   * declared `string` to the declared effort enum, so an out-of-enum literal is
+   * a compile-time error instead of a value that silently reaches the adapter.
+   */
+  readonly route?: {
+    provider?: string;
+    model?: string;
+    reasoningEffort?: EvoHarnessModelRouteEffort;
+  };
   /** Enable the idle-dream hook on agent/status; defaults to true. */
   readonly enableIdleDream?: boolean;
   /** Override the idle-dream replay body (tests pass a spy). */
@@ -349,6 +376,92 @@ export interface EvoHarnessPluginOptions {
     readonly sessionId?: string;
     readonly namespace?: string;
   };
+}
+/**
+ * Every key of the public options surface, alphabetically ordered (ADR 0005
+ * sections 3.1/3.5).
+ *
+ * The list is EXHAUSTIVE by construction: the three witnesses below are the
+ * compile-time gate. Adding a public option without registering it here leaves
+ * `MissingOptionKey` non-`never`; registering a key the interface does not
+ * declare leaves `ForeignOptionKey` non-`never`; both fail `tsc --noEmit`.
+ *
+ * Disjointness from the frozen config surface (`ROOT_KEYS` in src/config.ts and
+ * the host-only `modelRoute` group) is asserted at runtime in
+ * tests/unit/config/plugin-options-shape.test.ts by validating every option key
+ * as a config section (each one must be rejected with `unknown_key`). That
+ * invariant is what makes the shape decision below unambiguous: a bare config
+ * section can never contain an option key, so the two shapes cannot collide.
+ */
+export const OPTION_KEYS = [
+  'agentLoop',
+  'applyWinningPatch',
+  'autoFallbackEvents',
+  'backfillFromTreePool',
+  'clients',
+  'commitScope',
+  'config',
+  'deps',
+  'dream',
+  'dualTrack',
+  'enableIdleDream',
+  'experienceFilePath',
+  'host',
+  'hostAdvisor',
+  'hostAdvisorScope',
+  'listClients',
+  'mirrorClient',
+  'model',
+  'newId',
+  'now',
+  'persistence',
+  'registerAutoFallback',
+  'resolveDshCollaborators',
+  'route',
+  'runBranch',
+  'scopeRegistry'
+] as const;
+
+/** `true` only when both checked unions are empty. */
+type NeverBoth<Left, Right> = [Left] extends [never]
+  ? ([Right] extends [never] ? true : never)
+  : never;
+/** `true` only when both unions are identical (no wider, no narrower). */
+type IdenticalUnion<Left, Right> = [Left] extends [Right]
+  ? ([Right] extends [Left] ? true : never)
+  : never;
+
+/** Option keys the public interface declares but this list misses (must be never). */
+type MissingOptionKey = Exclude<keyof EvoHarnessPluginOptions, (typeof OPTION_KEYS)[number]>;
+/** List entries the public interface does not declare (must be never). */
+type ForeignOptionKey = Exclude<(typeof OPTION_KEYS)[number], keyof EvoHarnessPluginOptions>;
+/** Witness 1: the list is exactly `keyof EvoHarnessPluginOptions`. */
+const _OPTION_KEYS_EXHAUSTIVE: NeverBoth<MissingOptionKey, ForeignOptionKey> = true;
+/** Witness 2: the accepted contract is 26 keys (ADR 0005 section 3.1). */
+const _OPTION_KEYS_COUNT: (typeof OPTION_KEYS)['length'] extends 26 ? true : never = true;
+
+/** Route effort exactly as the public option declares it. */
+type DeclaredRouteEffort = Exclude<
+  NonNullable<EvoHarnessPluginOptions['route']>['reasoningEffort'],
+  undefined
+>;
+/**
+ * Witness 3: the declared route effort is exactly the dsh-bridge enum
+ * (ADR 0005 section 3.6) - neither a superset nor a subset.
+ */
+const _ROUTE_EFFORT_ENUM_EXACT: IdenticalUnion<DeclaredRouteEffort, EvoHarnessModelRouteEffort> = true;
+
+// The witnesses are declarations, not runtime checks; these reads keep them
+// deliberate for readers and lint without claiming they carry a value.
+void _OPTION_KEYS_EXHAUSTIVE;
+void _OPTION_KEYS_COUNT;
+void _ROUTE_EFFORT_ENUM_EXACT;
+
+/** Membership set over the list above, which stays the single source. */
+const OPTION_KEY_SET: ReadonlySet<string> = new Set<string>(OPTION_KEYS);
+/** True when `key` is one of the declared public plugin options. */
+function isPluginOptionKey(key: string): boolean {
+  return OPTION_KEY_SET.has(key);
 }
 /** Attribute of the mounted host adapter, in probing order. */
 export type EvoHarnessHostAdapterSource = 'injected' | 'dsh-hooks' | 'context' | 'in-memory';
@@ -388,18 +501,24 @@ export interface EvoHarnessDreamJitStatus {
     };
   };
 }
-/** L3 host-advisor visibility (plan section 3.3, Phase 5). */
-export interface EvoHarnessHostAdvisorStatus {
+/**
+ * L3 host-advisor visibility (plan section 3.3, Phase 5; ADR 0005 section 3.7).
+ *
+ * The counter fields come from {@link HostAdvisorObservabilityCounters} and are
+ * therefore OPTIONAL, because the entrypoint follows the collect-or-OMIT rule:
+ * an adapter that exposes no `hostAdvisorStats()` has NOT COLLECTED these
+ * measurements, so the keys are absent instead of a fabricated `0` (F-15). A
+ * present `0` always means a real measurement of zero (the real hook adapter
+ * reports every counter). Absence survives JSON serialization, which is what
+ * makes "not collected" and "zero occurrences" distinguishable on the wire.
+ */
+export interface EvoHarnessHostAdvisorStatus extends HostAdvisorObservabilityCounters {
   readonly enabled: boolean;
   readonly mode: 'advisory' | 'gate';
   /** True when an advisor is attached to the real hook adapter. */
   readonly attached: boolean;
   /** False while `/evo jit off` keeps the advisor gated (repair F1). */
   readonly runtimeEnabled: boolean;
-  readonly advisory: number;
-  readonly ask: number;
-  readonly noop: number;
-  readonly skipped: number;
   readonly diagnostics: readonly string[];
 }
 /** Aggregate-statistics mirror visibility (plan section 7.2, Phase 5). */
@@ -790,38 +909,98 @@ export function hostAdapterSeamCount(adapter: CordisHostAdapter): number {
   }
   return count;
 }
-const OPTION_KEYS = ['model',
-  'host',
-  'clients',
-  'listClients',
-  'runBranch',
-  'deps',
-  'now',
-  'newId',
-  'commitScope',
-  'registerAutoFallback',
-  'autoFallbackEvents',
-  'applyWinningPatch',
-  'mirrorClient',
-  'hostAdvisor',
-  'hostAdvisorScope'] as const;
-/** Accept either a raw plugin config section or a full options object. */
+/** Stable reason codes for a rejected plugin-options shape (ADR 0005 section 3.3). */
+export type PluginOptionsShapeErrorCode =
+  | 'plugin-options-invalid-shape'
+  | 'plugin-options-mixed-shape';
+
+/**
+ * Thrown when the second `apply()` argument is not a usable plugin-options shape.
+ *
+ * Both codes are LOUD by design. The pre-repair heuristic silently reinterpreted
+ * every object as a config section unless it happened to hold one of 15 option
+ * keys, which is how `enabled: false`, `triggerMode`, `persistence`, `dualTrack`,
+ * `scopeRegistry`, `route`, `agentLoop` and ten more public options were dropped
+ * without a diagnostic. `offendingKeys` names the keys that made a mixed object
+ * ambiguous, so the caller can move them under `config`.
+ */
+export class PluginOptionsShapeError extends Error {
+  readonly code: PluginOptionsShapeErrorCode;
+  readonly offendingKeys: readonly string[];
+
+  constructor(code: PluginOptionsShapeErrorCode,
+    message: string,
+    offendingKeys: readonly string[] = []) {
+    super(message);
+    this.name = 'PluginOptionsShapeError';
+    this.code = code;
+    this.offendingKeys = [...offendingKeys];
+  }
+}
+/** Bounded, payload-free name for a rejected shape (never echoes the value). */
+function describeRejectedShape(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'array';
+  }
+  return typeof value;
+}
+/**
+ * Accept either a raw plugin config section or a full options object.
+ *
+ * Shape decision (ADR 0005 section 3.2), replacing the 15-key heuristic:
+ *   0. `undefined`            -> the context config when there is one;
+ *   1. not a plain object     -> THROW plugin-options-invalid-shape (C-12);
+ *   2. `{}`                   -> `{}`, never a fabricated `{config:{}}`: an empty
+ *                                object must not swallow ctx.config (C-1);
+ *   3. any OPTION_KEY present -> the OPTIONS shape; when a non-option key is
+ *                                present too the shape is MIXED and THROWS
+ *                                (C-4..C-8) instead of silently dropping the
+ *                                config-looking keys;
+ *   4. otherwise              -> the CONFIG shape `{config: second}`, so a bare
+ *                                section (including `modelRoute`) keeps working
+ *                                and the frozen validator produces its named
+ *                                unknown_key rejection (C-9/C-10).
+ *
+ * `ctx.config` is replaced ONLY in case 0 (with the context config) or when the
+ * caller explicitly passes a `config` key (case 3, including `{config:{}}`).
+ */
 export function normalizePluginOptions(second: unknown,
   ctxConfig: unknown): EvoHarnessPluginOptions {
-  const record = asRecord(second);
-  if (record === undefined) {
-    return second === undefined && ctxConfig !== undefined ? {
-      config: ctxConfig
+  if (second === undefined) {
+    return ctxConfig === undefined ? {
     } : {
+      config: ctxConfig
     };
   }
-  const looksLikeOptions = OPTION_KEYS.some((key) => record[key] !== undefined);
-  if (looksLikeOptions) {
-    return record as EvoHarnessPluginOptions;
+  const record = asRecord(second);
+  if (record === undefined) {
+    throw new PluginOptionsShapeError('plugin-options-invalid-shape',
+      'plugin-options-invalid-shape: the second apply() argument must be a plain object (plugin options or a raw config section); received ' + describeRejectedShape(second));
   }
-  return {
-    config: second
-  };
+  const keys = Object.keys(record);
+  // Case 2: an empty object carries no option intent AND no configuration intent.
+  // It must never manufacture `{config:{}}`, which would override ctx.config with
+  // the built-in defaults. `{config:{}}` is the explicit way to do that (C-3).
+  if (keys.length === 0) {
+    return {
+    };
+  }
+  const optionKeys = keys.filter((key) => isPluginOptionKey(key));
+  if (optionKeys.length === 0) {
+    return {
+      config: second
+    };
+  }
+  const offendingKeys = keys.filter((key) => !isPluginOptionKey(key));
+  if (offendingKeys.length > 0) {
+    throw new PluginOptionsShapeError('plugin-options-mixed-shape',
+      'plugin-options-mixed-shape: the options object mixes plugin options (' + optionKeys.join(', ') + ') with keys that are not plugin options (' + offendingKeys.join(', ') + '); put the configuration section under the `config` key instead of mixing it with options',
+      offendingKeys);
+  }
+  return record as EvoHarnessPluginOptions;
 }
 /** A model adapter that fails loudly; used when the host injects no LLM. */
 export function missingModelAdapter(): IModelAdapter {
@@ -989,29 +1168,29 @@ export function hostAdvisorJitStatus(input: {
   readonly attached: boolean;
   readonly advisor?: HostAdvisor;
   readonly runtimeEnabled?: boolean;
-  readonly counters?: {
-    readonly advisory: number;
-    readonly ask: number;
-    readonly noop: number;
-    readonly skipped: number;
-  };
+  /**
+   * Adapter-side observability counters (ADR 0005 section 3.7). Omitted means
+   * NOT COLLECTED: the fields stay absent (never `0`). The real hook adapter
+   * always passes its full measured snapshot, where `0` is a measured zero.
+   */
+  readonly counters?: HostAdvisorObservabilityCounters;
 }): EvoHarnessHostAdvisorStatus {
-  const counters = input.counters ?? {
-    advisory: 0,
-    ask: 0,
-    noop: 0,
-    skipped: 0
-  };
-  return {
+  // The collect-or-omit rule lives in the SOURCE module (t5's
+  // `mapHostAdvisorStatus`): fixed fields plus `counters`, which is an empty
+  // object when nothing was collected. Spreading keeps the public FLAT shape, so
+  // an existing consumer still reads `hostAdvisor.advisory` - but the key is now
+  // absent instead of `0` when the adapter never measured it.
+  const { counters, ...fixed } = mapHostAdvisorStatus({
     enabled: input.config.jitrl.hostAdvisor.enabled,
     mode: input.config.jitrl.hostAdvisor.mode,
     attached: input.attached,
     runtimeEnabled: input.runtimeEnabled ?? true,
-    advisory: counters.advisory,
-    ask: counters.ask,
-    noop: counters.noop,
-    skipped: counters.skipped,
     diagnostics: input.advisor === undefined ? [] : [...input.advisor.diagnostics()]
+  },
+  input.counters);
+  return {
+    ...fixed,
+    ...counters
   };
 }
 /** P5-b status value; a disabled mirror always reports zero calls. */
@@ -1991,10 +2170,37 @@ export function createEvoHarnessPlugin(
    * a schemastery volatile reference yields its value.
    */
   const configuredRoute = resolveModelRouteConfig(section.modelRoute);
+  /**
+   * ADR 0005 section 3.6: the PROGRAMMATIC route shares the host group's single
+   * enum check (`assertModelRouteEffort` consumes the one `MODEL_ROUTE_EFFORTS`
+   * source from src/dsh-bridge). A PRESENT-but-out-of-enum effort is refused by
+   * name instead of silently falling back to the default: the t4 type narrowing
+   * only guards TypeScript callers, while a JavaScript host or a test can still
+   * hand us `'ultra'`.
+   *
+   * The value is read through a widened, null-safe view because THAT is the
+   * untrusted runtime value; the narrowed type means a typed caller cannot reach
+   * the rejection path at all. The cast back is sound only because the assertion
+   * above has already proven membership in the enum.
+   */
+  const declaredRoute: { readonly reasoningEffort?: unknown } | null | undefined =
+    options.route as { readonly reasoningEffort?: unknown } | null | undefined;
+  const declaredRouteEffort: unknown =
+    declaredRoute === null || declaredRoute === undefined
+      ? undefined
+      : declaredRoute.reasoningEffort;
+  assertModelRouteEffort(declaredRouteEffort);
+  const routeEffort: EvoHarnessModelRouteEffort | undefined =
+    typeof declaredRouteEffort === 'string' && declaredRouteEffort.length > 0
+      ? (declaredRouteEffort as EvoHarnessModelRouteEffort)
+      : undefined;
   const modelRoute: EvoHarnessModelRoute = {
     provider: options.route?.provider ?? configuredRoute.provider,
     model: options.route?.model ?? configuredRoute.model,
-    reasoningEffort: options.route?.reasoningEffort ?? configuredRoute.reasoningEffort
+    // Absent-like (undefined / null / '') follows the resolved `modelRoute`
+    // group - the same "an absent field is a default" rule the host path
+    // documents - so the adapter never receives an empty effort string.
+    reasoningEffort: routeEffort ?? configuredRoute.reasoningEffort
   };
 
   const holder: CollaboratorHolder = {};
@@ -2128,7 +2334,8 @@ export function createEvoHarnessPlugin(
       return {
         ...jitWiring.status,
         // P5-a can be inspected (enabled/mode) with no kernel, but it is never
-        // attached without one; report the observed adapter counters regardless.
+        // attached without one; the adapter-side counters are reported when the
+        // adapter actually collects them and stay absent when it does not.
         hostAdvisor: hostAdvisorJitStatus({
           config: resolved,
           attached: jitWiring.advisor !== undefined && hostAdapterSource === 'dsh-hooks',
@@ -2182,21 +2389,20 @@ export function createEvoHarnessPlugin(
       runtime: runtimeControl.snapshot()
     };
   };
-  /** Adapter-side L3 counters; zero when the adapter has no advisor support. */
-  const advisorCounters = (): {
-    readonly advisory: number;
-    readonly ask: number;
-    readonly noop: number;
-    readonly skipped: number;
-  } => {
+  /**
+   * Adapter-side L3 counters; ABSENT (never zero) when the adapter has no
+   * advisor support (F-15 / ADR 0005 section 3.7).
+   *
+   * A structural probe that finds no `hostAdvisorStats` means NOT COLLECTED, so
+   * the status fields stay absent and JSON serialization drops them. The real
+   * hook adapter always answers with a full measured snapshot (a `0` there is a
+   * measured zero), and that snapshot is spread through unchanged: no counter is
+   * derived from another, and nothing but counters travels.
+   */
+  const advisorCounters = (): HostAdvisorObservabilityCounters | undefined => {
     const adapter = hostAdapter as Partial<DshHookHostAdapter>;
     if (typeof adapter.hostAdvisorStats !== 'function') {
-      return {
-        advisory: 0,
-        ask: 0,
-        noop: 0,
-        skipped: 0
-      };
+      return undefined;
     }
     return adapter.hostAdvisorStats();
   };

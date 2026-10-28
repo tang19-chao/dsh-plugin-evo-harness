@@ -311,3 +311,187 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+
+  # ---------------------------------------------------------------------------
+  # P1 (ADR 0005 decision D1): the attestation-target gate.
+  #
+  # A committed attestation record can only describe the commit it was
+  # generated FROM, so "which revision does this record cover" must be decided
+  # PER COMMIT, not assumed:
+  #   - an ordinary commit passes when the canonical record is self-consistent
+  #     with its own commit AND that commit is an ancestor of HEAD; no parent
+  #     binding is invented for ordinary commits (unconditional --strict would
+  #     be always red, unconditional HEAD^1 would be a lax guess - both
+  #     prototype-refuted in ADR 0005 §1.1/§8.2);
+  #   - an evidence commit (trailer `Attestation-Target: first-parent`) must be
+  #     record-only, non-merge, stacked on an UNMARKED parent, and its record
+  #     must name exactly HEAD^1 - the target is DERIVED from the topology the
+  #     commit declares, never guessed.
+  #
+  # Why a SEPARATE job (not a `verify` step): `fingerprint`/`fingerprint-parity`
+  # are `needs: verify`; a target-gate failure inside `verify` would SKIP the
+  # cross-OS evidence jobs. An independent job fails alone and the parity
+  # evidence is still produced (same reasoning as `guarded-regression` above).
+  # Why not `guarded-regression`: its checkout has no `fetch-depth: 0`, and a
+  # shallow clone would misreport "missing history" as "bad evidence" - the
+  # ordinary-commit rule needs real ancestry and the evidence rule needs
+  # `HEAD^1`, so full history is REQUIRED here.
+  #
+  # Failure semantics: exit 1 with a stable reason code turns ONLY this job
+  # red (no retry, no `|| true`, no pipeline). The `verify` job's
+  # `attest:verify` keeps its historical self-consistency semantics untouched.
+  # ---------------------------------------------------------------------------
+  attestation-target:
+    name: Attestation target binding
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The ordinary rule re-verifies ancestry (`merge-base --is-ancestor`)
+          # and the evidence rule resolves `HEAD^1`; a shallow clone would turn
+          # missing history into a false gate failure.
+          fetch-depth: 0
+          # CI only reads; never leave the token in .git/config (same invariant
+          # as every other job).
+          persist-credentials: false
+
+      - name: Install pnpm 11.7.0
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: '11.7.0'
+
+      - name: Set up Node.js 22 with pnpm cache
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The gate itself decides ordinary vs evidence from the commit; its exit
+      # code is the only verdict. The T0-T8 rules are exercised by
+      # `scripts/eval/final-attestation.node-test.mjs` (guarded-regression job).
+      - name: Judge the attestation target binding of this revision
+        run: node scripts/eval/check-attestation-target.mjs --json
+
+  # ---------------------------------------------------------------------------
+  # P1 (ADR 0005 decision D5, t8): the targeted mutation gate.
+  #
+  # Four discriminating test groups pin four real defects (R1-M1 provenance
+  # expansion, R1-M2 unknown-scope fail-closed, R3-M1 winner private yardstick,
+  # R3-M2 readLearningTarget gain fallback). A test whose verdict never changes
+  # when the defect comes back is decoration, so this job REINTRODUCES each
+  # defect and requires the pinned tests to go red:
+  #   - the criterion is `must-red test NAMES subset-of actual red names`, never
+  #     an equal red COUNT (P1 legitimately grows the suites; the observed count
+  #     is recorded for t16 instead of being asserted);
+  #   - the same throwaway copy must be all green BEFORE the mutation, so an
+  #     environment failure can never be mistaken for a kill;
+  #   - the copy's target-file sha256 must change, so a no-op mutation cannot
+  #     claim a kill;
+  #   - mutants are applied ONLY inside a temp copy under os.tmpdir() - never
+  #     in this worktree: src/, tests/ and scripts/ are the attestation digest
+  #     roots, and an interrupted in-place mutation would silently poison
+  #     `pnpm run attest:verify`. The gate re-hashes the four target files in
+  #     the repository afterwards and fails on any change.
+  #
+  # Why a SEPARATE job: a lost discriminator is its own failure signal, and
+  # nothing here depends on `verify` (which would make a red mutation gate skip
+  # or mask the cross-OS evidence jobs). No `needs:`, no retry, no `|| true` -
+  # the script's exit code is the only verdict. It runs on Node 22 like the
+  # documented gates; the gate spawns the repository's own vitest binary, so no
+  # new (or heavy) dependency is installed for it.
+  # ---------------------------------------------------------------------------
+  mutation-gate:
+    name: Mutation gate (ADR 0005 D5)
+    runs-on: ubuntu-latest
+    # Four baseline runs plus four mutant runs, each in a fresh copy; the
+    # generous bound is a hang detector, not a budget.
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The gate reads the worktree and runs tests inside a temp copy; it
+          # never needs history, and CI only reads (same no-token invariant as
+          # every other job here).
+          persist-credentials: false
+
+      - name: Install pnpm 11.7.0
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: '11.7.0'
+
+      - name: Set up Node.js 22 with pnpm cache
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The documented gate and the CI gate are the same command string; the
+      # job fails when any pinned mutant survives.
+      - name: Run the four targeted mutation gates
+        run: pnpm run check:mutation
+
+  # ---------------------------------------------------------------------------
+  # P1 (ADR 0005 decision D5, t8): Node 24 compatibility.
+  #
+  # The project documents Node >= 20.19 and every published count comes from
+  # Node 22, but the runtime target line must be MEASURED on Node 24 rather
+  # than assumed. This leg installs Node 24 EXPLICITLY through actions/
+  # setup-node - the runner's preinstalled node is never mistaken for the
+  # tested version, and `node -v` is printed into the log so the job states
+  # which runtime produced its verdict.
+  #
+  # Failure semantics: red here is a COMPATIBILITY finding. It does not rewrite
+  # the Node 22 `verify` job's official counts or conclusions (README counts
+  # stay Node 22 measurements), which is exactly why this job has no `needs:`
+  # and nothing has `needs:` of it.
+  #
+  # Honesty boundary (ADR 0005 F-17): the development machine only has
+  # Node v22.23.1, so "Node 24 passes" can only ever be asserted from THIS
+  # job's run log after a push - never from a local claim.
+  # ---------------------------------------------------------------------------
+  node24-compat:
+    name: Node 24 compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm 11.7.0
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: '11.7.0'
+
+      # Explicit version installation, never the runner default: the whole
+      # point of the job is that the toolchain under test is Node 24.
+      - name: Set up Node.js 24 with pnpm cache
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Print the Node version actually under test
+        run: node -v
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run the unit suites on Node 24
+        run: pnpm exec vitest run tests/unit
+
+      - name: Run default eval CLI
+        run: node scripts/eval-jitrl.mjs --json
+
+      - name: Assert the historical negative result
+        run: node scripts/eval/negative-result-diag.mjs --assert

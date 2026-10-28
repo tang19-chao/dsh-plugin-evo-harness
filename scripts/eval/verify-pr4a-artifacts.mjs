@@ -30,22 +30,40 @@
  * In every state the executed source digests must still reconcile with the
  * bytes on disk, because those are the bytes the report claims actually ran.
  *
- * CHECKOUT BYTE SPEC (raw bytes, never normalised). `fileSha256` in the eval run
- * hashes the RAW working-tree bytes, so an executed-source digest describes the
- * checkout configuration that produced it, not an abstract file. This verifier
- * therefore compares raw bytes; a green run only means generation and
- * verification used the SAME checkout byte configuration. The shipped artifact
- * was generated on Windows with core.autocrlf=true (text files such as
- * scripts/eval/build-eval.mjs are CRLF in that worktree), so it is NOT portable
- * to an LF checkout and no such claim is made. For portable evidence, generate
- * and verify under an LF checkout:
- *     git -c core.autocrlf=false checkout -- .
- * A mismatch whose two byte forms differ ONLY by line endings is reported by the
- * named warning `provenance-executed-sources-eol-divergent` (WARN), while
- * `provenance-executed-sources-match-disk` still fails: the recorded bytes do
- * not describe this checkout. An executedSources entry that is malformed
- * (absolute/traversal/drive-letter path, non-hex digest) or unreadable is a
- * FAILURE, never silently filtered out of the comparison.
+ * CHECKOUT BYTE SPEC (eol-equiv-v1, ADR 0005 decision D2). `fileSha256` in the
+ * eval run hashes the RAW working-tree bytes, so an executed-source digest
+ * RECORDS the checkout byte configuration that produced it. Those recorded
+ * digests are historical byte facts: this verifier never rewrites, renormalises
+ * or regenerates them, and the generator side is untouched (no new
+ * generation-side field is required — records without any version field, such
+ * as the shipped artifact, are judged by the same rule). On top of the raw
+ * record the verifier applies a VERSIONED verification-side equivalence rule,
+ * `eol-equiv-v1`, so the same text under another line-ending checkout is judged
+ * explicitly instead of failing opaquely:
+ *   raw match       sha256(disk bytes) == recorded digest (strongest, unchanged);
+ *   eol-equivalent  the recorded digest equals the sha256 of the disk text after
+ *                   the ONE sanctioned transform CRLF -> LF, or its exact
+ *                   inverse LF -> CRLF. Nothing else is normalised: no BOM
+ *                   removal, no lone-CR handling, no trailing-whitespace or
+ *                   Unicode normalisation;
+ *   drift           everything else — real content change, BOM added/removed,
+ *                   binary or invalid-UTF-8 bytes — FAILS
+ *                   `provenance-executed-sources-match-disk` exactly as before.
+ * Binary (NUL-containing) and invalid-UTF-8 disk bytes NEVER enter the
+ * equivalence judgement (they must not be "normalised" into a match).
+ * Equivalence hits are reported as the named classification
+ * `provenance-executed-sources-eol-equivalent` (with the version string in its
+ * detail, advisory:false, pass kind 'eol-equivalent') and are NEVER merged into
+ * the raw-match count.
+ * MIGRATION of the old warning id (ADR 0005 §2.5): `provenance-executed-sources-eol-divergent`
+ * is RETAINED, not deleted. It no longer fires when every difference is
+ * eol-equivalent (that state became the pass classification above); it fires
+ * only in the mixed state — some entries hit equivalence while OTHER executed
+ * sources genuinely drift — as a diagnostic that part of the divergence set is
+ * line-ending-flavoured.
+ * An executedSources entry that is malformed (absolute/traversal/drive-letter
+ * path, non-hex digest) or unreadable is a FAILURE, never silently filtered
+ * out of the comparison.
  *
  * `--help` prints this contract (byte spec, exit codes and the eol/subset check
  * names), so the documented spec and the comparison cannot drift apart.
@@ -74,6 +92,13 @@ import { join } from 'node:path';
 
 const REPO_ROOT = process.cwd();
 const results = [];
+/**
+ * executedSources entries classified `eol-equivalent` under eol-equiv-v1
+ * (ADR 0005 D2). Reported as a NAMED classification in the stdout summary and
+ * in the status file's `eolEquivalents` key — never merged into the raw-match
+ * count and never a failure. Populated while judging the provenance block.
+ */
+const eolEquivalentPaths = [];
 function assert(id, condition, detail) {
   results.push({ id, ok: Boolean(condition), detail: detail ?? '' });
 }
@@ -99,7 +124,11 @@ function readRepoFileBytes(relativePath) {
     return null;
   }
 }
-/** sha256 of the current RAW bytes of a repo-relative file, or null. */
+/**
+ * sha256 of the current RAW bytes of a repo-relative file, or null.
+ * Retained as a helper; executed-source comparisons now go through
+ * `readRepoFileBytes` + `classifyExecutedSource` (eol-equiv-v1).
+ */
 function digestOfFile(relativePath) {
   const bytes = readRepoFileBytes(relativePath);
   return bytes === null ? null : digestOfBytes(bytes);
@@ -127,8 +156,10 @@ function isWellFormedExecutedEntry(entry) {
 /**
  * True when the current bytes and the recorded digest differ ONLY by CRLF/LF
  * form: the recorded bytes are the same text under another checkout byte
- * configuration. This is a DIAGNOSIS for the named warning, never an exemption:
- * `provenance-executed-sources-match-disk` still fails on it.
+ * configuration. The transforms are exactly the `eol-equiv-v1` ones (the only
+ * sanctioned normalisation: CRLF -> LF and its exact inverse LF -> CRLF; no BOM,
+ * lone-CR, whitespace or Unicode handling), and binary/invalid-UTF-8 bytes never
+ * enter the judgement.
  */
 function isEolOnlyDivergence(bytes, recorded) {
   if (bytes === null || bytes.includes(0)) return false;
@@ -137,6 +168,29 @@ function isEolOnlyDivergence(bytes, recorded) {
   const lf = text.replace(/\r\n/g, '\n');
   const crlf = lf.replace(/\n/g, '\r\n');
   return sha256(lf) === recorded || sha256(crlf) === recorded;
+}
+
+/** The version string of the verification-side equivalence rule (ADR 0005 D2). */
+const EOL_EQUIV_VERSION = 'eol-equiv-v1';
+
+/**
+ * Classify ONE executed-source entry against the disk bytes (eol-equiv-v1).
+ *
+ * @param {Buffer|null} bytes raw disk bytes (null when unreadable)
+ * @param {string} recorded the recorded (generation-time) digest
+ * @returns {'raw'|'eol-equivalent'|'drift'|'unreadable'}
+ *   raw            — strongest: sha256(disk bytes) equals the recorded digest;
+ *   eol-equivalent — the same text under the other line-ending form (the
+ *                    versioned equivalence rule, semantics reused verbatim from
+ *                    `isEolOnlyDivergence`);
+ *   drift          — any other byte difference (content, BOM, binary);
+ *   unreadable     — no bytes could be read (separate failure id).
+ */
+function classifyExecutedSource(bytes, recorded) {
+  if (bytes === null) return 'unreadable';
+  if (digestOfBytes(bytes) === recorded) return 'raw';
+  if (isEolOnlyDivergence(bytes, recorded)) return 'eol-equivalent';
+  return 'drift';
 }
 /**
  * Paths changed between the recorded codeBaseline and the current working tree.
@@ -181,22 +235,36 @@ const HELP_TEXT = [
   '  node scripts/eval/verify-pr4a-artifacts.mjs',
   '  node scripts/eval/verify-pr4a-artifacts.mjs --help',
   '',
-  'CHECKOUT BYTE SPEC (executedSources are compared as RAW worktree bytes)',
-  '  The recorded digests describe the files as they were checked out when the',
-  '  eval ran. This verifier does not normalise line endings: a green run means',
-  '  generation and verification used the SAME checkout byte configuration.',
-  '  The shipped artifact was generated on Windows with core.autocrlf=true, so',
-  '  text files such as scripts/eval/build-eval.mjs and jitrl-eval-lib.ts are',
-  '  CRLF in that worktree. It is NOT portable to an LF checkout.',
-  '  For portable evidence, generate AND verify under an LF checkout:',
-  '    git -c core.autocrlf=false checkout -- .',
+  'CHECKOUT BYTE SPEC (eol-equiv-v1; executedSources raw digests + a versioned',
+  '  verification-side equivalence rule)',
+  '  The recorded digests are the RAW worktree bytes as they existed when the',
+  '  eval ran; they are historical byte facts and are never rewritten,',
+  '  renormalised or regenerated by this verifier. Judgement per entry:',
+  '    raw match       sha256(disk bytes) == recorded digest (strongest);',
+  '    eol-equivalent  recorded == sha256 of the disk text after the ONE',
+  '                    sanctioned CRLF -> LF transform, or its exact inverse',
+  '                    LF -> CRLF (rule eol-equiv-v1). No BOM removal, no',
+  '                    lone-CR handling, no whitespace or Unicode normalisation;',
+  '                    binary (NUL) and invalid-UTF-8 disk bytes never enter the',
+  '                    equivalence judgement;',
+  '    drift           real content change, BOM added/removed or binary bytes:',
+  '                    provenance-executed-sources-match-disk FAILS as before.',
+  '  Equivalence hits are reported as the named classification',
+  '  provenance-executed-sources-eol-equivalent (pass kind eol-equivalent,',
+  '  advisory:false) and are never merged into the raw-match count. The',
+  '  generator side is untouched: records carry no new field (the shipped',
+  '  artifact has none) and the same rule judges records with or without a',
+  '  version field.',
   '',
-  '  A mismatch whose byte forms differ only by CRLF/LF is reported by the named',
-  '  warning `provenance-executed-sources-eol-divergent` (shown as WARN), while',
-  '  `provenance-executed-sources-match-disk` still fails: the recorded bytes do',
-  '  not describe this checkout. Malformed executedSources entries (absolute,',
-  '  traversal or drive-letter paths, non-hex digests) and unreadable entries are',
-  '  failures, never skipped comparisons.',
+  '  Migration of the old diagnostic (ADR 0005 §2.5): the warning id',
+  '  provenance-executed-sources-eol-divergent is retained. It no longer fires',
+  '  when every difference is eol-equivalent (that state is the pass',
+  '  classification above); it fires only in the MIXED state - some entries hit',
+  '  equivalence while other executed sources genuinely drift - naming the paths',
+  '  whose divergence is line-ending-flavoured.',
+  '  Malformed executedSources entries (absolute, traversal or drive-letter',
+  '  paths, non-hex digests) and unreadable entries are failures, never skipped',
+  '  comparisons.',
   '',
   'DIRTY EVIDENCE',
   '  dirtyFileDigests paths must be a subset of `git diff --name-only',
@@ -316,13 +384,30 @@ if (report !== null) {
   const selfEntry = (prov.executedSources ?? []).find(
     (entry) => entry.path === 'scripts/eval/pr4a-report.ts'
   );
-  const selfDigestOnDisk = digestOfFile('scripts/eval/pr4a-report.ts');
+  const selfBytes = readRepoFileBytes('scripts/eval/pr4a-report.ts');
+  const selfDigestOnDisk = selfBytes === null ? null : digestOfBytes(selfBytes);
+  // eol-equiv-v1 applies to EVERY executedSources comparison, including the
+  // self-hash: a raw match is the strongest form, an eol-only difference is the
+  // named equivalence pass, and any genuine drift still fails. The guard is not
+  // weakened: a mutated pr4a-report.ts is as fatal as before.
+  const selfClassification =
+    selfEntry === undefined || selfBytes === null ? null : classifyExecutedSource(selfBytes, selfEntry.sha256);
   assert(
     'provenance-self-hash-matches-working-tree',
-    selfEntry !== undefined && selfDigestOnDisk !== null && selfEntry.sha256 === selfDigestOnDisk,
+    selfEntry !== undefined &&
+      selfDigestOnDisk !== null &&
+      (selfClassification === 'raw' || selfClassification === 'eol-equivalent'),
     selfEntry === undefined
       ? 'entry missing for scripts/eval/pr4a-report.ts'
-      : 'recorded=' + String(selfEntry.sha256) + ' disk=' + String(selfDigestOnDisk)
+      : 'recorded=' +
+          String(selfEntry.sha256) +
+          ' disk=' +
+          String(selfDigestOnDisk) +
+          ' classification=' +
+          String(selfClassification) +
+          ' (rule ' +
+          EOL_EQUIV_VERSION +
+          ')'
   );
   // --- dirty/clean capture is TRI-STATE, never "the list must be non-empty".
   const dirtyDigests = Array.isArray(prov.dirtyFileDigests) ? prov.dirtyFileDigests : null;
@@ -418,6 +503,12 @@ if (report !== null) {
   // recomputing the list digest) still passed. Well-formedness and "every entry
   // was actually compared" are separate assertions; an entry that cannot be
   // verified is a FAILURE, not a skip.
+  //
+  // Judgement per entry is the versioned `eol-equiv-v1` classification
+  // (classifyExecutedSource): raw | eol-equivalent | drift | unreadable. The
+  // recorded digests stay the generation-time RAW byte facts (nothing is
+  // rewritten); only the VERDICT of an eol-only difference changes, from FAIL
+  // to the named pass classification — exactly ADR 0005 decision D2.
   const executedEntries = Array.isArray(prov.executedSources) ? prov.executedSources : [];
   const executedEntryRows = executedEntries.map((entry, index) => {
     const wellFormed = isWellFormedExecutedEntry(entry);
@@ -428,7 +519,8 @@ if (report !== null) {
       recorded: entry !== null && typeof entry === 'object' ? String(entry.sha256) : '',
       wellFormed,
       bytes,
-      disk: bytes === null ? null : digestOfBytes(bytes)
+      disk: bytes === null ? null : digestOfBytes(bytes),
+      classification: wellFormed ? classifyExecutedSource(bytes, String(entry.sha256)) : 'drift'
     };
   });
   const malformedExecuted = executedEntryRows.filter((row) => !row.wellFormed);
@@ -464,31 +556,71 @@ if (report !== null) {
       path: row.path,
       recorded: row.recorded,
       disk: row.disk,
-      eolOnly: isEolOnlyDivergence(row.bytes, row.recorded)
+      eolOnly: row.classification === 'eol-equivalent'
     }));
-  // Raw-byte equality under the CHECKOUT BYTE SPEC in the header/--help. An
-  // eol-only divergence is still a mismatch here (the recorded bytes do not
-  // describe this checkout); the named warning below makes it diagnosable
-  // instead of one opaque mismatch.
+  // eol-equiv-v1 (ADR 0005 D2): an entry whose difference is ONLY the
+  // line-ending form of the same text is an EXPLICIT PASS classification, not a
+  // failure. Raw matches and equivalence hits are counted separately; every
+  // other byte difference (content, BOM, binary) remains a mismatch.
+  const executedEolEquivalent = executedEntryRows.filter(
+    (row) => row.wellFormed && row.classification === 'eol-equivalent'
+  );
+  const executedDrifted = executedDiskMismatches.filter((mismatch) => !mismatch.eolOnly);
+  // Raw-byte equality remains the strongest check; under eol-equiv-v1 it passes
+  // when every entry is raw OR eol-equivalent, and fails on any genuine drift.
   assert(
     'provenance-executed-sources-match-disk',
     Array.isArray(prov.executedSources) &&
       executedEntries.length > 0 &&
       malformedExecuted.length === 0 &&
       unverifiableExecuted.length === 0 &&
-      executedDiskMismatches.length === 0,
+      executedDrifted.length === 0,
     JSON.stringify({
-      mismatches: executedDiskMismatches.slice(0, 5),
+      rule: EOL_EQUIV_VERSION,
+      mismatches: executedDrifted.slice(0, 5),
+      eolEquivalent: executedEolEquivalent.map((row) => row.path),
       malformed: malformedExecuted.slice(0, 5).map((row) => ({ path: row.path, sha256: row.recorded })),
       unverifiable: unverifiableExecuted.slice(0, 5).map((row) => row.path)
     })
   );
+  // The equivalence hits are their OWN named classification (advisory:false,
+  // pass kind 'eol-equivalent'), never merged into the raw-match count. The
+  // paths are also recorded in the status file's `eolEquivalents` key and the
+  // stdout summary, so a reviewer sees the classification without parsing
+  // assertion details.
+  // t18: this check reports ONLY which entries hit equivalence, and it is
+  // pushed exactly ONCE here. Its scope is the equivalence hits themselves —
+  // a genuine drift in ANOTHER entry fails
+  // `provenance-executed-sources-match-disk` (and drives the exit code), never
+  // this classification, so the same id can never sit in both the passed and
+  // the failed counts.
+  for (const row of executedEolEquivalent) {
+    eolEquivalentPaths.push(row.path);
+  }
+  if (executedEolEquivalent.length > 0) {
+    assert(
+      'provenance-executed-sources-eol-equivalent',
+      executedEolEquivalent.length > 0,
+      JSON.stringify({
+        kind: 'eol-equivalent',
+        rule: EOL_EQUIV_VERSION,
+        paths: executedEolEquivalent.map((row) => row.path),
+        note: 'recorded raw-byte digests are historical byte facts; these entries match the same text under the other line-ending form'
+      })
+    );
+  }
+  // MIGRATION of the old warning id (ADR 0005 §2.5): retained, NOT deleted. It
+  // no longer fires when every difference is eol-equivalent (that state is the
+  // pass classification above); it fires only in the MIXED state — some entries
+  // hit equivalence while OTHER executed sources genuinely drift — as a
+  // diagnostic that part of the divergence set is line-ending-flavoured.
   const eolDivergent = executedDiskMismatches.filter((mismatch) => mismatch.eolOnly);
-  if (eolDivergent.length > 0) {
+  if (executedDrifted.length > 0 && eolDivergent.length > 0) {
     warn(
       'provenance-executed-sources-eol-divergent',
       'recorded and on-disk bytes are the same text under different line-ending forms (not content drift); ' +
-        'the recorded artifact is bound to its generation checkout configuration: ' +
+        'under eol-equiv-v1 these entries are classified eol-equivalent, and this warning fires only because ' +
+        'OTHER executed sources genuinely drifted: ' +
         JSON.stringify(eolDivergent.map((mismatch) => mismatch.path))
     );
   }
@@ -1454,12 +1586,21 @@ if (report !== null) {
 // ---------------------------------------------------------------------------
 // report
 // ---------------------------------------------------------------------------
+// t18 (t11 O1): the equivalence classification is pushed exactly ONCE, where it
+// is judged (inside the provenance block). No late duplicate push here — the
+// old code re-pushed the same id with ok:true, inflating checked/passed on any
+// run with equivalence hits (real LF checkout: 691→693) and, in the mixed
+// state, recording the SAME id as both a failure and a forced pass.
 const advisories = results.filter((entry) => entry.advisory === true);
 const failed = results.filter((entry) => !entry.ok && entry.advisory !== true);
 const status = {
   checked: results.length,
   passed: results.length - failed.length,
   failed: failed.length,
+  // eol-equiv-v1 named classification (ADR 0005 D2): the executedSources
+  // entries whose recorded raw-byte digest matches the same text under the
+  // other line-ending form. Separate from raw matches and from warnings.
+  eolEquivalents: eolEquivalentPaths.map((eolPath) => ({ path: eolPath, rule: EOL_EQUIV_VERSION, kind: 'eol-equivalent' })),
   warnings: advisories.map((entry) => ({ id: entry.id, detail: entry.detail })),
   failures: failed.map((entry) => ({ id: entry.id, detail: entry.detail }))
 };
@@ -1481,6 +1622,17 @@ console.log(
 );
 for (const entry of advisories) {
   console.log('[verify-pr4a-artifacts] WARN ' + entry.id + (entry.detail === '' ? '' : ' :: ' + entry.detail));
+}
+// eol-equiv-v1 named classification in the stdout summary (empty on a run with
+// no equivalence hits, e.g. the shipped artifact on its generation checkout).
+for (const equivalent of status.eolEquivalents) {
+  console.log(
+    '[verify-pr4a-artifacts] EOL-EQUIVALENT (' +
+      EOL_EQUIV_VERSION +
+      ') ' +
+      equivalent.path +
+      ' :: same text under the other line-ending form; recorded digest is the historical byte fact'
+  );
 }
 for (const entry of failed) {
   console.log('[verify-pr4a-artifacts] FAIL ' + entry.id + (entry.detail === '' ? '' : ' :: ' + entry.detail));

@@ -62,7 +62,7 @@
  * silently treated as enforced.
  */
 import type { GuidanceMode, HarnessComponentKey, MiddlewareHook } from '../types/contracts';
-import type { HostAdvisorRequest } from '../types/contracts';
+import type { HostAdvisorRequest, HostAdvisorObservabilityCounters } from '../types/contracts';
 import type { HostAdvisor } from '../jitrl/host-advisor';
 import type {
   HostToolExperienceSink,
@@ -344,24 +344,22 @@ export interface DshHookCounter {
   readonly delegated: number;
 }
 
-/** Observable L3 advisor activity on this adapter (P5-a). */
-export interface DshHostAdvisorStats {
-  /** advisory decisions whose text was appended to a pre-step dispatch. */
-  readonly advisory: number;
-  /** gate decisions forwarded as `{ kind: 'ask' }` (never `deny`). */
-  readonly ask: number;
-  /** Evaluations that returned noop / could not be used. */
-  readonly noop: number;
-  /** Dispatches skipped because the advisor was off, busy or out of scope. */
-  readonly skipped: number;
-  /**
-   * D1 strict default diagnostic: dispatches skipped because their identity
-   * could not be proven (no branchId/sessionId/namespace, or an identity the
-   * ScopeRegistry resolves to 'unknown'). Counter only: no tool arguments or
-   * payload bodies are stored (ADR 0001 section 2.3).
-   */
-  readonly scopeUnknownSkipped: number;
-}
+/**
+ * Observable L3 advisor activity on this adapter (P5-a; ADR 0005 section 3.7).
+ *
+ * The shape IS the public observability contract in
+ * {@link HostAdvisorObservabilityCounters} (src/types/contracts.ts): every
+ * counter is optional there because "NOT COLLECTED" must stay distinguishable
+ * from "zero occurrences" — an absent key is never serialized as 0. The real
+ * hook adapter measures every counter at a real event point, so its
+ * {@link DshHookHostAdapter.hostAdvisorStats} return is typed as
+ * {@link DshHostAdvisorStatsSnapshot} (`Required<...>`): on this adapter a `0`
+ * is always a real measurement.
+ */
+export type DshHostAdvisorStats = HostAdvisorObservabilityCounters;
+
+/** What the real hook adapter guarantees: every observability counter measured (0 = measured zero). */
+export type DshHostAdvisorStatsSnapshot = Required<DshHostAdvisorStats>;
 
 /** Wiring for {@link DshHookHostAdapter.attachHostAdvisor}. */
 export interface DshHostAdvisorAttachOptions {
@@ -416,7 +414,7 @@ export interface DshHookHostAdapter extends CordisHostAdapter {
   readonly isDisposed: boolean;
   /** Snapshot of active mounts in registration order. */
   activeMounts(): readonly DshHookMountSummary[];
-  /** Snapshot of the counters. */
+  /** Snapshot of the per-hook counters (`applied`/`delegated` per event). */
   stats(): DshHookAdapterStats;
   /** Human-readable notes collected while installing/enforcing. */
   advisories(): readonly string[];
@@ -432,8 +430,8 @@ export interface DshHookHostAdapter extends CordisHostAdapter {
   attachHostAdvisor(advisor: HostAdvisor, options?: DshHostAdvisorAttachOptions): void;
   /** The currently attached advisor, when any. */
   readonly hostAdvisor?: HostAdvisor;
-  /** L3 activity counters since construction. */
-  hostAdvisorStats(): DshHostAdvisorStats;
+  /** L3 activity counters since construction; always a full measured snapshot. */
+  hostAdvisorStats(): DshHostAdvisorStatsSnapshot;
   /**
    * L3 evidence: install the host-tool experience producer (repair H2).
    *
@@ -695,6 +693,15 @@ export function createDshHookHostAdapter(
   let advisorMode: 'advisory' | 'gate' = options.hostAdvisorMode ?? 'advisory';
   const advisorCounters = { advisory: 0, ask: 0, noop: 0, skipped: 0 };
   /**
+   * ADR 0005 section 3.7 structured observability sources. Each is a real
+   * event point, never derived from the other counters:
+   *   - considered: dispatches that entered the advice-eligibility decision;
+   *   - excludedByDeclaration: rejected by a DECLARED rule (trusted invariant
+   *     registration / guidance_free declaration / host advisor scope) before
+   *     identity resolution.
+   */
+  const advisorObservability = { considered: 0, excludedByDeclaration: 0 };
+  /**
    * D1 status diagnostic: dispatches whose identity could not be proven, so the
    * advisor skipped them (no advice, no ask). Counter only - no tool arguments
    * or payload bodies are ever recorded (ADR 0001 section 2.3).
@@ -867,10 +874,17 @@ export function createDshHookHostAdapter(
 
   /** True when the advisor should evaluate this dispatch (fail-closed on scope). */
   const advisorInScope = (payloads: readonly unknown[]): boolean => {
+    // ADR 0005 section 3.7 event point: this dispatch reached the
+    // advice-eligibility decision, so it counts as considered regardless of
+    // the outcome. Payload-free; never derived from the outcome counters.
+    advisorObservability.considered += 1;
     const identity = readHookScope(...payloads);
 
     // 1. Invariant branches are strictly prohibited from receiving advice (plan section 4 R3 / 5.2)
     if (isInvariantDispatch(identity, payloads)) {
+      // Declared-excluded: a trusted invariant registration / guidance_free
+      // declaration / payload declaration, resolved before identity proof.
+      advisorObservability.excludedByDeclaration += 1;
       return false;
     }
 
@@ -881,6 +895,17 @@ export function createDshHookHostAdapter(
       advisorScope.namespace !== '';
 
     if (hasExplicitAdvisorScope) {
+      // The host DECLARED which scope gets advice; anything outside it is
+      // excluded by that declaration, not by an unprovable identity.
+      const inDeclaredScope =
+        advisorScope.branchId !== ''
+          ? identity.branchIds.has(advisorScope.branchId)
+          : advisorScope.sessionId !== ''
+            ? identity.sessionIds.has(advisorScope.sessionId)
+            : identity.namespaces.has(advisorScope.namespace);
+      if (!inDeclaredScope) {
+        advisorObservability.excludedByDeclaration += 1;
+      }
       if (advisorScope.branchId !== '') {
         return identity.branchIds.has(advisorScope.branchId);
       }
@@ -1358,8 +1383,9 @@ export function createDshHookHostAdapter(
           ')'
       );
     },
-    hostAdvisorStats: (): DshHostAdvisorStats => ({
+    hostAdvisorStats: (): DshHostAdvisorStatsSnapshot => ({
       ...advisorCounters,
+      ...advisorObservability,
       scopeUnknownSkipped
     }),
     setHostToolExperienceSink(sink: HostToolExperienceSink | undefined): void {
