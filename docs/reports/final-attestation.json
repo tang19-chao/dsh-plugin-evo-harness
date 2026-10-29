@@ -4,8 +4,8 @@
   "commit": {
     "ref": "HEAD",
     "refExplicit": true,
-    "commitId": "da0b080405ce6ca165f651386dad40cb785949da",
-    "treeId": "769de348c582dcb2eedfdaee49067728b7452c24",
+    "commitId": "1b7920eec137124a41685ddadb2989504b912942",
+    "treeId": "450b482d8975d3063e0e47dbc00d364ad6fd9588",
     "base": null
   },
   "algorithm": {
@@ -47,8 +47,8 @@
     "scripts"
   ],
   "fileCount": 257,
-  "compositeSha256": "01be45e5e76419c9722c95f0226d67ded1692279703e9c280ba063c19680ba93",
-  "bindingSha256": "fbdff3d2e43349b182b5301fd181d6a11ec97aa1131c52af500b4bfe9686c45a",
+  "compositeSha256": "79e53ef3ce8bd2306e22c340ef791f364b42e4a97119c53dadf81c0f67222c9b",
+  "bindingSha256": "e27c3d042c1c19c28969ff3292849d78374595aa971629d82ef175f3a86d5d07",
   "files": [
     {
       "path": "scripts/bench-jitrl-query.mjs",
@@ -2099,9 +2099,9 @@
     {
       "path": "tests/unit/eval/mutation-gate.test.ts",
       "mode": "100644",
-      "blobId": "c834ab32f3fc22ff26c37a7f200c4f658856bfd3",
-      "sha256": "c382050b85b9b82d60021d86d2a1616a1447fa25fb857d314c7291238f51deb6",
-      "bytes": 21185,
+      "blobId": "67540e5aea311d02896ea3eab948882a69e8623f",
+      "sha256": "108430cc238fa381d01010dae5f3fc6af1d5fde034291a88fe59c8802265c4ce",
+      "bytes": 21453,
       "encoding": "text-lf",
       "encodingException": false,
       "declaredTextUnset": false,
@@ -2879,7 +2879,7 @@
     }
   ],
   "environment": {
-    "generatedAt": "2026-10-28T23:57:30.865Z",
+    "generatedAt": "2026-10-29T00:07:55.940Z",
     "node": "v22.23.1",
     "platform": "win32",
     "arch": "x64",
