@@ -1,0 +1,211 @@
+{
+  "fixtureVersion": "p2-l1-mechanism-v1",
+  "protocol": "P2-L1-MECHANISM-20261029",
+  "purpose": "Discriminating synthetic fixture for the L1 mechanism. Four cells separate the two structural causes of klToPrior==0 (single-action support collapse vs saturated returns) from the recoverable case (multi-action support with differentiated returns). Inputs only; every expected value is recomputed by the test through the production kernel.",
+  "decision": {
+    "level": "meta",
+    "stateInput": {
+      "task": {
+        "id": "task-p2l1",
+        "prompt": "Fix the failing build and restore the publish job without touching the release train.",
+        "taskSignature": "fix-build",
+        "complexity": "moderate",
+        "contextTags": [
+          "ci"
+        ]
+      },
+      "round": 0,
+      "parentDepth": 0,
+      "memoryConfidence": 0.5,
+      "referenceStatus": "failed"
+    },
+    "candidates": [
+      {
+        "actionKey": "slot:exploit",
+        "baseLogit": 0,
+        "payload": "exploit"
+      },
+      {
+        "actionKey": "slot:explore_domain",
+        "baseLogit": 0,
+        "payload": "explore_domain"
+      },
+      {
+        "actionKey": "slot:explore_invariant",
+        "baseLogit": 0,
+        "payload": "explore_invariant"
+      },
+      {
+        "actionKey": "slot:recover",
+        "baseLogit": 0,
+        "payload": "recover"
+      }
+    ],
+    "kernelConfig": {
+      "beta": 1,
+      "k": 10,
+      "similarityThreshold": 0,
+      "selection": "argmax",
+      "lambda": 0,
+      "alpha": 0,
+      "unseenFallback": "baseline",
+      "halfLifeMs": 0
+    }
+  },
+  "cells": [
+    {
+      "id": "cold-start-no-evidence",
+      "hypothesis": "No neighbours at all: V=0, unsupported actions fall back to Q=V (baseline), every advantage is exactly 0 and the policy cannot move (KL=0).",
+      "records": [],
+      "expected": {
+        "neighborCount": 0,
+        "supportRank": 0,
+        "supportedActionKeys": [],
+        "stateValue": 0,
+        "allAdvantagesZero": true,
+        "klToPrior": 0,
+        "chosenActionKey": "slot:exploit"
+      }
+    },
+    {
+      "id": "single-action-support-heterogeneous-returns",
+      "hypothesis": "All support sits on ONE action key while the returns are heterogeneous (NOT saturated). The group mean equals the state mean, so q===V bitwise, every advantage is 0 and KL is exactly 0.",
+      "records": [
+        {
+          "actionKey": "slot:exploit",
+          "return": 2.5
+        },
+        {
+          "actionKey": "slot:exploit",
+          "return": 2.2
+        },
+        {
+          "actionKey": "slot:exploit",
+          "return": 2.4
+        }
+      ],
+      "expected": {
+        "neighborCount": 3,
+        "supportRank": 1,
+        "supportedActionKeys": [
+          "slot:exploit"
+        ],
+        "stateValue": 2.3666666666666667,
+        "allAdvantagesZero": true,
+        "klToPrior": 0,
+        "chosenActionKey": "slot:exploit"
+      }
+    },
+    {
+      "id": "multi-action-support-saturated-returns",
+      "hypothesis": "Support covers two action keys but every observed return is identical (genuine reward saturation). q equals V for every supported action, advantages are 0 and KL is exactly 0, exactly like the single-action cell.",
+      "records": [
+        {
+          "actionKey": "slot:exploit",
+          "return": 1
+        },
+        {
+          "actionKey": "slot:exploit",
+          "return": 1
+        },
+        {
+          "actionKey": "slot:exploit",
+          "return": 1
+        },
+        {
+          "actionKey": "slot:recover",
+          "return": 1
+        },
+        {
+          "actionKey": "slot:recover",
+          "return": 1
+        }
+      ],
+      "expected": {
+        "neighborCount": 5,
+        "supportRank": 2,
+        "supportedActionKeys": [
+          "slot:exploit",
+          "slot:recover"
+        ],
+        "stateValue": 1,
+        "allAdvantagesZero": true,
+        "klToPrior": 0,
+        "chosenActionKey": "slot:exploit"
+      }
+    },
+    {
+      "id": "multi-action-support-heterogeneous-returns",
+      "hypothesis": "Support covers two action keys with differentiated returns: the per-action means differ from V, advantages are non-zero and KL is recoverable (>0).",
+      "records": [
+        {
+          "actionKey": "slot:exploit",
+          "return": 2.5
+        },
+        {
+          "actionKey": "slot:exploit",
+          "return": 2.2
+        },
+        {
+          "actionKey": "slot:exploit",
+          "return": 2.4
+        },
+        {
+          "actionKey": "slot:recover",
+          "return": 0.1
+        },
+        {
+          "actionKey": "slot:recover",
+          "return": 0.4
+        }
+      ],
+      "expected": {
+        "neighborCount": 5,
+        "supportRank": 2,
+        "supportedActionKeys": [
+          "slot:exploit",
+          "slot:recover"
+        ],
+        "stateValue": 1.52,
+        "allAdvantagesZero": false,
+        "klToPrior": 0.13969260500113145,
+        "chosenActionKey": "slot:exploit"
+      }
+    }
+  ],
+  "betaSweep": {
+    "cellId": "multi-action-support-heterogeneous-returns",
+    "betas": [
+      0,
+      0.5,
+      1,
+      2
+    ],
+    "property": "KL(beta=0)===0 and KL strictly increases with beta on the heterogeneous multi-action cell: recoverability is parametric, not accidental."
+  },
+  "discrimination": {
+    "property": "KL alone cannot tell the two zero cells apart: (single-action-support-heterogeneous) and (multi-action-saturated) both give KL===0. The mechanism is separated by two other observables: supportRank and the between-group return variance. A report that attributes every KL==0 to 'reward saturation' is unfalsifiable with KL alone.",
+    "observablePair": [
+      "supportRank",
+      "betweenGroupReturnVariance"
+    ],
+    "cells": {
+      "single-action-support-heterogeneous-returns": {
+        "supportRank": 1,
+        "betweenGroupReturnVarianceZero": true
+      },
+      "multi-action-support-saturated-returns": {
+        "supportRank": 2,
+        "betweenGroupReturnVarianceZero": true
+      },
+      "multi-action-support-heterogeneous-returns": {
+        "supportRank": 2,
+        "betweenGroupReturnVarianceZero": false
+      }
+    },
+    "observableDefinition": {
+      "supportRank": "number of distinct action keys among the retrieved neighbours that carry their own Q",
+      "betweenGroupReturnVariance": "sum_g (n_g / n) * (mean_g - mean)^2 over the retrieved neighbours' learning targets grouped by actionKey"
+    }
+  }
+}

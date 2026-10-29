@@ -368,10 +368,35 @@ async function main() {
     } else {
       console.log(`[docs-verify] test-results.json not in root; generating test report in temporary location...`);
       const normalizedTemp = tempReportFile.replace(/\\/g, '/');
-      execSync(`pnpm exec vitest run --reporter=json --outputFile="${normalizedTemp}"`, {
-        cwd: rootDir,
-        stdio: 'inherit'
-      });
+      try {
+        execSync(`pnpm exec vitest run --reporter=json --outputFile="${normalizedTemp}"`, {
+          cwd: rootDir,
+          stdio: 'inherit'
+        });
+      } catch (runError) {
+        // A FAILING vitest run still writes its JSON report. Those failures must
+        // be reported as test failures (the F-14 branch below), not as a crash of
+        // this gate: "the suite has a red test" and "the documentation gate broke"
+        // demand opposite responses, and conflating them sends the reader hunting
+        // the README over a test timeout.
+        if (!fs.existsSync(tempReportFile)) {
+          // UNTESTED SAFETY NET (see the ratchet in
+          // tests/unit/config/readme-default-leaves.test.ts). Reaching this line
+          // needs the inner vitest run to fail AND to write no report at all,
+          // which no in-repo fixture can stage: the gate resolves rootDir from its
+          // own __dirname, so the inner run is always this repository's real
+          // suite. It is kept because the alternative (proceeding to readFileSync)
+          // would raise ENOENT and surface as "Unexpected error during
+          // verification" — the exact misattribution this try/catch exists to
+          // remove. Deleting this guard therefore still fails CLOSED (main() exits
+          // non-zero); what is lost is only the accurate "the inner run failed"
+          // message.
+          throw runError;
+        }
+        console.error(
+          '[docs-verify] the inner vitest run exited non-zero; reading its report to name the failures'
+        );
+      }
       testReport = JSON.parse(fs.readFileSync(tempReportFile, 'utf8'));
       tempReportCreated = true;
     }
@@ -452,18 +477,37 @@ async function main() {
     console.log(`  - E2E:     ${readmeE2eFiles} files, ${readmeE2eTests} tests`);
     console.log(`  - Total:   ${readmeTotalFiles} files, ${readmeTotalTests} tests`);
 
-    const testResults = testReport.testResults || [];
-    const actualTotalFiles = testResults.length;
-    const actualTotalTests = testReport.numTotalTests ?? testResults.reduce((acc, f) => acc + (f.assertionResults?.length || 0), 0);
+    const testReportResults = testReport.testResults || [];
+    const actualTotalFiles = testReportResults.length;
+    const actualTotalTests = testReport.numTotalTests ?? testReportResults.reduce((acc, f) => acc + (f.assertionResults?.length || 0), 0);
 
-    const unitFiles = testResults.filter((f) => {
+    // R-04 (a): TEST-ROOT ATTRIBUTION. Every consumed test file must belong to
+    // one of the two documented roots. A third root (eg. tests/integration/) is
+    // named explicitly instead of being silently dropped from every count, which
+    // is the failure mode this asserts against: unit + e2e would then appear to
+    // close while a whole directory goes uncounted.
+    const DOCUMENTED_TEST_ROOTS = ['/tests/unit/', '/tests/e2e/'];
+    const unattributed = testReportResults
+      .map((f) => String(f.name).replace(/\\/g, '/'))
+      .filter((norm) => !DOCUMENTED_TEST_ROOTS.some((root) => norm.includes(root)));
+    if (unattributed.length > 0) {
+      console.error(
+        `[docs-verify] FAIL: ${unattributed.length} test file(s) live outside the documented test roots (${DOCUMENTED_TEST_ROOTS.join(' | ')}).`
+      );
+      for (const name of unattributed) {
+        console.error('  - unattributed-root: ' + name);
+      }
+      process.exitCode = 1;
+    }
+
+    const unitFiles = testReportResults.filter((f) => {
       const norm = f.name.replace(/\\/g, '/');
       return norm.includes('/tests/unit/');
     });
     const actualUnitFiles = unitFiles.length;
     const actualUnitTests = unitFiles.reduce((acc, f) => acc + (f.assertionResults?.length || 0), 0);
 
-    const e2eFiles = testResults.filter((f) => {
+    const e2eFiles = testReportResults.filter((f) => {
       const norm = f.name.replace(/\\/g, '/');
       return norm.includes('/tests/e2e/');
     });
@@ -474,6 +518,54 @@ async function main() {
     console.log(`  - Unit:    ${actualUnitFiles} files, ${actualUnitTests} tests`);
     console.log(`  - E2E:     ${actualE2eFiles} files, ${actualE2eTests} tests`);
     console.log(`  - Total:   ${actualTotalFiles} files, ${actualTotalTests} tests`);
+
+    // R-04 (b): THREE-WAY CLOSURE. Both sides must satisfy unit + e2e == total
+    // (files AND tests), and the README summary line must equal its total row.
+    // These assertions compare the sides to EACH OTHER, never to an absolute
+    // number: a drifting count stays reported by the absolute checks below, so a
+    // closure failure always means the parts genuinely do not add up.
+    const closureErrors = [];
+    if (readmeUnitFiles + readmeE2eFiles !== readmeTotalFiles) {
+      closureErrors.push(
+        `README counts do not close (files): unit (${readmeUnitFiles}) + e2e (${readmeE2eFiles}) != total (${readmeTotalFiles})`
+      );
+    }
+    if (readmeUnitTests + readmeE2eTests !== readmeTotalTests) {
+      closureErrors.push(
+        `README counts do not close (tests): unit (${readmeUnitTests}) + e2e (${readmeE2eTests}) != total (${readmeTotalTests})`
+      );
+    }
+    if (readmeSummaryFiles !== readmeTotalFiles) {
+      closureErrors.push(
+        `README summary line disagrees with the total row (files): summary (${readmeSummaryFiles}) != total (${readmeTotalFiles})`
+      );
+    }
+    if (readmeSummaryTests !== readmeTotalTests) {
+      closureErrors.push(
+        `README summary line disagrees with the total row (tests): summary (${readmeSummaryTests}) != total (${readmeTotalTests})`
+      );
+    }
+    if (actualUnitFiles + actualE2eFiles !== actualTotalFiles) {
+      closureErrors.push(
+        `Vitest counts do not close (files): unit (${actualUnitFiles}) + e2e (${actualE2eFiles}) != total (${actualTotalFiles})`
+      );
+    }
+    if (actualUnitTests + actualE2eTests !== actualTotalTests) {
+      closureErrors.push(
+        `Vitest counts do not close (tests): unit (${actualUnitTests}) + e2e (${actualE2eTests}) != total (${actualTotalTests})`
+      );
+    }
+    if (closureErrors.length > 0) {
+      console.error('[docs-verify] FAIL: count closure:');
+      for (const err of closureErrors) {
+        console.error('  - count-closure: ' + err);
+      }
+      process.exitCode = 1;
+    } else {
+      console.log(
+        '[docs-verify] ✓ Counts close: unit + e2e == total on the README side and the report side, and every test file is attributed to tests/unit or tests/e2e.'
+      );
+    }
 
     const errors = [];
     if (readmeSummaryFiles !== actualTotalFiles) {

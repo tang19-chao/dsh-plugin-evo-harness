@@ -13,8 +13,15 @@
 
 export * from './types.js';
 export * from './pricing.js';
+// P3-A: the ONE validated assembly path for a manager (see src/ledger/assembly.ts).
+export * from './assembly.js';
 export * from './ledger-event.js';
 export * from './reservation-manager.js';
+// P3-C: measured/estimated/unknown separated; closure rules for cost reports.
+export * from './usage-report.js';
 export * from './wal.js';
 export * from './limits.js';
 export * from './reconciliation.js';
+// P3-C wiring: the durable callId -> reservationId index and the two-phase
+// settlement lifecycle the production consumers (dsh-bridge) are wired to.
+export * from './two-phase.js';

@@ -1,0 +1,9 @@
+{
+  "purpose": "development-only candidate-generation artifact: the firewall must pass",
+  "generatedBy": "p5-synthetic-generator",
+  "cases": [
+    "p5-case-p1",
+    "p5-case-p2",
+    "p5-case-a1"
+  ]
+}

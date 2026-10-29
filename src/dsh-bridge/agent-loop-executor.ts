@@ -62,9 +62,28 @@
  */
 
 import { TrajectoryCollector, toTrajectoryError } from '../cordis-seams/trajectory-collector';
-import type { LedgerPhase, ModelRateCard, CountingSemantics } from '../ledger/types.js';
-import { LedgerReservationManager } from '../ledger/reservation-manager.js';
-import { dshUsageToProviderPayload, RawDshUsageLike } from '../ledger/pricing.js';
+// P3-A: the ledger is reached ONLY through its module entry. The executor no
+// longer deep-imports './reservation-manager.js', and its config path never
+// constructs a manager itself (that was the "direct new" bypass):
+// 'assembleAgentLoopLedger' is the single validated assembly (src/ledger/assembly.ts).
+import {
+  assembleAgentLoopLedger,
+  describeLedgerAssembly,
+  dshUsageToProviderPayload,
+  TwoPhaseLedgerError,
+  twoPhaseSettlementFor,
+  type CountingSemantics,
+  type LateUsageEvent,
+  type LateUsageSettlement,
+  type LedgerAssemblyOptions,
+  type LedgerCallIdentity,
+  type LedgerPhase,
+  type LedgerReservationManager,
+  type ModelRateCard,
+  type RawDshUsageLike,
+  type SettleRequest,
+  type TwoPhaseSettlement
+} from '../ledger/index.js';
 import type {
   BranchExecutor,
   EightSurfacePatch,
@@ -75,6 +94,7 @@ import type {
   ModelRequest,
   ModelResponse,
   ProbeExecutionResult,
+  ProbeObservation,
   ProbeTrajectory,
   TokenUsage,
   ToolErrorRecord,
@@ -274,11 +294,29 @@ export interface AgentLoopAdapters {
   readonly onDiagnostic?: (message: string) => void;
   /** Trajectory id factory; injectable so tests are deterministic. */
   readonly createTrajectoryId?: () => string;
-  /** Optional Ledger reservation manager for real cost metering & limits (PR-3A) */
+  /**
+   * Optional C3 ledger CONFIGURATION, carried inside this ONE `agentLoop`
+   * option (the 26-key public surface of ADR 0005 section 3.1 is unchanged).
+   *
+   * Absent, or `{ enabled: false }`, keeps the probe completely unmetered.
+   * `{ enabled: true }` assembles the manager through the ledger module's single
+   * validated factory (src/ledger/assembly.ts), so a host never has to know the
+   * manager's constructor and the budget rules cannot drift from the executor.
+   */
+  readonly ledger?: LedgerAssemblyOptions;
+  /**
+   * Optional already-built manager, kept for backward compatibility.
+   *
+   * This is the pre-P3-A injection point and stays OPTIONAL exactly as before:
+   * a caller that passes nothing keeps working and stays unmetered (never
+   * "metered with nothing"). When both this and `ledger` are supplied the
+   * wiring is ambiguous and construction fails loudly instead of silently
+   * preferring one of them.
+   */
   readonly ledgerManager?: LedgerReservationManager;
-  /** Phase context for ledger reservation, defaults to 'probe' */
+  /** Phase context for the pre-built-manager path; defaults to 'probe'. */
   readonly ledgerPhase?: LedgerPhase;
-  /** Optional rate card for ledger reservations */
+  /** Rate card for the pre-built-manager path (the config path carries its own). */
   readonly ledgerRateCard?: ModelRateCard;
 }
 
@@ -286,6 +324,25 @@ export interface AgentLoopAdapters {
 export interface AgentLoopExecutor {
   readonly runBranch: BranchExecutor;
   readonly describe: () => readonly string[];
+  /**
+   * P3-C: the durable callId -> reservationId identities this executor created
+   * (one per model call). The same list is on `result.metadata.ledgerCalls`, so a
+   * host that only kept the trajectory can still join late usage.
+   */
+  readonly callIdentities: () => readonly LedgerCallIdentity[];
+  /**
+   * P3-C: merge late usage into the ORIGINAL callId (the ledger's
+   * `reconcileLateUsage`). This NEVER opens a new ledger call: an origin the
+   * durable index cannot join is refused with `LATE_USAGE_UNKNOWN_CALL`, which is
+   * exactly the cross-callId double-booking path the P3-C report calls path 乙.
+   */
+  readonly reconcileLateUsage: (event: LateUsageEvent) => LateUsageSettlement;
+  /**
+   * P3-C: the ONLY sanctioned cross-callId booking, for an origin that is
+   * provably unreachable. It requires the explicit `new-attempt` marker and a
+   * reason, both recorded on the new identity for later reconciliation.
+   */
+  readonly bookNewAttempt: (event: LateUsageEvent) => LateUsageSettlement;
 }
 
 /** Default probe prompt: a branch-context header plus the task prompt. */
@@ -391,13 +448,15 @@ function assertDecision(decision: unknown): AgentLoopDecision {
 /** Project a finalized trajectory into the executor's frozen result shape. */
 function toProbeExecutionResult(
   trajectory: ProbeTrajectory,
-  metadata: Readonly<Record<string, unknown>>
+  metadata: Readonly<Record<string, unknown>>,
+  observations: readonly ProbeObservation[]
 ): ProbeExecutionResult {
   return {
     status: trajectory.status,
     steps: trajectory.steps,
     toolErrors: trajectory.toolErrors,
     failureSignals: trajectory.failureSignals,
+    ...(observations.length === 0 ? {} : { observations }),
     ...(trajectory.deliverable === undefined ? {} : { deliverable: trajectory.deliverable }),
     ...(trajectory.error === undefined ? {} : { error: trajectory.error }),
     metadata: {
@@ -427,6 +486,37 @@ export function createAgentLoopExecutor(
   }
   const defaultBudget = configuredBudget ?? 0;
   const createTrajectoryId = adapters.createTrajectoryId ?? ((): string => 'agent-traj-' + String(now()));
+
+  // P3-A: resolve the optional ledger ONCE, through the validated module entry.
+  // Precedence is explicit (no silent preference):
+  //   - neither given          -> unmetered (undefined), the pre-P3-A default;
+  //   - `ledger` config only    -> assembled HERE, at construction; a bad budget
+  //                               throws now instead of midway through a probe;
+  //   - `ledgerManager` only    -> legacy injection, used verbatim;
+  //   - both                   -> refused as ambiguous.
+  if (adapters.ledger !== undefined && adapters.ledgerManager !== undefined) {
+    throw new Error(
+      'ledger and ledgerManager were both supplied: pass either the ledger configuration or a pre-built manager, not both'
+    );
+  }
+  const ledgerAssembly = assembleAgentLoopLedger(adapters.ledger);
+  const ledgerManager = adapters.ledgerManager ?? ledgerAssembly?.manager;
+  const ledgerPhase = ledgerAssembly?.options.phase ?? adapters.ledgerPhase ?? 'probe';
+  const ledgerRateCard = ledgerAssembly?.options.defaultRateCard ?? adapters.ledgerRateCard;
+  const ledgerEstimatedCostMicros = ledgerAssembly?.options.estimatedCostMicros ?? 10_000;
+  const ledgerRouteId = ledgerAssembly?.options.routeId;
+
+  // P3-C: the ONE sanctioned call lifecycle for this executor. It persists the
+  // callId -> reservationId mapping beside the WAL and decides interim vs final
+  // from the outcome, so this executor cannot book a locally-abandoned call as if
+  // the remote had terminated (ADR-0004 §5.1/§5.3).
+  const settlement: TwoPhaseSettlement | undefined =
+    ledgerManager === undefined
+      ? undefined
+      : twoPhaseSettlementFor(ledgerManager, {
+          consumer: 'agent-loop-executor',
+          ...(ledgerAssembly?.options.storageDir === undefined ? {} : { storageDir: ledgerAssembly.options.storageDir })
+        });
 
   /** Per-probe max steps: context metadata wins, then the adapter default. */
   const resolveMaxSteps = (context: IsolatedBranchContext): number =>
@@ -491,7 +581,33 @@ export function createAgentLoopExecutor(
 
     // ---- run state --------------------------------------------------------
     const usage: { current: TokenUsage | undefined } = { current: undefined };
+    // P3-A2: non-behavioral observations. Deliberately separate from
+    // failureSignals (see ProbeObservation in src/types/contracts.ts).
+    const observations: ProbeObservation[] = [];
     let deliverableText: string | undefined;
+
+    // P3-C: every wired model call this probe made, in order, with its durable
+    // callId/reservationId. Published on the result metadata so a host can join
+    // late usage by the ORIGINAL callId instead of opening a new one.
+    const ledgerCallRefs: LedgerCallIdentity[] = [];
+
+    /**
+     * Settle one wired model call through the two-phase coordinator.
+     *
+     * A ledger-side failure must never change the probe's outcome (metering is
+     * observational, P3-A2), so it is reported as a diagnostic instead of
+     * propagating — but it is never swallowed silently either.
+     */
+    const settleLedgerCall = (request: SettleRequest): void => {
+      if (settlement === undefined) {
+        return;
+      }
+      try {
+        ledgerCallRefs.push(settlement.settleCall(request).identity);
+      } catch (error) {
+        diagnostic('ledger settlement failed for call "' + request.callId + '": ' + errorMessageOf(error));
+      }
+    };
 
     const settle = (status: TrajectoryStatus, error?: unknown): ProbeExecutionResult => {
       if (error !== undefined) {
@@ -515,8 +631,12 @@ export function createAgentLoopExecutor(
         maxStepsPerProbe: maxSteps,
         probeTimeoutMs: budget,
         branchId: context.branchId,
-        namespace: context.namespace
-      });
+        namespace: context.namespace,
+        // P3-C: the call identities a host needs to reconcile late usage. Absent
+        // (not an empty list) when the ledger is off, so "unmetered" stays
+        // distinguishable from "metered and no calls".
+        ...(ledgerCallRefs.length === 0 ? {} : { ledgerCalls: [...ledgerCallRefs] })
+      }, observations);
     };
 
     // ---- tool catalog -----------------------------------------------------
@@ -661,23 +781,40 @@ export function createAgentLoopExecutor(
 
         let singleCallId: string | undefined;
         let singleResId: string | undefined;
-        if (adapters.ledgerManager !== undefined) {
+        if (settlement !== undefined) {
           singleCallId = 'call_' + context.branchId + '_0_' + String(now());
-          const reserveRes = adapters.ledgerManager.reserve({
+          // beginCall writes the durable callId -> reservationId mapping BEFORE the
+          // provider is invoked, so late usage can always be joined (contract 1).
+          const reserveRes = settlement.beginCall({
             callId: singleCallId,
-            phase: adapters.ledgerPhase ?? 'probe',
+            phase: ledgerPhase,
             pool: 'general',
-            estimatedCostMicros: 10_000,
+            estimatedCostMicros: ledgerEstimatedCostMicros,
             requiresSeat: true,
             sessionId: context.sessionId,
             operationId: context.sessionId,
             attempt: 1,
-            rateCard: adapters.ledgerRateCard
+            ...(ledgerRouteId === undefined ? {} : { routeId: ledgerRouteId }),
+            rateCard: ledgerRateCard
           });
           if (!reserveRes.granted) {
             const message = 'ledger budget reservation failed: ' + (reserveRes.rejectionReason ?? 'insufficient_budget');
             collector.recordFailureSignal({ kind: 'budget_exhausted', message, repairable: false });
             return settle('failed', { name: 'EvoHarnessLedgerError', message });
+          }
+          if (reserveRes.observedRejection !== undefined) {
+            observations.push({
+              kind: 'budget_exhausted',
+              stage: 'single_call',
+              message:
+                'ledger observation: ' + reserveRes.observedRejection +
+                ' (observe mode: call continues; spend is booked at settle)',
+              details: {
+                callId: singleCallId,
+                rejection: reserveRes.observedRejection,
+                meteringMode: 'observe'
+              }
+            });
           }
           singleResId = reserveRes.reservationId;
         }
@@ -695,17 +832,18 @@ export function createAgentLoopExecutor(
             })
           );
         } catch (callError) {
-          if (adapters.ledgerManager !== undefined && singleCallId !== undefined && singleResId !== undefined) {
+          if (singleCallId !== undefined && singleResId !== undefined) {
+            // A local cancel/timeout does NOT prove the remote stopped generating:
+            // the coordinator settles it INTERIM (money and seat held) and the late
+            // usage merges into this SAME callId.
             const outcome = timedOut ? 'timed_out' : cancelled ? 'cancelled' : 'failed';
-            try {
-              adapters.ledgerManager.settle({
-                callId: singleCallId,
-                reservationId: singleResId,
-                outcome,
-                rateCard: adapters.ledgerRateCard,
-                releaseSeat: true
-              });
-            } catch {}
+            settleLedgerCall({
+              callId: singleCallId,
+              reservationId: singleResId,
+              outcome,
+              rateCard: ledgerRateCard,
+              releaseSeat: true
+            });
           }
           throw callError;
         }
@@ -713,7 +851,7 @@ export function createAgentLoopExecutor(
         const durationMs = Math.max(0, now() - startedAt);
         usage.current = addUsage(usage.current, response.usage);
 
-        if (adapters.ledgerManager !== undefined && singleCallId !== undefined && singleResId !== undefined) {
+        if (singleCallId !== undefined && singleResId !== undefined) {
           const rawUsage = response.metadata?.rawUsage as RawDshUsageLike | undefined;
           const countingSemantics = response.metadata?.countingSemantics as CountingSemantics | undefined;
           const usagePayload = dshUsageToProviderPayload(rawUsage, countingSemantics);
@@ -724,16 +862,14 @@ export function createAgentLoopExecutor(
               : response.finishReason === 'error'
                 ? 'failed'
                 : 'succeeded';
-          try {
-            adapters.ledgerManager.settle({
-              callId: singleCallId,
-              reservationId: singleResId,
-              outcome,
-              usage: usagePayload,
-              rateCard: adapters.ledgerRateCard,
-              releaseSeat: true
-            });
-          } catch {}
+          settleLedgerCall({
+            callId: singleCallId,
+            reservationId: singleResId,
+            outcome,
+            usage: usagePayload,
+            rateCard: ledgerRateCard,
+            releaseSeat: true
+          });
         }
 
         const interrupted = settleInterrupted();
@@ -816,23 +952,38 @@ export function createAgentLoopExecutor(
 
           let loopCallId: string | undefined;
           let loopResId: string | undefined;
-          if (adapters.ledgerManager !== undefined) {
+          if (settlement !== undefined) {
             loopCallId = 'call_' + context.branchId + '_' + String(iteration) + '_' + String(now());
-            const reserveRes = adapters.ledgerManager.reserve({
+            const reserveRes = settlement.beginCall({
               callId: loopCallId,
-              phase: adapters.ledgerPhase ?? 'probe',
+              phase: ledgerPhase,
               pool: 'general',
-              estimatedCostMicros: 10_000,
+              estimatedCostMicros: ledgerEstimatedCostMicros,
               requiresSeat: true,
               sessionId: context.sessionId,
               operationId: context.sessionId,
               attempt: iteration + 1,
-              rateCard: adapters.ledgerRateCard
+              ...(ledgerRouteId === undefined ? {} : { routeId: ledgerRouteId }),
+              rateCard: ledgerRateCard
             });
             if (!reserveRes.granted) {
               const message = 'ledger budget reservation failed: ' + (reserveRes.rejectionReason ?? 'insufficient_budget');
               collector.recordFailureSignal({ kind: 'budget_exhausted', message, repairable: false });
               return settle('failed', { name: 'EvoHarnessLedgerError', message });
+            }
+            if (reserveRes.observedRejection !== undefined) {
+              observations.push({
+                kind: 'budget_exhausted',
+                stage: 'agent_loop',
+                message:
+                  'ledger observation: ' + reserveRes.observedRejection +
+                  ' (observe mode: call continues; spend is booked at settle)',
+                details: {
+                  callId: loopCallId,
+                  rejection: reserveRes.observedRejection,
+                  meteringMode: 'observe'
+                }
+              });
             }
             loopResId = reserveRes.reservationId;
           }
@@ -854,17 +1005,15 @@ export function createAgentLoopExecutor(
               })
             );
           } catch (modelError) {
-            if (adapters.ledgerManager !== undefined && loopCallId !== undefined && loopResId !== undefined) {
+            if (loopCallId !== undefined && loopResId !== undefined) {
               const outcome = timedOut ? 'timed_out' : cancelled ? 'cancelled' : 'failed';
-              try {
-                adapters.ledgerManager.settle({
-                  callId: loopCallId,
-                  reservationId: loopResId,
-                  outcome,
-                  rateCard: adapters.ledgerRateCard,
-                  releaseSeat: true
-                });
-              } catch {}
+              settleLedgerCall({
+                callId: loopCallId,
+                reservationId: loopResId,
+                outcome,
+                rateCard: ledgerRateCard,
+                releaseSeat: true
+              });
             }
             throw modelError;
           }
@@ -872,25 +1021,44 @@ export function createAgentLoopExecutor(
 
           const interruptedAfterModel = settleInterrupted();
           if (interruptedAfterModel !== undefined) {
-            if (adapters.ledgerManager !== undefined && loopCallId !== undefined && loopResId !== undefined) {
+            if (loopCallId !== undefined && loopResId !== undefined) {
+              // Local interruption: the coordinator settles INTERIM on this same
+              // callId (money + seat held) instead of claiming the remote stopped.
               const outcome = timedOut ? 'timed_out' : cancelled ? 'cancelled' : 'failed';
-              try {
-                adapters.ledgerManager.settle({
-                  callId: loopCallId,
-                  reservationId: loopResId,
-                  outcome,
-                  rateCard: adapters.ledgerRateCard,
-                  releaseSeat: true
-                });
-              } catch {}
+              settleLedgerCall({
+                callId: loopCallId,
+                reservationId: loopResId,
+                outcome,
+                rateCard: ledgerRateCard,
+                releaseSeat: true
+              });
             }
             return interruptedAfterModel;
           }
 
-          const decision = assertDecision(rawDecision);
+          // P3-C: a malformed decision must still CLOSE the ledger call. Without
+          // this, the reservation would stay active for the life of the process
+          // (money and seat held), and late usage for it would be refused as
+          // "not terminated yet" — the exact leak the two-phase lifecycle must not
+          // create.
+          let decision: AgentLoopDecision;
+          try {
+            decision = assertDecision(rawDecision);
+          } catch (error) {
+            if (loopCallId !== undefined && loopResId !== undefined) {
+              settleLedgerCall({
+                callId: loopCallId,
+                reservationId: loopResId,
+                outcome: 'failed',
+                rateCard: ledgerRateCard,
+                releaseSeat: true
+              });
+            }
+            throw error;
+          }
           usage.current = addUsage(usage.current, decision.usage);
 
-          if (adapters.ledgerManager !== undefined && loopCallId !== undefined && loopResId !== undefined) {
+          if (loopCallId !== undefined && loopResId !== undefined) {
             const outcome = timedOut
               ? 'timed_out'
               : cancelled
@@ -898,15 +1066,13 @@ export function createAgentLoopExecutor(
                 : (decision.kind === 'final' && decision.finishReason === 'error')
                   ? 'failed'
                   : 'succeeded';
-            try {
-              adapters.ledgerManager.settle({
-                callId: loopCallId,
-                reservationId: loopResId,
-                outcome,
-                rateCard: adapters.ledgerRateCard,
-                releaseSeat: true
-              });
-            } catch {}
+            settleLedgerCall({
+              callId: loopCallId,
+              reservationId: loopResId,
+              outcome,
+              rateCard: ledgerRateCard,
+              releaseSeat: true
+            });
           }
 
           if (decision.kind === 'final') {
@@ -1153,8 +1319,47 @@ export function createAgentLoopExecutor(
         ? 'model exposes planNext(): the multi-step loop is available'
         : 'model exposes no planNext(): every probe degrades to a single model call'
   );
+  // P3-A: make the metering state OBSERVABLE, so "off" can never be mistaken
+  // for "metered". An unmetered executor says so explicitly.
+  capabilities.push(
+    ledgerManager === undefined
+      ? 'ledger: OFF (unmetered; no cost is recorded or claimed)'
+      : ledgerAssembly === undefined
+        ? 'ledger: pre-built manager injected (cost recording only; hard bounds not enforced in this build)'
+        : describeLedgerAssembly(ledgerAssembly)
+  );
+  // P3-C: the two-phase wiring is observable too, including whether the call
+  // mapping survives a restart (an in-memory index is a visible degradation).
+  capabilities.push(
+    settlement === undefined
+      ? 'two-phase settlement: OFF (no ledger, so no call mapping is kept)'
+      : settlement.describe()
+  );
 
-  return { runBranch, describe: () => [...capabilities] };
+  return {
+    runBranch,
+    describe: () => [...capabilities],
+    callIdentities: (): readonly LedgerCallIdentity[] => settlement?.identities() ?? [],
+    reconcileLateUsage: (event: LateUsageEvent): LateUsageSettlement => {
+      if (settlement === undefined) {
+        throw new TwoPhaseLedgerError(
+          'LATE_USAGE_UNMETERED',
+          'this executor has no ledger, so late usage for originCallId "' + event.originCallId +
+            '" has no reservation to reconcile against'
+        );
+      }
+      return settlement.reconcileLateUsage(event);
+    },
+    bookNewAttempt: (event: LateUsageEvent): LateUsageSettlement => {
+      if (settlement === undefined) {
+        throw new TwoPhaseLedgerError(
+          'LATE_USAGE_UNMETERED',
+          'this executor has no ledger, so there is no budget to book a new attempt against'
+        );
+      }
+      return settlement.bookNewAttempt(event);
+    }
+  };
 }
 
 /**

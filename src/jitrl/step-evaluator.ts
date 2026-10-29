@@ -33,6 +33,8 @@ import {
   type TrajectoryStatus,
   type TrajectoryStep
 } from '../types/contracts';
+// P3-B: the LLM step judge is metered and stage-labelled like every other call.
+import { createMeteredModelAdapter, type MeteredModelOptions } from '../dsh-bridge/metered-model-adapter';
 import type { JitRlPrivacyConfig, JitRlRewardConfig, JitRlRewardWeightsConfig } from '../config';
 import { clamp01 } from './logit-sources';
 import { redactAbsolutePaths, redactSecrets } from './redaction';
@@ -171,6 +173,8 @@ export interface StepEvaluatorOptions {
   readonly reward: JitRlRewardConfig;
   readonly privacy?: JitRlPrivacyConfig;
   readonly model?: IModelAdapter;
+  /** P3-B metering wiring (ledger/registry); absent records calls without cost. */
+  readonly metering?: MeteredModelOptions;
   /**
    * Returns s_v in [0, 1] for a trajectory (and its reference), or undefined
    * when no surrogate value is available. The L1 integration adapts the
@@ -971,7 +975,12 @@ export function scoreTrajectorySignals(
  * enables it and a model adapter is injected. Every failure degrades to the
  * deterministic low-cost path with a diagnostic.
  */
-export function createStepEvaluator(options: StepEvaluatorOptions): JitStepEvaluator {  const privacy = options.privacy ?? DEFAULT_EVALUATOR_PRIVACY;
+export function createStepEvaluator(options: StepEvaluatorOptions): JitStepEvaluator {
+  const privacy = options.privacy ?? DEFAULT_EVALUATOR_PRIVACY;
+  const meteredModel =
+    options.model === undefined
+      ? undefined
+      : createMeteredModelAdapter(options.model, 'evaluate_steps', options.metering);
   const diagnostics: string[] = [];
   // clock/rng are accepted for injection symmetry; v1 outputs never read them.
   void options.clock;
@@ -995,9 +1004,9 @@ export function createStepEvaluator(options: StepEvaluatorOptions): JitStepEvalu
     const llmAvailable = options.reward.llmEvaluator && options.model !== undefined;
 
     let judge: JudgeOutcome = { ok: false, scores: new Map<number, number>() };
-    if (gate && llmAvailable && options.model !== undefined) {
+    if (gate && llmAvailable && options.model !== undefined && meteredModel !== undefined) {
       try {
-        const response = await options.model.complete({
+        const response = await meteredModel.call({
           purpose: 'evaluate_steps',
           messages: [{ role: 'user', content: buildJudgePrompt(input, privacy) }],
           temperature: 0,

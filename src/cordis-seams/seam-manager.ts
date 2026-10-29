@@ -30,6 +30,7 @@ import { DisposableRegistry } from './disposable-registry';
 import { mountEightSurfaces } from './eight-surfaces';
 import type { MountedSurfaces } from './eight-surfaces';
 import { CordisSeamAbortError, CordisSeamError, CordisSeamTimeoutError } from './errors';
+import type { ToolFaceRegistry } from './tool-face';
 import type { CordisHostAdapter } from './host-adapter';
 import { cloneAndFreezePatch } from './patch-utils';
 import { TrajectoryCollector } from './trajectory-collector';
@@ -47,6 +48,18 @@ export interface CordisSeamManagerOptions {
   readonly createBranchId?: () => string;
   readonly createTrajectoryId?: () => string;
   readonly onDiagnostic?: (message: string, details?: Readonly<Record<string, unknown>>) => void;
+  /**
+   * P4-C: branch tool face. When set together with `toolAllowlist`, every probe
+   * run installs a per-branch allowlist policy for its lifetime and removes it
+   * on cleanup, so the isolated branch context carries exactly one tool face and
+   * a sibling branch can never inherit it.
+   *
+   * The policy is an in-process cooperative fence, NOT a sandbox: it shares the
+   * host process, filesystem and credentials.
+   */
+  readonly toolFace?: ToolFaceRegistry;
+  /** The tools a probe branch may call. An empty array denies every tool. */
+  readonly toolAllowlist?: readonly string[];
 }
 
 interface ActiveBranchRecord {
@@ -122,6 +135,8 @@ export class CordisSeamManager implements ICordisSeamManager {
   private readonly createBranchId: () => string;
   private readonly createTrajectoryId: () => string;
   private readonly onDiagnostic: ((message: string, details?: Readonly<Record<string, unknown>>) => void) | undefined;
+  private readonly toolFace: ToolFaceRegistry | undefined;
+  private readonly toolAllowlist: readonly string[] | undefined;
   private readonly activeBranches = new Map<string, ActiveBranchRecord>();
   private readonly permanentPatches = new Map<string, PermanentPatchRecord>();
   private sequence = 0;
@@ -143,6 +158,14 @@ export class CordisSeamManager implements ICordisSeamManager {
     this.createBranchId = options.createBranchId ?? createBranchIdFactory();
     this.createTrajectoryId = options.createTrajectoryId ?? defaultTrajectoryIds;
     this.onDiagnostic = options.onDiagnostic;
+    this.toolFace = options.toolFace;
+    if (options.toolAllowlist !== undefined && !Array.isArray(options.toolAllowlist)) {
+      throw new CordisSeamError('toolAllowlist must be an array of tool names.', {
+        code: 'invalid_request',
+        details: { field: 'toolAllowlist' }
+      });
+    }
+    this.toolAllowlist = options.toolAllowlist === undefined ? undefined : options.toolAllowlist.slice();
 
     if (!Number.isInteger(this.maxConcurrentBranches) || this.maxConcurrentBranches < 1) {
       throw new CordisSeamError('maxConcurrentBranches must be a positive integer.', {
@@ -177,6 +200,10 @@ export class CordisSeamManager implements ICordisSeamManager {
     assertProbeBranchRequest(request);
 
     const sessionId = request.sessionId;
+    // ADR 0006 D-P4-4: a probe mount is branch-class, so the branch it proves
+    // must be attributable. A request may carry a branchId, or the manager
+    // mints one here; it is never left for a mount to be matched on the
+    // sessionId alone.
     const branchId =
       request.branchId !== undefined && request.branchId.length > 0
         ? request.branchId
@@ -215,6 +242,7 @@ export class CordisSeamManager implements ICordisSeamManager {
     let result: ProbeExecutionResult | undefined;
     let error: unknown;
     let status: TrajectoryStatus | undefined;
+    let toolFaceInstalled: string | undefined;
 
     try {
       resources = await createIsolatedBranch({
@@ -256,7 +284,12 @@ export class CordisSeamManager implements ICordisSeamManager {
           origin: resources.frozenPatch.origin,
           guidance: resources.frozenPatch.guidance,
           role: isInvariant ? 'invariant' : 'domain',
-          allowAdvice: !isInvariant
+          allowAdvice: !isInvariant,
+          // ADR 0006 D-P4-4: a probe mount belongs to ONE branch. It applies
+          // only to a dispatch that proves this exact branchId - never to a
+          // host dispatch, and never to a sibling branch that merely shares
+          // the same sessionId.
+          mountScope: 'branch'
         },
         { registry: resources.registry, enabledSurfaces: this.enabledSurfaces }
       );
@@ -276,6 +309,14 @@ export class CordisSeamManager implements ICordisSeamManager {
         signal: resources.signal
       };
 
+      // P4-C: the isolated branch context owns exactly one tool face for its
+      // lifetime. A sibling branch gets its own policy (or none), and cleanup
+      // removes it even when the executor throws or times out.
+      if (this.toolFace !== undefined && this.toolAllowlist !== undefined) {
+        this.toolFace.install({ branchId, allowTools: this.toolAllowlist, label: 'probe:' + branchId });
+        toolFaceInstalled = branchId;
+      }
+
       const outcome = await this.execute(request, resources, context);
       status = outcome.status;
       result = outcome.result;
@@ -284,6 +325,16 @@ export class CordisSeamManager implements ICordisSeamManager {
       error = caught;
       status = 'failed';
     } finally {
+      if (toolFaceInstalled !== undefined && this.toolFace !== undefined) {
+        try {
+          this.toolFace.remove(toolFaceInstalled);
+        } catch (cleanupError) {
+          this.onDiagnostic?.('branch_tool_face_cleanup_failed', {
+            branchId: toolFaceInstalled,
+            error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          });
+        }
+      }
       if (resources !== undefined) {
         const failures = await resources.dispose();
         collector.recordDiagnostic(
@@ -439,7 +490,14 @@ export class CordisSeamManager implements ICordisSeamManager {
           origin: frozenPatch.origin,
           guidance: frozenPatch.guidance,
           role: isInvariant ? 'invariant' : 'domain',
-          allowAdvice: !isInvariant
+          allowAdvice: !isInvariant,
+          // ADR 0006 D-P4-4: a permanent patch is the ONLY host-class mount.
+          // It carries the grant provenance with it; reaching this line means
+          // the execution profile's patch permission already allowed it (the
+          // orchestrator gates the call site), so the mount is a named
+          // authorization rather than an ambient default.
+          mountScope: 'host',
+          hostScopeGrant: 'permanent-patch:' + patch.id
         },
         { registry, enabledSurfaces: this.enabledSurfaces }
       );

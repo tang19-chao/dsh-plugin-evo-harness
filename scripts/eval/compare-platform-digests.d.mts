@@ -5,14 +5,21 @@
 
 export interface ParityPlatform {
   /** Canonical OS name used in the claim, e.g. `ubuntu-latest`. */
-  os: string;
+  readonly os: string;
   /** The artifact directory name CI produces, e.g. `attestation-ubuntu-latest`. */
-  artifactDirectory: string;
+  readonly artifactDirectory: string;
 }
 
 /**
  * The CLOSED three-OS set: exactly one record per entry and no other records.
  * Exported so callers name the same set the rule uses instead of re-typing it.
+ *
+ * R-08: the runtime freezes the array AND every element
+ * (`Object.freeze([...])` with `Object.freeze` per entry), so the declared
+ * type is field-level readonly — a caller cannot mutate a platform's `os` /
+ * `artifactDirectory` (or push an entry) through this declaration any more
+ * than it can at runtime. The runtime shape is unchanged; only the declaration
+ * was looser than the object it describes.
  */
 export declare const PARITY_PLATFORMS: readonly ParityPlatform[];
 

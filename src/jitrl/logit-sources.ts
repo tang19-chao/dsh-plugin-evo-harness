@@ -25,6 +25,8 @@ import {
   type ModelRequest,
   type ModelResponse
 } from '../types/contracts';
+// P3-B: the one-time capability probe is metered and labelled 'probe'.
+import { createMeteredModelAdapter, type MeteredModelOptions } from '../dsh-bridge/metered-model-adapter';
 
 /** Logit source kinds, mirroring the config jitrl.logitSource enum. */
 export const LOGIT_SOURCES = ['verbalized', 'token', 'policy_prior'] as const;
@@ -196,13 +198,19 @@ function meanTokenLogprob(entries: NonNullable<ModelResponse['tokenLogprobs']>):
  * throws: probe errors count as 'unsupported'.
  */
 export async function createTokenLogprobSource(
-  options: { readonly model: IModelAdapter; readonly capabilities: LogprobCapabilities }
+  options: {
+    readonly model: IModelAdapter;
+    readonly capabilities: LogprobCapabilities;
+    /** P3-B metering wiring; absent records the probe without cost. */
+    readonly metering?: MeteredModelOptions;
+  }
 ): Promise<LogitSource> {
   const diagnostics: string[] = [];
+  const model = createMeteredModelAdapter(options.model, 'logit_probe', options.metering);
   let verdict = options.capabilities.tokenLogprobs;
   if (verdict === 'unknown') {
     try {
-      const response = await options.model.complete(PROBE_REQUEST);
+      const response = await model.call(PROBE_REQUEST);
       verdict =
         Array.isArray(response.tokenLogprobs) && response.tokenLogprobs.length > 0
           ? 'supported'

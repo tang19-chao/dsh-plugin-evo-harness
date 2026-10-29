@@ -1,0 +1,109 @@
+{
+  "protocolId": "P2-V3-EVAL-PREREG-20261029-V3",
+  "salt": "P2-V3-SPLIT-SALT-V1",
+  "rule": {
+    "unit": "task family (all tasks of a family on one side)",
+    "hash": "sha256(canonicalJson([salt, family]))",
+    "order": "families ascending by that hash; taken until the 25% floor is met",
+    "bounds": "holdout >= 0.25 and <= 0.5 of tasks, fail-closed",
+    "metricsBlind": "the split reads task ids and families ONLY - no metric, reward, outcome or timestamp"
+  },
+  "minTasks": 3,
+  "maxTasks": 6,
+  "totalTasks": 12,
+  "development": {
+    "families": [
+      "release-gating",
+      "schema-migration",
+      "test-authoring"
+    ],
+    "taskIds": [
+      "v3-mig-01",
+      "v3-mig-02",
+      "v3-mig-03",
+      "v3-rel-01",
+      "v3-rel-02",
+      "v3-rel-03",
+      "v3-test-01",
+      "v3-test-02",
+      "v3-test-03"
+    ]
+  },
+  "holdout": {
+    "families": [
+      "ci-fix"
+    ],
+    "taskIds": [
+      "v3-ci-01",
+      "v3-ci-02",
+      "v3-ci-03"
+    ]
+  },
+  "tasks": [
+    {
+      "id": "v3-ci-01",
+      "family": "ci-fix",
+      "side": "holdout"
+    },
+    {
+      "id": "v3-ci-02",
+      "family": "ci-fix",
+      "side": "holdout"
+    },
+    {
+      "id": "v3-ci-03",
+      "family": "ci-fix",
+      "side": "holdout"
+    },
+    {
+      "id": "v3-mig-01",
+      "family": "schema-migration",
+      "side": "development"
+    },
+    {
+      "id": "v3-mig-02",
+      "family": "schema-migration",
+      "side": "development"
+    },
+    {
+      "id": "v3-mig-03",
+      "family": "schema-migration",
+      "side": "development"
+    },
+    {
+      "id": "v3-rel-01",
+      "family": "release-gating",
+      "side": "development"
+    },
+    {
+      "id": "v3-rel-02",
+      "family": "release-gating",
+      "side": "development"
+    },
+    {
+      "id": "v3-rel-03",
+      "family": "release-gating",
+      "side": "development"
+    },
+    {
+      "id": "v3-test-01",
+      "family": "test-authoring",
+      "side": "development"
+    },
+    {
+      "id": "v3-test-02",
+      "family": "test-authoring",
+      "side": "development"
+    },
+    {
+      "id": "v3-test-03",
+      "family": "test-authoring",
+      "side": "development"
+    }
+  ],
+  "shares": {
+    "development": 0.75,
+    "holdout": 0.25
+  },
+  "digest": "71cf9b17e8f051a8b53bac8f5825b3fcb64bea961158dc1f5541cd8f8ab00b1d"
+}

@@ -108,6 +108,25 @@ export type {
   SchemasteryObjectSchema,
   SchemasteryStringSchema
 } from './model-config';
+// P3-B: the unified MeteredModelAdapter boundary and the runtime call-count gate.
+export {
+  createMeteredModelAdapter,
+  globalModelCallRegistry,
+  ModelCallRegistry,
+  recordsForStage,
+  STAGE_LEDGER_PHASE,
+  STAGE_PURPOSE,
+  MeteredModelError
+} from './metered-model-adapter';
+export type {
+  MeteredCostProvenance,
+  MeteredModelAdapter,
+  MeteredModelErrorCode,
+  MeteredModelOptions,
+  MeteredModelStats,
+  MeteringStage,
+  ModelCallRecord
+} from './metered-model-adapter';
 
 // ---------------------------------------------------------------------------
 // Public result shapes

@@ -587,6 +587,10 @@ export type LimitAlertKind =
   | 'unbounded-route-rejected'
   | 'unbounded-route-granted'
   | 'critical-tier-throttled'
+  // P3-A2 observe mode: limits that WOULD have denied are surfaced here instead
+  // of changing the call's outcome. These are observations, not failures.
+  | 'observe-seat-exceeded'
+  | 'observe-budget-exceeded'
   | 'seat-retained-pending-remote'
   | 'call-unresolved-after-window';
 

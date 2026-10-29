@@ -260,6 +260,28 @@ normalize(second, ctxConfig):
 
 `ctx.config` 只在两种情况下被替换：调用方**显式**给出选项形态且带 `config` 键（`{config: …}`，含 `{config:{}}` 显式清空）；或 `apply(ctx)` 的第二参为 `undefined`（此时 `{config: ctxConfig}`）。**其余任何情况都必须保留 `ctx.config`**；空对象不得伪造 `config` 键。
 
+### 3.4.1 `{config: null}` 的裁定（R-03：先记录兼容性影响，再固定）
+
+上游审核项 t12 O2 指出" `{config: null}` 语义未定义"。裁定前先按本 ADR 的规矩**测量现状并列出每条选择的兼容性影响**：
+
+**现状实测**（可复算；命令与输出见 `docs/reports/p2-r-leftovers.md` R-03）：
+
+- `normalizePluginOptions({config:null}, ctxConfig)` → `{config:null}`：`config` 是合法 OPTION key，因此走**选项形态**，`config` 键**存在**（不是 C-1 的空对象，也不是 C-12 的第二参为 `null`）。
+- 入口 `readPluginSection` 用 `options.config ?? contextConfig(ctx)` 取值，`null` 与"未提供"同义 → **继承 `ctx.config`**。实测：`apply({config:{execution:{mode:'off'},jitrl:{enabled:false}}}, {config:null})` 解析出 `execution.mode='off'`、`jitrl.enabled=false`。
+- 上下文没有 `ctx.config` 时（`apply({}, {config:null})`）回落到冻结默认（`mode='shadow'`、`jitrl.enabled=true`），与"省略 config 键"完全一致。
+
+**三条候选与兼容性影响**：
+
+| 候选 | 实测/推演影响 | 裁定 |
+| --- | --- | --- |
+| (a) **拒绝**（抛 `plugin-options-invalid-shape`） | 宿主用 YAML/JSON 写 `config:`（空值）时会被解析成 `null`；把"空值"升级为挂载期抛错，等于让一个**合法配置写法**变成不可用，且与 C-12（**第二参**为 `null` 才拒绝）在错误语义上撞名 | 不采纳 |
+| (b) **显式清空**（等价 `{config:{}}`，用默认值覆盖宿主） | `config:null` 会用一个空 section 覆盖宿主已声明的 `execution.mode:'off'` / `jitrl.enabled:false`，即**静默放宽安全开关**——本 ADR 与全批授权边界都明令禁止 | 不采纳 |
+| (c) **继承宿主配置**（等同"未提供 config 键"） | **零行为改动**：当前实现（`??`）已经如此，且方向是"保留宿主声明的安全开关"，不产生任何放宽 | **采纳** |
+
+**裁定（固定为契约）**：`{config: null}` **既不是拒绝、也不是显式清空，而是"未提供配置" → 继承 `ctx.config`**（上下文也没有配置时等价于冻结默认）。它与 `{config:{}}`（唯一显式清空）和 `{config:<section>}`（显式覆盖）三态并列，语义由 `tests/unit/config/plugin-options-shape.test.ts` 的 `R-03` 用例固定。
+
+**实现说明**：本裁定**不需要改 `src/index.ts`**（`options.config ?? contextConfig(ctx)` 就是该语义）；若未来要改成拒绝或清空，必须先改本节、补安全开关回归用例，并在报告里记录兼容性破坏面 —— 不允许静默变更。
+
 ### 3.5 穷举的机械化（编译期，双保险）
 
 在 `src/index.ts` 内（不必新增公开导出）加类型级断言：
@@ -285,6 +307,7 @@ const _OPTION_KEYS_EXHAUSTIVE: [MissingOptionKey] extends [never] ? true : never
 - `DshHostAdvisorStats` 增加**可选** `scopeUnknownSkipped?: number` 与结构化来源字段（`considered`/`excludedByDeclaration` 计数必须来自适配器/收集器的真实事件点，不得从别处推算）。
 - **"未采集" ≠ "零发生"**：适配器不提供 `hostAdvisorStats` 时，入口**不得**把 `advisory/ask/noop/skipped` 报成 `0`（当前实测 F-15）；这些字段在 status 中应为 `undefined`（省略），只有适配器真的提供了统计时才是数字（可以是 0）。`EvoHarnessHostAdvisorStatus` 对应字段标 `?`。
 - 零值、增量、序列化（JSON 往返）与"未运行"四种形态必须有入口级测试；**不得**携带工具参数/正文（ADR 0001 §2.3 延续）。
+- **入口白名单（R-01 / t13 O2，已落地）**：`mapHostAdvisorStatus` 不再 `{...stats}` 原样转发，而是按 `HOST_ADVISOR_COUNTER_KEYS`（7 个公开计数，src/host-triggers.ts 单点定义，编译期双向穷举 + 计数见证）**逐键挑字段**。理由：公开 status 的**形状由入口负责**，不能依赖"来源自觉"——结构性适配器可能带回 `toolName` / 正文回显 / 私有计数，注入 canary 实测曾进入公开 status（t13 §O2）。白名单同时必须保留两侧不变量：实测 `0` 逐字保留（不得被 falsy 判断吞掉）、未采集/非数值仍为**省略**（不得伪造 `0`，F-15）。测试：`tests/unit/contracts/host-advisor-status-mapping.test.ts`。
 - 风险预检：改动后若既有测试（如 `tests/unit/integration/p5-*.test.ts`）对"无 stats 适配器"断言了 `0`，**不得**为了变绿而弱化语义——应报告测试路径，由队长扩展该测试的写范围。当前实测：`p5-host-tool-wiring.test.ts:398-401` 用的是**真实 hook 适配器**（有 stats），因此不在风险面内。
 
 ---
@@ -310,7 +333,7 @@ const _OPTION_KEYS_EXHAUSTIVE: [MissingOptionKey] extends [never] ? true : never
 | --- | --- | --- | --- |
 | M1 | provenance 展开丢失（R1-M1） | `src/cordis-seams/eight-surfaces.ts::mountSurface` 中 `base` 对 `origin/guidance/role/allowAdvice` 的 4 行展开 → 删除 | `tests/e2e/provenance-chain.test.ts` 中 scenario 1/2/5/6 的用例名（应 4 红；scenario 3/4 保持绿） |
 | M2 | collector 未知身份拒绝分支（R1-M2） | `src/jitrl/host-tool-experience.ts::observeToolCall` 的 `if (!scopeInfo.isKnown) { … }` 拒绝块 → 删除 | e2e `provenance-chain.test.ts` scenario 4；unit `tests/unit/jitrl/host-tool-experience.test.ts` 的 D1 strict default 两条（应 1 红 + 4 红） |
-| M3 | 赢家私有标尺分叉（R3-M1） | `recordOnlineExperience` 中赢家 → `winnerRewards` 均值的分叉恢复（非赢家仍走 `scoreUnderRewardContract`） | `tests/unit/jitrl/credit-attribution.test.ts -t "P6.1-D 7.4"` 的"同轨迹同尺度"与"judge 缺失不改语义"（应 2 红） |
+| M3 | 赢家私有标尺分叉（R3-M1） | `recordOnlineExperience` 中赢家 → `winnerRewards` 均值的分叉恢复（非赢家仍走 `scoreUnderRewardContract`） | `tests/unit/orchestrator/credit-attribution.test.ts -t "P6.1-D 7.4"` 的"同轨迹同尺度"与"judge 缺失不改语义"（**注册必红 2**；**观测红 3**，含 1 条额外判别用例 — 见下方口径注） |
 | M4 | `readLearningTarget` gain 优先（R3-M2） | 改成 `learningTarget` 优先、`observedReturn` 回退 | `tests/unit/jitrl/value-estimator.test.ts` 的 "reads observedReturn first" 与 "estimateStateValue averages the contract target, not the gain field"（应 2 红） |
 
 **门禁语义（硬性）**：
@@ -322,6 +345,8 @@ const _OPTION_KEYS_EXHAUSTIVE: [MissingOptionKey] extends [never] ? true : never
 5. **源码零残留**：结束时断言仓库工作树的 4 个目标文件 sha256 与开始时一致（本仓工作树从不被写），并清理临时目录。
 6. `--run` 是全量执行入口；`tests/unit/eval/mutation-gate.test.ts` 只测**纯函数**（解析变异规格、红集判定、路径安全、恢复语义），**不得**在 Vitest 里真的跑 4 个变异（会有递归/超时风险）。
 7. 不引入 Stryker 等新依赖；不写任何被测源码的"永久补丁"。
+
+**M3 红数口径（R-07 记录；t15 O1 / t21 复核）**：M3 的**注册必红集合是 2 条**（`tests/unit/orchestrator/credit-attribution.test.ts` 的"同轨迹同尺度"与"judge 缺失不改语义"，即 `scripts/eval/mutation-gate.mjs` M3 `mustRed` 注册值），**实测观测红 3 条**——多出的第 3 条是 `"scores a succeeded sibling from its own verifiable signals, not the winner vector"`（门禁按**整文件**跑，而注册值按 `-t "P6.1-D 7.4"` 过滤重放计），它同样检测"赢家私有标尺"回归，属**更强的额外判别力**。判据是"必红集合 ⊆ 实际红集合（按名字）"，额外红只进 `extraRed` 观察、**不参与判据也不改判据**；记录时必须写"**must-red 2/2、观测红 3（含 1 条额外判别用例）**"，**不得**把 3 写成注册必红数，也不得反向简写。证据：`docs/reports/t15-mutation-node24-review.md` §表格/O1、`docs/P62_STATUS.md` §5.2 行、`docs/reports/p2-r-leftovers.md` R-07。
 
 ### 5.2 CI 接线（mutation + Node24）
 

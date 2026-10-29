@@ -1,0 +1,176 @@
+{
+  "suiteId": "p5-synth-suite",
+  "version": "v1",
+  "frozenAt": 1730000000000,
+  "generator": {
+    "id": "p5-synthetic-generator",
+    "version": "0.1"
+  },
+  "sourceArtifacts": [
+    {
+      "path": "tests/fixtures/p5-synth/p5-synth-ci04-baseline-frozen.json",
+      "digest": "sha256:7317cc80bc52b51d75951bbf5a716257333a074d19612f4b38265f278cbd4474"
+    }
+  ],
+  "split": {
+    "development": [
+      "p5-case-a1",
+      "p5-case-a2",
+      "p5-case-a3",
+      "p5-case-a4",
+      "p5-case-p1",
+      "p5-case-p2",
+      "p5-case-p3",
+      "p5-case-p4",
+      "p5-case-p5",
+      "p5-case-p6",
+      "ci-04-2-2-noop-baseline"
+    ],
+    "holdout": [
+      "p5-holdout-a1",
+      "p5-holdout-p1"
+    ]
+  },
+  "cases": [
+    {
+      "id": "p5-case-p1",
+      "label": "bug-present",
+      "source": "mutation-derived",
+      "sourceDigest": "sha256:0744ff71d2467f032b4e7eb704e5454ead5e3dbb4e06ffe6782d89766b4cc0de",
+      "expectation": {
+        "kind": "fails",
+        "detail": "the seeded off-by-one must make the host runner fail"
+      }
+    },
+    {
+      "id": "p5-case-p2",
+      "label": "bug-present",
+      "source": "mutation-derived",
+      "sourceDigest": "sha256:a157428ae9be36597f1cf860fc351381ff9ab7aad884916fb02bf1ea2dc1a15c",
+      "expectation": {
+        "kind": "fails",
+        "detail": "the seeded null-deref must make the host runner fail"
+      }
+    },
+    {
+      "id": "p5-case-p3",
+      "label": "bug-present",
+      "source": "mutation-derived",
+      "sourceDigest": "sha256:0080c3d85ac40a4da04055e3a26030dac687e88459806244f126dffefe0958bf",
+      "expectation": {
+        "kind": "fails",
+        "detail": "the seeded wrong-branch must make the host runner fail"
+      }
+    },
+    {
+      "id": "p5-case-p4",
+      "label": "bug-present",
+      "source": "mutation-derived",
+      "sourceDigest": "sha256:12245dd942d62cd7f5920365438836098190ecb210bf7a4ef3a858893c51c131",
+      "expectation": {
+        "kind": "fails",
+        "detail": "the seeded missing-guard must make the host runner fail"
+      }
+    },
+    {
+      "id": "p5-case-p5",
+      "label": "bug-present",
+      "source": "mutation-derived",
+      "sourceDigest": "sha256:968337ede66e931926974296b47e69967108cc5c226a53c3436758f7e69621f3",
+      "expectation": {
+        "kind": "fails",
+        "detail": "the seeded truncation must make the host runner fail"
+      }
+    },
+    {
+      "id": "p5-case-p6",
+      "label": "bug-present",
+      "source": "mutation-derived",
+      "sourceDigest": "sha256:de9b3de2a9671a53844c1bff923157d7d235422600b8899a87349b4be5cd168e",
+      "expectation": {
+        "kind": "fails",
+        "detail": "the seeded encoding drift must make the host runner fail"
+      }
+    },
+    {
+      "id": "p5-case-a1",
+      "label": "bug-absent",
+      "source": "spec-derived",
+      "sourceDigest": "sha256:26aa858dceef983fd5f2659ae601c505b6ed0b4b05474d80b3c5deecae5545f6",
+      "expectation": {
+        "kind": "passes",
+        "detail": "clean implementation must pass the spec-derived check"
+      }
+    },
+    {
+      "id": "p5-case-a2",
+      "label": "bug-absent",
+      "source": "spec-derived",
+      "sourceDigest": "sha256:8111654767396bf229333e485ba4b740ba55bcd4ca84a0202a4b256884371ac4",
+      "expectation": {
+        "kind": "passes",
+        "detail": "clean implementation must pass the spec-derived check"
+      }
+    },
+    {
+      "id": "p5-case-a3",
+      "label": "bug-absent",
+      "source": "spec-derived",
+      "sourceDigest": "sha256:3f22dd5e63142cd2122a7134c4529a95b84367d2bf800a3a87aaba11dd8d3620",
+      "expectation": {
+        "kind": "passes",
+        "detail": "clean implementation must pass the spec-derived check"
+      }
+    },
+    {
+      "id": "p5-case-a4",
+      "label": "bug-absent",
+      "source": "spec-derived",
+      "sourceDigest": "sha256:01b20fc6e380e4e6c51d4337da353bcb7e91bc4008fa167bf9a3d7cc64cfac74",
+      "expectation": {
+        "kind": "passes",
+        "detail": "clean implementation must pass the spec-derived check"
+      }
+    },
+    {
+      "id": "ci-04-2-2-noop-baseline",
+      "label": "bug-absent",
+      "source": "baseline-frozen",
+      "sourceDigest": "sha256:9723383c54ab95cb256e70a32db1753aab42b60ca7a0e433c18acc4d7869026a",
+      "expectation": {
+        "kind": "passes",
+        "detail": "the frozen noop outcome of the baseline (history), NOT a specification"
+      },
+      "baselineObservation": {
+        "taskId": "ci-04",
+        "run": 2,
+        "round": 2,
+        "actionKey": "noop",
+        "support": 0,
+        "advantage": 0,
+        "observedCoverage": 0.6666666666666666,
+        "priorCoverage": 1
+      }
+    },
+    {
+      "id": "p5-holdout-p1",
+      "label": "bug-present",
+      "source": "mutation-derived",
+      "sourceDigest": "sha256:13649b78e4263bbdafa081585d328bd0e65feda88f75b314f0395a98c6cf7217",
+      "expectation": {
+        "kind": "fails",
+        "detail": "holdout: the seeded failure must be caught by the final check"
+      }
+    },
+    {
+      "id": "p5-holdout-a1",
+      "label": "bug-absent",
+      "source": "spec-derived",
+      "sourceDigest": "sha256:3246ee56503c69979b51606acf1bb073c6c3ec78ba43a2f4381e9a5eec7f87e7",
+      "expectation": {
+        "kind": "passes",
+        "detail": "holdout: the clean case must pass"
+      }
+    }
+  ]
+}

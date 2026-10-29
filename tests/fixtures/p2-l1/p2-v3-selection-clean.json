@@ -1,0 +1,9 @@
+{
+  "purpose": "development-only selection artifact (firewall must pass)",
+  "pool": [
+    "v3-mig-01",
+    "v3-mig-02",
+    "v3-rel-01",
+    "v3-test-01"
+  ]
+}

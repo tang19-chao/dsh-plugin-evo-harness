@@ -130,16 +130,62 @@ export interface SessionEventClassification {
  *
  * Mapping rule for t7 (`src/index.ts`, second writer):
  *   - When the adapter exposes `hostAdvisorStats()` (the real hook adapter),
- *     spread its snapshot verbatim: every counter is present and numeric (0 =
- *     a measured zero).
+ *     its snapshot is filtered through {@link HOST_ADVISOR_COUNTER_KEYS}: every
+ *     one of the seven PUBLIC counters that was measured is forwarded verbatim
+ *     (0 = a measured zero) and every other adapter field is dropped.
  *   - When it does NOT, the counter fields must stay ABSENT — never defaulted
  *     to 0 (F-15). `HostAdvisorObservabilityCounters`' optional fields plus
  *     JSON serialization drop absent keys automatically, which is exactly the
  *     desired wire shape.
  *
  * The fixed fields here are the ones the entrypoint already owns; only the
- * counters follow the collect-or-omit rule.
+ * counters follow the collect-or-omit rule. The whitelist is deliberate
+ * (R-01/t13 O2): the public status shape is owned by THIS module, not by
+ * whatever the adapter happens to return. A structural adapter that leaks an
+ * extra field (a tool name, a payload echo, a future private counter) must not
+ * reach the public status through `{...stats}`.
  */
+
+/**
+ * The seven PUBLIC observability counters (ADR 0005 §3.7), in the order the
+ * status contract documents them.
+ *
+ * Single source of truth for the mapping whitelist AND for the compile-time
+ * exhaustiveness witness below: adding a counter to
+ * `HostAdvisorObservabilityCounters` without registering it here (or removing
+ * one here while the contract still declares it) fails `tsc --noEmit`.
+ */
+export const HOST_ADVISOR_COUNTER_KEYS = [
+  'advisory',
+  'ask',
+  'noop',
+  'skipped',
+  'scopeUnknownSkipped',
+  'considered',
+  'excludedByDeclaration'
+] as const;
+
+/** Both directions of the counter surface, plus the exact count. */
+type PublicCounterKey = keyof HostAdvisorObservabilityCounters;
+type MissingCounterKey = Exclude<PublicCounterKey, (typeof HOST_ADVISOR_COUNTER_KEYS)[number]>;
+type ForeignCounterKey = Exclude<(typeof HOST_ADVISOR_COUNTER_KEYS)[number], PublicCounterKey>;
+/** Fails `tsc` when a declared public counter is not in the whitelist. */
+const _COUNTER_KEYS_EXHAUSTIVE: [MissingCounterKey] extends [never] ? true : never = true;
+/** Fails `tsc` when the whitelist names a key the public contract does not. */
+const _COUNTER_KEYS_FOREIGN: [ForeignCounterKey] extends [never] ? true : never = true;
+/** Fails `tsc` when the whitelist is not exactly the documented seven. */
+const _COUNTER_KEYS_COUNT: (typeof HOST_ADVISOR_COUNTER_KEYS)['length'] extends 7 ? true : never = true;
+void _COUNTER_KEYS_EXHAUSTIVE;
+void _COUNTER_KEYS_FOREIGN;
+void _COUNTER_KEYS_COUNT;
+
+/**
+ * Mutable view of the counter contract, used only to BUILD the whitelisted
+ * counters object; the public type stays readonly.
+ */
+type MutableCounters = {
+  -readonly [Key in keyof HostAdvisorObservabilityCounters]: HostAdvisorObservabilityCounters[Key];
+};
 export interface DshHostAdvisorStatusMapping {
   readonly enabled: boolean;
   readonly mode: 'advisory' | 'gate';
@@ -153,9 +199,13 @@ export interface DshHostAdvisorStatusMapping {
  * Pure t5-provided helper for the t7 wiring: merge the fixed status fields with
  * an adapter stats source that may be absent.
  *
- * - `stats` present  -> counters are the source's own numbers, verbatim.
+ * - `stats` present  -> the seven PUBLIC counters are copied, key by key, and
+ *   every other adapter field is dropped (the status shape belongs to this
+ *   module, not to the adapter). A measured `0` is copied as `0`.
  * - `stats` absent   -> counters stay ABSENT (an empty object, so JSON drops
  *   every counter key instead of reporting fabricated zeros).
+ * - a present-but-non-numeric / non-finite counter value is NOT a measurement:
+ *   it is omitted exactly like an absent one, never coerced to `0` (F-15).
  *
  * No payload ever flows through this function: counters only.
  */
@@ -171,8 +221,35 @@ export function mapHostAdvisorStatus(
 ): DshHostAdvisorStatusMapping {
   return {
     ...fixed,
-    counters: stats === undefined ? {} : { ...stats }
+    counters: pickHostAdvisorCounters(stats)
   };
+}
+
+/**
+ * Copy ONLY the seven public counters out of an adapter snapshot.
+ *
+ * R-01 (t13 O2): the previous `{...stats}` forwarded whatever the adapter
+ * returned, so an extra field could reach the public status. The whitelist keeps
+ * the public surface authoritative here AND preserves the two invariants that
+ * make the counters trustworthy:
+ *   - "measured zero stays zero": `0` is a number and is copied verbatim;
+ *   - "not collected is absent": a missing or non-numeric value is dropped, so
+ *     no fabricated `0` can ever appear.
+ */
+function pickHostAdvisorCounters(
+  stats?: HostAdvisorObservabilityCounters
+): HostAdvisorObservabilityCounters {
+  const counters: MutableCounters = {};
+  if (stats === undefined) {
+    return counters;
+  }
+  for (const key of HOST_ADVISOR_COUNTER_KEYS) {
+    const value = stats[key];
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      counters[key] = value;
+    }
+  }
+  return counters;
 }
 
 /** Idle-dream wiring. Both halves are optional and independently gated. */

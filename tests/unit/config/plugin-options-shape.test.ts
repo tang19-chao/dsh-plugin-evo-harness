@@ -8,15 +8,31 @@
  * contract this file enforces; the pre-repair behaviour measured in the ADR
  * (section 8.4) is quoted where a case exists because that behaviour was wrong.
  *
- * Two boundaries are deliberately recorded instead of over-claimed:
- *  - `MODEL_ROUTE_EFFORTS` enum ENFORCEMENT is not this window: t4 narrows the
- *    public TYPE (`EvoHarnessModelRouteEffort` + the `_ROUTE_EFFORT_ENUM_EXACT`
- *    witness in src/index.ts); a value that arrives from JavaScript or from the
- *    host `modelRoute` group is rejected at RUNTIME by the host-group validation
- *    and the state-wiring follow-up (ADR 0005 section 3.6).
+ * Two boundaries are recorded here, and the FIRST ONE IS CLOSED (R-05):
+ *  - `MODEL_ROUTE_EFFORTS` enum ENFORCEMENT was a follow-up window when this
+ *    file was written; it has since landed on BOTH paths and is no longer
+ *    outstanding (ADR 0005 section 3.6 as landed): the host `modelRoute` group
+ *    is rejected at RUNTIME inside `splitModelRoute` (src/host-triggers.ts) and
+ *    the programmatic `route.reasoningEffort` inside `assertModelRouteEffort`
+ *    (src/index.ts), both naming `model-route-effort-invalid` /
+ *    `ModelRouteEffortError`; t4 also narrowed the public TYPE
+ *    (`EvoHarnessModelRouteEffort` + the `_ROUTE_EFFORT_ENUM_EXACT` witness in
+ *    src/index.ts). The runtime coverage lives in
+ *    tests/unit/seams/status-observability.test.ts; THIS file pins the shape
+ *    decision (C-11) and the in-enum path only. The inline sentence inside C-11
+ *    below ("the runtime rejection ... belongs to ... the state-wiring
+ *    follow-up") predates that landing and is superseded by this header.
  *  - C-10's rejection text comes from the frozen validator in src/config.ts,
  *    which the entrypoint repair must not modify; the ADR requires the rejection
  *    to be LOUD, not that this window rewrites its wording.
+ *
+ * R-03 (ADR 0005 section 3.4.1): `{config: null}` is pinned here too. It is the
+ * OPTIONS shape with an explicit `config` key whose value is null, and the
+ * entrypoint resolves it to "no config supplied" → the host `ctx.config` is
+ * honoured (frozen defaults apply when the context carries none). It is NOT a
+ * rejection and NOT the explicit clear (that is `{config:{}}`); the three-way
+ * distinction is asserted below so a safety switch a host declared in
+ * `ctx.config` can never be silently loosened.
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -361,6 +377,35 @@ describe('shape decision: the C-1..C-12 counterexamples (ADR 0005 section 3.2/3.
     // value arriving from JavaScript or from the host group belongs to the
     // host-group validation and the state-wiring follow-up (ADR 0005 section 3.6).
     expect([...MODEL_ROUTE_EFFORTS]).toEqual(['high', 'max', 'low']);
+  });
+
+  it('R-03 (ADR 0005 section 3.4.1): {config: null} inherits ctx.config, it is neither a rejection nor the explicit clear', () => {
+    // Shape: `config` IS a public option key, so this is the OPTIONS shape with
+    // an explicit config key carrying null - NOT C-12's non-object second
+    // argument and NOT C-1's empty options object.
+    expect(normalizePluginOptions({ config: null }, CTX_CONFIG)).toEqual({ config: null });
+    expect(Object.prototype.hasOwnProperty.call(normalizePluginOptions({ config: null }, CTX_CONFIG), 'config')).toBe(true);
+
+    // Behaviour 1: a host that declared safety switches in ctx.config keeps
+    // them (inheritance) - {config:null} must NOT clear to the defaults.
+    const plugin = apply(ctxWithConfig(CTX_CONFIG), { config: null });
+    expect(plugin.config.execution.mode).toBe('off');
+    expect(plugin.config.jitrl.enabled).toBe(false);
+
+    // Behaviour 2: without ctx.config the frozen defaults apply, exactly like
+    // omitting the config key - inheritance, not an override to defaults.
+    const bare = apply({}, { config: null });
+    expect(bare.config.execution.mode).toBe(DEFAULT_EVO_HARNESS_CONFIG.execution.mode);
+    expect(bare.config.jitrl.enabled).toBe(DEFAULT_EVO_HARNESS_CONFIG.jitrl.enabled);
+
+    // Behaviour 3: {config:null} is distinct from the explicit clear
+    // ({config:{}} resolves to the defaults) and from {config:undefined}, which
+    // is the "key absent" shape and keeps ctx.config through the same ?? rule.
+    expect(normalizePluginOptions({ config: undefined }, CTX_CONFIG)).toEqual({});
+    const cleared = apply(ctxWithConfig(CTX_CONFIG), { config: {} });
+    expect(cleared.config.execution.mode).toBe(DEFAULT_EVO_HARNESS_CONFIG.execution.mode);
+    expect(cleared.config.jitrl.enabled).toBe(DEFAULT_EVO_HARNESS_CONFIG.jitrl.enabled);
+    expect(plugin.config.execution.mode).not.toBe(cleared.config.execution.mode);
   });
 
   it('C-12: a non-object second argument throws plugin-options-invalid-shape (null included)', () => {

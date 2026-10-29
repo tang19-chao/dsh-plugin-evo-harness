@@ -15,12 +15,15 @@
 
 import { aggregatePrecision, calculateUsageCost } from './pricing.js';
 import { createUsageLedgerEvent } from './ledger-event.js';
+import { summarizeUsageAccounting, type UsageAccountingReport } from './usage-report.js';
 import {
   BudgetPoolType,
   CostCalculation,
   ExecutionOutcome,
   LedgerBudgetConfig,
   LedgerBudgetStatus,
+  LedgerMeteringMode,
+  LedgerMeteringStatus,
   LedgerRecoveryReport,
   ModelRateCard,
   ProviderUsagePayload,
@@ -107,6 +110,17 @@ export interface LedgerManagerOptions extends LedgerBudgetConfig {
 
   /** Route cost bounds declared up front, keyed by routeId. */
   readonly routeBounds?: readonly RouteCostBound[];
+
+  /**
+   * P3-A2: 'enforce' (default for direct construction, preserving every existing
+   * accounting contract) denies on budget/seat/admission grounds. 'observe'
+   * never denies for those reasons: it records the rejection it WOULD have made
+   * and lets the call proceed, so a probe's outcome can never be changed by
+   * metering. The assembly path defaults to 'observe' and only
+   * `enforceHardBounds: true` opts into enforcement — independent of any other
+   * permission switch.
+   */
+  readonly meteringMode?: LedgerMeteringMode;
 }
 
 export class LedgerReservationManager {
@@ -145,6 +159,15 @@ export class LedgerReservationManager {
 
   private defaultRateCard?: ModelRateCard;
   private walWriter: LedgerWalWriter;
+
+  // P3-A2 mode + observable counters. Counters exist so "ledger with zero calls"
+  // and "no ledger at all" are distinguishable (the caller's undefined manager
+  // is the third state, represented by absence).
+  private readonly meteringMode: LedgerMeteringMode;
+  private reserveAttempts = 0;
+  private reserveGranted = 0;
+  private observedDenials = 0;
+  private settleCount = 0;
 
   /** Active reservations mapped by reservationId */
   private activeReservations = new Map<string, ReservationRecord>();
@@ -196,6 +219,7 @@ export class LedgerReservationManager {
     this.verificationTotalMicros = Math.max(0, config.verificationReserveMicros);
     this.maxSeats = Math.max(0, config.maxConcurrencySeats);
     this.defaultRateCard = config.defaultRateCard;
+    this.meteringMode = config.meteringMode ?? 'enforce';
     this.walWriter = config.walWriter ?? new LedgerWalWriter({ storageDir: config.storageDir });
     this.admissionPolicy = config.admissionPolicy;
     this.watermarks = config.watermarks;
@@ -429,13 +453,25 @@ export class LedgerReservationManager {
       };
     }
 
+    this.reserveAttempts += 1;
+
     // 2. Check seat availability if required
+    //
+    // P3-A2: observe mode NEVER denies for seats. It records
+    // observedRejection='insufficient_seats' and proceeds seatless.
     //
     // PR-3B §7.4-2: at the CRITICAL watermark, general exploration concurrency is
     // halved. The verification pool is exempt so a run can still be judged after
     // the exploration budget is nearly exhausted.
     const needsSeat = requiresSeat ?? false;
-    const effectiveSeatCap = pool === 'verification' ? this.maxSeats : this.getEffectiveSeatCap();
+    const observe = this.meteringMode === 'observe';
+    let observedRejection: ReserveRejectionReason | undefined;
+    // Observe mode is not throttled by enforcement-tier watermarks: its seat cap
+    // is the real cap, so an observed denial reflects the true capacity rather
+    // than a limit observe is not enforcing.
+    const effectiveSeatCap = observe || pool === 'verification'
+      ? this.maxSeats
+      : this.getEffectiveSeatCap();
     if (needsSeat && this.seatOwners.size >= effectiveSeatCap) {
       if (effectiveSeatCap < this.maxSeats) {
         this.pushAlert(
@@ -444,21 +480,30 @@ export class LedgerReservationManager {
           { pool }
         );
       }
-      return {
-        granted: false,
-        callId,
-        pool,
-        reservedCostMicros: 0,
-        seatAcquired: false,
-        rejectionReason: 'insufficient_seats'
-      };
+      if (observe) {
+        observedRejection = 'insufficient_seats';
+        this.pushAlert(
+          'observe-seat-exceeded',
+          `call "${callId}" would have been denied for seats (${this.seatOwners.size}/${effectiveSeatCap}); observe mode proceeds without a seat`,
+          { pool, callId }
+        );
+      } else {
+        return {
+          granted: false,
+          callId,
+          pool,
+          reservedCostMicros: 0,
+          seatAcquired: false,
+          rejectionReason: 'insufficient_seats'
+        };
+      }
     }
 
     // 2b. PR-3B §7.3: route admission. In hard mode an unbounded route is refused
     // outright (or admitted only under an explicit, ceiling-limited override); a
     // bounded route reserves the PHYSICAL CEILING, not an estimate.
     let boundAdmission: AdmissionDecision | undefined;
-    if (this.admissionPolicy !== undefined) {
+    if (!observe && this.admissionPolicy !== undefined) {
       boundAdmission = this.decideAdmissionFor({
         ...(request.routeId === undefined ? {} : { routeId: request.routeId }),
         ...(request.rateCard === undefined ? {} : { rateCard: request.rateCard }),
@@ -495,11 +540,30 @@ export class LedgerReservationManager {
     // PHYSICAL CEILING, not the caller's estimate. Reserving the estimate and
     // hoping is exactly the failure §7.1 documents (a runaway generation can bill
     // far past it). An explicit risk override ring-fences its stop-loss instead.
-    const requiredMicros =
-      boundAdmission !== undefined && boundAdmission.admitted
+    const requiredMicros = observe
+      ? 0
+      : boundAdmission !== undefined && boundAdmission.admitted
         ? (boundAdmission.reserveMicros as number)
         : Math.max(0, estimatedCostMicros);
-    if (pool === 'general') {
+    if (observe) {
+      // Observation: ring-fence NOTHING and deny NOTHING. The spend still books
+      // at settle time, so the pool can report an overdraft (visible) without
+      // ever changing the probe's control flow.
+      const wouldExceed =
+        pool === 'general'
+          ? this.generalRemainingMicros < Math.max(0, estimatedCostMicros)
+          : this.verificationRemainingMicros < Math.max(0, estimatedCostMicros);
+      if (wouldExceed) {
+        observedRejection =
+          observedRejection ??
+          (pool === 'general' ? 'insufficient_budget' : 'insufficient_verification_reserve');
+        this.pushAlert(
+          'observe-budget-exceeded',
+          `call "${callId}" would have been denied for budget (${String(Math.max(0, estimatedCostMicros))}u requested); observe mode proceeds and books actual spend at settle`,
+          { pool, callId }
+        );
+      }
+    } else if (pool === 'general') {
       if (this.generalRemainingMicros < requiredMicros) {
         return {
           granted: false,
@@ -525,7 +589,8 @@ export class LedgerReservationManager {
       this.verificationReservedMicros += requiredMicros;
     }
 
-    if (needsSeat) {
+    const seatAcquired = needsSeat && !observe;
+    if (seatAcquired) {
       this.seatOwners.add(callId);
     }
 
@@ -541,7 +606,7 @@ export class LedgerReservationManager {
       phase: request.phase,
       pool,
       reservedCostMicros: requiredMicros,
-      seatAcquired: needsSeat,
+      seatAcquired,
       sessionId: request.sessionId,
       operationId: request.operationId,
       attempt: request.attempt,
@@ -562,21 +627,30 @@ export class LedgerReservationManager {
       phase: request.phase,
       pool,
       reservedCostMicros: requiredMicros,
-      seatAcquired: needsSeat,
-      sessionId: request.sessionId,
+      seatAcquired,
       pricingIdentity: request.pricingIdentity,
       // Freeze the rate card in the WAL as well as in memory: replay must not
       // silently reprice a recovered reservation against today's default card.
       ...(effectiveRateCard === undefined ? {} : { rateCard: effectiveRateCard })
     });
 
+    if (observe) {
+      this.reserveGranted += 1;
+      if (observedRejection !== undefined) {
+        this.observedDenials += 1;
+      }
+    } else {
+      this.reserveGranted += 1;
+    }
     return {
       granted: true,
       reservationId,
       callId,
       pool,
       reservedCostMicros: requiredMicros,
-      seatAcquired: needsSeat
+      seatAcquired,
+      ...(observe ? { observed: true } : {}),
+      ...(observedRejection === undefined ? {} : { observedRejection })
     };
   }
 
@@ -644,6 +718,7 @@ export class LedgerReservationManager {
         isIdempotentReplay: true
       };
     }
+    this.settleCount += 1;
 
     // 2. Active reservation lookup
     const expectedResId = this.callToReservation.get(callId);
@@ -1644,6 +1719,39 @@ export class LedgerReservationManager {
    */
   getSettledResult(callId: string): SettleResult | undefined {
     return this.settledCalls.get(callId);
+  }
+
+  /** P3-A2: observe or enforce; never inferred from any other permission switch. */
+  getMeteringMode(): LedgerMeteringMode {
+    return this.meteringMode;
+  }
+
+  /**
+   * P3-A2: ledger-side metering status.
+   *
+   * "Ledger assembled but ZERO calls so far" (reserveAttempts=0) and "ledger
+   * with calls whose provenance is unknown" are both visible here, so a cost
+   * report can never conflate "0 calls" with "no metering" or "measured".
+   */
+  getMeteringStatus(): LedgerMeteringStatus {
+    const accounting = summarizeUsageAccounting(this.ledgerEvents);
+    return {
+      mode: this.meteringMode,
+      metered: true,
+      reserveAttempts: this.reserveAttempts,
+      reserveGranted: this.reserveGranted,
+      observedDenials: this.observedDenials,
+      settleCount: this.settleCount,
+      measuredCalls: accounting.measured.calls,
+      estimatedCalls: accounting.estimated.calls,
+      unknownCalls: accounting.unknown.calls,
+      totalCostMicros: accounting.totalCostMicros
+    };
+  }
+
+  /** P3-C: measured/estimated/unknown accounting over the recorded events. */
+  getUsageAccounting(): UsageAccountingReport {
+    return summarizeUsageAccounting(this.ledgerEvents);
   }
 
   /**

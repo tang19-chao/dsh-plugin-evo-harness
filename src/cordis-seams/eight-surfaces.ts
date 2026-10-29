@@ -37,6 +37,7 @@ import type {
   CordisHostAdapter,
   HostDisposer,
   HostGuardrailsSpec,
+  HostMountScopeClass,
   HostMemoryScopeSpec,
   HostMiddlewareSpec,
   HostPromptSegmentSpec,
@@ -68,6 +69,15 @@ export interface SurfaceMountContext {
   readonly branchId: string;
   readonly namespace: string;
   readonly patchId: string;
+  /**
+   * Whom the mounts may act on (ADR 0006 D-P4-4). Probe branches pass 'branch'
+   * (strict branch authority); only an authorized permanent patch passes
+   * 'host' with a non-empty hostScopeGrant. Omitted = 'legacy-host-local',
+   * which the production mount path must never produce.
+   */
+  readonly mountScope?: HostMountScopeClass;
+  /** Required when mountScope is 'host': non-empty grant provenance. */
+  readonly hostScopeGrant?: string;
   /** Slot provenance (e.g. 'explore_invariant', 'explore_domain'). */
   readonly origin?: string;
   /** Guidance mode (e.g. 'guidance_free', 'memory'). */
@@ -76,6 +86,25 @@ export interface SurfaceMountContext {
   readonly role?: ScopeRole;
   /** Whether host advisor may inject advice into this branch. */
   readonly allowAdvice?: boolean;
+}
+
+/**
+ * The mount-scope fields a spec carries (ADR 0006 D-P4-4).
+ *
+ * Kept OUT of the shared `base` object on purpose: ADR 0005 D5 mutant M1 pins
+ * the exact text of `base` (the four provenance spreads), and the mutation
+ * gate must keep resolving that anchor against the pristine source. Adding the
+ * scope class per spec also keeps the concern explicit: which dispatches a
+ * mount may act on is not a provenance field.
+ */
+function mountScopeFields(context: SurfaceMountContext): {
+  readonly mountScope?: HostMountScopeClass;
+  readonly hostScopeGrant?: string;
+} {
+  return {
+    ...(context.mountScope !== undefined ? { mountScope: context.mountScope } : {}),
+    ...(context.hostScopeGrant !== undefined ? { hostScopeGrant: context.hostScopeGrant } : {})
+  };
 }
 
 /** Handle for one mounted surface; dispose is idempotent. */
@@ -206,6 +235,7 @@ export async function mountSurface(
       const seam = requireSeam(host, key, host.registerPromptSegment, context.branchId);
       const spec: HostPromptSegmentSpec = {
         ...base,
+        ...mountScopeFields(context),
         segment: typed.segment ?? defaultPromptSegment(key),
         mode: typed.mode,
         content: typed.content,
@@ -219,6 +249,7 @@ export async function mountSurface(
       const seam = requireSeam(host, key, host.registerGuardrails, context.branchId);
       const spec: HostGuardrailsSpec = {
         ...base,
+        ...mountScopeFields(context),
         appendRules: copyArray(typed.appendRules),
         forbiddenActions: copyArray(typed.forbiddenActions),
         formatContract: typed.formatContract,
@@ -232,6 +263,7 @@ export async function mountSurface(
       const seam = requireSeam(host, key, host.registerMemoryScope, context.branchId);
       const spec: HostMemoryScopeSpec = {
         ...base,
+        ...mountScopeFields(context),
         scopedViewId: typed.scopedViewId ?? context.namespace,
         workingNotes: copyArray(typed.workingNotes),
         recallTags: copyArray(typed.recallTags)
@@ -244,6 +276,7 @@ export async function mountSurface(
       const seam = requireSeam(host, key, host.patchToolGuidance, context.branchId);
       const spec: HostToolGuidanceSpec = {
         ...base,
+        ...mountScopeFields(context),
         descriptions: { ...typed.descriptions },
         priorityOrder: typed.priorityOrder === undefined ? undefined : copyArray(typed.priorityOrder),
         examples: typed.examples === undefined ? undefined : copyArray(typed.examples)
@@ -254,28 +287,44 @@ export async function mountSurface(
     case 'skills': {
       const typed = edit as SkillsSurfaceEdit;
       const seam = requireSeam(host, key, host.mountSkills, context.branchId);
-      const spec: HostSkillsSpec = { ...base, skills: copyArray(typed.skills) };
+      const spec: HostSkillsSpec = {
+        ...base,
+        ...mountScopeFields(context),
+        skills: copyArray(typed.skills)
+      };
       result = await seam(spec);
       break;
     }
     case 'scripts': {
       const typed = edit as ScriptsSurfaceEdit;
       const seam = requireSeam(host, key, host.mountScripts, context.branchId);
-      const spec: HostScriptsSpec = { ...base, scripts: copyArray(typed.scripts) };
+      const spec: HostScriptsSpec = {
+        ...base,
+        ...mountScopeFields(context),
+        scripts: copyArray(typed.scripts)
+      };
       result = await seam(spec);
       break;
     }
     case 'subagents': {
       const typed = edit as SubagentsSurfaceEdit;
       const seam = requireSeam(host, key, host.registerSubagents, context.branchId);
-      const spec: HostSubagentsSpec = { ...base, agents: copyArray(typed.agents) };
+      const spec: HostSubagentsSpec = {
+        ...base,
+        ...mountScopeFields(context),
+        agents: copyArray(typed.agents)
+      };
       result = await seam(spec);
       break;
     }
     case 'plugins': {
       const typed = edit as PluginsSurfaceEdit;
       const seam = requireSeam(host, key, host.mountMiddleware, context.branchId);
-      const spec: HostMiddlewareSpec = { ...base, middleware: copyArray(typed.middleware) };
+      const spec: HostMiddlewareSpec = {
+        ...base,
+        ...mountScopeFields(context),
+        middleware: copyArray(typed.middleware)
+      };
       result = await seam(spec);
       break;
     }

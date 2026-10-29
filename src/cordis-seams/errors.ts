@@ -22,7 +22,8 @@ export const CORDIS_SEAM_ERROR_CODES = [
   'permanent_mount_failed',
   'registry_disposed',
   'dispose_failed',
-  'manager_disposed'
+  'manager_disposed',
+  'mount_scope_not_authorized'
 ] as const;
 export type CordisSeamErrorCode = (typeof CORDIS_SEAM_ERROR_CODES)[number];
 

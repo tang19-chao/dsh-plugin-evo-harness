@@ -33,7 +33,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkEncodingPolicy } from '../../../scripts/eval/check-encoding-policy.mjs';
-import { smokeBuild } from '../../../scripts/eval/smoke-build.mjs';
+import { smokeBuild, type SmokeBuildResult } from '../../../scripts/eval/smoke-build.mjs';
 import { comparePlatformDigests } from '../../../scripts/eval/compare-platform-digests.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -527,15 +527,30 @@ describe('PR-1 encoding-policy gate', () => {
 });
 
 describe('PR-1 build/ESM smoke gate', () => {
-  it('builds and imports the bundle as ESM', async () => {
-    // CI builds before running the suite; a developer may not have. Build when
-    // the artifact is absent so the test is honest in both situations.
-    const artifact = path.join(repoRoot, 'lib', 'index.js');
-    const result = await smokeBuild({ skipBuild: fs.existsSync(artifact) });
-    expect(result.ok, JSON.stringify(result.steps, null, 2)).toBe(true);
+  // This suite used to pass `skipBuild: fs.existsSync(artifact)`, so an existing
+  // `lib/index.js` was reused and the gate certified bytes the source no longer
+  // produced. Measured (t8): with a CommonJS `require` added to `src/` this
+  // suite stayed green (3 passed) while `node scripts/eval/smoke-build.mjs`
+  // went red on a real build - expired evidence reported as a passed gate. The
+  // whole value of the check is that the artifact came from the CURRENT source,
+  // so the build is unconditional: one build per run, shared by both tests
+  // below. `beforeAll` (not the first test) so a filtered run (`-t`) also
+  // builds before asserting anything.
+  let built: SmokeBuildResult;
+
+  beforeAll(async () => {
+    built = await smokeBuild();
+  }, 300_000);
+
+  it('builds and imports the bundle as ESM', () => {
+    // Prove the build actually ran: a skipped build is the bypass itself.
+    expect(built.steps[0]).toEqual({ step: 'build', ok: true, detail: 'pnpm run build exited 0' });
+    expect(built.ok, JSON.stringify(built.steps, null, 2)).toBe(true);
   }, 300_000);
 
   it('reports the required public surface', async () => {
+    // `skipBuild` is honest here only because the `beforeAll` above just rebuilt
+    // the artifact from this working tree, in this process.
     const result = await smokeBuild({ skipBuild: true });
     expect(result.exportCount).toBeGreaterThan(10);
     expect(result.bytes).toBeGreaterThan(1000);

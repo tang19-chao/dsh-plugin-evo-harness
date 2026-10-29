@@ -101,7 +101,10 @@ describe('prompt segments through system-prompt/assemble', () => {
       segment: 'evo-harness-system_prompt',
       mode: 'append',
       content: 'Prefer evidence over speculation.',
-      priority: 5
+      priority: 5,
+      // P4-C: identity-free visibility is an explicitly granted host scope.
+      mountScope: 'host',
+      hostScopeGrant: 'test-integrator:host-scope'
     });
 
     const mounted = await dispatchAssemble(fixture);
@@ -166,7 +169,9 @@ describe('prompt segments through system-prompt/assemble', () => {
       ...baseSpec,
       segment: 'identity',
       mode: 'replace',
-      content: 'You are an evolved harness.'
+      content: 'You are an evolved harness.',
+      mountScope: 'host',
+      hostScopeGrant: 'test-integrator:host-scope'
     });
 
     const result = await dispatchAssemble(fixture, {
@@ -183,7 +188,9 @@ describe('prompt segments through system-prompt/assemble', () => {
       ...baseSpec,
       segment: 'tool:bash',
       mode: 'append',
-      content: 'evo guidance'
+      content: 'evo guidance',
+      mountScope: 'host',
+      hostScopeGrant: 'test-integrator:host-scope'
     });
 
     const result = await dispatchAssemble(fixture, {
@@ -204,7 +211,14 @@ describe('prompt segments through system-prompt/assemble', () => {
   it('delegates with next() and preserves every other contribution', async () => {
     const fixture = createHookFixture();
     const adapter = createDshHookHostAdapter(fixture.ctx);
-    await adapter.registerPromptSegment({ ...baseSpec, segment: 'evo', mode: 'append', content: 'evo text' });
+    await adapter.registerPromptSegment({
+      ...baseSpec,
+      segment: 'evo',
+      mode: 'append',
+      content: 'evo text',
+      mountScope: 'host',
+      hostScopeGrant: 'test-integrator:host-scope'
+    });
 
     const result = await dispatchAssemble(fixture, {
       sections: [{ name: 'tool:bash', text: 'prefer bash' }],
@@ -246,13 +260,29 @@ describe('branch and session scoping', () => {
     await adapter.dispose();
   });
 
-  it('treats an identity-free host-local assembly as in scope, documented fail-open', async () => {
+  it('refuses an undeclared mount on an identity-free dispatch (P4-C tightened default)', async () => {
     const fixture = createHookFixture();
     const adapter = createDshHookHostAdapter(fixture.ctx);
+    // P4-C: a mount without mountScope is BRANCH-class, so an identity-free
+    // host assembly can no longer see it (the pre-ADR fail-open is gone).
     await adapter.registerPromptSegment({ ...baseSpec, segment: 'global', mode: 'append', content: 'g' });
 
     const result = await dispatchAssemble(fixture, emptyAssembly(), {});
-    expect(result.sections.map((section) => section.name)).toEqual(['global']);
+    expect(result.sections).toEqual([]);
+    expect(adapter.stats().scope.assemble.anonymousSuppressed).toBe(1);
+
+    // The old behaviour survives only as a counted, explicit opt-in.
+    await adapter.registerPromptSegment({
+      ...baseSpec,
+      segment: 'legacy-global',
+      mode: 'append',
+      content: 'legacy',
+      mountScope: 'legacy-host-local'
+    });
+    const legacy = await dispatchAssemble(fixture, emptyAssembly(), {});
+    expect(legacy.sections.map((section) => section.name)).toEqual(['legacy-global']);
+    expect(adapter.stats().scope.legacyHostLocalMounts).toBe(1);
+    expect(adapter.advisories().join(' ')).toContain('explicitly opted into legacy host-local matching');
     await adapter.dispose();
   });
 
@@ -351,11 +381,21 @@ describe('tool policy through tools/pre-execute and tools/post-execute', () => {
         Promise.resolve({ kind: 'enter', messages: [], startsRequestSeries: true })
       )
     );
+    // P4-C: a session-only dispatch proves no branch, so a branch mount is
+    // neither applied nor suppressed silently - it is counted as delegated.
+    const sessionOnlyStep = await Promise.resolve(
+      stepListener({ agent: { id: 'sess-1' }, messages: [] }, () =>
+        Promise.resolve({ kind: 'enter', messages: [] })
+      )
+    );
+    expect(sessionOnlyStep).toEqual({ kind: 'enter', messages: [] });
 
     const stats = adapter.stats();
     expect(stats.deniedToolCalls).toBe(1);
     expect(stats.postExecute.applied).toBe(1);
-    expect(stats.preStep.applied).toBe(1);
+    expect(stats.preStep.applied).toBe(0);
+    expect(stats.preStep.delegated).toBe(2);
+    expect(stats.scope.preExecute.sessionOnlySuppressed).toBe(0);
 
     // an out-of-scope dispatch is delegated, never counted as applied
     await Promise.resolve(

@@ -251,6 +251,44 @@ export interface JitRlConfig {
   /** Dream-RSI x JitRL dual loop (plan section 7.3). */
   dream: JitRlDreamConfig;
   privacy: JitRlPrivacyConfig;
+  /**
+   * P6 budget hook (ADR 0007 section 7.4) — OPTIONAL and ABSENT by default.
+   *
+   * This leaf deliberately has NO default value. The P6 decorator runs its
+   * budget gate whenever a `budget` object is present, and the gate writes a
+   * `metadata.jit.budget` key onto every decision. A default object would
+   * therefore change the default-config host behaviour (every decision would
+   * grow a budget key), which is exactly what ADR 0007 section 8 forbids.
+   *
+   * Absent -> `src/index.ts` passes no `budget` at all -> the decorator is
+   * byte-identical to the pre-P6 one. Present -> the host opted in explicitly.
+   */
+  budget?: JitRlBudgetConfig;
+}
+
+/**
+ * P6 budget hook configuration (ADR 0007 sections 6-7). Every member is
+ * optional and every switch inside it defaults to OFF.
+ */
+export interface JitRlBudgetConfig {
+  /**
+   * Probe-count tier (ADR 0007 section 6.1): 'lite' | 'medium' | 'heavy'.
+   * A tier caps how many probe slots one round may spend. It is NEVER money.
+   * Absent keeps the decorator's own default ('medium').
+   */
+  tier?: 'lite' | 'medium' | 'heavy';
+  /**
+   * The ask-only budget reminder (ADR 0007 section 7).
+   *
+   * `enabled` is its OWN permission switch and defaults to FALSE. It never
+   * reuses guarded-active, the patch permission, or any other authority: a
+   * host that granted patch mounting still gets no reminder until it turns
+   * this on. When false the decorator produces no reminder object, sends
+   * nothing and records nothing.
+   */
+  reminder?: {
+    enabled?: boolean;
+  };
 }
 
 /** Fully resolved plugin configuration. */
@@ -531,8 +569,13 @@ const JITRL_KEYS = new Set<string>([
   'reward',
   'hostAdvisor',
   'dream',
-  'privacy'
+  'privacy',
+  // P6 (ADR 0007 section 7.4): optional, absent by default, no default entry.
+  'budget'
 ]);
+const JITRL_BUDGET_KEYS = new Set<string>(['tier', 'reminder']);
+const JITRL_BUDGET_REMINDER_KEYS = new Set<string>(['enabled']);
+const JITRL_BUDGET_TIERS_ALLOWED: readonly string[] = ['lite', 'medium', 'heavy'];
 const JITRL_EXPLORATION_KEYS = new Set<string>(['lambda', 'alpha']);
 const JITRL_STORE_KEYS = new Set<string>([
   'driver',
@@ -1305,6 +1348,23 @@ function validateJitRlGroup(root: Record<string, unknown>, issues: ConfigValidat
     validateBoolean(privacy.redactSecrets, 'jitrl.privacy.redactSecrets', issues);
     validateBoolean(privacy.storeRawText, 'jitrl.privacy.storeRawText', issues);
   }
+  // P6 (ADR 0007 section 7.4): the budget leaf is OPTIONAL and absent by
+  // default, so it is validated only when the host actually wrote it. Absent
+  // means "not configured", never "invalid": no issue is pushed.
+  if (jitrl.budget !== undefined) {
+    const budget = asGroup(jitrl.budget, 'jitrl.budget', issues);
+    if (budget !== null) {
+      if (budget.tier !== undefined) {
+        validateEnum(budget.tier, 'jitrl.budget.tier', JITRL_BUDGET_TIERS_ALLOWED, issues);
+      }
+      if (budget.reminder !== undefined) {
+        const reminder = asGroup(budget.reminder, 'jitrl.budget.reminder', issues);
+        if (reminder !== null && reminder.enabled !== undefined) {
+          validateBoolean(reminder.enabled, 'jitrl.budget.reminder.enabled', issues);
+        }
+      }
+    }
+  }
 }
 
 function buildConfig(rawInput: unknown): ConfigBuildResult {
@@ -1356,6 +1416,15 @@ function buildConfig(rawInput: unknown): ConfigBuildResult {
     );
     collectUnknownKeys(raw.jitrl.privacy, JITRL_PRIVACY_KEYS, 'jitrl.privacy', issues);
     collectUnknownKeys(raw.jitrl.dream, JITRL_DREAM_KEYS, 'jitrl.dream', issues);
+    collectUnknownKeys(raw.jitrl.budget, JITRL_BUDGET_KEYS, 'jitrl.budget', issues);
+    if (isPlainObject(raw.jitrl.budget)) {
+      collectUnknownKeys(
+        raw.jitrl.budget.reminder,
+        JITRL_BUDGET_REMINDER_KEYS,
+        'jitrl.budget.reminder',
+        issues
+      );
+    }
   }
   collectUnknownKeys(raw.execution, EXECUTION_KEYS, 'execution', issues);
   collectUnknownKeys(raw.logging, LOGGING_KEYS, 'logging', issues);

@@ -20,18 +20,32 @@
  *   - `({agent, messages, signal, step}, next) => PreStepDecision`
  * A listener that does not own a decision must delegate with `next()`.
  *
- * Scope isolation
- * ---------------
- * A mount records the branch/session/namespace it belongs to. Every listener
- * resolves the identity of the dispatch (branch id, session id, agent id,
- * namespace) from the payload and applies only mounts owned by that identity.
- * A payload that names a branch matches on the branch alone, so a session shared
- * by sibling probe branches can never leak one branch's patch into another.
- * A dispatch that carries no identity at all is still treated as host-local for
- * mount matching and sees every mount; that is the only fail-open case and is
- * documented in {@link hookScopeMatches}. The advice/learning channels are the
- * opposite (D1 strict default): an unprovable identity gets no advice, no ask
- * and no experience record.
+ * Scope isolation (ADR 0006: fail-closed mount authority)
+ * -------------------------------------------------------
+ * A mount records the branch/session/namespace it belongs to AND whom it may
+ * act on ({@link HostMountScopeClass}). Every listener resolves the identity of
+ * the dispatch (branch id, session id, agent id, namespace) from the payload
+ * and applies only mounts that dispatch PROVES:
+ *
+ * - the default class for an undeclared mount is 'branch' (P4-C): a direct
+ *   registration is fail-closed unless it explicitly declares 'host' (with a
+ *   grant) or the counted 'legacy-host-local' opt-in;
+ * - a branch-class mount (every probe mount) applies only to a dispatch that
+ *   names its exact branchId. A dispatch with no branchId - including one that
+ *   shares the mount's sessionId with a sibling probe - can never act on it,
+ *   so a probe can no longer leak its prompt content into the host's
+ *   system-prompt/assemble or deny host tool calls through its guardrails.
+ * - a host-class mount (only a permanent patch, granted by the execution
+ *   profile's patch permission) may act on identity-free and host-session
+ *   dispatches; it is the single authorized host-wide channel.
+ * - a dispatch with NO provable identity at all is fail-closed for every
+ *   branch-class mount and every suppressed deny rule, and every outcome is
+ *   counted in `stats().scope` (ADR 0006 acceptance: structured counts).
+ *
+ * sessionId NEVER stands in for a branch identity (ADR 0006 D-P4-1): matching
+ * by a shared session was the documented leak this contract closes. The
+ * advice/learning channels keep the D1 strict default from ADR 0001: an
+ * unprovable identity gets no advice, no ask and no experience record.
  *
  * Lifetime
  * --------
@@ -49,6 +63,18 @@
  * or cancel decided further down the chain. An `append` prompt mount never
  * overwrites a same-named section owned by another plugin; it appends under a
  * deterministic per-mount name instead.
+ *
+ * Branch tool face (P4-C)
+ * -----------------------
+ * When a {@link ToolFaceRegistry} is attached, `tools/pre-execute` also
+ * enforces the per-branch tool ALLOWLIST: a call that proves a branchId with an
+ * installed policy and names a tool that is not on that list is DENIED with a
+ * structured decision and counted (`stats().toolFace.denials`). A host call
+ * (no proven branchId) is never denied by a probe policy, and a branch without
+ * a policy is reported as `noPolicy` rather than silently treated as a pass.
+ * This is an in-process cooperative fence, **not a sandbox**: it shares the
+ * host's process, filesystem and credentials, and code that bypasses
+ * `tools/pre-execute` is not contained here.
  *
  * Enforcement subset
  * ------------------
@@ -84,8 +110,10 @@ import type {
   HostDisposer,
   HostGuardrailsSpec,
   HostMiddlewareSpec,
+  HostMountScopeClass,
   HostPromptSegmentSpec
 } from './host-adapter';
+import type { ToolFaceDecision, ToolFaceRegistry } from './tool-face';
 
 /** The four DSH hook events this adapter owns. */
 export const DSH_HOOK_EVENT_NAMES = [
@@ -250,25 +278,65 @@ export function readHookScope(...payloads: readonly unknown[]): HookScopeIdentit
   return { branchIds, sessionIds, namespaces };
 }
 
-/** Identity fields a mount is attributed to. */
+/**
+ * Identity fields a mount is attributed to, plus whom it may act on.
+ *
+ * `scopeClass` defaults to 'legacy-host-local' for a plain object so the
+ * exported function keeps its pre-ADR matching shape; every mount the adapter
+ * registers carries an explicit class.
+ */
 export interface HookMountScope {
   readonly branchId: string;
   readonly sessionId: string;
   readonly namespace: string;
+  readonly scopeClass?: HostMountScopeClass;
+  /** Required when scopeClass is 'host': non-empty grant provenance. */
+  readonly hostScopeGrant?: string;
 }
 
 /**
- * Whether a mount applies to a dispatch with `identity`.
+ * Whether a mount applies to a dispatch with `identity` (ADR 0006 D-P4-4).
  *
- * Precedence matters for isolation: when the dispatch names a branch, only that
- * branch's mounts apply — a shared session id must never leak one probe branch's
- * patch into a sibling branch. Without a branch id the session (or namespace)
- * decides. A payload with no identity at all is host-local for mounts and fails
- * open here only; the advisor scope ({@link advisorInScope}) applies the D1
- * strict default and never treats an unprovable identity as in scope.
+ * Class rules, fail-closed by construction:
+ * - 'branch': the dispatch must PROVE the mount's branchId. A dispatch with no
+ *   branchId never matches - not even one sharing the mount's sessionId - so a
+ *   shared session can no longer leak one probe's mount into the host or a
+ *   sibling branch. A mount with an empty branchId never matches anything.
+ * - 'host': the only host-wide class. An identity-free dispatch matches (that
+ *   is what "host-wide" means); a dispatch naming a branch is served by that
+ *   branch's mounts plus any ambient host mount whose session matches; a
+ *   dispatch naming only a session matches a host mount with that session (or
+ *   one declared session-wide).
+ * - 'legacy-host-local' (the default for a plain object without a class): the
+ *   pre-ADR matching kept for compatibility. It is counted per apply and per
+ *   mount by a diagnostic; the production mount path never produces it.
  */
 export function hookScopeMatches(identity: HookScopeIdentity, mount: HookMountScope): boolean {
+  // P4-C: an unclassified mount is branch-class (fail-closed), never legacy.
+  const scopeClass: HostMountScopeClass = mount.scopeClass ?? 'branch';
   const total = identity.branchIds.size + identity.sessionIds.size + identity.namespaces.size;
+  if (scopeClass === 'branch') {
+    // Branch authority only: sessionId is never a branch identity (D-P4-1).
+    if (identity.branchIds.size === 0 || mount.branchId.length === 0) {
+      return false;
+    }
+    return identity.branchIds.has(mount.branchId);
+  }
+  if (scopeClass === 'host') {
+    if (total === 0) {
+      return true;
+    }
+    if (identity.branchIds.size > 0) {
+      // A branch dispatch keeps its own mounts; an ambient host mount applies
+      // only when the dispatch's session is covered by the host mount.
+      return mount.sessionId.length === 0 || identity.sessionIds.has(mount.sessionId);
+    }
+    if (identity.sessionIds.size > 0) {
+      return mount.sessionId.length === 0 || identity.sessionIds.has(mount.sessionId);
+    }
+    return mount.namespace.length > 0 && identity.namespaces.has(mount.namespace);
+  }
+  // 'legacy-host-local': the pre-ADR matching (documented compatibility debt).
   if (total === 0) {
     return true;
   }
@@ -300,6 +368,8 @@ export interface DshHookMountSummary {
   readonly sessionId: string;
   readonly namespace: string;
   readonly active: boolean;
+  /** ADR 0006 D-P4-4: 'branch' | 'host' | 'legacy-host-local'. */
+  readonly scopeClass: HostMountScopeClass;
 }
 
 interface MountBase extends HookMountScope {
@@ -310,6 +380,8 @@ interface MountBase extends HookMountScope {
   readonly origin?: string;
   readonly guidance?: GuidanceMode;
   readonly allowAdvice?: boolean;
+  /** ADR 0006 D-P4-4: resolved scope class; defaults to 'legacy-host-local'. */
+  readonly scopeClass: HostMountScopeClass;
 }
 
 interface PromptMount extends MountBase {
@@ -379,6 +451,28 @@ export interface DshHostAdvisorAttachOptions {
   readonly isRuntimeEnabled?: () => boolean;
 }
 
+/**
+ * Payload-free mount-authority counters (ADR 0006 acceptance: missing identity
+ * must be fail-closed AND counted). Per hook event:
+ *   - applied: a scoped mount changed or observed the call (with proven
+ *     branch authority, or a host/legacy mount that matched);
+ *   - delegated: no mount acted on the dispatch;
+ *   - branchProofApplied: a branch-class mount acted on a dispatch that PROVED
+ *     its exact branchId;
+ *   - sessionOnlySuppressed: the pre-ADR adapter would have matched via the
+ *     shared sessionId; the mount (or its deny rule) was suppressed instead.
+ *     This is THE shared-session leak counter;
+ *   - anonymousSuppressed: an identity-free dispatch was refused by a
+ *     branch-class mount (fail-closed without a proven identity).
+ */
+export interface DshHookScopeCounters {
+  readonly applied: number;
+  readonly delegated: number;
+  readonly branchProofApplied: number;
+  readonly sessionOnlySuppressed: number;
+  readonly anonymousSuppressed: number;
+}
+
 /** Observable adapter statistics used by diagnostics and tests. */
 export interface DshHookAdapterStats {
   readonly assemble: DshHookCounter;
@@ -387,6 +481,25 @@ export interface DshHookAdapterStats {
   readonly preStep: DshHookCounter;
   readonly deniedToolCalls: number;
   readonly installFailures: readonly string[];
+  /** ADR 0006 D-P4-4/D-P4-6: structured scope-authority counters. */
+  readonly scope: {
+    readonly assemble: DshHookScopeCounters;
+    readonly preExecute: DshHookScopeCounters;
+    readonly postExecute: DshHookScopeCounters;
+    readonly preStep: DshHookScopeCounters;
+    /** Legacy host-local mounts currently registered. */
+    readonly legacyHostLocalMounts: number;
+    /** Mounts (of any class) whose deny rules were suppressed on a session-only dispatch. */
+    readonly deniedRulesSuppressed: number;
+  };
+  /**
+   * P4-C branch tool-face counters: every tool call that reached the allowlist
+   * decision, and every denial it produced. A denial is never silent.
+   */
+  readonly toolFace: {
+    readonly decisions: number;
+    readonly denials: number;
+  };
 }
 
 /**
@@ -445,6 +558,13 @@ export interface DshHookHostAdapter extends CordisHostAdapter {
   /** Trusted scope registry for branch authorization and invariant isolation. */
   readonly scopeRegistry?: ScopeRegistry;
   setScopeRegistry(registry: ScopeRegistry | undefined): void;
+  /**
+   * P4-C: the branch tool face (allowlist). Attaching one enables
+   * `tools/pre-execute` enforcement for every dispatch that proves a branchId
+   * with an installed policy. Passing undefined detaches it.
+   */
+  readonly toolFace?: ToolFaceRegistry;
+  attachToolFace(registry: ToolFaceRegistry | undefined): void;
   /** Tool results forwarded to the sink since construction. */
   hostToolObservationCount(): number;
   /** Uninstall every listener and clear every mount. Idempotent. */
@@ -474,6 +594,8 @@ export interface DshHookHostAdapterOptions {
   readonly hostToolExperience?: HostToolExperienceSink;
   /** Trusted scope registry for branch authorization and invariant isolation. */
   readonly scopeRegistry?: ScopeRegistry;
+  /** P4-C: branch tool-face allowlist enforced on tools/pre-execute. */
+  readonly toolFace?: ToolFaceRegistry;
 }
 
 function compileDenyRules(
@@ -687,6 +809,38 @@ export function createDshHookHostAdapter(
   };
   let denied = 0;
   let disposed = false;
+  // --- ADR 0006 D-P4-4: structured, payload-free mount-authority counters ----
+  // applied/delegated count DISPATCHES; branchProofApplied / sessionOnlySuppressed /
+  // anonymousSuppressed count (dispatch x mount) pairs, so a shared-session leak
+  // blocked against three mounts is three counted suppressions, not one.
+  type MutableScopeCounters = {
+    applied: number;
+    delegated: number;
+    branchProofApplied: number;
+    sessionOnlySuppressed: number;
+    anonymousSuppressed: number;
+  };
+  const newScopeCounters = (): MutableScopeCounters => ({
+    applied: 0,
+    delegated: 0,
+    branchProofApplied: 0,
+    sessionOnlySuppressed: 0,
+    anonymousSuppressed: 0
+  });
+  const scopeCounters: Record<'assemble' | 'preExecute' | 'postExecute' | 'preStep', MutableScopeCounters> = {
+    assemble: newScopeCounters(),
+    preExecute: newScopeCounters(),
+    postExecute: newScopeCounters(),
+    preStep: newScopeCounters()
+  };
+  let legacyHostLocalMounts = 0;
+  let deniedRulesSuppressed = 0;
+  // P4-C: branch tool face (allowlist) and its own decision counters.
+  let toolFace: ToolFaceRegistry | undefined = options.toolFace;
+  let toolFaceDecisions = 0;
+  let toolFaceDenials = 0;
+  // Bounded host-contract note: emitted once per adapter (see the assemble listener).
+  let unusableAssemblyNoted = false;
 
   // --- L3 host advisor (P5-a) ------------------------------------------------
   let advisor: HostAdvisor | undefined = options.hostAdvisor;
@@ -1000,20 +1154,139 @@ export function createDshHookHostAdapter(
     options.onDiagnostic?.(message);
   };
 
-  const isScopeMatch = (payloads: readonly unknown[]): boolean => {
-    const identity = readHookScope(...payloads);
-    return mounts.some((mount) => mount.active && hookScopeMatches(identity, mount));
+  /**
+   * Resolve and validate a mount's scope class (ADR 0006 D-P4-4).
+   *
+   * - explicit 'branch': requires a non-empty branchId (a branch mount without
+   *   a branch cannot be attributed, so it is refused instead of guessing);
+   * - explicit 'host': requires a non-empty hostScopeGrant; the ONLY host-wide
+   *   class, and always a named authorization;
+   * - omitted: 'legacy-host-local' for compatibility - the pre-ADR fail-open
+   *   matching, kept out of the production mount path (mountEightSurfaces
+   *   always declares a class), counted and diagnosed per mount.
+   */
+  const resolveMountScope = (
+    kind: string,
+    surfaceId: string,
+    spec: { readonly branchId?: string; readonly mountScope?: HostMountScopeClass; readonly hostScopeGrant?: string }
+  ): { readonly scopeClass: HostMountScopeClass; readonly hostScopeGrant?: string } => {
+    const requested = spec.mountScope;
+    if (requested === 'branch') {
+      if (typeof spec.branchId !== 'string' || spec.branchId.length === 0) {
+        throw new CordisSeamError(
+          'Mount "' + surfaceId + '" declares mountScope "branch" but carries no branchId; a branch mount must be attributable (ADR 0006 D-P4-4).',
+          { code: 'mount_scope_not_authorized', details: { kind, surfaceId, mountScope: requested } }
+        );
+      }
+      return { scopeClass: 'branch' };
+    }
+    if (requested === 'host') {
+      const grant = typeof spec.hostScopeGrant === 'string' ? spec.hostScopeGrant.trim() : '';
+      if (grant.length === 0) {
+        throw new CordisSeamError(
+          'Mount "' + surfaceId + '" declares mountScope "host" without a hostScopeGrant; host-wide mounts require an explicit authorization (ADR 0006 D-P4-4).',
+          { code: 'mount_scope_not_authorized', details: { kind, surfaceId, mountScope: requested } }
+        );
+      }
+      return { scopeClass: 'host', hostScopeGrant: grant };
+    }
+    if (requested === 'legacy-host-local') {
+      // Explicit opt-in only (P4-C): never a default. Counted per registration
+      // and by a bounded diagnostic, so the debt is visible wherever it is used.
+      legacyHostLocalMounts += 1;
+      note(
+        'mount "' + surfaceId + '" (' + kind + ') explicitly opted into legacy host-local matching; ' +
+          'it is counted (ADR 0006 section 6.3.1) and is never the default.'
+      );
+      return { scopeClass: 'legacy-host-local' };
+    }
+    if (requested !== undefined) {
+      throw new CordisSeamError(
+        'Mount "' + surfaceId + '" declares an unknown mountScope "' + String(requested) + '".',
+        { code: 'invalid_request', details: { kind, surfaceId, mountScope: requested } }
+      );
+    }
+    // P4-C tightened default: an undeclared mount is BRANCH-class, i.e.
+    // fail-closed. It can only act on a dispatch that proves this exact
+    // branchId, so a direct registration can no longer fall back to the
+    // pre-ADR "unattributable dispatch sees every mount" behaviour.
+    if (typeof spec.branchId !== 'string' || spec.branchId.length === 0) {
+      throw new CordisSeamError(
+        'Mount "' + surfaceId + '" declares no mountScope and carries no branchId; an undeclared mount is branch-class and must be attributable (ADR 0006 D-P4-4, P4-C).',
+        { code: 'mount_scope_not_authorized', details: { kind, surfaceId, mountScope: 'branch(default)' } }
+      );
+    }
+    return { scopeClass: 'branch' };
   };
 
-  const promptMountsInScope = (payloads: readonly unknown[]): PromptMount[] => {
+  /**
+   * Resolve one dispatch's mount authority against every active mount.
+   *
+   * This is the ONLY place mount authority is decided, so prompt injection,
+   * guardrail deny and the observation counters cannot drift apart. It also
+   * records the ADR 0006 structured counters: every suppression is a counted
+   * fact, never a silent pass-through.
+   */
+  const evaluateMountAuthority = (
+    event: 'assemble' | 'preExecute' | 'postExecute' | 'preStep',
+    payloads: readonly unknown[],
+    toolName?: string
+  ): {
+    readonly identity: HookScopeIdentity;
+    readonly unattributed: boolean;
+    readonly sessionOnly: boolean;
+    readonly matched: number;
+    readonly suppressed: number;
+  } => {
     const identity = readHookScope(...payloads);
-    return mounts
+    const eventCounters = scopeCounters[event];
+    const unattributed =
+      identity.branchIds.size === 0 && identity.sessionIds.size === 0 && identity.namespaces.size === 0;
+    const sessionOnly = identity.branchIds.size === 0 && identity.sessionIds.size > 0;
+    let matched = 0;
+    let suppressed = 0;
+    for (const mount of mounts) {
+      if (!mount.active) {
+        continue;
+      }
+      if (hookScopeMatches(identity, mount)) {
+        matched += 1;
+        if (mount.scopeClass === 'branch' && identity.branchIds.has(mount.branchId)) {
+          eventCounters.branchProofApplied += 1;
+        }
+        continue;
+      }
+      if (mount.scopeClass !== 'branch') {
+        continue;
+      }
+      suppressed += 1;
+      if (sessionOnly) {
+        eventCounters.sessionOnlySuppressed += 1;
+      } else if (unattributed) {
+        eventCounters.anonymousSuppressed += 1;
+      }
+      // A guardrail mount that WOULD have denied this tool call is the
+      // out-of-scope deny the ADR closes; count it once per matching rule.
+      if (toolName !== undefined && mount.kind === 'guardrails') {
+        if (mount.denyRules.some((rule) => rule.toolName === '*' || rule.toolName === toolName)) {
+          deniedRulesSuppressed += 1;
+        }
+      }
+    }
+    return { identity, unattributed, sessionOnly, matched, suppressed };
+  };
+
+  /** Pure filter: prompt mounts a dispatch with this identity may receive. */
+  const promptMountsFor = (identity: HookScopeIdentity): PromptMount[] =>
+    mounts
       .filter((mount): mount is PromptMount => mount.kind === 'prompt' && mount.active && hookScopeMatches(identity, mount))
       .sort((left, right) => left.priority - right.priority || left.segment.localeCompare(right.segment));
-  };
 
-  const denyRulesInScope = (payloads: readonly unknown[]): DshHookDenyRule[] => {
-    const identity = readHookScope(...payloads);
+  /**
+   * Deny rules a dispatch with this identity is subject to: host-supplied
+   * integrator policy first, then the guardrails mounts the dispatch proves.
+   */
+  const denyRulesFor = (identity: HookScopeIdentity): DshHookDenyRule[] => {
     const rules: DshHookDenyRule[] = [...(options.denyTools ?? [])];
     for (const mount of mounts) {
       if (mount.kind !== 'guardrails' || !mount.active || !hookScopeMatches(identity, mount)) {
@@ -1028,16 +1301,29 @@ export function createDshHookHostAdapter(
     'system-prompt/assemble': async (assembly: unknown, context: unknown, next: unknown): Promise<unknown> => {
       const advance = typeof next === 'function' ? (next as () => Promise<unknown>) : async (): Promise<unknown> => assembly;
       const base = await advance();
-      const scoped = promptMountsInScope([context, assembly]);
-      if (scoped.length === 0) {
-        counters.assemble.delegated += 1;
-        return base;
-      }
       const baseRecord = asRecord(base);
       const sections = readSections(base);
+      // ADR 0006 D-P4-4: the ONLY mount-authority decision point. A dispatch
+      // that proves no branchId can never receive a probe mount, whatever
+      // session it shares.
+      const authority = evaluateMountAuthority('assemble', [context, assembly]);
+      const scoped = promptMountsFor(authority.identity);
+      // Host-contract observation, independent of scope matching: when the
+      // assembly has no sections array, mounting is impossible for everyone
+      // (host or probe). The note is emitted once (bounded) so the host
+      // contract stays diagnosable without re-opening a leak path.
       if (baseRecord === undefined || sections === undefined) {
+        if (mounts.some((mount) => mount.kind === 'prompt' && mount.active) && !unusableAssemblyNoted) {
+          unusableAssemblyNoted = true;
+          note('system-prompt/assemble returned a shape without a sections array; prompt mount was not applied');
+        }
         counters.assemble.delegated += 1;
-        note('system-prompt/assemble returned a shape without a sections array; prompt mount was not applied');
+        scopeCounters.assemble.delegated += 1;
+        return base;
+      }
+      if (scoped.length === 0) {
+        counters.assemble.delegated += 1;
+        scopeCounters.assemble.delegated += 1;
         return base;
       }
       const merged = sections.slice();
@@ -1069,9 +1355,11 @@ export function createDshHookHostAdapter(
       }
       if (!changed) {
         counters.assemble.delegated += 1;
+        scopeCounters.assemble.delegated += 1;
         return base;
       }
       counters.assemble.applied += 1;
+      scopeCounters.assemble.applied += 1;
       return { ...baseRecord, sections: merged };
     },
     'tools/pre-execute': async (exec: unknown, next: unknown): Promise<unknown> => {
@@ -1083,12 +1371,41 @@ export function createDshHookHostAdapter(
         return decision;
       }
       const toolName = toolNameOf(exec);
-      const rules = denyRulesInScope([exec]);
+      // ADR 0006 D-P4-4: a probe's guardrails can deny only a tool call the
+      // dispatch PROVES belongs to that branch. A host call (no branchId, or
+      // only the shared sessionId) is never denied by a probe mount; the
+      // suppressed rules are counted instead.
+      const authority = evaluateMountAuthority('preExecute', [exec], toolName);
+      const rules = denyRulesFor(authority.identity);
       const matched = rules.find((rule) => rule.toolName === '*' || rule.toolName === toolName);
       if (matched !== undefined) {
         counters.preExecute.applied += 1;
+        scopeCounters.preExecute.applied += 1;
         denied += 1;
         return { kind: 'deny', reason: matched.reason };
+      }
+      // P4-C branch tool face: the allowlist applies ONLY to a call that proves
+      // a branchId. A host call stays out of scope (a probe policy must never
+      // deny the host), and an unlisted tool inside the branch is denied with a
+      // structured code - fail-closed, never a silent pass.
+      if (toolFace !== undefined && !disposed && toolName !== undefined) {
+        const branchId =
+          authority.identity.branchIds.size === 1 ? [...authority.identity.branchIds][0] : undefined;
+        const sessionId =
+          authority.identity.sessionIds.size === 1 ? [...authority.identity.sessionIds][0] : undefined;
+        const face: ToolFaceDecision = toolFace.decide({
+          toolName,
+          ...(branchId === undefined ? {} : { branchId }),
+          ...(sessionId === undefined ? {} : { sessionId })
+        });
+        toolFaceDecisions += 1;
+        if (!face.allowed) {
+          toolFaceDenials += 1;
+          counters.preExecute.applied += 1;
+          scopeCounters.preExecute.applied += 1;
+          denied += 1;
+          return { kind: 'deny', reason: face.reason ?? 'denied by the branch tool face' };
+        }
       }
       // P5-a gate: the advisor may ask the user, never deny. The host decision
       // this adapter was handed stays authoritative for every other outcome.
@@ -1121,16 +1438,20 @@ export function createDshHookHostAdapter(
         }
       }
       counters.preExecute.delegated += 1;
+      scopeCounters.preExecute.delegated += 1;
       return decision;
     },
     'tools/post-execute': async (exec: unknown, result: unknown, next: unknown): Promise<unknown> => {
       const advance =
         typeof next === 'function' ? (next as () => Promise<unknown>) : async (): Promise<unknown> => ({ kind: 'accept' });
       const decision = await advance();
-      if (isScopeMatch([exec, result])) {
+      const authority = evaluateMountAuthority('postExecute', [exec, result]);
+      if (authority.matched > 0) {
         counters.postExecute.applied += 1;
+        scopeCounters.postExecute.applied += 1;
       } else {
         counters.postExecute.delegated += 1;
+        scopeCounters.postExecute.delegated += 1;
       }
       // H2 repair: forward the observed tool result to the host-tool experience
       // producer. Only {toolName, isError, exitCode, errorClass, ids} is read -
@@ -1156,10 +1477,13 @@ export function createDshHookHostAdapter(
       const advance =
         typeof next === 'function' ? (next as () => Promise<unknown>) : async (): Promise<unknown> => ({ kind: 'enter', messages: [] });
       const decision = await advance();
-      if (isScopeMatch([payload])) {
+      const authority = evaluateMountAuthority('preStep', [payload]);
+      if (authority.matched > 0) {
         counters.preStep.applied += 1;
+        scopeCounters.preStep.applied += 1;
       } else {
         counters.preStep.delegated += 1;
+        scopeCounters.preStep.delegated += 1;
       }
       // P5-a advisory: append the rendered advice to additionalContexts. The
       // messages and the step decision itself are never rewritten.
@@ -1284,8 +1608,31 @@ export function createDshHookHostAdapter(
         allowAdvice: isInv ? false : (mount.allowAdvice ?? true)
       });
     }
+    // ADR 0006 D-P4-3: a host-class mount records its grant as a trusted host
+    // scope, so the authorization is visible in the registry and expires with
+    // it. The host scope NEVER authorizes a branch (authorizesBranch is false).
+    let hostScopeHandle: { dispose(): void } | undefined;
+    if (scopeRegistry !== undefined && mount.scopeClass === 'host' && mount.hostScopeGrant !== undefined) {
+      try {
+        hostScopeHandle = scopeRegistry.registerHostScope({
+          sessionId: mount.sessionId,
+          ...(mount.namespace.length > 0 ? { namespace: mount.namespace } : {}),
+          grantedBy: mount.hostScopeGrant
+        });
+      } catch (error) {
+        note(
+          'host-scope registration failed for mount "' + mount.surfaceId + '": ' +
+            (error instanceof Error ? error.message : String(error))
+        );
+      }
+    }
     return {
       dispose: (): void => {
+        try {
+          hostScopeHandle?.dispose();
+        } catch {
+          // idempotent
+        }
         try {
           scopeHandle?.dispose();
         } catch {
@@ -1341,7 +1688,8 @@ export function createDshHookHostAdapter(
           branchId: mount.branchId,
           sessionId: mount.sessionId,
           namespace: mount.namespace,
-          active: mount.active
+          active: mount.active,
+          scopeClass: mount.scopeClass
         })),
     stats: (): DshHookAdapterStats => ({
       assemble: { ...counters.assemble },
@@ -1349,7 +1697,19 @@ export function createDshHookHostAdapter(
       postExecute: { ...counters.postExecute },
       preStep: { ...counters.preStep },
       deniedToolCalls: denied,
-      installFailures: diagnostics.slice()
+      installFailures: diagnostics.slice(),
+      scope: {
+        assemble: { ...scopeCounters.assemble },
+        preExecute: { ...scopeCounters.preExecute },
+        postExecute: { ...scopeCounters.postExecute },
+        preStep: { ...scopeCounters.preStep },
+        legacyHostLocalMounts,
+        deniedRulesSuppressed
+      },
+      toolFace: {
+        decisions: toolFaceDecisions,
+        denials: toolFaceDenials
+      }
     }),
     advisories: (): readonly string[] => diagnostics.slice(),
     get hostAdvisor(): HostAdvisor | undefined {
@@ -1409,6 +1769,20 @@ export function createDshHookHostAdapter(
     setScopeRegistry(registry: ScopeRegistry | undefined): void {
       scopeRegistry = registry;
     },
+    get toolFace(): ToolFaceRegistry | undefined {
+      return toolFace;
+    },
+    attachToolFace(registry: ToolFaceRegistry | undefined): void {
+      if (disposed) {
+        return;
+      }
+      toolFace = registry;
+      note(
+        registry === undefined
+          ? 'branch tool face detached'
+          : 'branch tool face attached (per-branch allowlist enforced on tools/pre-execute; in-process fence, NOT a sandbox)'
+      );
+    },
 
     async registerPromptSegment(spec: HostPromptSegmentSpec): Promise<HostDisposer> {
       ensureInstalled();
@@ -1420,6 +1794,7 @@ export function createDshHookHostAdapter(
         return missingSeam('registerPromptSegment', 'system_prompt', spec);
       }
       const specRec = asRecord(spec);
+      const scope = resolveMountScope('prompt', spec.surfaceId, spec);
       return register({
         kind: 'prompt',
         surfaceId: spec.surfaceId,
@@ -1427,6 +1802,8 @@ export function createDshHookHostAdapter(
         sessionId: spec.sessionId,
         namespace: spec.namespace,
         active: true,
+        scopeClass: scope.scopeClass,
+        ...(scope.hostScopeGrant !== undefined ? { hostScopeGrant: scope.hostScopeGrant } : {}),
         role: specRec?.['role'] as ScopeRole | undefined,
         origin: specRec?.['origin'] as string | undefined,
         guidance: specRec?.['guidance'] as GuidanceMode | undefined,
@@ -1452,6 +1829,7 @@ export function createDshHookHostAdapter(
         note(advisory);
       }
       const specRec = asRecord(spec);
+      const scope = resolveMountScope('guardrails', spec.surfaceId, spec);
       return register({
         kind: 'guardrails',
         surfaceId: spec.surfaceId,
@@ -1459,6 +1837,8 @@ export function createDshHookHostAdapter(
         sessionId: spec.sessionId,
         namespace: spec.namespace,
         active: true,
+        scopeClass: scope.scopeClass,
+        ...(scope.hostScopeGrant !== undefined ? { hostScopeGrant: scope.hostScopeGrant } : {}),
         role: specRec?.['role'] as ScopeRole | undefined,
         origin: specRec?.['origin'] as string | undefined,
         guidance: specRec?.['guidance'] as GuidanceMode | undefined,
@@ -1478,6 +1858,7 @@ export function createDshHookHostAdapter(
         return missingSeam('mountMiddleware', 'plugins', spec);
       }
       const specRec = asRecord(spec);
+      const scope = resolveMountScope('middleware', spec.surfaceId, spec);
       return register({
         kind: 'middleware',
         surfaceId: spec.surfaceId,
@@ -1485,6 +1866,8 @@ export function createDshHookHostAdapter(
         sessionId: spec.sessionId,
         namespace: spec.namespace,
         active: true,
+        scopeClass: scope.scopeClass,
+        ...(scope.hostScopeGrant !== undefined ? { hostScopeGrant: scope.hostScopeGrant } : {}),
         role: specRec?.['role'] as ScopeRole | undefined,
         origin: specRec?.['origin'] as string | undefined,
         guidance: specRec?.['guidance'] as GuidanceMode | undefined,

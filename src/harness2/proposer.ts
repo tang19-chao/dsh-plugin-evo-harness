@@ -46,6 +46,8 @@ import {
   type ToolGuidanceSurfaceEdit,
   type ToolPrecondition
 } from '../types/contracts';
+// P3-B: every model call leaves this module through the unified metered boundary.
+import { createMeteredModelAdapter, type MeteredModelOptions } from '../dsh-bridge/metered-model-adapter';
 import {
   type Clock,
   type IdFactory,
@@ -67,6 +69,8 @@ import {
 export interface HarnessProposerOptions {
   /** Host-neutral LLM boundary. Required: proposals are model-authored. */
   readonly model: IModelAdapter;
+  /** P3-B metering wiring (ledger/registry); absent records calls without cost. */
+  readonly metering?: MeteredModelOptions;
   /** Injected clock; defaults to Date.now(). */
   readonly now?: Clock;
   /** Injected id factory; defaults to a deterministic counter. */
@@ -751,6 +755,7 @@ export function createDualTrackProposer(options: HarnessProposerOptions): IHarne
   const now = options.now ?? systemClock;
   const newId = options.newId ?? createDeterministicIdFactory('propose');
   const maxLessons = options.maxLessonsPerSection ?? 8;
+  const model = createMeteredModelAdapter(options.model, 'propose', options.metering);
 
   const proposer: IHarnessProposer = {
     async propose(request: ProposeRequest): Promise<ProposedPatch> {
@@ -775,7 +780,7 @@ export function createDualTrackProposer(options: HarnessProposerOptions): IHarne
           attemptIndex: request.attemptIndex
         }
       };
-      const response = await options.model.complete(modelRequest);
+      const response = await model.call(modelRequest);
       const parsed = extractJsonValue(response.text);
       const record = isRecord(parsed) ? parsed : undefined;
       if (record === undefined) {
@@ -888,7 +893,7 @@ export function createDualTrackProposer(options: HarnessProposerOptions): IHarne
         candidateCount: k
       }
     };
-    const response = await options.model.complete(modelRequest);
+    const response = await model.call(modelRequest);
     const parsed = extractJsonValue(response.text);
     const rawCandidates: unknown[] = Array.isArray(parsed)
       ? parsed.slice(0, k)

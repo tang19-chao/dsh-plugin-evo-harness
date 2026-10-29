@@ -143,3 +143,343 @@ export function createJitRuntimeControl(
     }
   };
 }
+
+
+// ---------------------------------------------------------------------------
+// ADR 0006 D-P4-5: explicit authorization ledger - same-process is NOT a sandbox
+// ---------------------------------------------------------------------------
+
+/**
+ * The action classes that can never be authorized implicitly, by JitRL being
+ * switched on, by a shared sessionId, or by running in the same process.
+ *
+ * ADR 0006 states: **a process is not a sandbox.** A probe shares the host's
+ * memory, network and tool surface, so every action below changes state outside
+ * the probe's own measurement world and needs a named human/system grant. This
+ * module only *records and decides* grants; no call site is wired in P4-A (the
+ * plugin entrypoint is outside that task's write scope), so production behavior
+ * is unchanged and every required grant is an explicit future step.
+ *
+ * The ledger is deliberately independent of {@link createJitRuntimeControl}:
+ * `runtimeEnabled: true` authorizes NOTHING here, and a disposed runtime does
+ * not lift these requirements. Permission layering (ADR 0001 D4) is preserved.
+ */
+export const PROBE_AUTHORIZATION_KINDS = [
+  'external-tool-call',
+  'memory-write',
+  'multi-step-probe',
+  'real-host-smoke',
+  'paid-model-call'
+] as const;
+
+export type ProbeAuthorizationKind = (typeof PROBE_AUTHORIZATION_KINDS)[number];
+
+/** The action asking for authorization. */
+export interface ProbeAuthorizationRequest {
+  readonly kind: ProbeAuthorizationKind;
+  /** The probe branch asking; branch-scoped requests need a branch-scoped grant. */
+  readonly branchId?: string;
+  /** A session identity. It NEVER substitutes for a branch identity (ADR 0006 D-P4-1). */
+  readonly sessionId?: string;
+}
+
+export type ProbeAuthorizationCode =
+  | 'authorized'
+  | 'no-grant'
+  | 'grant-expired'
+  | 'identity-required'
+  | 'session-cannot-authorize-branch'
+  | 'grant-scope-mismatch'
+  | 'ledger-disposed';
+
+/** Fail-closed decision; `code` says exactly why an action was not authorized. */
+export interface ProbeAuthorizationDecision {
+  readonly allowed: boolean;
+  readonly code: ProbeAuthorizationCode;
+  readonly kind: ProbeAuthorizationKind;
+  /** Set only for 'authorized': the grant that produced the decision. */
+  readonly grantId?: string;
+}
+
+/** One recorded grant. Grants are explicit, reasoned and removable. */
+export interface ProbeAuthorizationGrant {
+  readonly grantId: string;
+  readonly kind: ProbeAuthorizationKind;
+  /** Non-empty provenance (operator, approved issue, signed scope document). */
+  readonly grantedBy: string;
+  /** Non-empty human-readable reason. */
+  readonly reason: string;
+  readonly branchId?: string;
+  readonly sessionId?: string;
+  readonly createdAt: number;
+  readonly expiresAt?: number;
+  /** Single-use grants are consumed by the first allowed decision. */
+  readonly singleUse: boolean;
+  /** Set once a single-use grant was consumed; the grant no longer authorizes. */
+  readonly usedAt?: number;
+  readonly revokedAt?: number;
+}
+
+/** Input for creating a grant. Rejected when any required field is empty. */
+export interface ProbeAuthorizationGrantSpec {
+  readonly kind: ProbeAuthorizationKind;
+  readonly grantedBy: string;
+  readonly reason: string;
+  /** Restricts the grant to exactly one probe branch. */
+  readonly branchId?: string;
+  /** Restricts the grant to one session (never a substitute for a branch). */
+  readonly sessionId?: string;
+  readonly ttlMs?: number;
+  readonly singleUse?: boolean;
+}
+
+export interface ProbeAuthorizationCounters {
+  readonly grants: number;
+  readonly grantsRejected: number;
+  readonly revocations: number;
+  readonly checks: number;
+  readonly allowed: number;
+  readonly denied: number;
+  /** Per denial code; closure `checks === allowed + denied` always holds. */
+  readonly deniedByCode: Readonly<Record<Exclude<ProbeAuthorizationCode, 'authorized'>, number>>;
+  readonly expiredGrants: number;
+  /** Attempts to authorize a branch with a session-only grant (ADR 0006 D-P4-1). */
+  readonly sessionCannotAuthorizeBranch: number;
+}
+
+export interface ProbeAuthorizationLedgerOptions {
+  readonly now?: () => number;
+  /** Payload-free diagnostic sink (grant/revoke/deny events, no identities). */
+  readonly onDiagnostic?: (message: string) => void;
+}
+
+export interface ProbeAuthorizationLedger {
+  /** Record a grant. Throws (after counting) on an unknown kind or empty provenance. */
+  grant(spec: ProbeAuthorizationGrantSpec): ProbeAuthorizationGrant;
+  revoke(grantId: string): boolean;
+  /** Decide one request; default deny with a structured code. */
+  authorize(request: ProbeAuthorizationRequest): ProbeAuthorizationDecision;
+  /** Live grants in creation order. */
+  grants(): readonly ProbeAuthorizationGrant[];
+  /** Cumulative payload-free counters. */
+  stats(): ProbeAuthorizationCounters;
+  dispose(): void;
+  readonly isDisposed: boolean;
+}
+
+const AUTHORIZATION_KIND_SET: ReadonlySet<string> = new Set(PROBE_AUTHORIZATION_KINDS);
+
+const DENIAL_CODES: readonly Exclude<ProbeAuthorizationCode, 'authorized'>[] = [
+  'no-grant',
+  'grant-expired',
+  'identity-required',
+  'session-cannot-authorize-branch',
+  'grant-scope-mismatch',
+  'ledger-disposed'
+];
+
+/**
+ * Create the authorization ledger. Every decision is deny-by-default: without a
+ * matching, unexpired, non-revoked grant the answer is always `false`, and the
+ * reason is one structured code instead of a silent allow.
+ */
+export function createProbeAuthorizationLedger(
+  options: ProbeAuthorizationLedgerOptions = {}
+): ProbeAuthorizationLedger {
+  const now = options.now ?? ((): number => Date.now());
+  const note = (message: string): void => {
+    options.onDiagnostic?.(message);
+  };
+
+  let disposed = false;
+  let grantSeq = 0;
+  const grantsById = new Map<string, ProbeAuthorizationGrant>();
+  const counters = {
+    grants: 0,
+    grantsRejected: 0,
+    revocations: 0,
+    checks: 0,
+    allowed: 0,
+    denied: 0,
+    deniedByCode: Object.fromEntries(DENIAL_CODES.map((code) => [code, 0])) as Record<
+      Exclude<ProbeAuthorizationCode, 'authorized'>,
+      number
+    >,
+    expiredGrants: 0,
+    sessionCannotAuthorizeBranch: 0
+  };
+
+  const denied = (
+    code: Exclude<ProbeAuthorizationCode, 'authorized'>,
+    kind: ProbeAuthorizationKind,
+    grantId?: string
+  ): ProbeAuthorizationDecision => {
+    counters.checks += 1;
+    counters.denied += 1;
+    counters.deniedByCode[code] += 1;
+    if (code === 'session-cannot-authorize-branch') {
+      counters.sessionCannotAuthorizeBranch += 1;
+    }
+    note('probe_authorization_denied: ' + kind + ' (' + code + ')');
+    return { allowed: false, code, kind, ...(grantId === undefined ? {} : { grantId }) };
+  };
+
+  const dropExpired = (currentTime: number): void => {
+    for (const [id, grant] of [...grantsById.entries()]) {
+      if (grant.expiresAt !== undefined && grant.expiresAt <= currentTime) {
+        grantsById.delete(id);
+        counters.expiredGrants += 1;
+      }
+    }
+  };
+
+  return {
+    get isDisposed(): boolean {
+      return disposed;
+    },
+
+    grant(spec: ProbeAuthorizationGrantSpec): ProbeAuthorizationGrant {
+      if (disposed) {
+        throw new Error('ProbeAuthorizationLedger has been disposed.');
+      }
+      const kind = spec.kind;
+      const grantedBy = typeof spec.grantedBy === 'string' ? spec.grantedBy.trim() : '';
+      const reason = typeof spec.reason === 'string' ? spec.reason.trim() : '';
+      if (!AUTHORIZATION_KIND_SET.has(kind)) {
+        counters.grantsRejected += 1;
+        throw new Error('ProbeAuthorizationLedger.grant requires a known PROBE_AUTHORIZATION_KIND, received: ' + String(kind));
+      }
+      if (grantedBy.length === 0 || reason.length === 0) {
+        counters.grantsRejected += 1;
+        throw new Error('ProbeAuthorizationLedger.grant requires a non-empty grantedBy and reason (explicit authorization, ADR 0006 D-P4-5).');
+      }
+      if (spec.branchId !== undefined && typeof spec.branchId !== 'string') {
+        counters.grantsRejected += 1;
+        throw new Error('ProbeAuthorizationLedger.grant requires branchId to be a string.');
+      }
+      if (spec.sessionId !== undefined && typeof spec.sessionId !== 'string') {
+        counters.grantsRejected += 1;
+        throw new Error('ProbeAuthorizationLedger.grant requires sessionId to be a string.');
+      }
+      grantSeq += 1;
+      const grantId = 'grant-' + String(grantSeq);
+      const currentTime = now();
+      const branchId = spec.branchId !== undefined && spec.branchId.trim().length > 0 ? spec.branchId.trim() : undefined;
+      const sessionId = spec.sessionId !== undefined && spec.sessionId.trim().length > 0 ? spec.sessionId.trim() : undefined;
+      const grant: ProbeAuthorizationGrant = Object.freeze({
+        grantId,
+        kind,
+        grantedBy,
+        reason,
+        ...(branchId === undefined ? {} : { branchId }),
+        ...(sessionId === undefined ? {} : { sessionId }),
+        createdAt: currentTime,
+        ...(typeof spec.ttlMs === 'number' && spec.ttlMs > 0 ? { expiresAt: currentTime + spec.ttlMs } : {}),
+        singleUse: spec.singleUse === true
+      });
+      grantsById.set(grantId, grant);
+      counters.grants += 1;
+      note('probe_authorization_granted: ' + kind + ' (' + grantId + ')');
+      return grant;
+    },
+
+    revoke(grantId: string): boolean {
+      if (disposed || grantsById.get(grantId) === undefined) {
+        return false;
+      }
+      grantsById.delete(grantId);
+      counters.revocations += 1;
+      note('probe_authorization_revoked: ' + grantId);
+      return true;
+    },
+
+    authorize(request: ProbeAuthorizationRequest): ProbeAuthorizationDecision {
+      const kind = request.kind;
+      if (!AUTHORIZATION_KIND_SET.has(kind)) {
+        // An unknown kind is not a grantable action: deny, never guess.
+        return denied('no-grant', kind);
+      }
+      if (disposed) {
+        return denied('ledger-disposed', kind);
+      }
+      const branchId = typeof request.branchId === 'string' && request.branchId.trim().length > 0 ? request.branchId.trim() : undefined;
+      const sessionId = typeof request.sessionId === 'string' && request.sessionId.trim().length > 0 ? request.sessionId.trim() : undefined;
+      if (branchId === undefined && sessionId === undefined) {
+        // Missing identity is fail-closed and counted: a grant cannot attach to
+        // an action nobody can attribute.
+        return denied('identity-required', kind);
+      }
+      const currentTime = now();
+      // A grant that WOULD have matched but expired is reported as
+      // 'grant-expired' instead of collapsing into 'no-grant', so a caller can
+      // tell "never authorized" from "authorization lapsed" (and renew it).
+      let expiredCandidate: ProbeAuthorizationGrant | undefined;
+      for (const grant of grantsById.values()) {
+        if (grant.kind !== kind) {
+          continue;
+        }
+        if (grant.expiresAt !== undefined && grant.expiresAt <= currentTime) {
+          expiredCandidate = expiredCandidate ?? grant;
+          continue;
+        }
+        if (grant.branchId !== undefined) {
+          // A branch-scoped grant covers exactly that branch and nothing else.
+          if (branchId !== grant.branchId) {
+            continue;
+          }
+        } else if (branchId !== undefined) {
+          // A grant without a branchId can never authorize a branch-scoped
+          // action, whatever session it names: sessionId is not a branch
+          // identity (ADR 0006 D-P4-1).
+          return denied('session-cannot-authorize-branch', kind, grant.grantId);
+        }
+        if (grant.sessionId !== undefined && sessionId !== undefined && grant.sessionId !== sessionId) {
+          continue;
+        }
+        if (grant.usedAt !== undefined) {
+          continue;
+        }
+        counters.checks += 1;
+        counters.allowed += 1;
+        if (grant.singleUse) {
+          const consumed: ProbeAuthorizationGrant = Object.freeze({ ...grant, usedAt: currentTime });
+          grantsById.set(grant.grantId, consumed);
+        }
+        note('probe_authorization_allowed: ' + kind + ' (' + grant.grantId + ')');
+        return { allowed: true, code: 'authorized', kind, grantId: grant.grantId };
+      }
+      if (expiredCandidate !== undefined) {
+        grantsById.delete(expiredCandidate.grantId);
+        counters.expiredGrants += 1;
+        return denied('grant-expired', kind, expiredCandidate.grantId);
+      }
+      return denied('no-grant', kind);
+    },
+
+    grants(): readonly ProbeAuthorizationGrant[] {
+      dropExpired(now());
+      return [...grantsById.values()];
+    },
+
+    stats(): ProbeAuthorizationCounters {
+      return Object.freeze({
+        grants: counters.grants,
+        grantsRejected: counters.grantsRejected,
+        revocations: counters.revocations,
+        checks: counters.checks,
+        allowed: counters.allowed,
+        denied: counters.denied,
+        deniedByCode: Object.freeze({ ...counters.deniedByCode }),
+        expiredGrants: counters.expiredGrants,
+        sessionCannotAuthorizeBranch: counters.sessionCannotAuthorizeBranch
+      });
+    },
+
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      grantsById.clear();
+      note('probe_authorization_ledger_disposed');
+    }
+  };
+}

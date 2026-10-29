@@ -702,6 +702,20 @@ export interface IsolatedBranchContext {
   readonly metadata?: ContractMetadata;
 }
 
+/**
+ * P3-A2: a non-behavioral observation, e.g. "the ledger WOULD have denied this
+ * call for budget in observe mode". It is deliberately NOT a FailureSignal:
+ * composer robustness, step-evaluator, the failure taxonomy and prompt builders
+ * all consume failureSignals, so putting an observation there would silently
+ * lower scores and reclassify a normal run as failed.
+ */
+export interface ProbeObservation {
+  readonly kind: string;
+  readonly message: string;
+  readonly stage?: string;
+  readonly details?: ContractMetadata;
+}
+
 /** Outcome returned by the injected branch executor. */
 export interface ProbeExecutionResult {
   readonly status?: TrajectoryStatus;
@@ -712,6 +726,8 @@ export interface ProbeExecutionResult {
   readonly failureSignals?: readonly FailureSignal[];
   readonly error?: TrajectoryError;
   readonly metadata?: ContractMetadata;
+  /** P3-A2 non-behavioral observations; never read as failures. */
+  readonly observations?: readonly ProbeObservation[];
 }
 
 /** Injected branch body. The seam manager supplies context and cleanup. */
@@ -1894,16 +1910,30 @@ export type HostAdvisorDecision =
  *                               (D1 strict default; payload-free, ADR 0001
  *                               section 2.3);
  *   - `advisory` / `ask` / `noop` — advisor decision outcomes;
- *   - `skipped`               — dispatches whose advice channel produced no
- *                               advisor evaluation. This includes skips BEFORE
- *                               the eligibility decision (advisor off or the
- *                               runtime gate closed) AND — after a partial
- *                               eligibility run — the out-of-scope and
- *                               nameless-dispatch paths, which were already
- *                               counted as `considered` but never reached the
- *                               advisor. `skipped` and the outcome counters
+ *   - `skipped`               — dispatches the ADAPTER OBSERVED on its advice
+ *                               channel for which no advisor evaluation
+ *                               happened. Two kinds of real event points book
+ *                               it: (a) BEFORE the eligibility decision, when
+ *                               the runtime gate is closed (`/evo jit off`);
+ *                               (b) after a partial eligibility run, on the
+ *                               out-of-scope / unprovable-identity path and on
+ *                               the nameless-dispatch path (no tool name), which
+ *                               were already counted as `considered` but never
+ *                               reached the advisor.
+ *
+ *                               COUNTING BOUNDARY (R-02): this counter is an
+ *                               adapter observation, NOT a host dispatch count.
+ *                               The adapter books NOTHING when no advisor is
+ *                               mounted (the entrypoint attaches one only when
+ *                               the L3 host advisor is enabled) and nothing
+ *                               after disposal; the counter then keeps its
+ *                               measured initial `0`, which means "no
+ *                               advice-channel skip was observed" — it does NOT
+ *                               mean "every dispatch was skipped" and it must
+ *                               never be read as the host's dispatch volume.
+ *                               `skipped` and the outcome counters
  *                               (`advisory`/`ask`/`noop`) are mutually
- *                               exclusive per dispatch.
+ *                               exclusive per booked event.
  *
  * Payload-free by construction (ADR 0001 section 2.3): counters only — never
  * tool arguments, payload bodies or rendered advice text.

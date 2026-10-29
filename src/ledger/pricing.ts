@@ -14,7 +14,8 @@ import {
   MeasurementPrecision,
   ModelRateCard,
   ProviderUsagePayload,
-  TokenMetric
+  TokenMetric,
+  UsageMetricName
 } from './types.js';
 
 /**
@@ -150,6 +151,24 @@ export function calculateUsageCost(
   } else if (conservativeSurchargeMicros > 0) {
     auditNote = `conservative fallback floor applied: base=${baseCalculatedCost}u, floor=${fallbackFloor}u`;
   }
+  // P3-C: provenance is per dimension. cacheRead that the provider never
+  // reported stays 'unknown'; it is NOT a measured zero and the conservative
+  // floor is a floor, never evidence that cache reads were free.
+  const dimensionProvenance = {
+    input: usage.inputTokens?.precision ?? 'unknown',
+    output: usage.outputTokens?.precision ?? 'unknown',
+    cacheRead: usage.cacheReadTokens?.precision ?? 'unknown',
+    cacheWrite: usage.cacheWriteTokens?.precision ?? 'unknown',
+    reasoning: usage.reasoningTokens?.precision ?? 'unknown'
+  } as const;
+  const cacheReadUnavailable =
+    usage.cacheReadTokens === undefined || usage.cacheReadTokens.precision !== 'measured';
+  if (cacheReadUnavailable) {
+    // An unreported cacheRead dimension is NOT a measured zero. The floor (if
+    // any) is a cost floor, not evidence that cache reads were free.
+    const cacheNote = 'cacheRead unavailable; cacheRead cost is unknown, not a measured zero';
+    auditNote = auditNote === undefined ? cacheNote : auditNote + '; ' + cacheNote;
+  }
 
   return {
     totalCostMicros,
@@ -167,6 +186,8 @@ export function calculateUsageCost(
       conservativeSurchargeMicros: conservativeSurchargeMicros > 0 ? conservativeSurchargeMicros : undefined
     },
     provenance,
+    dimensionProvenance,
+    cacheReadUnavailable,
     conservative,
     auditNote
   };
@@ -229,15 +250,31 @@ export interface RawDshUsageLike {
  */
 export function dshUsageToProviderPayload(
   usage: RawDshUsageLike | undefined,
-  semantics: CountingSemantics = DEFAULT_DSH_COUNTING_SEMANTICS
+  semantics?: CountingSemantics
 ): ProviderUsagePayload {
+  // P3-C: counting semantics come ONLY from the explicit argument (provider or
+  // host metadata). There is no default: omitting them means "unknown", never a
+  // guessed DSH/DeepSeek shape inferred from field names or a model id.
+  const unreported: UsageMetricName[] = [];
   if (!usage) {
     return {
       inputTokens: { tokens: 0, precision: 'unknown' },
       outputTokens: { tokens: 0, precision: 'unknown' },
-      countingSemantics: semantics
+      ...(semantics === undefined ? {} : { countingSemantics: semantics }),
+      unreportedMetrics: [
+        'inputTokens',
+        'outputTokens',
+        'cacheReadTokens',
+        'cacheWriteTokens',
+        'reasoningTokens'
+      ]
     };
   }
+  if (usage.inputTokens === undefined) unreported.push('inputTokens');
+  if (usage.outputTokens === undefined) unreported.push('outputTokens');
+  if (usage.cacheReadTokens === undefined) unreported.push('cacheReadTokens');
+  if (usage.cacheWriteTokens === undefined) unreported.push('cacheWriteTokens');
+  if (usage.reasoningTokens === undefined) unreported.push('reasoningTokens');
   return {
     inputTokens: {
       tokens: usage.inputTokens ?? 0,
@@ -248,17 +285,18 @@ export function dshUsageToProviderPayload(
       precision: usage.outputTokens !== undefined ? 'measured' : 'unknown'
     },
     ...(usage.cacheReadTokens !== undefined
-      ? { cacheReadTokens: { tokens: usage.cacheReadTokens, precision: 'measured' } }
+      ? { cacheReadTokens: { tokens: usage.cacheReadTokens, precision: 'measured' as const } }
       : {}),
     ...(usage.cacheWriteTokens !== undefined
-      ? { cacheWriteTokens: { tokens: usage.cacheWriteTokens, precision: 'measured' } }
+      ? { cacheWriteTokens: { tokens: usage.cacheWriteTokens, precision: 'measured' as const } }
       : {}),
     ...(usage.reasoningTokens !== undefined
-      ? { reasoningTokens: { tokens: usage.reasoningTokens, precision: 'measured' } }
+      ? { reasoningTokens: { tokens: usage.reasoningTokens, precision: 'measured' as const } }
       : {}),
     ...(usage.totalTokens !== undefined
-      ? { totalTokens: { tokens: usage.totalTokens, precision: 'measured' } }
+      ? { totalTokens: { tokens: usage.totalTokens, precision: 'measured' as const } }
       : {}),
-    countingSemantics: semantics
+    ...(semantics === undefined ? {} : { countingSemantics: semantics }),
+    ...(unreported.length === 0 ? {} : { unreportedMetrics: unreported })
   };
 }

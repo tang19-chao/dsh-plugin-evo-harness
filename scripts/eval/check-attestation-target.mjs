@@ -43,6 +43,8 @@
  *   T6 canonical record missing/unreadable/shapeless                 -> FAIL attestation-record-missing
  *   T7 ordinary commit whose record names a non-ancestor             -> FAIL attestation-record-not-ancestor
  *   T8 marker duplicated / unsupported value                         -> FAIL attestation-marker-duplicated / attestation-marker-unsupported
+ *   R-06 evidence commit judging uncommitted/drifted record bytes    -> FAIL attestation-record-not-committed / attestation-record-worktree-drift
+ *      (ordinary commits NOTE the same comparison; the verdict is unchanged)
  *
  * DESIGN RULES (ADR 0005 §1.4, hard constraints)
  * ----------------------------------------------
@@ -64,6 +66,15 @@
  *      on `%B`, so only a real trailer block counts: a body sentence quoting
  *      `Attestation-Target: first-parent` does NOT make a commit an evidence
  *      commit.
+ *   7. (R-06) Record-source binding: the record is READ from the working tree
+ *      but every content check recomputes from the OBJECT DATABASE, so the gate
+ *      explicitly compares the worktree bytes with the judged commit's blob
+ *      (`git ls-tree` + `git cat-file`). An EVIDENCE commit fails with
+ *      `attestation-record-not-committed` (no blob at the path) or
+ *      `attestation-record-worktree-drift` (bytes differ) — an evidence commit
+ *      must judge its own committed bytes, fail-closed. An ORDINARY commit keeps
+ *      the documented "regenerate locally, commit later" posture (ADR §1.6.2):
+ *      the comparison is only a NOTE, never a verdict change.
  *
  * EXIT CODES
  *   0  the commit's rule holds (mode ordinary or evidence, per above)
@@ -81,7 +92,13 @@ import {
   CANONICAL_RECORD_PATH,
   verifyAttestation
 } from './final-attestation.mjs';
-import { GitEvidenceError, assertAncestor, resolveCommit } from './lib/git-objects.mjs';
+import {
+  GitEvidenceError,
+  assertAncestor,
+  readCommitBlobAtPath,
+  resolveCommit,
+  sha256Bytes
+} from './lib/git-objects.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -242,11 +259,70 @@ function readCanonicalRecord(cwd) {
     return {
       record,
       recordedCommitId: null,
+      bytes: null,
       recordMissing:
         `${CANONICAL_RECORD_PATH} has no commit.commitId; a record without a target is not evidence (T6)`
     };
   }
-  return { record, recordedCommitId, recordMissing: null };
+  return { record, recordedCommitId, bytes, recordMissing: null };
+}
+
+/**
+ * R-06: bind the record bytes the gate READS to the commit it JUDGES.
+ *
+ * `readCanonicalRecord` and `verifyAttestation` read the record from the
+ * WORKING TREE (`fs.readFileSync`), while every content check recomputes from
+ * the OBJECT DATABASE. On a clean checkout (CI) the two agree byte for byte; on
+ * a dirty worktree they can disagree, and then the gate would judge bytes that
+ * are not committed evidence. This helper compares the worktree bytes against
+ * the blob at the judged commit:
+ *
+ *   - `committed === null`      : the judged commit has NO record at
+ *     \`CANONICAL_RECORD_PATH\` — the evidence bytes exist only on disk
+ *     (`attestation-record-not-committed`);
+ *   - \`bytes differ\`           : the worktree record drifted from the judged
+ *     commit's blob (`attestation-record-worktree-drift`).
+ *
+ * Failure codes are consumed ONLY where the ADR requires the judged bytes to be
+ * the commit's own (evidence mode, whose declared content is exactly this
+ * record); ordinary mode keeps reading the worktree record (the documented
+ * "regenerate locally, commit later" posture, ADR §1.6.2) and reports the
+ * comparison as a NOTE instead.
+ *
+ * @param {{commitId: string}} commit the judged commit (`resolveCommit` result)
+ * @param {Buffer|null} worktreeBytes the bytes the gate read from disk
+ * @param {string} cwd
+ * @returns {{ok: true, note: string} | {ok: false, code: string, detail: string, note: string}}
+ */
+function compareRecordSource(commit, worktreeBytes, cwd) {
+  const committed = readCommitBlobAtPath(commit, CANONICAL_RECORD_PATH, cwd);
+  if (committed === null) {
+    return {
+      ok: false,
+      code: 'attestation-record-not-committed',
+      detail:
+        `commit ${commit.commitId} has no '${CANONICAL_RECORD_PATH}' blob, but the gate read '${CANONICAL_RECORD_PATH}' from the working tree; ` +
+        'bytes that exist only on disk are not committed evidence, so the gate refuses to judge them (R-06)',
+      note: `record source: NOT committed at ${commit.commitId} (judged from the working tree only)`
+    };
+  }
+  const worktreeSha = worktreeBytes === null ? null : sha256Bytes(worktreeBytes);
+  const committedSha = sha256Bytes(committed.bytes);
+  if (worktreeBytes === null || !worktreeBytes.equals(committed.bytes)) {
+    return {
+      ok: false,
+      code: 'attestation-record-worktree-drift',
+      detail:
+        `the working-tree '${CANONICAL_RECORD_PATH}' does not match the blob committed at ${commit.commitId}` +
+        ` (worktree sha256=${String(worktreeSha)}, committed blob ${committed.blobId} sha256=${committedSha}); ` +
+        'the gate judges COMMITTED evidence, so the drifted working-tree copy is refused (R-06)',
+      note: `record source: worktree sha256=${String(worktreeSha)} != committed ${committed.blobId}`
+    };
+  }
+  return {
+    ok: true,
+    note: `record source: worktree bytes == HEAD blob ${committed.blobId} (sha256 ${committedSha})`
+  };
 }
 
 /**
@@ -292,12 +368,19 @@ export function checkAttestationTarget(options) {
   // shape (the CLI turns `ok:false` into exit 1 either way). The mode reported
   // here is the marker classification determined above ('ordinary' when the
   // commit carries no marker, 'evidence' otherwise); T6 applies to both.
-  const { recordedCommitId, recordMissing } = readCanonicalRecord(cwd);
+  const { recordedCommitId, bytes: recordBytes, recordMissing } = readCanonicalRecord(cwd);
   if (recordMissing !== null) {
     return gateFailure(markerLines.length === 0 ? 'ordinary' : 'evidence', ref, headCommitId, markerLines, 'attestation-record-missing', {
       detailOverride: recordMissing
     });
   }
+
+  // ---- R-06: the bytes this gate reads must be the judged commit's bytes ----
+  // The recordSource failure is consumed per mode below: evidence mode FAILS on
+  // it (its declared content is exactly this record, so uncommitted or drifted
+  // bytes invalidate the declared topology), ordinary mode keeps the
+  // "regenerate locally, commit later" posture and only notes the divergence.
+  const recordSource = compareRecordSource(head, recordBytes, cwd);
 
   if (markerLines.length === 0) {
     // ---- T0 / T7: ordinary commit --------------------------------------
@@ -340,7 +423,11 @@ export function checkAttestationTarget(options) {
       failures,
       notes: [
         `ordinary: HEAD ${headCommitId} is NOT covered by this record; the record binds its own commit ` +
-          `${recordedCommitId} only (self-consistency + ancestry, ADR 0005 §1.3 T0)`
+          `${recordedCommitId} only (self-consistency + ancestry, ADR 0005 §1.3 T0)`,
+        // R-06: ordinary mode keeps the documented "regenerate locally, commit
+        // later" posture, so the worktree/HEAD comparison is OBSERVATION only -
+        // it never changes the verdict.
+        recordSource.note
       ],
       verifyNotes: verify.notes
     };
@@ -373,6 +460,17 @@ export function checkAttestationTarget(options) {
     });
   }
 
+  // R-06 (fail-closed): an evidence commit declares that its ONLY content is
+  // this record, so the bytes being judged must be exactly the bytes the commit
+  // contains. Uncommitted or worktree-drifted bytes would let a gate PASS on
+  // evidence the commit never carried - refuse them with a named code.
+  if (!recordSource.ok) {
+    return gateFailure('evidence', ref, headCommitId, markerLines, recordSource.code, {
+      parent,
+      detailOverride: recordSource.detail
+    });
+  }
+
   // T1/T2: three-way binding - the record must name exactly HEAD^1 (expectCommit)
   // AND re-verify against it (content) via the SHARED verifier.
   const verify = verifyAttestation(CANONICAL_RECORD_PATH, { cwd, expectCommit: parent });
@@ -398,7 +496,10 @@ export function checkAttestationTarget(options) {
     failures,
     notes: [
       `evidence: parent=${parent} (HEAD^1) is covered by this record ` +
-        '(marker + record-only + non-merge + unmarked parent, ADR 0005 §1.3 T1)'
+        '(marker + record-only + non-merge + unmarked parent, ADR 0005 §1.3 T1)',
+      // R-06: on PASS the binding is still stated explicitly, so a reviewer can
+      // see that the judged bytes were the commit's own bytes.
+      recordSource.note
     ],
     verifyNotes: verify.notes
   };
@@ -565,7 +666,11 @@ const USAGE_TEXT = [
   'attestation-evidence-merge, attestation-evidence-stacked,',
   'attestation-record-missing, attestation-record-not-ancestor,',
   'attestation-marker-duplicated, attestation-marker-unsupported,',
-  'attestation-content-mismatch).'
+  'attestation-record-not-committed, attestation-record-worktree-drift,',
+  'attestation-content-mismatch).',
+  'R-06: an evidence commit must judge its own committed record bytes',
+  '(no blob at the path / worktree drift = fail); an ordinary commit only',
+  'NOTES the worktree/HEAD comparison.'
 ].join('\n');
 
 const isDirectExecution = process.argv[1] !== undefined && path.resolve(process.argv[1]) === path.resolve(__filename);

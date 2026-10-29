@@ -404,3 +404,193 @@ describe('readme default-leaf docs gate (ADR 0005 §4 D4)', () => {
     assertNoResidue(dir);
   });
 });
+
+/**
+ * R-04: the three-way count-closure and test-root attribution checks.
+ *
+ * What is pinned, and why:
+ *  - The gate asserts unit + e2e == total on BOTH sides (README and report) and
+ *    that the summary line equals the table total — WITHOUT depending on any
+ *    absolute number, so the assertions stay meaningful while the counts move.
+ *  - EVERY consumed test file must live under `tests/unit/` or `tests/e2e/`:
+ *    a third test root means the documented two-suite breakdown cannot describe
+ *    the real run, and the gate must fail by NAME instead of silently dropping
+ *    those files from every count it verifies.
+ *  - The shipped README must close TODAY (its own unit + e2e == total), which is
+ *    what makes the closure assertion a regression guard rather than a tautology.
+ */
+describe('count closure and test-root attribution (R-04)', () => {
+  /** Read the README's own unit/e2e/total numbers with the gate's row shapes. */
+  function readmeCounts(readme: string): {
+    summary: [number, number];
+    unit: [number, number];
+    e2e: [number, number];
+    total: [number, number];
+  } {
+    const summary = readme.match(/reports\s+`(\d+)`\s+test files and\s+`(\d+)`\s+passing tests for\s+`pnpm run test`/i);
+    const unit = readme.match(/\|\s*`pnpm run test:unit`\s*\|\s*`tests\/unit`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i);
+    const e2e = readme.match(/\|\s*`pnpm run test:e2e`\s*\|\s*`tests\/e2e`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i);
+    const total = readme.match(/\|\s*`pnpm run test`\s*\|\s*everything\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i);
+    expect(summary).not.toBeNull();
+    expect(unit).not.toBeNull();
+    expect(e2e).not.toBeNull();
+    expect(total).not.toBeNull();
+    return {
+      summary: [Number(summary![1]), Number(summary![2])],
+      unit: [Number(unit![1]), Number(unit![2])],
+      e2e: [Number(e2e![1]), Number(e2e![2])],
+      total: [Number(total![1]), Number(total![2])]
+    };
+  }
+
+  it('the shipped README closes today: unit + e2e == total, and the summary equals the total row', () => {
+    const counts = readmeCounts(realReadme);
+    expect(counts.unit[0] + counts.e2e[0]).toBe(counts.total[0]);
+    expect(counts.unit[1] + counts.e2e[1]).toBe(counts.total[1]);
+    expect(counts.summary[0]).toBe(counts.total[0]);
+    expect(counts.summary[1]).toBe(counts.total[1]);
+  });
+
+  it('fails and names the file when a test file lives in a third test root', () => {
+    const dir = makeFixtureDir('third-root', fixtureReadme(buildReferenceRows()));
+    // README numbers deliberately MATCH the report, so the ONLY failures are the
+    // two new assertion classes (attribution + report-side closure).
+    fs.writeFileSync(
+      path.join(dir, 'README.md'),
+      fixtureReadme(buildReferenceRows())
+        .replace('reports `1` test files and `2` passing tests for `pnpm run test`', 'reports `2` test files and `4` passing tests for `pnpm run test`')
+        .replace('| `pnpm run test:unit` | `tests/unit` | 1 files, 2 tests |', '| `pnpm run test:unit` | `tests/unit` | 1 files, 2 tests |')
+        .replace('| `pnpm run test` | everything | 1 files, 2 tests |', '| `pnpm run test` | everything | 2 files, 4 tests |'),
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(dir, 'third-root-report.json'),
+      JSON.stringify({
+        numTotalTests: 4,
+        numPassedTests: 4,
+        numFailedTests: 0,
+        numPendingTests: 0,
+        testResults: [
+          {
+            name: fixtureReportFile,
+            assertionResults: [
+              { fullName: 'a passes', status: 'passed', title: 'a passes' },
+              { fullName: 'b passes', status: 'passed', title: 'b passes' }
+            ]
+          },
+          {
+            name: '/virtual/tests/integration/b.test.ts',
+            assertionResults: [
+              { fullName: 'c passes', status: 'passed', title: 'c passes' },
+              { fullName: 'd passes', status: 'passed', title: 'd passes' }
+            ]
+          }
+        ]
+      }),
+      'utf8'
+    );
+    const run = runGate(dir, ['--report', 'third-root-report.json', '--readme', 'README.md']);
+    expect(run.status).toBe(1);
+    // 1. attribution: the third-root file is named, never silently dropped.
+    expect(run.stderr).toContain('outside the documented test roots');
+    expect(run.stderr).toContain('unattributed-root: /virtual/tests/integration/b.test.ts');
+    // 2. report-side closure: unit + e2e can no longer equal the total.
+    expect(run.stderr).toContain('Vitest counts do not close');
+    // The README-side numbers matched the report, so no README absolute-number
+    // mismatch is manufactured here beyond the closure itself.
+    assertNoResidue(dir);
+  });
+
+  it('fails when the README counts do not close (unit + e2e != total)', () => {
+    const dir = makeFixtureDir('unclosed', fixtureReadme(buildReferenceRows()));
+    // unit claims 1 test but the report says 2, and the README rows then cannot
+    // close: 1 + 0 != 2. Both the equality check and the closure check fire.
+    fs.writeFileSync(
+      path.join(dir, 'README.md'),
+      fixtureReadme(buildReferenceRows()).replace('| `pnpm run test:unit` | `tests/unit` | 1 files, 2 tests |', '| `pnpm run test:unit` | `tests/unit` | 1 files, 1 tests |'),
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(dir, 'green-report.json'),
+      JSON.stringify({
+        numTotalTests: 2,
+        numPassedTests: 2,
+        numFailedTests: 0,
+        numPendingTests: 0,
+        testResults: [
+          {
+            name: fixtureReportFile,
+            assertionResults: [
+              { fullName: 'a passes', status: 'passed', title: 'a passes' },
+              { fullName: 'b passes', status: 'passed', title: 'b passes' }
+            ]
+          }
+        ]
+      }),
+      'utf8'
+    );
+    const run = runGate(dir, ['--report', 'green-report.json', '--readme', 'README.md']);
+    expect(run.status).toBe(1);
+    expect(run.stderr).toContain('README counts do not close (tests): unit (1) + e2e (0) != total (2)');
+    expect(run.stderr).toContain('Table unit tests mismatch');
+    assertNoResidue(dir);
+  });
+
+  it('reports the closure line when the two documented roots close exactly', () => {
+    const dir = makeFixtureDir('closed', fixtureReadme(buildReferenceRows()));
+    fs.writeFileSync(
+      path.join(dir, 'green-report.json'),
+      JSON.stringify({
+        numTotalTests: 2,
+        numPassedTests: 2,
+        numFailedTests: 0,
+        numPendingTests: 0,
+        testResults: [
+          {
+            name: fixtureReportFile,
+            assertionResults: [
+              { fullName: 'a passes', status: 'passed', title: 'a passes' },
+              { fullName: 'b passes', status: 'passed', title: 'b passes' }
+            ]
+          }
+        ]
+      }),
+      'utf8'
+    );
+    const run = runGate(dir, ['--report', 'green-report.json', '--readme', 'README.md']);
+    expect({ status: run.status, stderr: run.stderr }).toMatchObject({ status: 0 });
+    expect(run.stdout).toContain('Counts close: unit + e2e == total');
+    assertNoResidue(dir);
+  });
+
+  /**
+   * KNOWN COVERAGE GAP RATCHET — NOT a claim that the branch is exercised.
+   *
+   * The gate's inner-run try/catch has two exits: (a) vitest fails AND leaves a
+   * report -> name the failures and continue; (b) vitest fails and leaves NO
+   * report -> rethrow. (a) is pinned by the two tests above. (b) cannot be staged
+   * from a fixture: the gate resolves `rootDir` from its own `__dirname`, so the
+   * inner run is always this repository's real, currently-green suite, and no argv
+   * or cwd a test may pass can redirect it.
+   *
+   * So instead of a fake test, this ratchet pins the guard's TEXT: if someone
+   * deletes the rethrow, the assertion below goes red and they must come here and
+   * read why it existed. Deleting it still fails CLOSED (proceeding would raise
+   * ENOENT and main() exits non-zero) — what is lost is only the accurate
+   * "the inner run failed" message, which is exactly the misattribution the
+   * try/catch was added to remove.
+   *
+   * RELEASE CONDITION: delete this ratchet in the SAME change that gives the gate
+   * an injectable command or rootDir (at which point branch (b) becomes stageable
+   * and must get a real test), or that removes the guard.
+   */
+  it('keeps the untestable no-report rethrow guard, and says why (ratchet)', () => {
+    const source = fs.readFileSync(gateScript, 'utf8');
+    expect(source).toContain('if (!fs.existsSync(tempReportFile)) {');
+    expect(source).toContain('throw runError;');
+    // The guard must live INSIDE the catch, not in the happy path.
+    const catchIndex = source.indexOf('} catch (runError) {');
+    expect(catchIndex).toBeGreaterThan(-1);
+    expect(source.indexOf('if (!fs.existsSync(tempReportFile)) {')).toBeGreaterThan(catchIndex);
+  });
+});

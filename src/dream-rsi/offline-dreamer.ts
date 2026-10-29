@@ -48,6 +48,8 @@ import type {
   PolicyEvaluation
 } from '../types/contracts';
 import { BATCH_SLOT_KINDS, DREAM_RHO_PREFERENCES } from '../types/contracts';
+// P3-B: policy generation is metered and stage-labelled 'dream'.
+import { createMeteredModelAdapter, type MeteredModelOptions } from '../dsh-bridge/metered-model-adapter';
 import { DEFAULT_EVO_HARNESS_CONFIG } from '../config';
 import {
   REPLAY_GATE_BOUNDARY,
@@ -1849,6 +1851,8 @@ export interface ModelPolicyGeneratorOptions {
   readonly now?: () => number;
   readonly temperature?: number;
   readonly fallback?: PolicyGenerator;
+  /** P3-B metering wiring; absent records calls without cost. */
+  readonly metering?: MeteredModelOptions;
 }
 
 /**
@@ -1864,6 +1868,7 @@ export function createModelPolicyGenerator(
   const fallback =
     options.fallback ??
     ((baseline, count) => generateCandidatePolicies(baseline, count, { now }));
+  const model = createMeteredModelAdapter(adapter, 'dream', options.metering);
   return async (baseline, count, request) => {
     const instruction =
       'Propose ' +
@@ -1887,7 +1892,7 @@ export function createModelPolicyGenerator(
       String(request.trees.length) +
       '.';
     try {
-      const response = await adapter.complete({
+      const response = await model.call({
         purpose: 'dream_policy',
         messages: [
           {

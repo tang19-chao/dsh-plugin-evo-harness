@@ -779,6 +779,199 @@ export function experienceFilterReason(
   return 'kept';
 }
 
+// ---------------------------------------------------------------------------
+// Section 6.2/6.5: production-filtered survival (P2-B / p2-a-b-kernel)
+// ---------------------------------------------------------------------------
+
+/**
+ * One snapshot's fate under a filter, counted per reason.
+ *
+ * Why this is part of the kernel and not a test helper: "the replay learned
+ * something" is a claim about the PRODUCTION-filtered neighbourhood, and the
+ * interesting failure is not "few neighbours" but "zero survivors while the
+ * snapshot looked full". A consumer that reports a policy effect without
+ * carrying this denominator can not be audited after the fact, so the evidence
+ * is a first-class value its callers must pass around.
+ */
+export interface ExperienceSurvival {
+  /** The filter's level (part of its identity; copied for the error message). */
+  readonly level: JitLevel;
+  /** Denominator: records the filter saw. */
+  readonly records: number;
+  /** Records that survived; the usable neighbourhood denominator. */
+  readonly survivors: number;
+  /** records - survivors. */
+  readonly excluded: number;
+  /** Counts per reason, 'kept' included, so a caller can print the split. */
+  readonly byReason: Readonly<Record<ExperienceFilterReason, number>>;
+  /** The largest EXCLUSION reason, or null when nothing was excluded. */
+  readonly mainExclusion: ExperienceFilterReason | null;
+  readonly excludeLegacy: boolean;
+  readonly learningEligibleOnly: boolean;
+  /** Up to three excluded records as 'id:reason', for a readable failure. */
+  readonly sample: readonly string[];
+}
+
+/** Zeroed reason table (kept in sync with EXPERIENCE_FILTER_REASONS by tests). */
+function emptyFilterReasonCounts(): Record<ExperienceFilterReason, number> {
+  const counts = {} as Record<ExperienceFilterReason, number>;
+  for (const reason of EXPERIENCE_FILTER_REASONS) {
+    counts[reason] = 0;
+  }
+  return counts;
+}
+
+/**
+ * Tally one snapshot against one filter. Pure; preserves the caller's order in
+ * the sample list, so a failure names the first offending records
+ * deterministically.
+ */
+export function experienceSurvival(
+  records: readonly ExperienceRecord[],
+  options: ExperienceFilterOptions
+): ExperienceSurvival {
+  const byReason = emptyFilterReasonCounts();
+  const sample: string[] = [];
+  const seen = Array.isArray(records) ? records : [];
+  let survivors = 0;
+  for (const record of seen) {
+    const reason = experienceFilterReason(record, options);
+    byReason[reason] += 1;
+    if (reason === 'kept') {
+      survivors += 1;
+    } else if (sample.length < 3) {
+      sample.push(((record as ExperienceRecord | null)?.id ?? '<missing-id>') + ':' + reason);
+    }
+  }
+  let mainExclusion: ExperienceFilterReason | null = null;
+  let mainCount = 0;
+  for (const reason of EXPERIENCE_FILTER_REASONS) {
+    if (reason === 'kept') {
+      continue;
+    }
+    if (byReason[reason] > mainCount) {
+      mainCount = byReason[reason];
+      mainExclusion = reason;
+    }
+  }
+  return {
+    level: options.level,
+    records: seen.length,
+    survivors,
+    excluded: seen.length - survivors,
+    byReason,
+    mainExclusion,
+    excludeLegacy: options.excludeLegacy === true,
+    learningEligibleOnly: options.learningEligibleOnly === true,
+    sample
+  };
+}
+
+/** Scope of a learning-facing survival probe (the kernel's own filter inputs). */
+export interface LearningSurvivalScope {
+  readonly level: JitLevel;
+  readonly bucket?: string;
+  readonly guidance?: GuidanceMode;
+  readonly before?: number;
+  readonly minimumExperienceSchemaVersion?: number;
+}
+
+/**
+ * Survival under THE production learning filter.
+ *
+ * This is the exact filter every learning consumer must apply
+ * ({@link learningFacingFilterOptions}), so the denominator a replay reports is
+ * the denominator the online decision would have had. Building the options here
+ * (instead of letting each caller pass two booleans) is what makes "did the
+ * caller actually opt in?" answerable from the survival record itself.
+ */
+export function learningFacingSurvival(
+  records: readonly ExperienceRecord[],
+  scope: LearningSurvivalScope
+): ExperienceSurvival {
+  return experienceSurvival(records, {
+    level: scope.level,
+    ...(scope.bucket === undefined ? {} : { bucket: scope.bucket }),
+    ...(scope.guidance === undefined ? {} : { guidance: scope.guidance }),
+    ...(scope.before === undefined ? {} : { before: scope.before }),
+    ...learningFacingFilterOptions(
+      scope.minimumExperienceSchemaVersion === undefined
+        ? {}
+        : { minimumExperienceSchemaVersion: scope.minimumExperienceSchemaVersion }
+    )
+  });
+}
+
+/** Stable code carried by {@link LearningFacingSurvivalError}. */
+export const LEARNING_FACING_SURVIVAL_ABORT = 'learning_facing_survival_abort' as const;
+
+/**
+ * The explicit abort for "every record was filtered out".
+ *
+ * A replay/selection run whose production-filtered denominator is zero has no
+ * evidence at all: every q is null, every advantage is zero, and the reported
+ * "effect" is guaranteed to be the prior. Reporting that as a policy result is
+ * the defect P2-B closes, so it is an ERROR - never a warning, never a silent
+ * zero-advantage decision.
+ */
+export class LearningFacingSurvivalError extends Error {
+  readonly code: string = LEARNING_FACING_SURVIVAL_ABORT;
+  readonly survival: ExperienceSurvival;
+  readonly context: string;
+
+  constructor(context: string, survival: ExperienceSurvival) {
+    const reasons = EXPERIENCE_FILTER_REASONS.filter((reason) => reason !== 'kept')
+      .map((reason) => reason + '=' + String(survival.byReason[reason]))
+      .join(', ');
+    super(
+      'learning-facing survival abort (' +
+        context +
+        '): ' +
+        String(survival.survivors) +
+        ' of ' +
+        String(survival.records) +
+        ' records survive the production filter' +
+        (survival.mainExclusion === null ? '' : '; main exclusion reason: ' + survival.mainExclusion) +
+        ' [' +
+        reasons +
+        ']' +
+        ' - with no learnable evidence the run must abort instead of reporting a policy effect.' +
+        ' Records must be stamped with the current reward contract (rewardVersion=' +
+        CURRENT_REWARD_VERSION +
+        '), experienceSchemaVersion >= ' +
+        String(EXPERIENCE_SCHEMA_VERSION) +
+        ' and learningEligible !== false.' +
+        (survival.sample.length === 0 ? '' : ' Excluded sample: ' + survival.sample.join(', '))
+    );
+    this.name = 'LearningFacingSurvivalError';
+    this.context = context;
+    this.survival = survival;
+  }
+}
+
+/**
+ * Assert the production-filtered denominator is non-empty.
+ *
+ * Empty snapshot: a cold start is legitimate and NOT an abort (there is nothing
+ * to filter). Non-empty snapshot with zero survivors: every record was legacy or
+ * learning-ineligible, which is a producer-contract failure, so it aborts. The
+ * threshold is a minimum SURVIVOR count, not a share, because one usable record
+ * is still evidence while zero never is.
+ */
+export function assertLearningFacingSurvival(
+  survival: ExperienceSurvival,
+  options: { readonly context?: string; readonly minimumSurvivors?: number } = {}
+): ExperienceSurvival {
+  const minimum = Math.max(1, Math.trunc(finiteOr(options.minimumSurvivors, 1)));
+  if (survival.records > 0 && survival.survivors < minimum) {
+    throw new LearningFacingSurvivalError(
+      options.context ?? 'learning-facing decision',
+      survival
+    );
+  }
+  return survival;
+}
+
 /** Apply the shared filter, preserving the caller's order. */
 export function filterExperienceSnapshot(
   records: readonly ExperienceRecord[],

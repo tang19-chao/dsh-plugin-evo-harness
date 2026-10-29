@@ -1,0 +1,8 @@
+{
+  "purpose": "deliberately contaminated generation artifact: a holdout case id appears, the firewall must fail",
+  "generatedBy": "p5-synthetic-generator",
+  "cases": [
+    "p5-case-p1",
+    "p5-holdout-p1"
+  ]
+}

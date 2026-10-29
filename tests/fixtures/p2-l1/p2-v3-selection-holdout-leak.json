@@ -1,0 +1,7 @@
+{
+  "purpose": "deliberately contaminated artifact: a holdout id in the selection pool (firewall must fail)",
+  "pool": [
+    "v3-ci-01",
+    "v3-mig-01"
+  ]
+}

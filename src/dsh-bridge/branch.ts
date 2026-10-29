@@ -43,6 +43,11 @@ import type {
   TrajectoryStep
 } from '../types/contracts';
 import type { DshModelRoute } from './model';
+// P3-B: every probe branch model call goes through the unified metered boundary.
+import {
+  createMeteredModelAdapter,
+  type MeteredModelOptions
+} from './metered-model-adapter';
 
 /** Where the probe's prompt text comes from. */
 export type BranchPromptSource = (context: IsolatedBranchContext) => readonly ModelMessage[];
@@ -70,6 +75,8 @@ export interface BranchAdapters {
   readonly probeTimeoutMs?: number;
   /** Receiver for non-fatal observations; never throws into the run. */
   readonly onDiagnostic?: (message: string) => void;
+  /** P3-B metering wiring (ledger/registry); absent records calls without cost. */
+  readonly metering?: MeteredModelOptions;
 }
 
 /** Executor plus the recorded identity of what it can do. */
@@ -237,6 +244,11 @@ export function createBranchExecutor(
   if (adapters.memory === undefined) {
     capabilities.push('memory bridge unavailable: branch-scoped recall is skipped');
   }
+  const meteredModel =
+    adapters.model === undefined
+      ? undefined
+      : createMeteredModelAdapter(adapters.model, 'probe', adapters.metering);
+  capabilities.push('metering: ' + (meteredModel?.metering ?? 'unmetered'));
 
   const runBranch = async (context: IsolatedBranchContext): Promise<ProbeExecutionResult> => {
     const recorder = new BranchRecorder(now, context.mountedSurfaces);
@@ -264,7 +276,7 @@ export function createBranchExecutor(
       }
     });
 
-    const model = adapters.model;
+    const model = meteredModel;
     if (model === undefined) {
       const message =
         'no model adapter is available to this probe; inject options.model, or mount @deepseek-ai/dsh-llm '
@@ -316,12 +328,14 @@ export function createBranchExecutor(
       recorder.push('model', {
         text: 'model request sent',
         metadata: {
-          purpose: 'compose',
+          // P3-B: a probe branch is PROBE traffic. Labelling it 'compose' made
+          // routing/usage statistics treat candidate execution as judging.
+          purpose: 'probe',
           provider: adapters.route?.provider ?? null,
           model: adapters.route?.model ?? null
         }
       });
-      const call = model.complete({ purpose: 'compose', messages });
+      const call = model.call({ purpose: 'probe', messages });
       // The losing promise must stay handled so a late rejection from an
       // abandoned model call can never become an unhandled rejection.
       call.catch(() => undefined);

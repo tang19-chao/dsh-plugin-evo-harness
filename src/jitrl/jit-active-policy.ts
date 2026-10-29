@@ -158,6 +158,12 @@ export interface JitBatchDiagnostics {
     /** True when non-learning evidence was excluded (§6.2). */
     readonly learningEligibleOnly?: boolean;
   };
+  /**
+   * P6 (ADR 0007 §4/§5): budget-gate diagnostics. Present ONLY when the
+   * decorator was constructed with a `budget` block - the pre-P6 shape has no
+   * such key at all, so a default construction stays byte-identical.
+   */
+  readonly budget?: BudgetGateResult;
 }
 
 /** One per-slot diagnostic line; mirrors JitAdjustment with the action key inlined. */
@@ -308,6 +314,14 @@ export interface JitActivePolicyOptions {
   readonly policyConfigProvider?: EffectivePolicyConfigProvider;
   /** C2b (ADR 0004 §8): Dual-track consumption options */
   readonly dualTrack?: DualTrackConsumptionOptions;
+  /**
+   * P6 (ADR 0007 §4/§5): budget tiers, the ask-only reminder and the
+   * measured-only Pareto axis. Absent means the hook is fully OFF: no gate is
+   * computed, no diagnostics key is added and the plan is byte-identical to
+   * the pre-P6 output. Present but `reminder.enabled` false keeps the gate
+   * diagnostic-only (the default, rollback-safe shape).
+   */
+  readonly budget?: BudgetHookConfig;
 }
 
 function resolveSnapshot(source: ExperienceSnapshotSource | undefined): readonly ExperienceRecord[] {
@@ -478,6 +492,262 @@ function resolveCacheEntries(configured: number | undefined): number {
   );
 }
 
+// ---------------------------------------------------------------------------
+// P6 (ADR 0007 §4/§5): budget tiers, the ask-only reminder and the
+// measured-only Pareto axis.
+//
+// Everything below is ADDITIVE and OFF by default: a decorator constructed
+// without a `budget` block produces exactly the pre-P6 plan and carries no
+// budget diagnostics at all. The hook can only ASK - it never removes a slot,
+// never reorders a plan, never denies a decision and never rewrites a tool
+// result (post-execute is observation-only; a host-side reminder belongs in
+// the pre-step additionalContexts channel, ADR 0007 §4.4).
+// ---------------------------------------------------------------------------
+
+/** P6 budget tiers (ADR 0007 §4). A tier is a probe-count budget, nothing else. */
+export const BUDGET_TIERS = ['lite', 'medium', 'heavy'] as const;
+export type BudgetTier = (typeof BUDGET_TIERS)[number];
+
+/**
+ * Probe-count ceiling per tier (ADR 0007 §4.2).
+ *
+ * These are LOCAL operational defaults for this repository's batch widths.
+ * They are deliberately NOT weights lifted from any paper (a paper's numbers
+ * are that paper's optima, not this repository's), and they are NOT money: a
+ * tier caps how many probe slots one round may spend. Probe counts are never
+ * expressed as, or converted into, a monetary amount - only a MEASURED ledger
+ * cost may be quoted in currency, and this hook quotes none.
+ */
+export const BUDGET_TIER_PROBE_CEILINGS: Readonly<Record<BudgetTier, number>> = Object.freeze({
+  lite: 2,
+  medium: 4,
+  heavy: 8
+});
+
+/** Provenance of a cost figure on the Pareto axis (ADR 0007 §5). */
+export type CostProvenance = 'measured' | 'estimated' | 'unknown';
+
+/**
+ * One cost observation offered to the Pareto axis (ADR 0007 §5).
+ *
+ * `costProvenance` is mapped from the P3 ledger buckets: an observation may
+ * claim `measured` ONLY when the whole call cost is measured
+ * (`CostCalculation.dimensionProvenance` all `measured`). Estimated and
+ * unknown observations never enter the axis - and they are not filtered out
+ * either: ONE of them makes the WHOLE axis unavailable (`§5.2`), because a
+ * measured-only subset would be selected by exactly the cost dimension being
+ * compared, which is a silent favourable bias.
+ */
+export interface CostObservation {
+  /** Stable caller-chosen id; echoed on the front unchanged. */
+  readonly id: string;
+  /** Probe count spent for this observation (the tier's unit; never money). */
+  readonly probes: number;
+  /** Comparable quality in [0, 1]. */
+  readonly quality: number;
+  readonly costProvenance: CostProvenance;
+}
+
+/** The ask-only budget reminder payload (ADR 0007 §4.3). */
+export interface BudgetReminder {
+  readonly kind: 'budget-tier-exceeded';
+  /** Probes the plan would spend this round (BatchPlan.width at decision time). */
+  readonly observedProbes: number;
+  /** The tier's probe ceiling. */
+  readonly probeCeiling: number;
+  readonly tier: BudgetTier;
+  /** Always 'probes': the reminder never claims a monetary amount (§4.2). */
+  readonly unit: 'probes';
+}
+
+/** Resolved budget-gate result for one decision (diagnostics only). */
+export interface BudgetGateResult {
+  readonly tier: BudgetTier;
+  /** Probe ceiling of the tier. */
+  readonly probeCeiling: number;
+  /** Probes the plan would spend this round. */
+  readonly observedProbes: number;
+  /** observedProbes <= probeCeiling. Over-tier is REPORTED, never denied. */
+  readonly withinTier: boolean;
+  /**
+   * Pareto-axis state. 'measured' = every observation is measured and the
+   * front is trustworthy. 'unavailable' = zero observations or at least one
+   * estimated/unknown observation: NO front is computed (whole-axis
+   * fail-closed, ADR 0007 §5.2).
+   */
+  readonly costAxisProvenance: 'measured' | 'unavailable';
+  /** Observations that forced 'unavailable' (estimated/unknown/unusable shape). */
+  readonly costAxisRejected: number;
+  /** Front ids; absent unless the axis is 'measured'. */
+  readonly pareto?: {
+    readonly nondominatedIds: readonly string[];
+    readonly dominatedIds: readonly string[];
+  };
+  /** The ask-only reminder; absent unless the reminder switch allowed it. */
+  readonly reminder?: BudgetReminder;
+}
+
+/**
+ * P6 budget hook configuration (ADR 0007 §4/§5). An absent `budget` block
+ * means the hook is fully OFF and the plan is byte-identical to pre-P6.
+ */
+export interface BudgetHookConfig {
+  /** Budget tier; defaults to 'medium'. */
+  readonly tier?: BudgetTier;
+  /**
+   * Ask-only reminder channel (ADR 0007 §4.3).
+   *
+   * Its OWN permission switch, default FALSE. It never reuses the
+   * guarded-active/patch permission, the execution mode or any other flag:
+   * enabling a budget reminder must not be reachable from a permission that
+   * authorizes patches. The reminder can only ask - it appends diagnostics and
+   * calls onReminder; it can never remove a slot or deny a decision.
+   */
+  readonly reminder?: {
+    /** Independent permission switch; defaults to false. */
+    readonly enabled?: boolean;
+    /** Reminder sink; absent keeps reminders in the diagnostics only. */
+    readonly onReminder?: (reminder: BudgetReminder) => void;
+  };
+  /**
+   * Cost observations for the Pareto axis (ADR 0007 §5).
+   *
+   * Supplied by the caller from the P3 ledger's MEASURED bucket. The decorator
+   * never derives them from a holdout split: held-out data is reserved for the
+   * pre-registered final-winner check and must not reach selection, filtering
+   * or tuning (ADR 0007 §3). An empty or partly non-measured list leaves the
+   * axis unavailable rather than half-populated.
+   */
+  readonly costObservations?: readonly CostObservation[];
+}
+
+/** Resolve a budget tier to its probe ceiling; an unknown tier fails CLOSED. */
+export function resolveBudgetTier(tier: BudgetTier | undefined): {
+  readonly tier: BudgetTier;
+  readonly probeCeiling: number;
+} {
+  const resolved: BudgetTier = tier ?? 'medium';
+  if (!(BUDGET_TIERS as readonly string[]).includes(resolved)) {
+    throw new TypeError(
+      'unknown budget tier ' + String(tier) + ' (expected one of ' + BUDGET_TIERS.join('|') + ')'
+    );
+  }
+  const probeCeiling = BUDGET_TIER_PROBE_CEILINGS[resolved];
+  if (!Number.isFinite(probeCeiling) || probeCeiling <= 0) {
+    throw new TypeError(
+      'budget tier ' + resolved + ' must have a positive finite probe ceiling'
+    );
+  }
+  return { tier: resolved, probeCeiling };
+}
+
+/** Why one observation cannot be admitted to the axis, if it cannot. */
+function costObservationIssue(observation: CostObservation): string | undefined {
+  if (typeof observation.id !== 'string' || observation.id.length === 0) {
+    return 'id must be a non-empty string';
+  }
+  if (!Number.isFinite(observation.probes) || observation.probes < 0) {
+    return 'probes must be a finite number >= 0';
+  }
+  if (
+    !Number.isFinite(observation.quality) ||
+    observation.quality < 0 ||
+    observation.quality > 1
+  ) {
+    return 'quality must be a finite number in [0, 1]';
+  }
+  if (observation.costProvenance !== 'measured') {
+    return 'costProvenance "' + String(observation.costProvenance) + '" is not measured';
+  }
+  return undefined;
+}
+
+/**
+ * Strict dominance on the (quality max, probes min) plane.
+ *
+ * A dominates B only when A is nowhere strictly worse and strictly better on
+ * at least one axis. Equality on both axes is NOT domination (two identical
+ * observations both stay on the front), and an improvement on one axis never
+ * buys a regression on the other - which is exactly what makes "non-inferior"
+ * a different and WEAKER statement than this test (ADR 0007 §2).
+ */
+function dominates(a: CostObservation, b: CostObservation): boolean {
+  if (a.quality < b.quality || a.probes > b.probes) {
+    return false;
+  }
+  return a.quality > b.quality || a.probes < b.probes;
+}
+
+/**
+ * Compute the Pareto front over cost observations (ADR 0007 §5).
+ *
+ * WHOLE-AXIS fail-closed: zero observations, or any observation whose
+ * provenance is not 'measured' (or whose shape is unusable), yields
+ * `usable: false` with an EMPTY front - never a front computed over the
+ * surviving measured subset. Input order is preserved, so the output is
+ * deterministic for a fixed input.
+ */
+export function paretoFront(observations: readonly CostObservation[] | undefined): {
+  readonly usable: boolean;
+  readonly rejected: number;
+  readonly nondominated: readonly CostObservation[];
+  readonly dominated: readonly CostObservation[];
+} {
+  const list = observations ?? [];
+  if (list.length === 0) {
+    return { usable: false, rejected: 0, nondominated: [], dominated: [] };
+  }
+  let rejected = 0;
+  for (const observation of list) {
+    if (costObservationIssue(observation) !== undefined) {
+      rejected += 1;
+    }
+  }
+  if (rejected > 0) {
+    return { usable: false, rejected, nondominated: [], dominated: [] };
+  }
+  const nondominated = list.filter(
+    (candidate) => !list.some((other) => other !== candidate && dominates(other, candidate))
+  );
+  const dominated = list.filter((candidate) => !nondominated.includes(candidate));
+  return { usable: true, rejected: 0, nondominated, dominated };
+}
+
+/**
+ * Evaluate the budget gate for one decision (pure; diagnostics only).
+ *
+ * `observedProbes` is the number of probe slots this round would spend
+ * (`BatchPlan.width`). It is never converted into money (§4.2).
+ */
+export function evaluateBudgetGate(input: {
+  readonly tier?: BudgetTier;
+  readonly observedProbes: number;
+  readonly costObservations?: readonly CostObservation[];
+}): BudgetGateResult {
+  const resolved = resolveBudgetTier(input.tier);
+  const observedProbes = Math.max(
+    0,
+    Math.floor(Number.isFinite(input.observedProbes) ? input.observedProbes : 0)
+  );
+  const front = paretoFront(input.costObservations);
+  return {
+    tier: resolved.tier,
+    probeCeiling: resolved.probeCeiling,
+    observedProbes,
+    withinTier: observedProbes <= resolved.probeCeiling,
+    costAxisProvenance: front.usable ? 'measured' : 'unavailable',
+    costAxisRejected: front.rejected,
+    ...(front.usable
+      ? {
+          pareto: {
+            nondominatedIds: front.nondominated.map((entry) => entry.id),
+            dominatedIds: front.dominated.map((entry) => entry.id)
+          }
+        }
+      : {})
+  };
+}
+
 /**
  * Bounded LRU over derived policies (repair B3).
  *
@@ -562,6 +832,8 @@ class JitActivePolicyImpl implements JitActivePolicy {
   private readonly history: JitBatchDiagnostics[] = [];
   private readonly notices: string[] = [];
   private readonly derivedCache: DerivedPolicyCache;
+  /** P6 (ADR 0007 §4/§5): the opt-in budget hook; undefined means fully OFF. */
+  private readonly budget: BudgetHookConfig | undefined;
 
   constructor(options: JitActivePolicyOptions) {
     this.base = options.inner;
@@ -572,6 +844,12 @@ class JitActivePolicyImpl implements JitActivePolicy {
     this.derivedCache = new DerivedPolicyCache(
       resolveCacheEntries(options.config?.derivedCacheEntries)
     );
+    this.budget = options.budget;
+    // P6 (ADR 0007 §4): an unusable tier is a CONSTRUCTION error, never a
+    // silently ignored option - a typo must not degrade into "no budget".
+    if (this.budget !== undefined) {
+      resolveBudgetTier(this.budget.tier);
+    }
   }
 
   get inner(): IActivePolicy {
@@ -712,18 +990,81 @@ class JitActivePolicyImpl implements JitActivePolicy {
     if (baseline.width <= 0 || baseline.slots.length === 0) {
       return baseline;
     }
+    // P6 (ADR 0007 §4): the budget gate rides the SAME interception gate as the
+    // L1 correction, so runtime-off and non-intercepting assemblies stay
+    // byte-identical (that is the rollback path). Computing it before the kernel
+    // means even a degraded decision still reports it; the gate can never change
+    // the plan - it only records, and (behind its own switch) asks.
+    const budget = this.budgetGate(baseline);
     try {
-      return this.adjust(request, baseline);
+      return this.adjust(request, baseline, budget);
     } catch (error) {
       const reason =
         error instanceof Error ? error.name + ': ' + error.message : String(error);
       this.notice('jit_meta_adjust: degraded to the unadjusted plan (' + reason + ')');
-      return this.degraded(baseline, reason);
+      return this.degraded(baseline, reason, undefined, budget);
     }
   }
 
+  /**
+   * P6 budget gate for one decision (ADR 0007 §4/§5).
+   *
+   * Diagnostics only: the gate never touches the plan. The reminder is emitted
+   * here, and only when its own switch is on; a sink that throws is contained,
+   * because an observer must never be able to fail a decision.
+   */
+  private budgetGate(baseline: BatchPlan): BudgetGateResult | undefined {
+    if (this.budget === undefined) {
+      return undefined;
+    }
+    const gate = evaluateBudgetGate({
+      ...(this.budget.tier === undefined ? {} : { tier: this.budget.tier }),
+      observedProbes: baseline.width,
+      ...(this.budget.costObservations === undefined
+        ? {}
+        : { costObservations: this.budget.costObservations })
+    });
+    const reminder = this.emitBudgetReminder(gate);
+    return reminder === undefined ? gate : { ...gate, reminder };
+  }
+
+  /**
+   * Ask-only reminder (ADR 0007 §4.3).
+   *
+   * Emitted only when the INDEPENDENT default-false switch is on AND the round
+   * exceeds the tier's probe ceiling. It asks; it never denies, never trims the
+   * plan and never rewrites a tool result.
+   */
+  private emitBudgetReminder(gate: BudgetGateResult): BudgetReminder | undefined {
+    const reminder = this.budget?.reminder;
+    if (reminder?.enabled !== true || gate.withinTier) {
+      return undefined;
+    }
+    const payload: BudgetReminder = {
+      kind: 'budget-tier-exceeded',
+      observedProbes: gate.observedProbes,
+      probeCeiling: gate.probeCeiling,
+      tier: gate.tier,
+      unit: 'probes'
+    };
+    try {
+      reminder.onReminder?.(payload);
+    } catch (error) {
+      this.notice(
+        'budget_reminder: the sink threw (' +
+          (error instanceof Error ? error.name : 'unknown error') +
+          '); the reminder stays in the diagnostics'
+      );
+    }
+    return payload;
+  }
+
   /** One L1 correction: abstract, decide, re-apportion, attach diagnostics. */
-  private adjust(request: SelectBatchRequest, baseline: BatchPlan): BatchPlan {
+  private adjust(
+    request: SelectBatchRequest,
+    baseline: BatchPlan,
+    budget?: BudgetGateResult
+  ): BatchPlan {
     const policy = this.base.policy;
     // Repair H1 + P6 PR5: resolve the configuration from the *current* published
     // version so a hot swap takes effect on this very decision, and keep the
@@ -776,6 +1117,7 @@ class JitActivePolicyImpl implements JitActivePolicy {
         : { policyVersion: resolved.policyVersion }),
       ignoredDimensions: kernel.ignored.map((entry) => entry.dimension),
       ...(kernel.trackSelection === undefined ? {} : { trackSelection: kernel.trackSelection }),
+      ...(budget === undefined ? {} : { budget }),
       filter: {
         records: kernel.filters.records,
         kept: kernel.filters.kept,
@@ -967,7 +1309,8 @@ class JitActivePolicyImpl implements JitActivePolicy {
   private degraded(
     baseline: BatchPlan,
     reason: string,
-    previous?: JitBatchDiagnostics
+    previous?: JitBatchDiagnostics,
+    budget?: BudgetGateResult
   ): BatchPlan {
     const diagnostics: JitBatchDiagnostics = {
       level: 'meta',
@@ -977,7 +1320,8 @@ class JitActivePolicyImpl implements JitActivePolicy {
       adjustments: previous?.adjustments ?? [],
       rationale: 'jit meta: degraded to the unadjusted plan',
       degraded: true,
-      degradedReason: reason
+      degradedReason: reason,
+      ...(budget === undefined ? {} : { budget })
     };
     this.history.push(diagnostics);
     return withJitMetadata(baseline, diagnostics);
@@ -1005,6 +1349,8 @@ interface DiagnosticsAudit {
   readonly trackSelection?: AtomicTrackSelectionVerdict<unknown>;
   readonly policyVersion?: string;
   readonly ignoredDimensions?: readonly string[];
+  /** P6 (ADR 0007 §4): budget-gate result; absent when the hook is off. */
+  readonly budget?: BudgetGateResult;
   readonly filter?: {
     readonly records: number;
     readonly kept: number;
@@ -1056,6 +1402,7 @@ function toDiagnostics(
     ...(audit.ignoredDimensions === undefined
       ? {}
       : { ignoredDimensions: audit.ignoredDimensions }),
+    ...(audit.budget === undefined ? {} : { budget: audit.budget }),
     ...(audit.filter === undefined ? {} : { filter: audit.filter })
   };
 }

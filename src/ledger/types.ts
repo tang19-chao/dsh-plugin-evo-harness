@@ -53,6 +53,14 @@ export interface CountingSemantics {
 /**
  * Complete provider usage payload carrying individual token metrics and counting semantics.
  */
+export type UsageMetricName =
+  | 'inputTokens'
+  | 'outputTokens'
+  | 'cacheReadTokens'
+  | 'cacheWriteTokens'
+  | 'reasoningTokens'
+  | 'totalTokens';
+
 export interface ProviderUsagePayload {
   /** Uncached / prompt input tokens */
   inputTokens: TokenMetric;
@@ -77,6 +85,15 @@ export interface ProviderUsagePayload {
    * If undefined, provenance must be marked 'unknown'.
    */
   countingSemantics?: CountingSemantics;
+
+  /**
+   * Dimensions the provider did not report at all.
+   *
+   * An absent metric is NOT a measured zero: cacheRead/write/reasoning that the
+   * provider never exposed stay unknown, and the cost report surfaces that
+   * separately instead of letting the conservative floor pass as measured data.
+   */
+  unreportedMetrics?: readonly UsageMetricName[];
 }
 
 /**
@@ -152,6 +169,26 @@ export interface CostCalculation {
 
   /** Overall provenance of calculation */
   provenance: MeasurementPrecision;
+
+  /**
+   * Per-dimension provenance. A provider can report measured input/output while
+   * cacheRead is unavailable; collapsing them into one number is what this field
+   * prevents (P3-C: cacheRead unavailable stays unknown).
+   */
+  dimensionProvenance?: Readonly<{
+    input: MeasurementPrecision;
+    output: MeasurementPrecision;
+    cacheRead: MeasurementPrecision;
+    cacheWrite: MeasurementPrecision;
+    reasoning: MeasurementPrecision;
+  }>;
+
+  /**
+   * True when cache-read usage was not reported. The cacheRead cost must then be
+   * treated as UNKNOWN, not as a measured zero, and the conservative surcharge is
+   * a floor — never evidence that cacheRead was free.
+   */
+  cacheReadUnavailable?: boolean;
 
   /** Whether conservative fallback or unknown upper bound was applied */
   conservative: boolean;
@@ -240,6 +277,9 @@ export type BudgetPoolType = 'general' | 'verification';
 /**
  * Request to reserve budget and concurrency seats before invoking an LLM call.
  */
+/** Observation never denies; enforcement denies. Explicit, never inferred. */
+export type LedgerMeteringMode = 'observe' | 'enforce';
+
 export interface ReserveRequest {
   callId: string;
   phase: LedgerPhase;
@@ -288,6 +328,44 @@ export interface ReserveResult {
   reservedCostMicros: number;
   seatAcquired: boolean;
   rejectionReason?: ReserveRejectionReason;
+
+  /**
+   * TRUE when the reservation was granted in OBSERVE mode. Nothing was
+   * ring-fenced and no seat was taken; the call proceeds and its spend is
+   * settled afterwards.
+   */
+  observed?: boolean;
+
+  /**
+   * The rejection the ENFORCE mode would have produced. Set only in observe mode
+   * when the call would have been denied for budget/seat/admission reasons: the
+   * probe must see that the limit was OBSERVED (and can warn) while it is not
+   * enforced. Never set when the call was actually denied.
+   */
+  observedRejection?: ReserveRejectionReason;
+}
+
+/**
+ * Ledger-side metering status.
+ *
+ * Distinguishes the three states a cost report must never conflate:
+ *   - no ledger at all (the caller's manager is undefined);
+ *   - ledger assembled but ZERO calls so far (calls=0, metered=true);
+ *   - ledger with calls whose cost provenance is measured/estimated/unknown.
+ */
+export interface LedgerMeteringStatus {
+  readonly mode: LedgerMeteringMode;
+  /** True whenever a manager exists; "no ledger" is represented by absence. */
+  readonly metered: true;
+  readonly reserveAttempts: number;
+  readonly reserveGranted: number;
+  /** Calls that would have been denied but were observed instead (observe only). */
+  readonly observedDenials: number;
+  readonly settleCount: number;
+  readonly measuredCalls: number;
+  readonly estimatedCalls: number;
+  readonly unknownCalls: number;
+  readonly totalCostMicros: number;
 }
 
 /**

@@ -40,6 +40,8 @@ import {
   type ReflectionRequest,
   type ReflectionResult
 } from '../types/contracts';
+// P3-B: every model call leaves this module through the unified metered boundary.
+import { createMeteredModelAdapter, type MeteredModelOptions } from '../dsh-bridge/metered-model-adapter';
 import {
   type Clock,
   type IdFactory,
@@ -60,6 +62,8 @@ import {
 export interface HarnessReflectorOptions {
   /** Host-neutral LLM boundary used to refine lesson headers. */
   readonly model: IModelAdapter;
+  /** P3-B metering wiring (ledger/registry); absent records calls without cost. */
+  readonly metering?: MeteredModelOptions;
   /** Injected clock; defaults to Date.now(). */
   readonly now?: Clock;
   /** Injected id factory; defaults to a deterministic counter. */
@@ -565,6 +569,7 @@ export function createEvidenceReflector(options: HarnessReflectorOptions): IHarn
   const now = options.now ?? systemClock;
   const newId = options.newId ?? createDeterministicIdFactory('reflect');
   const maxClauses = options.maxClauses ?? 8;
+  const model = createMeteredModelAdapter(options.model, 'reflect', options.metering);
 
   return {
     async reflect(request: ReflectionRequest): Promise<ReflectionResult> {
@@ -619,7 +624,7 @@ export function createEvidenceReflector(options: HarnessReflectorOptions): IHarn
           responseFormat: 'json',
           metadata: { sessionId: request.sessionId, dossierCount: dossiers.length, scope: request.scope.kind }
         };
-        const response = await options.model.complete(modelRequest);
+        const response = await model.call(modelRequest);
         headers = readAssistedHeaders(response.text);
         if (headers.size === 0) {
           diagnostics.push('model header refinement returned no usable lesson headers; deterministic headers were used');

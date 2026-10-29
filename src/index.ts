@@ -22,8 +22,10 @@ import {
   CONFIG_SCHEMA_VERSION,
   parseEvoHarnessConfig,
   validateEvoHarnessConfig,
-  type EvoHarnessConfig
+  type EvoHarnessConfig,
+  type JitRlConfig
 } from './config';
+import type { UsageLedgerEvent } from './ledger';
 import {
   createCordisSeamManager,
   createDshHookHostAdapter,
@@ -97,6 +99,8 @@ import {
   halfLifeMsFromConfig,
   jitMetaEnabled,
   type BridgeMirrorStore,
+  type BudgetHookConfig,
+  type CostObservation,
   type HostAdvisor,
   type JitActivePolicy,
   type JitMirrorMcpClient,
@@ -1490,6 +1494,123 @@ export const JITRL_EXPERIENCE_FILE = 'jitrl-experience.jsonl';
  * cold-start backfill, both of which are awaited by the caller before the plugin
  * reports ready. A JitRL failure must never break the plugin: any throw leaves
  * the policy unwrapped and records a diagnostic. */
+/**
+ * P6 (ADR 0007 section 7.4): translate the OPTIONAL `config.jitrl.budget` leaf
+ * into the decorator's `BudgetHookConfig` option.
+ *
+ * Returns `undefined` when the leaf is absent, which is the DEFAULT: the caller
+ * then passes no `budget` key at all, so the decorator is byte-identical to the
+ * pre-P6 one and emits no budget diagnostics.
+ *
+ * The reminder switch is copied verbatim. It is NOT derived from the execution
+ * mode, from `interceptExecution`, from the patch permission, or from
+ * guarded-active (ADR 0007 section 7.1: the reminder is its own permission).
+ * Nothing here can turn the reminder on; only the host's own configuration can.
+ *
+ * `costObservations` is deliberately NOT produced here. The measured-only cost
+ * axis must be assembled from a real P3 ledger, and this function has no ledger
+ * (the agent-loop executor keeps its reservation manager private). Passing a
+ * fabricated or estimated observation would violate ADR 0007 section 6.2, so the
+ * axis simply stays unavailable - which is the fail-closed outcome.
+ */
+export function resolveBudgetHookConfig(
+  budget: JitRlConfig['budget'],
+  costObservations?: readonly CostObservation[]
+): BudgetHookConfig | undefined {
+  if (budget === undefined) {
+    return undefined;
+  }
+  return {
+    ...(budget.tier === undefined ? {} : { tier: budget.tier }),
+    ...(budget.reminder === undefined
+      ? {}
+      : {
+          reminder: {
+            // Absent `enabled` inside a present `reminder` block stays FALSE:
+            // the decorator requires the literal `true` to emit anything.
+            enabled: budget.reminder.enabled === true
+          }
+        }),
+    // Measured-only axis (ADR 0007 section 6.2). Absent when no real ledger
+    // produced measured observations, which leaves the axis unavailable instead
+    // of inventing a data point.
+    ...(costObservations === undefined ? {} : { costObservations })
+  };
+}
+/**
+ * P6 host wiring (ADR 0007 section 6.2): assemble the measured-only Pareto cost
+ * axis from REAL P3 ledger events.
+ *
+ * THE RULE THIS FUNCTION EXISTS TO ENFORCE
+ *   The axis takes `measured` observations ONLY. When a single `estimated` or
+ *   `unknown` observation is present, the WHOLE axis becomes unavailable - the
+ *   point is NOT dropped and the front is NOT computed over the remaining
+ *   subset. Dropping the non-measured points would produce a front that looks
+ *   better, because whether a point is kept would be decided by exactly the cost
+ *   dimension being compared: a silent favourable bias (ADR 0007 section 6.2).
+ *
+ * So this returns `undefined` (axis unavailable, fail-closed) whenever:
+ *   - no events are supplied (an empty set cannot rank costs),
+ *   - any event is audit-only or is not quality evidence,
+ *   - any event's cost provenance is not `measured`,
+ *   - an event carries no usable probe count or quality figure.
+ *
+ * WHY IT CANNOT FABRICATE DATA
+ *   The probe count and the quality figure are taken from the caller's OWN
+ *   per-event lookup; when a caller cannot supply one, that event makes the axis
+ *   unavailable rather than being defaulted to 0 (a fabricated zero is still a
+ *   fabricated measurement). This function never invents an observation.
+ *
+ * This is the honest wiring boundary: `src/index.ts` has no ledger manager
+ * (the agent-loop executor keeps its reservation manager private), so in a
+ * default assembly nothing calls this and `costObservations` stays absent. That
+ * is the correct fail-closed outcome, not a gap to be papered over.
+ */
+export function assembleMeasuredCostObservations(
+  events: readonly UsageLedgerEvent[],
+  describe: (event: UsageLedgerEvent) => {
+    readonly id: string;
+    readonly probes: number;
+    readonly quality: number;
+  } | undefined
+): readonly CostObservation[] | undefined {
+  if (events.length === 0) {
+    return undefined;
+  }
+  const observations: CostObservation[] = [];
+  for (const event of events) {
+    // An audit-only or non-quality event is not a measurement of task quality,
+    // so it can never anchor a (quality, cost) point.
+    if (event.auditOnly || !event.qualityEvidence) {
+      return undefined;
+    }
+    // ANY non-measured provenance collapses the whole axis. This is the
+    // fail-closed branch, and it must stay a `return`, never a `continue`.
+    if (event.cost.provenance !== 'measured') {
+      return undefined;
+    }
+    const shape = describe(event);
+    if (shape === undefined) {
+      return undefined;
+    }
+    if (
+      !Number.isFinite(shape.probes) ||
+      shape.probes < 0 ||
+      !Number.isFinite(shape.quality) ||
+      shape.quality < 0 ||
+      shape.quality > 1
+    ) {
+      return undefined;
+    }
+    observations.push({
+      id: shape.id,
+      probes: shape.probes,
+      quality: shape.quality,
+      costProvenance: 'measured'
+    });
+  }
+  return observations.length === 0 ? undefined : observations;
+}
 export function buildJitRlWiring(input: {
   readonly config: EvoHarnessConfig;
   readonly policy: IActivePolicy;
@@ -1572,6 +1693,35 @@ export function buildJitRlWiring(input: {
     const runtimeEnabled = {
       enabled: runtimeControl.snapshot().runtimeEnabled
     };
+    // P6 (ADR 0007 section 7.4): translate the OPTIONAL config leaf into the
+    // decorator's `budget` option. Absent leaf -> undefined -> no `budget` key
+    // is passed at all (default behaviour unchanged). The reminder switch is
+    // copied verbatim from configuration: no other authority feeds it.
+    //
+    // P6 cost axis (ADR 0007 section 6.2): DELIBERATELY NOT PRODUCED HERE.
+    //
+    // `assembleMeasuredCostObservations()` below is the honest assembler, and it
+    // is exported and tested, but this construction point cannot feed it a real
+    // observation, for two independent reasons:
+    //
+    //   1. `BudgetHookConfig.costObservations` is a construction-time ARRAY. The
+    //      decorator is built once at plugin mount, before any probe has run, so
+    //      even a live `ledgerManager.getLedgerEvents()` would be captured as an
+    //      EMPTY snapshot. A per-decision live view would require changing
+    //      `src/jitrl/jit-active-policy.ts` to take a provider function.
+    //   2. That file must not change: its bytes are pinned by
+    //      `PINNED_DECORATOR_SHA256` in `tests/unit/jitrl/p6-pareto-budget.test.ts`
+    //      (the reproducible restoration witness), so editing it would break a
+    //      P6 deliverable to satisfy a P2 wiring convenience.
+    //
+    // The third reason is data, not structure: the P3 ledger records COST per
+    // call, and a `qualityEvidence` boolean, but it carries NO quality NUMBER.
+    // A (probes, quality) pair therefore has no real source at this layer.
+    //
+    // So the axis stays unavailable. That is the fail-closed outcome required by
+    // ADR 0007 section 6.2 - a fabricated or estimated observation would be far
+    // worse than an honest "unavailable".
+    const budgetHook = resolveBudgetHookConfig(jitrl.budget);
     const wrapped = kernel.createJitActivePolicy({
       inner: input.policy,
       now: input.now,
@@ -1592,7 +1742,21 @@ export function buildJitRlWiring(input: {
       // leave L1 intercepting on `config.execution.mode` while the orchestrator
       // skipped L2 on the injected mode - two sources of truth for one mode.
       interceptExecution: () =>
-        effectiveWiringProfile.mode !== 'baseline' && effectiveWiringProfile.mode !== 'off'
+        effectiveWiringProfile.mode !== 'baseline' && effectiveWiringProfile.mode !== 'off',
+      // P6 host wiring (ADR 0007 section 7.4). This is the ONE production
+      // construction point of the decorator, so it is the only place the budget
+      // hook can become host-reachable.
+      //
+      // FAIL-CLOSED / ZERO-CHANGE DEFAULT: `config.jitrl.budget` has no default
+      // entry, so an ordinary host resolves it to `undefined` and the spread
+      // below contributes NOTHING - the decorator object is byte-identical to
+      // the pre-wiring one and `budgetGate()` never runs. A decision therefore
+      // carries no `metadata.jit.budget` key at all, exactly as before.
+      //
+      // The reminder is its OWN permission switch (ADR 0007 section 7.1): it is
+      // read here and nowhere else, and it is NEVER derived from the execution
+      // mode, `interceptExecution`, the patch permission or guarded-active.
+      ...(budgetHook === undefined ? {} : { budget: budgetHook })
     });
     if (input.options.deps?.policy !== undefined) {
       // A host that injects its own policy owns that decision; the decorator

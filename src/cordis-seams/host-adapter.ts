@@ -40,12 +40,36 @@ export interface HostBranchHandle {
   dispose(): Promise<void>;
 }
 
+/**
+ * Whom a mount is allowed to act on when a host dispatch cannot prove a branch
+ * identity (ADR 0006 D-P4-4).
+ *
+ * - 'branch': the mount belongs to one probe branch and applies ONLY to a
+ *   dispatch that proves that exact branchId. A dispatch naming no branchId —
+ *   not even one sharing the mount's sessionId — can never act on it. This is
+ *   the class every probe mount gets.
+ * - 'host': the mount acts host-wide (identity-free and host-session
+ *   dispatches). Registration REQUIRES a non-empty `hostScopeGrant`; the
+ *   permanent-patch path derives it from the execution profile's patch
+ *   permission, so a host mount is always a named authorization.
+ * - 'legacy-host-local': the PRE-ADR fail-open matching, now reachable ONLY as
+ *   an explicit opt-in value. It is counted per registration
+ *   (`stats().scope.legacyHostLocalMounts`) plus once per mount by a diagnostic
+ *   note; P4-C removed it as the default, so an undeclared mount is 'branch'
+ *   (fail-closed) and the production mount path never produces it.
+ */
+export type HostMountScopeClass = 'branch' | 'host' | 'legacy-host-local';
+
 /** Fields common to every surface mount request. */
 export interface HostSurfaceSpecBase {
   readonly surfaceId: string;
   readonly branchId: string;
   readonly sessionId: string;
   readonly namespace: string;
+  /** Mount scope class (ADR 0006 D-P4-4). Omitted = 'branch' (fail-closed, P4-C). */
+  readonly mountScope?: HostMountScopeClass;
+  /** Required for mountScope 'host': non-empty provenance of the authorization. */
+  readonly hostScopeGrant?: string;
 }
 
 /** Surface 1: system prompt segment registration. */

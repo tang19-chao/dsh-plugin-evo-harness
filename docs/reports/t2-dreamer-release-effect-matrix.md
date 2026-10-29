@@ -247,7 +247,7 @@ gen2: jitrl.enabled=true, beta=0.5, k=4, similarityThreshold=0.9
 | 普通 dreamer 通过 `activePolicy` 自动接线 | `updates` 数组 | **✓效果**（同上） | `offline-dreamer.test.ts:539-558` |
 | Jit-wired dreamer 热替换携带 jit 块 | `applied[0].jit.beta===2` | **✓效果** | `jit-dream.test.ts:922-975` |
 | jit off 时钉回 incumbent jit 块 | `swapped.jit.beta===1` | **✓效果** | `runtime-control.test.ts:319-421` |
-| 生产插件任务周期会 dream | `dreamTriggered`、`dreamReports().length` | **○旁证**（不断言策略是否被改写） | `offline-dream.test.ts:16-59`、`runtime-control.test.ts:259-315`、`units/integration/p4-wiring.test.ts` 全篇 |
+| 生产插件任务周期会 dream | `dreamTriggered`、`dreamReports().length` | **○旁证**（不断言策略是否被改写） | `offline-dream.test.ts:16-59`、`runtime-control.test.ts:259-315`、`tests/unit/integration/p4-wiring.test.ts` 全篇 |
 | 生产插件 dream 的**发布**后果 | — | **✗** | 无任何测试读取 `dreamReports()[i].publication.publish` 或对比 dream 前后策略 |
 | idle 入口会触发 dream | `dream.run` 被调用（vi.fn） | **○旁证** | `dsh-triggers.test.ts:249-286` |
 | idle 入口的**发布**后果 | — | **✗** | 无（本报告 §3.3 是首个证据） |

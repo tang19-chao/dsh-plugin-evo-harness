@@ -59,16 +59,20 @@ import {
   isOnLearningTrack
 } from './experience-store';
 import {
+  assertLearningFacingSurvival,
   createEffectivePolicyConfigProvider,
+  LearningFacingSurvivalError,
   freshPolicySupport,
   baseEffectivePolicyConfig,
   learningFacingFilterOptions,
+  learningFacingSurvival,
   projectNeighborsBySlotKind,
   runDecisionKernel,
   selectTrackAtomically,
   type EffectivePolicyConfig,
   type EffectivePolicyConfigProvider,
-  type DualTrackConsumptionOptions
+  type DualTrackConsumptionOptions,
+  type ExperienceSurvival
 } from './decision-kernel';
 import { isAuthenticatedQualityRecord } from '../verification';
 import { policyPriorLogit } from './logit-sources';
@@ -183,6 +187,12 @@ export interface JitRl {
       readonly decisionMode?: DecisionMode;
       readonly actionKeyVocabulary?: ActionKeyVocabulary;
     };
+    /**
+     * P2-B (p2-a-b-kernel): forward the learning-facing survival assertion to
+     * the hook (default absent = the documented "never throws" contract). See
+     * JitReplayHookFactoryOptions.requireLearningFacingSurvival.
+     */
+    readonly requireLearningFacingSurvival?: boolean;
   }): JitReplayHook;
   /** P5-a: L3 host advisor over this kernel's experience store. */
   createHostAdvisor(options?: { readonly rng?: () => number }): HostAdvisor;
@@ -470,6 +480,8 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
         readonly actionKeyVocabulary?: ActionKeyVocabulary;
       };
       readonly dualTrack?: DualTrackConsumptionOptions;
+      /** P2-B (p2-a-b-kernel): forward the survival assertion (default false). */
+      readonly requireLearningFacingSurvival?: boolean;
     } = {}): JitReplayHook {
       // t12/R3b2 (t11 high finding): the defaults are resolved ONCE, in front of
       // the caller's value - `caller ?? default`, field by field. The t10
@@ -496,6 +508,9 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
         config: jitrl,
         ...(replayOptions.driftRho === undefined ? {} : { driftRho: replayOptions.driftRho }),
         ...(replayOptions.dualTrack === undefined ? (options.dualTrack === undefined ? {} : { dualTrack: options.dualTrack }) : { dualTrack: replayOptions.dualTrack }),
+        ...(replayOptions.requireLearningFacingSurvival === true
+          ? { requireLearningFacingSurvival: true }
+          : {}),
         replayDeclarations
       });
     },
@@ -910,6 +925,26 @@ export interface JitReplayHookFactoryOptions {
     readonly actionKeyVocabulary?: ActionKeyVocabulary;
   };
   readonly dualTrack?: DualTrackConsumptionOptions;
+  /**
+   * P2-B (p2-a-b-kernel): fail LOUDLY when the production learning filter leaves
+   * no usable replay neighbour.
+   *
+   * Default false, because the hook's documented contract is "never throws" and
+   * an existing caller that only compares prior weights must keep its behaviour.
+   * A caller that reports a POLICY EFFECT from replay (the research replay, a
+   * resumed dream evaluation) must set this: an all-filtered snapshot means
+   * every recorded outcome is on an older reward contract or was never a quality
+   * signal, so the replay's zero advantage is a property of the FILTER, not a
+   * measurement. The abort runs before the hook's degrade-to-prior catch and is
+   * rethrown there, so it can never be swallowed into a "degraded" note.
+   */
+  readonly requireLearningFacingSurvival?: boolean;
+  /**
+   * Observability for the survival denominator: called once per hook invocation
+   * with the production-filtered counts, regardless of the assertion setting. A
+   * caller that must not throw still has to show how many records survived.
+   */
+  readonly onLearningSurvival?: (survival: ExperienceSurvival) => void;
 }
 
 /**
@@ -1013,6 +1048,27 @@ export function createJitReplayHook(options: JitReplayHookFactoryOptions): JitRe
           (enableDualTrack || isOnLearningTrack(entry, PRODUCTION_LEARNING_TRACK)) &&
           declaredFilter(entry)
       );
+      /**
+       * P2-B (p2-a-b-kernel): the PRODUCTION survival denominator.
+       *
+       * Computed with the SAME filter the kernel call below applies, so the
+       * number a caller reports is the denominator the online decision would
+       * have had. onLearningSurvival fires whatever the assertion setting (a
+       * caller that may not throw still needs the counts); when
+       * requireLearningFacingSurvival is set, an all-filtered snapshot aborts
+       * instead of producing a prior-shaped "effect" (the catch below rethrows
+       * this error instead of degrading it).
+       */
+      const survival = learningFacingSurvival(replaySnapshot, {
+        level: 'meta',
+        ...(input.frontier.guidance === 'guidance_free'
+          ? { guidance: 'guidance_free' as const }
+          : {})
+      });
+      options.onLearningSurvival?.(survival);
+      if (options.requireLearningFacingSurvival === true) {
+        assertLearningFacingSurvival(survival, { context: 'jit-replay-hook' });
+      }
       const kernel = runDecisionKernel({
         level: 'meta',
         state,
@@ -1157,6 +1213,14 @@ export function createJitReplayHook(options: JitReplayHookFactoryOptions): JitRe
         }
       };
     } catch (error) {
+      // P2-B (p2-a-b-kernel): the learning-facing survival abort must NOT be
+      // degraded into prior weights - a caller that asked for the assertion wants
+      // the run to STOP, not to receive a policy-effect-shaped result. The
+      // degrade path below stays the documented behaviour for every other
+      // failure (retrieval, valuation, projection).
+      if (error instanceof LearningFacingSurvivalError) {
+        throw error;
+      }
       return {
         slotWeights: input.slotWeights,
         diagnostics: {

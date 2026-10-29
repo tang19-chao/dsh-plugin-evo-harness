@@ -17,4 +17,5 @@ export * from './context-forker';
 export * from './host-adapter';
 export * from './patch-utils';
 export * from './seam-manager';
+export * from './tool-face';
 export * from './trajectory-collector';

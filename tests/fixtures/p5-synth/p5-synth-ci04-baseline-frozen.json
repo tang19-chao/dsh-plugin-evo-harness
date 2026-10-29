@@ -1,0 +1,17 @@
+{
+  "note": "Historical anchor: the first harmful deviation of the offline negative result. The baseline chose noop (support 0) at (task ci-04, run 2, round 2); coverage fell from 1.000 (prior) to 0.667 (observed). Sources: docs/reports/p61-eval-negative-result-explanation.md (firstHarmfulDeviation, poolDigestsByRound be05e090/73ba2b59/650d0bfa), docs/reports/p62-review-round1-pr-b.md section 1.",
+  "observation": {
+    "taskId": "ci-04",
+    "run": 2,
+    "round": 2,
+    "actionKey": "noop",
+    "support": 0,
+    "advantage": 0,
+    "observedCoverage": 0.6666666666666666,
+    "priorCoverage": 1
+  },
+  "priorActionKey": "guardrails:append(1)",
+  "derivedCaseId": "ci-04-2-2-noop-baseline",
+  "derivedCaseLabel": "bug-absent",
+  "why": "A synthetic test whose expectation is copied from this observation would enshrine the harmful noop and fail every candidate that repairs it: exactly the wrongly-frozen-baseline failure mode the trust layer must detect and exclude."
+}

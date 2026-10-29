@@ -34,6 +34,8 @@ import {
   type ProbeTrajectory,
   type TrajectoryStatus
 } from '../types/contracts';
+// P3-B: every model call leaves this module through the unified metered boundary.
+import { createMeteredModelAdapter, type MeteredModelOptions } from '../dsh-bridge/metered-model-adapter';
 import {
   type Clock,
   type IdFactory,
@@ -79,6 +81,8 @@ export const DEFAULT_ADOPTION_BLEND = { evidence: 0.85, judge: 0.15 } as const;
 export interface HarnessComposerOptions {
   /** Host-neutral LLM boundary used as the anonymous judge. */
   readonly model: IModelAdapter;
+  /** P3-B metering wiring (ledger/registry); absent records calls without cost. */
+  readonly metering?: MeteredModelOptions;
   /** Injected clock; defaults to Date.now(). */
   readonly now?: Clock;
   /** Injected id factory; defaults to a deterministic counter. */
@@ -564,6 +568,7 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
   const evidenceWeight = options.evidenceWeight ?? DEFAULT_ADOPTION_BLEND.evidence;
   const judgeWeight = options.judgeWeight ?? DEFAULT_ADOPTION_BLEND.judge;
   const deliverableChars = options.deliverableChars ?? 1200;
+  const model = createMeteredModelAdapter(options.model, 'compose', options.metering);
 
   return {
     async compose(request: ComposeRequest): Promise<CompositionResult> {
@@ -620,7 +625,7 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
           responseFormat: 'json',
           metadata: { sessionId: request.sessionId, candidateCount: evaluations.length, anonymous: true }
         };
-        const response = await options.model.complete(modelRequest);
+        const response = await model.call(modelRequest);
         const verdict = readJudgeVerdict(response.text, aliases);
         if (verdict === undefined) {
           judgeUnavailableReason = 'judge returned an unparseable verdict';

@@ -83,6 +83,18 @@
  *   - §9.3 six token fields, §6.1 host verdict, §10.2 execution-control coverage,
  *     §12.2 the 12x10 per-task table, FULL SHA-256 ledger digests, and a code
  *     provenance block that can locate the executed code.
+ *
+ * MEASUREMENT CAPABILITY (P3-C, cost/token provenance). "measured" is judged by
+ * a DECLARATION, not forbidden forever:
+ *   - no declaration (the frozen artifact): the historical rule stands — the
+ *     measured count must be 0 and no token field may claim precision measured;
+ *   - `measurement: { tokenizer: true }` (or top-level `tokenizer: true`):
+ *     measured data is ALLOWED but must actually appear (zero measured calls
+ *     under a declaration is a broken capture), and the counts/shares closure
+ *     rules still apply unchanged.
+ * The frozen artifact contains no declaration, so its 691/691 judgement is
+ * byte-for-byte unchanged; the capability path is covered by the mutation tests
+ * in tests/unit/eval/pr4a-cost-provenance-gate.test.ts.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -303,6 +315,24 @@ try {
 } catch (error) {
   assert('json-parses', false, String(error));
 }
+
+/**
+ * Measurement-capability declaration (P3-C).
+ *
+ * The frozen artifact predates a tokenizer and carries NO declaration, so the
+ * ABSENCE means "no tokenizer": the historical judgement (measured count and
+ * per-field precision must be 0 / non-measured) is unchanged byte-for-byte in
+ * effect. A future run that can really measure declares it explicitly as
+ * `measurement: { tokenizer: true }` (top-level `tokenizer: true` is accepted
+ * for forward compatibility). Only then may `measured` appear — and then it MUST
+ * appear: a declared capability that produced ZERO measured calls is either a
+ * broken capture or a false declaration, never a silent pass.
+ */
+function declaresMeasurementCapability(candidate) {
+  return candidate?.measurement?.tokenizer === true || candidate?.tokenizer === true;
+}
+
+const hasMeasurementCapability = report !== null && declaresMeasurementCapability(report);
 
 if (report !== null) {
   // -------------------------------------------------------------------------
@@ -1341,7 +1371,17 @@ if (report !== null) {
       entry.measured.count + entry.estimated.count + entry.unknown.count === entry.decisionPoints,
       String(entry.measured.count + entry.estimated.count + entry.unknown.count) + ' vs ' + String(entry.decisionPoints)
     );
-    assert('cost-measured-zero:' + entry.armId, entry.measured.count === 0, 'no tokenizer => measured must be 0');
+    if (hasMeasurementCapability) {
+      // A declared capability must actually produce measurements. Zero measured
+      // calls under a tokenizer declaration is a broken capture, not a pass.
+      assert(
+        'cost-measured-capability:' + entry.armId,
+        entry.measured.count > 0 && entry.measured.count <= entry.decisionPoints,
+        'a declared measurement capability must produce at least one measured call and never exceed the denominator'
+      );
+    } else {
+      assert('cost-measured-zero:' + entry.armId, entry.measured.count === 0, 'no tokenizer => measured must be 0');
+    }
     assert(
       'cost-surcharge-separate:' + entry.armId,
       typeof entry.conservativeSurchargeMicros === 'number',
@@ -1377,11 +1417,21 @@ if (report !== null) {
         output: entry.outputTokens.tokens
       })
     );
-    assert(
-      'token-no-measured:' + entry.armId,
-      SIX.every((field) => entry[field].precision !== 'measured'),
-      'no token field may claim measured without a tokenizer'
-    );
+    if (hasMeasurementCapability) {
+      // Measured precision is permitted ONLY under an explicit capability, and
+      // even then every field must carry one of the three valid precisions.
+      assert(
+        'token-measured-capability:' + entry.armId,
+        SIX.every((field) => ['measured', 'estimated', 'unknown'].includes(entry[field].precision)),
+        'a declared measurement capability must label every token field measured/estimated/unknown'
+      );
+    } else {
+      assert(
+        'token-no-measured:' + entry.armId,
+        SIX.every((field) => entry[field].precision !== 'measured'),
+        'no token field may claim measured without a tokenizer'
+      );
+    }
     assert(
       'token-denominator-named:' + entry.armId,
       typeof entry.denominator === 'string' && typeof entry.decisionPoints === 'number',
