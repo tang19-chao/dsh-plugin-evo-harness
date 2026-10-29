@@ -481,6 +481,10 @@ describe('CI and package wiring stays append-only (t2 → t8 order, ADR 0005 §6
     expect(block).toContain('node scripts/eval-jitrl.mjs --json');
     expect(block).toContain('node scripts/eval/negative-result-diag.mjs --assert');
     expect(block).toContain('persist-credentials: false');
+    // The PR-1 evidence suites in `tests/unit` resolve `HEAD~1` and the frozen
+    // pre-policy baseline, so this job needs real history; without it a
+    // checkout defect is misreported as a Node 24 incompatibility.
+    expect(block).toContain('fetch-depth: 0');
   });
 
   it('does not rewrite the t2 attestation job or the Node 22 verify job', () => {

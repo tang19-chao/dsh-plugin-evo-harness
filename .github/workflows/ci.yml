@@ -466,6 +466,14 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          # Full history: the unit suites this job runs include the PR-1
+          # evidence tests, which resolve `HEAD~1` and the frozen pre-policy
+          # baseline commit (`84a3d828...`). On a shallow clone those
+          # legitimate tests fail with "Not a valid object name" / "Needed a
+          # single revision", which reports a CHECKOUT defect as a Node 24
+          # incompatibility. History is REQUIRED here, exactly as in `verify`
+          # and `attestation-target`.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install pnpm 11.7.0
