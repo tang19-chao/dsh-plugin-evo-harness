@@ -174,15 +174,38 @@ describe('runner-level guard (real invocation, no report written)', () => {
 
   it('still reports readiness with --check and never writes', () => {
     const before = fs.statSync(path.join(repoRoot, FROZEN_RC1_RELATIVE)).mtimeMs;
-    const run = spawnSync(process.execPath, ['scripts/host-smoke/run.mjs', '--check'], {
-      cwd: repoRoot,
-      encoding: 'utf8',
-      windowsHide: true,
-      timeout: 60_000
-    });
-    expect(run.status).toBe(0);
-    expect(run.stdout ?? '').toContain('readiness ok=true');
-    expect(fs.statSync(path.join(repoRoot, FROZEN_RC1_RELATIVE)).mtimeMs).toBe(before);
+    // `--check` reports `readiness ok=false` when no installed DSH host is
+    // found. A CI runner has no DSH installation, so asserting `ok=true`
+    // against the developer machine made this test environment-dependent.
+    // Pin host discovery to a throwaway installation instead: the assertion
+    // then tests the readiness logic, not whether the machine happens to have
+    // DeepSeek Harness installed.
+    const fakeHostHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-host-smoke-fake-host-'));
+    fs.mkdirSync(path.join(fakeHostHome, 'resources', 'app.asar'), { recursive: true });
+    fs.writeFileSync(
+      path.join(fakeHostHome, 'resources', 'app.asar', 'package.json'),
+      JSON.stringify({ name: 'deepseek-harness', version: '0.0.0-test' }) + '\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(fakeHostHome, process.platform === 'win32' ? 'DeepSeek Harness.exe' : 'DeepSeek Harness'),
+      '',
+      'utf8'
+    );
+    try {
+      const run = spawnSync(process.execPath, ['scripts/host-smoke/run.mjs', '--check'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 60_000,
+        env: { ...process.env, HOSTSMOKE_DSH_HOME: fakeHostHome }
+      });
+      expect(run.status).toBe(0);
+      expect(run.stdout ?? '').toContain('readiness ok=true');
+      expect(fs.statSync(path.join(repoRoot, FROZEN_RC1_RELATIVE)).mtimeMs).toBe(before);
+    } finally {
+      fs.rmSync(fakeHostHome, { recursive: true, force: true });
+    }
   });
 
   it('keeps a temp-tree rc1 protected and its absence unprotected', () => {
