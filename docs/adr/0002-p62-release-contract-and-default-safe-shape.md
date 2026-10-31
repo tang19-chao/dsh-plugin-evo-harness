@@ -48,7 +48,7 @@
 | 权限 | 含义 | 默认 | 解锁条件 |
 | --- | --- | --- | --- |
 | **patch** | 任何**永久**八面 patch 应用：Jit 偏离替换、探索预算执行、winning patch 的探测后永久挂载（基线 `applyWinningPatch: true`，`src/index.ts:1618`——本轮默认装配显式禁用，t6 修订） | **deny** | 仅 guarded-active 显式启用 + 第 6 节证据规则（充分证据替换，或显式可撤销探索预算）。隔离分支内的可回滚探测不属于本层权限对象 |
-| **publish** | 发布/热更新策略（publishPolicy 类动作） | **deny** | holdout 非劣证据 + 显式授权 + 匹配 artifact 三者齐备；任一缺失即拒绝。本轮**任何路径都不解锁** |
+| **publish** | 发布/热更新策略（publishPolicy 类动作） | **deny** | holdout **严格超越**验证（优胜者在 holdout 上 hypervolume > baseline + ε；ADR 0002 原文"非劣"为文案漂移，实际实现与 ADR 0007 §2 均为严格超越，非劣不是本仓凭证）+ 显式授权 + 匹配 artifact 三者齐备；任一缺失即拒绝。本轮**任何路径都不解锁** |
 | **memory** | 真实记忆写入（writeMemory / mirror 落真实 namespace） | **deny** | 本轮一律不真实写入（含验证与评审过程）；mirror 维持 ADR 0001 D4 默认关闭 |
 
 - 任何权限判定缺失证据、配置不明、对象无版本或 artifact 不匹配时，**一律按拒绝处理**（fail-closed），不得按"看起来合理"放行。

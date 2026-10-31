@@ -111,6 +111,17 @@ import {
   shouldReleaseReservation
 } from './jitrl/replacement-policy';
 import { conservativeAdvantage } from './jitrl/value-estimator';
+import {
+  accumulateWritebackSummary,
+  emptyWritebackGateSummary,
+  indexWritebackHistory,
+  judgeWriteback,
+  writebackHistoryEntryOf,
+  writebackRefusalCode,
+  writebackRouteCode,
+  type WritebackGateSummary,
+  type WritebackHistoryEntry
+} from './jitrl/writeback-gate';
 import { CURRENT_PROVENANCE_VERSION, EXPERIENCE_SCHEMA_VERSION } from './jitrl/experience-store';
 import {
   REWARD_CONTRACT,
@@ -253,6 +264,26 @@ export interface EvoHarnessOrchestratorDeps {
    */
   readonly conservativeGate?: boolean;
   /**
+   * rev6 R1-2 (t9): the EVIDENCE GATE on online write-back. Defaults to FALSE
+   * (absent = the historical behaviour, byte-identical: every executed probe is
+   * written into L2 experience).
+   *
+   * When true, `recordOnlineExperience` consults `src/jitrl/writeback-gate.ts`
+   * before letting an executed trajectory steer L2 selection: only a record
+   * that clears a PREREGISTERED route (verified fail->pass, or preregistered
+   * convergence) stays learning-eligible; everything else persists for AUDIT
+   * with `learningEligible: false` and a zero learning target.
+   *
+   * WHY IT IS OPT-IN AND NOT A DEFAULT: the historical negative result
+   * (`C3-online − C3-frozen` = −0.250, `gateFired: 0`) is the evidence that the
+   * ungated path is unsafe, but flipping the gate ON by default would change
+   * production learning semantics on the strength of a SYNTHETIC pool where no
+   * trajectory carries a trusted receipt. The gate therefore ships OFF, the
+   * experiment (t9) reports it as a measured policy change, and promotion stays
+   * the captain's adjudication. This is the same pattern as `conservativeGate`.
+   */
+  readonly writebackGate?: boolean;
+  /**
    * P6.2 C1 (ADR 0002 R1/R2): the resolved execution profile. The plugin
    * entrypoint resolves config.execution + permissions into this shape;
    * absent means "hand-built orchestrator, conservative defaults": shadow
@@ -301,7 +332,17 @@ export interface EvoHarnessOrchestratorDeps {
  * src/jitrl/index.ts without importing it.
  */
 export interface OrchestratorJitRl {
-  readonly store: Pick<IExperienceStore, 'append' | 'query' | 'size'>;
+  /**
+   * rev6 R1-2 (t9) widened this from `'append' | 'query' | 'size'` to include
+   * `'export'`: the write-back gate must count evidence across the WHOLE
+   * visible history (see `readWritebackHistory`), and the only honest way to do
+   * that without turning support into an artefact of a retrieval breadth is to
+   * enumerate the level. It stays OPTIONAL so a hand-built kernel that never
+   * provides it still type-checks; when absent the gate fails closed
+   * (`history-unusable`) rather than assuming an empty history.
+   */
+  readonly store: Pick<IExperienceStore, 'append' | 'query' | 'size'> &
+    Partial<Pick<IExperienceStore, 'export'>>;
   readonly optimizer: {
     decide<T>(
       level: JitLevel,
@@ -971,6 +1012,11 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
   private readonly releasedReservationKeys: Set<string> = new Set();
   /** P6.2 PR-B / F4: whether the conservative L2 gate intercepts deviations. */
   private readonly conservativeGate: boolean;
+  /**
+   * rev6 R1-2 (t9): whether the EVIDENCE GATE judges online write-back before
+   * it may steer L2 (see `writeback-gate.ts`). False = historical path.
+   */
+  private readonly writebackGate: boolean;
   /** P6.2 C1: the resolved execution profile (fail-closed defaults when absent). */
   private readonly executionProfile: ExecutionProfile;
 
@@ -1014,6 +1060,11 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     }
     this.conservativeGate =
       deps.conservativeGate === true || this.executionProfile.mode === 'guarded-active';
+    // rev6 R1-2 (t9): opt-in evidence gate on write-back. Deliberately NOT tied
+    // to guarded-active (unlike conservativeGate): that mode is about mounting a
+    // permanent patch, while this gate is about which EXECUTED probes may train
+    // L2 at all. Default off = the historical ungated path, byte for byte.
+    this.writebackGate = deps.writebackGate === true;
     this.treePool = deps.treePool;
   }
 
@@ -2088,6 +2139,109 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
    * Returns the number of records appended (0 when nothing was written).
    */
   /**
+   * rev6 R1-2 (t9): read the history the WRITE-BACK gate judges G-B against.
+   *
+   * WHY IT PAGES THE WHOLE LEVEL AND NOT ONE DECISION'S NEIGHBOURS: G-B is a
+   * claim about how much INDEPENDENT evidence an actionKey has accumulated, not
+   * about how similar the most recent neighbours happened to be. Asking the
+   * store for `k` neighbours would make support an artefact of `k` (a larger
+   * retrieval breadth would "prove" convergence), so the query asks for the
+   * level with the same causal cutoff and learning-eligibility filter the
+   * decision uses, and the gate counts what comes back.
+   *
+   * FAIL-CLOSED: any error returns `undefined`, which the gate turns into
+   * `history-unusable` (G-B refused). "I could not read the history" must never
+   * become "there were no counterexamples".
+   */
+  private async readWritebackHistory(
+    kernel: OrchestratorJitRl | undefined,
+    input: {
+      readonly diagnostics: string[];
+    },
+    before: number
+  ): Promise<WritebackHistoryEntry[] | undefined> {
+    if (kernel === undefined) {
+      return undefined;
+    }
+    try {
+      // Read the LEVEL, not one decision's neighbour window.
+      //
+      // G-B asks "how much INDEPENDENT evidence has this actionKey accumulated",
+      // which is a property of the whole visible history. Two cheaper-looking
+      // alternatives are both wrong and were rejected deliberately:
+      //   - `store.query({k})` makes support an artefact of `k`: a wider retrieval
+      //     breadth would "prove" convergence on its own;
+      //   - `store.query({state: <this decision's state>})` is bucket-keyed and
+      //     similarity-ranked, so it would only see neighbours of ONE decision and
+      //     would silently miss evidence stored under a different bucket token.
+      // `export()` yields every persisted record; the gate then applies the
+      // causal cutoff and the same learning-eligibility filter the decision's
+      // own filter uses, so "visible to L2" and "counted by the gate" agree.
+      const entries: WritebackHistoryEntry[] = [];
+      const exportFn = kernel.store.export;
+      if (exportFn === undefined) {
+        // The store cannot enumerate: G-B has no denominator here. Return
+        // `undefined` (history-unusable) instead of pretending the history is
+        // empty - an empty history would make `rejected-insufficient-support`
+        // look like a measured finding rather than an unreadable store.
+        input.diagnostics.push(
+          'jitrl write-back gate: the experience store does not implement export(); G-B convergence is refused for this run (fail-closed)'
+        );
+        return undefined;
+      }
+      for await (const record of exportFn.call(kernel.store)) {
+        if (!Number.isFinite(record.createdAt) || record.createdAt > before) {
+          continue;
+        }
+        if (record.learningEligible === false) {
+          continue;
+        }
+        const schemaVersion = record.experienceSchemaVersion;
+        if (
+          typeof schemaVersion !== 'number' ||
+          !Number.isFinite(schemaVersion) ||
+          schemaVersion < EXPERIENCE_SCHEMA_VERSION
+        ) {
+          continue;
+        }
+        const actionKey = typeof record.actionKey === 'string' ? record.actionKey : '';
+        if (actionKey.length === 0) {
+          continue;
+        }
+        // The persisted marks are the ONLY evidence source: `verificationVerdict`
+        // is 1 for passed / 2 for failed / 0 for unknown, and
+        // `verificationTrusted` is 1 only for a host-trusted receipt
+        // (src/verification/attach.ts:617-622). Nothing here is re-derived from
+        // the current run's opinion.
+        const marks = record.rewardSources ?? {};
+        const verdictCode = typeof marks.verificationVerdict === 'number' ? marks.verificationVerdict : 0;
+        entries.push(
+          writebackHistoryEntryOf(actionKey, {
+            trustedSource: marks.verificationTrusted === 1,
+            verificationStatus:
+              verdictCode === 1 ? 'passed' : verdictCode === 2 ? 'failed' : 'unknown',
+            // A persisted record whose verifier failed while its target stayed
+            // positive is the mismatch shape the negative-result diagnosis names
+            // (`negative-result-diag.mjs:225-226`). It is read from the record
+            // itself so a historical poisoning stays visible to every later gate.
+            verifierRewardMismatch:
+              verdictCode === 2 && (record.learningTarget ?? 0) > 0,
+            forceAuditOnly: marks.verificationAuditOnly === 1
+          })
+        );
+      }
+      return entries;
+    } catch (error) {
+      input.diagnostics.push(
+        'jitrl write-back gate: the experience history could not be read (' +
+          errorMessage(error) +
+          '); G-B convergence is refused for this run (fail-closed)'
+      );
+      return undefined;
+    }
+  }
+
+  /**
    * evaluate_steps + record_experience (plan Phase 3 / gap G2-3; rewritten by
    * P6 PR4 / plan sections 6.1-6.5).
    *
@@ -2257,6 +2411,33 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     const mode: DecisionMode = recordModeOf(this.executionProfile.mode);
     const actionKeyVocabulary: ActionKeyVocabulary = 'signature';
     let releasedReservations = 0;
+    // rev6 R1-2 (t9): the write-back gate's per-run roll-up and the history it
+    // judges against. Both exist unconditionally so the `record_experience`
+    // stage detail can report `enabled: false` explicitly instead of omitting
+    // the fields (an absent field reads as "not measured"; `enabled: false` reads
+    // as "measured: the historical path ran").
+    let writebackSummary: WritebackGateSummary = emptyWritebackGateSummary(this.writebackGate);
+    let gateAdmitted = 0;
+    let gateAuditedOnly = 0;
+    const gateVerdicts: Array<{
+      readonly actionKey: string;
+      readonly admitted: boolean;
+      readonly route?: string;
+      readonly refusal?: string;
+      readonly support: number;
+      readonly verifiedRate: number;
+      readonly counterexamples: number;
+    }> = [];
+    // G-B's denominator: the history L2 itself would consult for this run. It is
+    // indexed from the SAME store snapshot the decisions read (`before` = this
+    // run's createdAt, so nothing written by THIS run can vouch for itself).
+    // Undefined when the gate is off: the gate never forces a store read it would
+    // otherwise never do.
+    const writebackHistory = this.writebackGate
+      ? indexWritebackHistory(
+          await this.readWritebackHistory(kernel, input, createdAt)
+        )
+      : undefined;
 
     for (const probe of ordered) {
       // R5-6: a budget-charged execution whose outcome carries no quality
@@ -2424,7 +2605,78 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           ...decisionMarks
         };
       }
-      const learningTarget = eligible ? clamp(observedReturn - baseline, -3, 3) : 0;
+      // rev6 R1-2 (t9): judge this executed trajectory ONCE, BEFORE the record
+      // shape is assembled, so the SAME verdict decides the persisted
+      // `learningEligible`, the persisted `learningTarget`, and both the L1 and
+      // L2 records. (Judging after the association was built would leave the
+      // already-written fields untouched while claiming the gate had applied.)
+      //
+      // WHAT THE VERDICT READS (and only this):
+      //   - the scorer's own `trustedSource` (a host-trusted receipt, not a claim);
+      //   - the resolved verification status;
+      //   - the host disposition's `forceAuditOnly` (the host's own veto);
+      //   - the snapshot history the L2 decision actually consults.
+      // It does NOT read the composer's judgement, the surrogate score, or the
+      // record's reward - a high reward is exactly the thing the gate must not be
+      // impressed by (that is the historical failure this gate exists for).
+      let writebackAudited = false;
+      if (this.writebackGate) {
+        const gateVerdict = judgeWriteback(
+          {
+            actionKey: probe.selection?.actionKey ?? probe.actionKey,
+            trustedSource: evaluation.verification.trustedSource === true,
+            verificationStatus: evaluation.verification.status,
+            // A verifier/reward disagreement is the negative-result diagnosis'
+            // own definition (`negative-result-diag.mjs:225-226`): the verifier
+            // failed while the fused reward stayed positive. Derived HERE from the
+            // same two facts, so the gate and that diagnostic cannot drift.
+            verifierRewardMismatch: evaluation.verification.status === 'failed' && reward > 0,
+            forceAuditOnly: forcedAuditOnly,
+            recordLearningEligible: eligible && outcomeEligible
+          },
+          // Inside `if (this.writebackGate)` the index is definitionally built
+          // (it is created under the same flag), so this fallback is unreachable;
+          // it exists so the type is honest without a non-null assertion. An
+          // unusable (empty) index is the correct fail-closed value if it ever
+          // were reached: G-B must not pass on a history nobody read.
+          writebackHistory ?? indexWritebackHistory(undefined)
+        );
+        writebackSummary = accumulateWritebackSummary(writebackSummary, gateVerdict);
+        writebackAudited = !gateVerdict.admitted;
+        if (writebackAudited) {
+          // AUDIT-ONLY ENCODING (the same shape the pre-existing audit branch
+          // uses): the negative sample is NOT deleted - hiding harm was the
+          // original defect - but it is forced ineligible with a ZERO learning
+          // target, so `filterExperienceSnapshot`'s learning-eligibility filter
+          // drops it and no consumer can read a gain from it.
+          gateAuditedOnly += 1;
+          rewardSources = {
+            ...rewardSources,
+            writebackRefusal: writebackRefusalCode(gateVerdict.refusal)
+          };
+        } else {
+          gateAdmitted += 1;
+          rewardSources = {
+            ...rewardSources,
+            writebackRoute: writebackRouteCode(gateVerdict.route)
+          };
+        }
+        gateVerdicts.push({
+          actionKey: probe.selection?.actionKey ?? probe.actionKey,
+          admitted: gateVerdict.admitted,
+          route: gateVerdict.route,
+          refusal: gateVerdict.refusal,
+          support: gateVerdict.support,
+          verifiedRate: gateVerdict.verifiedRate,
+          counterexamples: gateVerdict.counterexamples
+        });
+      }
+
+      // The gate may only LOWER eligibility; it never grants learning a record
+      // the scorer refused. `&& !writebackAudited` is therefore a no-op when the
+      // gate is off (writebackAudited stays false).
+      const learningTarget =
+        eligible && !writebackAudited ? clamp(observedReturn - baseline, -3, 3) : 0;
       const decisionId = probe.selection?.decisionId ?? 'jit-meta-decision-' + input.runId + '-r' + String(probe.round);
       const association = {
         round: probe.round,
@@ -2459,7 +2711,12 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         // C2a (ADR 0003 §5.1/§5.2): the learning branch writes the two-gate
         // conjunction (in this branch both gates are true, i.e. exactly
         // `evaluation.learningEligible`); the audit branch wrote `false` above.
-        learningEligible: eligible && outcomeEligible
+        //
+        // rev6 R1-2 (t9): `!writebackAudited` is the gate's ONLY effect on this
+        // flag (see the gate block above the association). The gate can lower
+        // eligibility, never raise it, and when it is off `writebackAudited`
+        // stays false so this expression is byte-identical to the pre-t9 shape.
+        learningEligible: eligible && outcomeEligible && !writebackAudited
       } as const;
 
       const isTaskQualityRecord = learningTrack === 'task-quality' && eligible && outcomeEligible;
@@ -2653,7 +2910,25 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           ...new Set(
             decisionsWithPrior.map((probe) => probe.selection?.semanticKind ?? '').filter((kind) => kind !== '')
           )
-        ]
+        ],
+        // rev6 R1-2 (t9): the write-back gate's own accounting. Reported
+        // unconditionally so `enabled: false` is an explicit measurement ("the
+        // historical ungated path ran") rather than an absent field the reader
+        // has to interpret. `gateFired` is the number the historical
+        // `deviationStats` reported as 0; `admittedToL2 + auditedOnly === judged`
+        // by construction, and both are cross-checked by the unit suite.
+        writebackGate: {
+          enabled: writebackSummary.enabled,
+          judged: writebackSummary.judged,
+          admittedToL2: writebackSummary.admitted,
+          auditedOnly: writebackSummary.auditedOnly,
+          gateFired: writebackSummary.gateFired,
+          refusalCounts: writebackSummary.refusalCounts,
+          routeCounts: writebackSummary.routeCounts,
+          // Per-execution verdicts, so a counterexample can be located by
+          // (task, run, round, actionKey) instead of inferred from counts.
+          verdicts: gateVerdicts
+        }
       }
     });
     // C2b F4: remember which pending quality registrations belong to this
@@ -2723,7 +2998,32 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         level: 'proposal',
         state: input.state,
         k: finiteOr(config.k, DEFAULT_PROPOSAL_K),
-        similarityThreshold: finiteOr(config.similarityThreshold, DEFAULT_PROPOSAL_SIMILARITY)
+        similarityThreshold: finiteOr(config.similarityThreshold, DEFAULT_PROPOSAL_SIMILARITY),
+        // rev6 R1-2 fix (t21 finding T21-F1): when the writeback gate is ON, the
+        // L2 neighbourhood is a LEARNING consumer, so a record the gate refused
+        // (audit-only: `learningEligible === false`, `learningTarget === 0`) must
+        // not be retrievable as a neighbour at all.
+        //
+        // Why this flag and not "trust the record fields": the previous code
+        // relied on the gate zeroing `learningTarget`, but the value estimator
+        // reads `observedReturn` (`readLearningTarget`), NOT `learningTarget` - so
+        // an audited record carrying `observedReturn: 0.9` stayed fully visible
+        // and could steer selection with exactly the reward the gate refused. The
+        // store's `learningEligibleOnly` filter is the documented mechanism
+        // (`LEARNING_CONSUMER_FILTER` in ./jitrl/decision-kernel names "the
+        // store's learningEligibleOnly query" for precisely this), and it also
+        // drops records whose reward/schema version cannot be proven current -
+        // which is the same "may this train?" question, not a wider one.
+        //
+        // WHEN GATE IS OFF the option is ABSENT, so the query is byte-identical
+        // to the historical shape and the pre-t9 path is unchanged. This is the
+        // task contract's "default writebackGate=false keeps history equivalent".
+        //
+        // It is NOT tied to `enableQualityTrackConsumption`/dual-track: the gate
+        // decides whether refused evidence may train, which is orthogonal to
+        // whether the quality track is consumed (the T21-F1 defect was exactly
+        // that dependency).
+        ...(this.writebackGate ? { learningEligibleOnly: true } : {})
       });
     } catch (error) {
       input.diagnostics.push(

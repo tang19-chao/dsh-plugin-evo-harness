@@ -118,7 +118,7 @@ export function resolveExecutionProfile(input: ExecutionProfileInput = {}): Exec
       },
       publish: {
         allowed: false,
-        reason: 'publish is never granted in this round: holdout non-inferiority + explicit authorization + matching artifact are all required and none exists (ADR 0002 R2)'
+        reason: 'publish is never granted in this round: holdout STRICT-IMPROVEMENT validation (winner hypervolume > baseline + epsilon on the held-out trees, ADR 0007 §2 - the earlier "non-inferiority" wording was drift) + explicit authorization + matching artifact are all required and none exists (ADR 0002 R2)'
       },
       memory: {
         allowed: memoryAllowed,

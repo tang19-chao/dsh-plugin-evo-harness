@@ -1,0 +1,967 @@
+{
+  "rule": "rev6 contract §5.5 (R1-3/R1-4); preregistration §3/§5/§6/§9",
+  "preregistration": {
+    "path": "docs/reports/rev6-ablation-preregistration.md",
+    "sha256": "fc30f7d07450da80d614feba6441b630e934ec20acd9256cd27820686779b901",
+    "mtimeMs": 1793391300026,
+    "mtimeIso": "2026-10-30T20:15:00.026Z"
+  },
+  "firstSampleAtMs": 1793392545465,
+  "firstSampleIso": "2026-10-30T20:35:45.465Z",
+  "preregisteredBeforeFirstSample": true,
+  "design": {
+    "pool": {
+      "taskCount": 12,
+      "rounds": 3,
+      "designVersion": "v3/tasks-20261029"
+    },
+    "summary": {
+      "version": "v3/tasks-20261029",
+      "poolRuleVersion": "v3/narrow+pair/fixed-lineage",
+      "scheduleVersion": "v3/schedule-20261029",
+      "rounds": 3,
+      "taskCount": 12,
+      "surfaces": [
+        "guardrails",
+        "tool_guidance",
+        "skills",
+        "memory",
+        "scripts"
+      ],
+      "unproposableSurfaces": [
+        "subagents",
+        "plugins"
+      ],
+      "slotKinds": [
+        "exploit",
+        "explore_domain",
+        "explore_invariant",
+        "recover"
+      ],
+      "baselineBand": {
+        "low": 0.3,
+        "high": 0.7,
+        "inBand": true
+      },
+      "priorMeanCoverage": 0.569444,
+      "oracleMeanCoverage": 0.805556,
+      "meanHeadroom": 0.236111,
+      "requiredOutsideTop3Share": 0.833333,
+      "tasksWithRequiredOutsideTop3": 10,
+      "tasksWithConstrainedCeiling": 6,
+      "tasksWithHeadroom": 7,
+      "minActionsPerDecisionPoint": 3,
+      "supportMatrix": {
+        "decisionPoints": 36,
+        "actionClasses": [
+          "guardrails",
+          "guardrails+memory",
+          "guardrails+scripts",
+          "guardrails+skills",
+          "guardrails+tool_guidance",
+          "memory",
+          "memory+skills",
+          "memory+tool_guidance",
+          "scripts",
+          "scripts+skills",
+          "scripts+tool_guidance",
+          "skills",
+          "skills+tool_guidance",
+          "tool_guidance"
+        ],
+        "rank": 9,
+        "minActionsPerDecisionPoint": 3
+      },
+      "rows": [
+        {
+          "id": "v3-ci-01",
+          "family": "ci-fix",
+          "required": [
+            "guardrails",
+            "skills"
+          ],
+          "prefs": [
+            "guardrails",
+            "skills",
+            "tool_guidance",
+            "memory",
+            "scripts"
+          ],
+          "blind": [],
+          "taskClass": "prior-saturates",
+          "requiredWithinTop3Prefs": true,
+          "reachable": [
+            "guardrails",
+            "memory",
+            "skills",
+            "tool_guidance"
+          ],
+          "actionsPerDecisionPoint": [
+            {
+              "round": 0,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+skills",
+                "skills"
+              ]
+            },
+            {
+              "round": 1,
+              "actions": 3,
+              "classes": [
+                "skills",
+                "skills+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 2,
+              "actions": 3,
+              "classes": [
+                "memory",
+                "memory+tool_guidance",
+                "tool_guidance"
+              ]
+            }
+          ],
+          "oracle": 1,
+          "prior": 1,
+          "headroom": 0,
+          "ceilingIsOne": true
+        },
+        {
+          "id": "v3-mig-01",
+          "family": "schema-migration",
+          "required": [
+            "tool_guidance"
+          ],
+          "prefs": [
+            "tool_guidance",
+            "guardrails",
+            "skills",
+            "memory",
+            "scripts"
+          ],
+          "blind": [],
+          "taskClass": "prior-saturates",
+          "requiredWithinTop3Prefs": true,
+          "reachable": [
+            "guardrails",
+            "memory",
+            "skills",
+            "tool_guidance"
+          ],
+          "actionsPerDecisionPoint": [
+            {
+              "round": 0,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 1,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+skills",
+                "skills"
+              ]
+            },
+            {
+              "round": 2,
+              "actions": 3,
+              "classes": [
+                "memory",
+                "memory+skills",
+                "skills"
+              ]
+            }
+          ],
+          "oracle": 1,
+          "prior": 1,
+          "headroom": 0,
+          "ceilingIsOne": true
+        },
+        {
+          "id": "v3-ci-02",
+          "family": "ci-fix",
+          "required": [
+            "guardrails",
+            "memory"
+          ],
+          "prefs": [
+            "guardrails",
+            "skills",
+            "tool_guidance",
+            "memory",
+            "scripts"
+          ],
+          "blind": [],
+          "taskClass": "preference-blind",
+          "requiredWithinTop3Prefs": false,
+          "reachable": [
+            "guardrails",
+            "memory",
+            "skills",
+            "tool_guidance"
+          ],
+          "actionsPerDecisionPoint": [
+            {
+              "round": 0,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+skills",
+                "skills"
+              ]
+            },
+            {
+              "round": 1,
+              "actions": 3,
+              "classes": [
+                "skills",
+                "skills+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 2,
+              "actions": 3,
+              "classes": [
+                "memory",
+                "memory+tool_guidance",
+                "tool_guidance"
+              ]
+            }
+          ],
+          "oracle": 1,
+          "prior": 0.5,
+          "headroom": 0.5,
+          "ceilingIsOne": true
+        },
+        {
+          "id": "v3-ci-03",
+          "family": "ci-fix",
+          "required": [
+            "scripts",
+            "tool_guidance"
+          ],
+          "prefs": [
+            "tool_guidance",
+            "skills",
+            "guardrails",
+            "scripts",
+            "memory"
+          ],
+          "blind": [],
+          "taskClass": "preference-blind",
+          "requiredWithinTop3Prefs": false,
+          "reachable": [
+            "guardrails",
+            "scripts",
+            "skills",
+            "tool_guidance"
+          ],
+          "actionsPerDecisionPoint": [
+            {
+              "round": 0,
+              "actions": 3,
+              "classes": [
+                "skills",
+                "skills+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 1,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+skills",
+                "skills"
+              ]
+            },
+            {
+              "round": 2,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+scripts",
+                "scripts"
+              ]
+            }
+          ],
+          "oracle": 1,
+          "prior": 0.5,
+          "headroom": 0.5,
+          "ceilingIsOne": true
+        },
+        {
+          "id": "v3-test-01",
+          "family": "test-authoring",
+          "required": [
+            "memory",
+            "skills"
+          ],
+          "prefs": [
+            "skills",
+            "guardrails",
+            "tool_guidance",
+            "memory",
+            "scripts"
+          ],
+          "blind": [],
+          "taskClass": "preference-blind",
+          "requiredWithinTop3Prefs": false,
+          "reachable": [
+            "guardrails",
+            "memory",
+            "skills",
+            "tool_guidance"
+          ],
+          "actionsPerDecisionPoint": [
+            {
+              "round": 0,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+skills",
+                "skills"
+              ]
+            },
+            {
+              "round": 1,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 2,
+              "actions": 3,
+              "classes": [
+                "memory",
+                "memory+tool_guidance",
+                "tool_guidance"
+              ]
+            }
+          ],
+          "oracle": 1,
+          "prior": 0.5,
+          "headroom": 0.5,
+          "ceilingIsOne": true
+        },
+        {
+          "id": "v3-test-02",
+          "family": "test-authoring",
+          "required": [
+            "guardrails",
+            "scripts",
+            "skills"
+          ],
+          "prefs": [
+            "guardrails",
+            "skills",
+            "tool_guidance",
+            "scripts",
+            "memory"
+          ],
+          "blind": [],
+          "taskClass": "preference-blind",
+          "requiredWithinTop3Prefs": false,
+          "reachable": [
+            "guardrails",
+            "scripts",
+            "skills",
+            "tool_guidance"
+          ],
+          "actionsPerDecisionPoint": [
+            {
+              "round": 0,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+skills",
+                "skills"
+              ]
+            },
+            {
+              "round": 1,
+              "actions": 3,
+              "classes": [
+                "skills",
+                "skills+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 2,
+              "actions": 3,
+              "classes": [
+                "scripts",
+                "scripts+tool_guidance",
+                "tool_guidance"
+              ]
+            }
+          ],
+          "oracle": 1,
+          "prior": 0.6666666666666666,
+          "headroom": 0.333333,
+          "ceilingIsOne": true
+        },
+        {
+          "id": "v3-mig-02",
+          "family": "schema-migration",
+          "required": [
+            "memory",
+            "scripts",
+            "tool_guidance"
+          ],
+          "prefs": [
+            "tool_guidance",
+            "guardrails",
+            "skills",
+            "scripts",
+            "memory"
+          ],
+          "blind": [],
+          "taskClass": "preference-blind",
+          "requiredWithinTop3Prefs": false,
+          "reachable": [
+            "guardrails",
+            "scripts",
+            "skills",
+            "tool_guidance"
+          ],
+          "actionsPerDecisionPoint": [
+            {
+              "round": 0,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 1,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+skills",
+                "skills"
+              ]
+            },
+            {
+              "round": 2,
+              "actions": 3,
+              "classes": [
+                "scripts",
+                "scripts+skills",
+                "skills"
+              ]
+            }
+          ],
+          "oracle": 0.6666666666666666,
+          "prior": 0.3333333333333333,
+          "headroom": 0.333333,
+          "ceilingIsOne": false
+        },
+        {
+          "id": "v3-rel-01",
+          "family": "release-gating",
+          "required": [
+            "guardrails",
+            "subagents"
+          ],
+          "prefs": [
+            "guardrails",
+            "skills",
+            "tool_guidance",
+            "memory",
+            "scripts"
+          ],
+          "blind": [
+            "subagents"
+          ],
+          "taskClass": "family-blind",
+          "requiredWithinTop3Prefs": false,
+          "reachable": [
+            "guardrails",
+            "memory",
+            "skills",
+            "tool_guidance"
+          ],
+          "actionsPerDecisionPoint": [
+            {
+              "round": 0,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+skills",
+                "skills"
+              ]
+            },
+            {
+              "round": 1,
+              "actions": 3,
+              "classes": [
+                "skills",
+                "skills+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 2,
+              "actions": 3,
+              "classes": [
+                "memory",
+                "memory+tool_guidance",
+                "tool_guidance"
+              ]
+            }
+          ],
+          "oracle": 0.5,
+          "prior": 0.5,
+          "headroom": 0,
+          "ceilingIsOne": false
+        },
+        {
+          "id": "v3-rel-02",
+          "family": "release-gating",
+          "required": [
+            "plugins",
+            "skills"
+          ],
+          "prefs": [
+            "skills",
+            "tool_guidance",
+            "guardrails",
+            "memory",
+            "scripts"
+          ],
+          "blind": [
+            "plugins"
+          ],
+          "taskClass": "family-blind",
+          "requiredWithinTop3Prefs": false,
+          "reachable": [
+            "guardrails",
+            "memory",
+            "skills",
+            "tool_guidance"
+          ],
+          "actionsPerDecisionPoint": [
+            {
+              "round": 0,
+              "actions": 3,
+              "classes": [
+                "skills",
+                "skills+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 1,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 2,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+memory",
+                "memory"
+              ]
+            }
+          ],
+          "oracle": 0.5,
+          "prior": 0.5,
+          "headroom": 0,
+          "ceilingIsOne": false
+        },
+        {
+          "id": "v3-mig-03",
+          "family": "schema-migration",
+          "required": [
+            "skills",
+            "subagents",
+            "tool_guidance"
+          ],
+          "prefs": [
+            "tool_guidance",
+            "skills",
+            "guardrails",
+            "memory",
+            "scripts"
+          ],
+          "blind": [
+            "subagents"
+          ],
+          "taskClass": "family-blind",
+          "requiredWithinTop3Prefs": false,
+          "reachable": [
+            "guardrails",
+            "memory",
+            "skills",
+            "tool_guidance"
+          ],
+          "actionsPerDecisionPoint": [
+            {
+              "round": 0,
+              "actions": 3,
+              "classes": [
+                "skills",
+                "skills+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 1,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+skills",
+                "skills"
+              ]
+            },
+            {
+              "round": 2,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+memory",
+                "memory"
+              ]
+            }
+          ],
+          "oracle": 0.6666666666666666,
+          "prior": 0.6666666666666666,
+          "headroom": 0,
+          "ceilingIsOne": false
+        },
+        {
+          "id": "v3-rel-03",
+          "family": "release-gating",
+          "required": [
+            "guardrails",
+            "plugins",
+            "scripts"
+          ],
+          "prefs": [
+            "guardrails",
+            "tool_guidance",
+            "skills",
+            "scripts",
+            "memory"
+          ],
+          "blind": [
+            "plugins"
+          ],
+          "taskClass": "mixed",
+          "requiredWithinTop3Prefs": false,
+          "reachable": [
+            "guardrails",
+            "scripts",
+            "skills",
+            "tool_guidance"
+          ],
+          "actionsPerDecisionPoint": [
+            {
+              "round": 0,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 1,
+              "actions": 3,
+              "classes": [
+                "skills",
+                "skills+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 2,
+              "actions": 3,
+              "classes": [
+                "scripts",
+                "scripts+skills",
+                "skills"
+              ]
+            }
+          ],
+          "oracle": 0.6666666666666666,
+          "prior": 0.3333333333333333,
+          "headroom": 0.333333,
+          "ceilingIsOne": false
+        },
+        {
+          "id": "v3-test-03",
+          "family": "test-authoring",
+          "required": [
+            "memory",
+            "skills",
+            "subagents"
+          ],
+          "prefs": [
+            "skills",
+            "guardrails",
+            "tool_guidance",
+            "memory",
+            "scripts"
+          ],
+          "blind": [
+            "subagents"
+          ],
+          "taskClass": "mixed",
+          "requiredWithinTop3Prefs": false,
+          "reachable": [
+            "guardrails",
+            "memory",
+            "skills",
+            "tool_guidance"
+          ],
+          "actionsPerDecisionPoint": [
+            {
+              "round": 0,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+skills",
+                "skills"
+              ]
+            },
+            {
+              "round": 1,
+              "actions": 3,
+              "classes": [
+                "guardrails",
+                "guardrails+tool_guidance",
+                "tool_guidance"
+              ]
+            },
+            {
+              "round": 2,
+              "actions": 3,
+              "classes": [
+                "memory",
+                "memory+tool_guidance",
+                "tool_guidance"
+              ]
+            }
+          ],
+          "oracle": 0.6666666666666666,
+          "prior": 0.3333333333333333,
+          "headroom": 0.333333,
+          "ceilingIsOne": false
+        }
+      ],
+      "findings": []
+    },
+    "identifiability": {
+      "cells": [
+        "Arm-1 process/off",
+        "Arm-2 process/on",
+        "Arm-3 quality/off",
+        "Arm-4 quality/on"
+      ],
+      "columns": 4,
+      "rank": 4,
+      "fullRank": true,
+      "rankOneFixtureDetected": true,
+      "interpretation": "all four effects (two mains + interaction) are separately estimable => the interaction is IDENTIFIABLE by design, not `undetermined`"
+    },
+    "floor": {
+      "familySizes": [
+        1,
+        2,
+        4
+      ],
+      "holmThresholds": [
+        0.0125,
+        0.016666666666666666,
+        0.025,
+        0.05
+      ],
+      "minDiscordant": {
+        "1": 6,
+        "2": 7,
+        "4": 8
+      },
+      "table": [
+        {
+          "m": 1,
+          "pMin": 1,
+          "pMinFormula": "2^(1-m) = 2^0",
+          "correctable": false,
+          "label": "structurally-non-rejectable"
+        },
+        {
+          "m": 2,
+          "pMin": 0.5,
+          "pMinFormula": "2^(1-m) = 2^-1",
+          "correctable": false,
+          "label": "structurally-non-rejectable"
+        },
+        {
+          "m": 3,
+          "pMin": 0.25,
+          "pMinFormula": "2^(1-m) = 2^-2",
+          "correctable": false,
+          "label": "structurally-non-rejectable"
+        },
+        {
+          "m": 4,
+          "pMin": 0.125,
+          "pMinFormula": "2^(1-m) = 2^-3",
+          "correctable": false,
+          "label": "structurally-non-rejectable"
+        },
+        {
+          "m": 5,
+          "pMin": 0.0625,
+          "pMinFormula": "2^(1-m) = 2^-4",
+          "correctable": false,
+          "label": "structurally-non-rejectable"
+        },
+        {
+          "m": 6,
+          "pMin": 0.03125,
+          "pMinFormula": "2^(1-m) = 2^-5",
+          "correctable": false,
+          "label": "structurally-non-rejectable"
+        },
+        {
+          "m": 7,
+          "pMin": 0.015625,
+          "pMinFormula": "2^(1-m) = 2^-6",
+          "correctable": false,
+          "label": "structurally-non-rejectable"
+        },
+        {
+          "m": 8,
+          "pMin": 0.0078125,
+          "pMinFormula": "2^(1-m) = 2^-7",
+          "correctable": true,
+          "label": "rejectable"
+        },
+        {
+          "m": 9,
+          "pMin": 0.00390625,
+          "pMinFormula": "2^(1-m) = 2^-8",
+          "correctable": true,
+          "label": "rejectable"
+        },
+        {
+          "m": 10,
+          "pMin": 0.001953125,
+          "pMinFormula": "2^(1-m) = 2^-9",
+          "correctable": true,
+          "label": "rejectable"
+        },
+        {
+          "m": 11,
+          "pMin": 0.0009765625,
+          "pMinFormula": "2^(1-m) = 2^-10",
+          "correctable": true,
+          "label": "rejectable"
+        },
+        {
+          "m": 12,
+          "pMin": 0.00048828125,
+          "pMinFormula": "2^(1-m) = 2^-11",
+          "correctable": true,
+          "label": "rejectable"
+        }
+      ]
+    },
+    "power": {
+      "basis": "exact sign test (minTasksForPower) / exact sign-flip (piStarForSignFlip); CONDITIONAL on the magnitude set, not an unconditional power analysis",
+      "tasksForEightyPercent": {
+        "0.7": 49,
+        "0.75": 30,
+        "0.8": 20,
+        "0.85": 15,
+        "0.9": 12,
+        "0.95": 9
+      },
+      "piAtPoolSize": {
+        "8": 0.9725,
+        "10": 0.9167,
+        "12": 0.8693,
+        "16": 0.8529,
+        "20": 0.7987
+      }
+    },
+    "firewall": {
+      "clean": {
+        "ok": true,
+        "violations": []
+      },
+      "leak": {
+        "ok": false,
+        "violations": [
+          {
+            "kind": "holdout-in-selection-artifact",
+            "detail": "tests/fixtures/p2-l1/p2-v3-selection-holdout-leak.json:v3-ci-01"
+          }
+        ]
+      },
+      "bidirectional": true,
+      "interpretation": "clean passes AND leak fails: the firewall discriminates rather than always passing"
+    },
+    "taskTableGate": {
+      "ok": true,
+      "findings": [],
+      "digest": "sha256:585d030790072ba2fc096d00821e1a2a88bbb0866e91491962ae117fa15a2142",
+      "taskCount": 12,
+      "outsideTop3Share": 0.833333,
+      "outsideTop3Tasks": 10,
+      "oracleBelowOne": 6,
+      "headroomTasks": 7,
+      "minActionsPerDecisionPoint": 3,
+      "supportMatrixRank": 9,
+      "supportMatrixColumns": 14,
+      "supportMatrixRows": 36
+    },
+    "arms": {
+      "status": "not-run",
+      "reason": "executing the four arms is a five-arm experiment (its own budget, its own V2/V3 artifact binding), and this task owns the DESIGN, not the run. The design facts above are the deliverable; arm-level μ/π intervals are `not-evaluable` here and must not be inferred from design arithmetic.",
+      "preregisteredArms": [
+        "Arm-0 (frozen reference)",
+        "Arm-1 process/off",
+        "Arm-2 process/on",
+        "Arm-3 quality/off",
+        "Arm-4 quality/on"
+      ],
+      "armFiveAdded": false,
+      "independentUnit": "task (episodes/rounds are NOT independent samples)"
+    }
+  },
+  "boundaries": {
+    "synthetic": true,
+    "noRealModel": true,
+    "noMemoryWrite": true,
+    "noArmFive": true,
+    "episodesAreNotIndependentSamples": true,
+    "historicalNumbersUnchanged": true,
+    "notAResultAboutProductionLearning": true,
+    "armsNotRun": true
+  }
+}

@@ -572,6 +572,151 @@ describe('PR-1 build/ESM smoke gate', () => {
   });
 });
 
+describe('PR-1 build child environment (rev6 CI pin)', () => {
+  // rev6 pins the production build child to `CI=true` (scripts/eval/smoke-build.mjs):
+  // pnpm and the tools behind it change behavior when CI is set, so a build
+  // child that inherits the caller's CI value produces different evidence from
+  // a developer shell than from a CI job. These tests do not trust the spawn
+  // options - they OBSERVE the environment: the fixture's `build` script is a
+  // real node process that dumps `process.env` to disk before doing anything
+  // else, so every assertion below is evidence of what the child ACTUALLY saw
+  // through the real `pnpm run build` spawn path. No test here uses
+  // `--skip-build`: a skipped build could never have produced the probe output.
+  //
+  // The fixtures ship no `lib/index.js`, so after the build step is observed
+  // the gate is EXPECTED to fail on `artifact-exists`; that failure is part of
+  // the assertion, not noise.
+
+  /** The fixture build script: record the child environment, then optionally fail. */
+  const PROBE_SCRIPT = [
+    "import fs from 'node:fs';",
+    "fs.writeFileSync('child-env.json', JSON.stringify(process.env), 'utf8');",
+    "if (process.env.PR1_PROBE_FAIL === '1') {",
+    "  console.error('PR1-NEGATIVE-BUILD-MARKER fixture build failed on purpose');",
+    '  process.exit(1);',
+    '}',
+    ''
+  ].join('\n');
+
+  /** One throw-away package whose `build` script is the probe above. */
+  function makeProbeFixture(): string {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'pr1-ci-env-')));
+    fs.writeFileSync(
+      path.join(dir, 'package.json'),
+      JSON.stringify(
+        { name: 'pr1-ci-env-fixture', version: '0.0.0', private: true, scripts: { build: 'node probe-build.mjs' } },
+        null,
+        2
+      ) + '\n',
+      'utf8'
+    );
+    fs.writeFileSync(path.join(dir, 'probe-build.mjs'), PROBE_SCRIPT, 'utf8');
+    return dir;
+  }
+
+  /**
+   * Run the gate against `dir` with a temporarily mutated CALLER environment.
+   * The mutation is exactly what the pin must neutralise, so it happens on the
+   * live `process.env` the spawn inherits - and is restored even when
+   * assertions throw, so no other test in this worker sees fixture variables.
+   */
+  async function smokeWithCallerEnv(dir: string, mutate: (env: NodeJS.ProcessEnv) => void): Promise<SmokeBuildResult> {
+    const watched = ['CI', 'PR1_CALLER_MARKER', 'PR1_PROBE_FAIL'] as const;
+    const snapshot = watched.map((key) => [key, process.env[key]] as const);
+    mutate(process.env);
+    try {
+      return await smokeBuild({ cwd: dir });
+    } finally {
+      for (const [key, value] of snapshot) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  }
+
+  /** The environment the build child ACTUALLY saw, recorded by the probe. */
+  function readChildEnv(dir: string): Record<string, string> {
+    return JSON.parse(fs.readFileSync(path.join(dir, 'child-env.json'), 'utf8'));
+  }
+
+  /**
+   * Case-insensitive environment lookup. Windows environment variable names are
+   * case-insensitive, and every middleman between this process and the build
+   * child (shell, cmd, pnpm) may rewrite the spelling - the same machine
+   * observed `ComSpec` through one spawn chain and `COMSPEC` through another.
+   * Assertions about presence must therefore never depend on the recorded case.
+   */
+  function pickEnv(env: Record<string, string>, name: string): string | undefined {
+    const key = Object.keys(env).find((key) => key.toLowerCase() === name.toLowerCase());
+    return key === undefined ? undefined : env[key];
+  }
+
+  it('pins CI=true for the build child even when the caller exports CI=false, preserving the caller environment', async () => {
+    const dir = makeProbeFixture();
+    const result = await smokeWithCallerEnv(dir, (env) => {
+      env.CI = 'false'; // the exact caller state the pin exists to neutralise
+      env.PR1_CALLER_MARKER = 'inherited-verbatim';
+    });
+    // The build step is real and succeeded: `child-env.json` can only exist
+    // because pnpm executed the probe.
+    expect(result.steps[0]).toEqual({ step: 'build', ok: true, detail: 'pnpm run build exited 0' });
+    const child = readChildEnv(dir);
+    // (a) THE PIN: the child sees CI=true, never the caller's false.
+    expect(pickEnv(child, 'CI')).toBe('true');
+    // (b) necessary system env survived: PATH for tool discovery, plus the
+    // platform variables programs rely on (Windows keeps its own spellings).
+    expect(pickEnv(child, 'PATH'), 'PATH must reach the build child').toBeTruthy();
+    if (process.platform === 'win32') {
+      expect(pickEnv(child, 'ComSpec'), 'ComSpec must reach the build child').toBeTruthy();
+      expect(pickEnv(child, 'SystemRoot'), 'SystemRoot must reach the build child').toBeTruthy();
+    } else {
+      expect(pickEnv(child, 'HOME'), 'HOME must reach the build child').toBeTruthy();
+    }
+    // (c) inheritance is WHOLESALE, not a curated whitelist: a caller variable
+    // the gate has never heard of reaches the child unchanged.
+    expect(child.PR1_CALLER_MARKER).toBe('inherited-verbatim');
+    // The fixture ships no artifact, so the gate's first verdict after the
+    // observed build is the artifact check - the probe build was never
+    // mistaken for a full pass.
+    expect(result.ok).toBe(false);
+    expect(result.steps[1]).toMatchObject({ step: 'artifact-exists', ok: false });
+  }, 60_000);
+
+  it('pins CI=true when the caller does not define CI at all', async () => {
+    const dir = makeProbeFixture();
+    const result = await smokeWithCallerEnv(dir, (env) => {
+      delete env.CI;
+    });
+    expect(result.steps[0]).toEqual({ step: 'build', ok: true, detail: 'pnpm run build exited 0' });
+    expect(readChildEnv(dir).CI).toBe('true');
+  }, 60_000);
+
+  it('FAILS the gate when the real build fails, with CI=true still pinned in the failing child', async () => {
+    // Negative direction: the pin must not turn a red build green, and the
+    // verdict must be the build step's own failure carrying the child's stderr.
+    const dir = makeProbeFixture();
+    const result = await smokeWithCallerEnv(dir, (env) => {
+      env.CI = 'false';
+      env.PR1_PROBE_FAIL = '1';
+    });
+    expect(result.ok).toBe(false);
+    expect(result.steps).toHaveLength(1); // a failed build fails fast: no artifact steps follow
+    // Narrow once: under noUncheckedIndexedAccess `result.steps[0]` is
+    // `Step | undefined`, so the four property assertions below read a single
+    // narrowed local instead of repeating a non-null assertion per line.
+    const buildStep = result.steps[0];
+    expect(buildStep).toBeDefined();
+    expect(buildStep?.step).toBe('build');
+    expect(buildStep?.ok).toBe(false);
+    expect(buildStep?.detail).toContain('pnpm run build failed');
+    expect(buildStep?.detail).toContain('PR1-NEGATIVE-BUILD-MARKER');
+    // The failing child was still a REAL build under the pin: the probe wrote
+    // its environment before exiting 1, so the negative run is also evidence
+    // of the pinned environment - not of a skipped build.
+    expect(readChildEnv(dir).CI).toBe('true');
+  }, 60_000);
+});
+
 describe('PR-1 attestation CLI', () => {
   it('refuses to attest a dirty tracked tree', () => {
     // This repository is currently dirty (the PR-1 change itself), so the
