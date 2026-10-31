@@ -539,3 +539,42 @@ node scripts/eval/verify-pr4a-artifacts.mjs     # checked=691 passed=691 failed=
 4. **t5/t7 接口**：`DshHostAdvisorStats.scopeUnknownSkipped?` 与"未采集 ≠ 零"的语义由 t5 定类型、t7 落地到 status（§3.7）；`src/index.ts` 只允许 t4→t7 顺序写。
 5. **t8 判据**：mutation 以**必红测试名集合**为判据（红数只作观察值，§5.1）；Node24 以 CI 实跑为准，本地不得宣称（F-17）。
 6. **t16 集成点**：全局计数只在 t16 同步；691（PR-4A）与 97/1979（Vitest）作为历史值保留，新增实测值并列记录；`P62_STATUS`/`DEVELOPMENT_LOG` 的 F1 表述更新为"eol-equiv-v1 后 LF 检出可复验；历史 691 仍为当时计数"，**不删历史**。
+
+---
+
+## 11. rev5 诊断面与公开键同步（t10，A-t10-15）
+
+本节记录 rev5 P1/P2 新增的**只读诊断面**与它们对公开契约的影响。原则不变（§3.1）：公开选项键只有 `OPTION_KEYS` 那 26 个，**新增任何顶层键都要先改本节并让 `plugin-options-shape` 测试同步**；本节的所有新增都**不是**选项键。
+
+### 11.1 新增的只读状态（`src/index.ts`，增量、无宿主副作用）
+
+| 公开键 | 形态 | 语义边界 |
+| --- | --- | --- |
+| `plugin.surfaces: EvoHarnessSurfaceStatus[]` | 8 项，恒有 | `enabled` = `config.enabledSurfaces` 事实；`mountable` = 解析出的适配器是否暴露该 seam 方法；`lastMountResult`/`seamUnavailable` 只在适配器留下挂载记录时出现（**未采集 ≠ 0**，F-15）；`cacheRead` 恒为 `'unknown'`（本进程无读缓存测量点，不得猜命中率） |
+| `plugin.evaluateTextProbe(input?)` | 纯函数投影 | 文本探针恒返回 `not-evaluable`（含稳定 reason code）；`TextProbeEvaluation` **只**携带 `reward: 0`（字面量 0，永不为正）与 `evaluable: false`，**没有** score/passed 字段，因此"正奖励"或"文本探针通过"在类型层不可构造 |
+| `agentLoop.safety`（**嵌套**在既有 `agentLoop` 键内） | `ProbeSafetyGate` | 缺省即惰性（`checks: 0`，行为与本轮前完全一致）；存在即 fail-closed：只读 allowlist → 授权账本，两级都要过；拒绝返回结构化错误，永不回落到执行 |
+
+`plugin.surfaces` 与 `plugin.evaluateTextProbe` 都是 `EvoHarnessPlugin` 句柄上的增量成员，不进入 `OPTION_KEYS` / `ROOT_KEYS`，因此 §3.2 的形态判定与 `plugin-options-shape` 的 26 键断言不变（本轮 `pnpm run typecheck` + `tests/unit/meta` 全绿即为同步证据）。
+
+### 11.2 新增的结构化计数（诊断可判定，不是宣传口径）
+
+| 位置 | 计数 | 恒等式 / 不变量 |
+| --- | --- | --- |
+| `dshHookAdapter.stats().surfaceMounts[]` | `attempts / ok / failed / seamUnavailable / lastResult` | 每个 surface 一条；`failed` 只由真实抛出的错误累加，`seamUnavailable` 只由 `code === 'seam_unavailable'` 累加 |
+| `ProbeSafetyGate.stats()` | `checks / allowed / denied / byCode / allowlistTier / authorizationTier / branchChecks / hostChecks / branchNoPolicy` | `checks === allowed + denied`；`branchChecks + hostChecks === checks`；`ΣbyCode === checks`；**装了分支策略时 `branchNoPolicy === 0`**（`validateProbeSafetyCounters` 对它 fail-closed） |
+
+`branchNoPolicy` 是这一轮新增的唯一硬不变量：`ToolFaceRegistry.decide` 对"分支无策略"按设计透明放行（宿主级调用需要这种透明），但一条**分支**探针调用落在透明分支上就等于无围栏执行 JitRL 建议的工具，因此闸门把它判为 `no-policy` 拒绝并计数。`branchNoPolicy === 0` 才说明装配路径正确。
+
+### 11.3 与 §3.7（可观测性契约）的关系
+
+§3.7 规定"未采集的字段缺席，而不是补 0"。本节的三处新增都遵守同一条：
+
+- `surfaceMounts` 在适配器从未挂载任何面时仍列出 8 条记录（`attempts: 0`），这是**真实测量到的零**；而 `plugin.surfaces` 在没有任何挂载记录时**省略** `lastMountResult`/`seamUnavailable` 两键；
+- `ProbeSafetyGate` 未配置时 `checks: 0` 且 `allowlistTier.checks === 0`：它报告"没有测量"，不报告"全部放行"；
+- 文本探针不产出任何分数，也不产出 0 分——0 分会把"不可评估"污染成"评估为零收益"。
+
+### 11.4 不声称什么
+
+- 本节不声称八表面在真实宿主上全部 `native`：rc2 的逐面表是 `native=3 / not-run=5`，`not-run` 的原因（裸 Cordis Context 不注入服务 seam）写在表里；
+- 不声称 `cacheRead` 有任何测量；
+- 不声称两级闸门已在真实宿主默认启用：`agentLoop.safety` 需要宿主显式注入，缺省惰性。P1/P2 的证据是单元测试与 rc2 的行，不是 Gate 4 通过。

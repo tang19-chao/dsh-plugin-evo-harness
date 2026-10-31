@@ -29,8 +29,15 @@
  */
 
 import { LedgerReservationManager } from './reservation-manager.js';
+import { twoPhaseSettlementFor, type TwoPhaseSettlement } from './two-phase.js';
 import type { RouteCostBound, WatermarkConfig } from './limits.js';
-import type { EvoLedgerConfig, LedgerMeteringMode, LedgerPhase, ModelRateCard } from './types.js';
+import type {
+  EvoLedgerConfig,
+  LedgerMeteringMode,
+  LedgerMeteringStatus,
+  LedgerPhase,
+  ModelRateCard
+} from './types.js';
 
 /** Frozen assembly defaults; every field is mirrored in the ADR-0004 section 9.2 comments. */
 export const LEDGER_ASSEMBLY_DEFAULTS = Object.freeze({
@@ -101,10 +108,22 @@ export interface ResolvedLedgerAssemblyOptions {
   readonly unboundedRiskStopLossMicros?: number;
 }
 
-/** One validated manager plus the options it was assembled from. */
+/**
+ * One validated assembly: the PRE-BUILT two-phase settlement the production
+ * bridges receive, the live metering status of the manager behind it, and the
+ * options it was assembled from.
+ *
+ * P3-4 (rev5 t12, structural debt B): this type deliberately does NOT expose
+ * the `LedgerReservationManager`. The bridges must hold a settlement, never the
+ * mutable accounting primitive, so `manager.settle({...})` cannot be reached
+ * from `src/dsh-bridge/**` at all. `meteringStatus()` is the one live read that
+ * remains (a snapshot, not the manager).
+ */
 export interface LedgerAssembly {
-  readonly manager: LedgerReservationManager;
+  readonly settlement: TwoPhaseSettlement;
   readonly options: ResolvedLedgerAssemblyOptions;
+  /** Live metering status of the assembled manager (P3-A2 observability). */
+  readonly meteringStatus: () => LedgerMeteringStatus;
 }
 
 /** Stable assembly failure codes, so assertions never grep prose. */
@@ -353,7 +372,20 @@ export function assembleAgentLoopLedger(
     return undefined;
   }
   const options = resolveLedgerAssemblyOptions(config);
-  return { manager: buildManager(options), options };
+  const manager = buildManager(options);
+  // P3-4 (structural debt B): the settlement is built HERE, at the assembly
+  // point, and travels to the bridges instead of the manager. The per-call
+  // consumer label is carried by `beginCall({consumer})` in the bridges; this
+  // default only labels the coordinator itself (and its new-attempt children).
+  const settlement = twoPhaseSettlementFor(manager, {
+    consumer: 'ledger-assembly',
+    ...(options.storageDir === undefined ? {} : { storageDir: options.storageDir })
+  });
+  return {
+    settlement,
+    options,
+    meteringStatus: () => manager.getMeteringStatus()
+  };
 }
 
 /** One-line diagnostic summary; safe to log (contains no prompts or budgets of calls). */

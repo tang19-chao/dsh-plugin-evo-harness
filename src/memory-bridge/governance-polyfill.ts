@@ -508,18 +508,49 @@ export function clauseMatchesContext(clause: string, contextTokens: ReadonlySet<
   return hits / tokens.length >= 0.5;
 }
 
+/** Every clause of one channel matched by the query context, in declaration order. */
+function matchingClauses(clauses: readonly string[] | undefined, context: ReadonlySet<string>): string[] {
+  const matches: string[] = [];
+  for (const clause of clauses ?? []) {
+    if (clauseMatchesContext(clause, context)) {
+      matches.push(clause);
+    }
+  }
+  return matches;
+}
+
+/**
+ * P4-2 (positive recall conditions): both channels are matched by the SAME
+ * deterministic CJK/latin rule above, over one tokenized context.
+ *
+ * `whenToApply` hits are observations — the cue that says this lesson is
+ * relevant now. `whenNotToApply` hits are vetoes — the negative firewall drops
+ * the lesson. Sharing the matcher is the property guaranteed here: one clause
+ * moved between the two arrays matches (or does not) identically.
+ */
+export interface LessonConditionMatches {
+  readonly whenToApply: readonly string[];
+  readonly whenNotToApply: readonly string[];
+}
+
+export function matchLessonConditions(
+  lesson: CanonicalLesson,
+  query: MemoryRecallQuery
+): LessonConditionMatches {
+  const context = tokenizeContext(buildRecallFingerprint(query));
+  return {
+    whenToApply: matchingClauses(lesson.whenToApply, context),
+    whenNotToApply: matchingClauses(lesson.whenNotToApply, context)
+  };
+}
+
 /** The first whenNotToApply clause matched by the query context, if any. */
 export function matchedRestraintClause(lesson: CanonicalLesson, query: MemoryRecallQuery): string | undefined {
   const context = tokenizeContext(buildRecallFingerprint(query));
   if (context.size === 0) {
     return undefined;
   }
-  for (const clause of lesson.whenNotToApply ?? []) {
-    if (clauseMatchesContext(clause, context)) {
-      return clause;
-    }
-  }
-  return undefined;
+  return matchingClauses(lesson.whenNotToApply, context)[0];
 }
 
 export interface FirewallInput {

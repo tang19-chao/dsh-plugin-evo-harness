@@ -14,6 +14,7 @@ export * from './governance-polyfill';
 export * from './drivers/index';
 export * from './auto-discovery';
 export * from './bridge';
+export * from './status';
 
 import { createMemoryBridge } from './bridge';
 import type { MemoryBridgeDeps, UniversalMemoryBridge } from './bridge';

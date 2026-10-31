@@ -9,10 +9,23 @@
  *      this run (root `test-results.json`, `--report <path>`, or a fresh
  *      temporary Vitest run written to the OS temp dir);
  *   3. the consumed report carries FAILING tests (`numFailedTests > 0`) or
- *      PENDING/SKIPPED tests (`numPendingTests > 0`) — the README wording is
- *      "passing tests", so a failing run must never be able to mint green
+ *      PENDING/SKIPPED/TODO tests (`numPendingTests > 0`) — the README wording
+ *      is "passing tests", so a failing run must never be able to mint green
  *      documentation counts. This check runs BEFORE the count comparison, so a
  *      report with failures can never produce a count-only green light.
+ *   3b. (J-1, rev5 P0-3) the report is not evidence of a COMPLETE, SUCCESSFUL
+ *      run. A count-complete report can still describe a broken run: a dead
+ *      worker or an unhandled rejection sets `success=false`, a file that
+ *      failed to collect adds `numFailedTestSuites`, and `numTodoTests` counts
+ *      tests that did not run. Each of those is refused BY NAME. A report that
+ *      omits `success`, `numFailedTestSuites` or `numTodoTests` is refused as
+ *      `partial-report` instead of being read as green: absent evidence is not
+ *      evidence of success. `unhandledErrors` is optional because Vitest
+ *      3.2.7's JSON reporter omits the key when there are none (measured); if
+ *      present it must be an array and a non-empty array fails. This is the
+ *      J-1 gap in `docs/reports/p2-p6-integration-round.md` row 15; the old
+ *      gate only looked at failed/pending assertion counts and let the
+ *      injections through.
  *   4. the Configuration reference does not document EVERY default leaf: the
  *      gate bundles `src/config.ts` and `src/dsh-bridge/model-config.ts` with
  *      esbuild, walks the REAL `DEFAULT_EVO_HARNESS_CONFIG` (arrays count as
@@ -429,6 +442,96 @@ async function main() {
       return;
     }
     console.log('[docs-verify] ✓ Report carries zero failed and zero pending tests.');
+
+    // J-1 (rev5 P0-3): the report must describe a COMPLETE, SUCCESSFUL run.
+    // A report can match every README count and still be evidence of a broken
+    // run: vitest sets `success=false` when a worker dies or an unhandled
+    // rejection escapes, `numFailedTestSuites>0` when a suite failed to
+    // collect, `unhandledErrors` lists errors that never became a test
+    // failure, and `numTodoTests>0` counts tests that never ran. Assertion
+    // status alone cannot see any of those, which is exactly the gap recorded
+    // in docs/reports/p2-p6-integration-round.md row 15 (J-1).
+    //
+    // Field PRESENCE is part of the evidence: `success`, `numFailedTestSuites`
+    // and `numTodoTests` exist in every Vitest JSON reporter output, so a
+    // report without them is not a report this gate can call green (see
+    // tests/unit/config/readme-default-leaves.test.ts fixtures and
+    // tests/unit/p62/docs-gate-j1.test.ts negative controls). `unhandledErrors`
+    // is the exception: Vitest 3.2.7's JSON reporter OMITS the key when there
+    // are none (measured key list on a green run), so absence means "none
+    // reported by this reporter version"; when present it must be an array and
+    // a non-empty array fails. `success=false` is the reporter-independent
+    // backstop for errors that never became a test failure.
+    const reportIntegrityFailures = [];
+    const missingReportFields = [];
+    if (typeof testReport.success !== 'boolean') {
+      missingReportFields.push('success (boolean)');
+    }
+    if (typeof testReport.numFailedTestSuites !== 'number') {
+      missingReportFields.push('numFailedTestSuites (number)');
+    }
+    if (typeof testReport.numTodoTests !== 'number') {
+      missingReportFields.push('numTodoTests (number)');
+    }
+    if (testReport.unhandledErrors !== undefined && !Array.isArray(testReport.unhandledErrors)) {
+      reportIntegrityFailures.push(
+        'invalid-report: unhandledErrors is present but is not an array; the report shape cannot be trusted'
+      );
+    }
+    if (missingReportFields.length > 0) {
+      reportIntegrityFailures.push(
+        'partial-report: the consumed report lacks ' +
+          missingReportFields.join(', ') +
+          '; a report without these fields cannot prove the run itself succeeded ' +
+          '(J-1 fail-closed: absent evidence is not evidence of success)'
+      );
+    } else {
+      if (testReport.success === false) {
+        reportIntegrityFailures.push(
+          'success=false: the Vitest run itself failed even though every counted assertion passed ' +
+            '(a failed worker, an unhandled rejection or a collection error can leave the counts intact)'
+        );
+      }
+      if (testReport.numFailedTestSuites > 0) {
+        reportIntegrityFailures.push(
+          `numFailedTestSuites=${testReport.numFailedTestSuites}: ` +
+            `${testReport.numFailedTestSuites} test suite(s) failed, which the passing-test counts cannot show`
+        );
+      }
+      if (Array.isArray(testReport.unhandledErrors) && testReport.unhandledErrors.length > 0) {
+        const first = testReport.unhandledErrors[0];
+        const firstMessage =
+          first !== null && typeof first === 'object'
+            ? String(first.message ?? first.name ?? '(no message)')
+            : String(first);
+        reportIntegrityFailures.push(
+          `unhandledErrors=${testReport.unhandledErrors.length}: at least one unhandled error escaped the run ` +
+            `(first: ${firstMessage.replace(/\s+/g, ' ').slice(0, 300)})`
+        );
+      }
+      if (testReport.numTodoTests > 0) {
+        reportIntegrityFailures.push(
+          `numTodoTests=${testReport.numTodoTests}: ${testReport.numTodoTests} test(s) are marked todo and did not run`
+        );
+      }
+    }
+    if (reportIntegrityFailures.length > 0) {
+      console.error(
+        '[docs-verify] FAIL: the consumed report is not evidence of a complete, successful run (J-1):'
+      );
+      for (const failure of reportIntegrityFailures) {
+        console.error('  - report-integrity: ' + failure);
+      }
+      const failedSuiteNames = (testReport.testResults || [])
+        .filter((file) => file && file.status === 'failed')
+        .map((file) => String(file.name).replace(/\\/g, '/'));
+      for (const name of failedSuiteNames) {
+        console.error('  - failed-suite: ' + name);
+      }
+      process.exitCode = 1;
+      return;
+    }
+    console.log('[docs-verify] ✓ Report describes a complete, successful run (success=true, 0 failed suites, 0 unhandled errors, 0 todo tests).');
 
     // 5. Parse README numbers
     const summaryRegex = /reports\s+`(\d+)`\s+test files and\s+`(\d+)`\s+passing tests for\s+`pnpm run test`/i;

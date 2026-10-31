@@ -1,0 +1,204 @@
+{
+  "fixtureSet": "pr4a-frozen-five-arm-artifacts",
+  "purpose": "Tracked, self-contained inputs for the P3-C PR-4A cost/token provenance gate (tests/unit/eval/pr4a-cost-provenance-gate.test.ts). The bytes are the FROZEN PR-4A eval artifacts: they are copied verbatim from the gitignored work/ drop so the gate can judge the historical artifact in a clean checkout, where work/ does not exist.",
+  "frozenAt": "2026-10-30T04:46:05+08:00",
+  "frozenFrom": {
+    "repositoryHead": "97e38db37305b24f695a5f989428b3611f84987c",
+    "sourceDirectory": "work/",
+    "whyCopy": "work/ is gitignored (.gitignore:8), so a clean checkout has no such inputs",
+    "method": "Copy-Item of each file into tests/fixtures/pr4a/, then byte-for-byte compare (SHA256 over the raw file bytes) and an LF/NUL/BOM check; the digests below are the MEASURED values of both the source and the copy on that timestamp"
+  },
+  "eolPolicy": {
+    "rule": "every fixture file is plain LF text",
+    "enforcement": "tests/fixtures/pr4a/.gitattributes pins text eol=lf for this directory so a core.autocrlf=true checkout cannot rewrite the frozen bytes; the test re-checks bytes + sha256 + absence of CR/NUL/BOM at run time",
+    "measured": "this workstation has core.autocrlf=true. Measured on 2026-10-30: an UNDECLARED .jsonl checked out through git becomes CRLF (sha256 would change and all five cases would go red), while a .jsonl declared text eol=lf in this directory keeps its LF bytes. The policy is therefore load-bearing, not decorative.",
+    "policyFileIsNotData": ".gitattributes is NOT listed in files[]: it is policy, not a fixture. Removing it does not change the five P3-C cases (they verify bytes+sha256 on the files they read), so the deletion experiment shows it as \"optional\" — but the meta-test tests/unit/meta/no-work-dependency.test.ts catches the removal directly: with the file parked, `git check-attr` reports text/eol \"unspecified\" and that case fails (exit 1) naming \"every frozen fixture must be declared text eol=lf\"; restoring the file returns the byte-identical sha256."
+  },
+  "deletionExperiment": {
+    "rule": "A-t8-2 minimality: copy the fixture set to a temp dir, delete ONE file, point PR4A_FIXTURE_DIR at the copy and re-run tests/unit/eval/pr4a-cost-provenance-gate.test.ts",
+    "command": "node work/t8-probe/minimality.mjs (throwaway probe; the same experiment is re-runnable by deleting any single file from a copy of this directory)",
+    "observedAt": "2026-10-30T05:13:00+08:00",
+    "baseline": "exit=0, Tests 5 passed (5)",
+    "perFile": [
+      {
+        "path": "pr4a-five-arm-eval.json",
+        "removed": "exit=1 (no tests collected: the manifest load throws)",
+        "verdict": "required (deleting it turns all five cases RED)"
+      },
+      {
+        "path": "pr4a-ledger-Arm-0.jsonl",
+        "removed": "exit=0, Tests 5 passed (5)",
+        "verdict": "optional: deleting it leaves the five P3-C cases GREEN, so it is NOT their input; it is kept because it is the reproducible input for the verifier ledger assertions named in servesAssertions"
+      },
+      {
+        "path": "pr4a-ledger-Arm-1.jsonl",
+        "removed": "exit=0, Tests 5 passed (5)",
+        "verdict": "optional: deleting it leaves the five P3-C cases GREEN, so it is NOT their input; it is kept because it is the reproducible input for the verifier ledger assertions named in servesAssertions"
+      },
+      {
+        "path": "pr4a-ledger-Arm-2.jsonl",
+        "removed": "exit=0, Tests 5 passed (5)",
+        "verdict": "optional: deleting it leaves the five P3-C cases GREEN, so it is NOT their input; it is kept because it is the reproducible input for the verifier ledger assertions named in servesAssertions"
+      },
+      {
+        "path": "pr4a-ledger-Arm-3.jsonl",
+        "removed": "exit=0, Tests 5 passed (5)",
+        "verdict": "optional: deleting it leaves the five P3-C cases GREEN, so it is NOT their input; it is kept because it is the reproducible input for the verifier ledger assertions named in servesAssertions"
+      },
+      {
+        "path": "pr4a-ledger-Arm-4.jsonl",
+        "removed": "exit=0, Tests 5 passed (5)",
+        "verdict": "optional: deleting it leaves the five P3-C cases GREEN, so it is NOT their input; it is kept because it is the reproducible input for the verifier ledger assertions named in servesAssertions"
+      }
+    ],
+    "twoLayerRule": "`optional` is NOT \"may be missing from a checkout\". Measured with node work/t8-probe/optional-two-layers.mjs (2026-10-30T05:15): with pr4a-ledger-Arm-2.jsonl parked, the 5 P3-C cases stay GREEN (exit 0) while tests/unit/meta/no-work-dependency.test.ts goes RED naming \"pr4a-ledger-Arm-2.jsonl must be present in the checkout\"; restoring the file returns the byte-identical sha256."
+  },
+  "fileCount": 6,
+  "totalBytes": 1112702,
+  "files": [
+    {
+      "path": "pr4a-five-arm-eval.json",
+      "source": "work/pr4a-five-arm-eval.json",
+      "bytes": 365314,
+      "sha256": "f22bdb14a637c08f24576e6325a0cf3ff03e19551bd72eca10e9512dd1c55acb",
+      "optional": false,
+      "eol": "lf",
+      "servesAssertions": [
+        "cost-five-arms",
+        "cost-counts-match:*",
+        "cost-shares-sum-1:*",
+        "cost-measured-zero:*",
+        "cost-measured-capability:*",
+        "token-six-fields-declared",
+        "token-per-arm-present",
+        "token-field-precision:*",
+        "token-no-measured:*",
+        "token-measured-capability:*",
+        "justification: the ONLY input the five P3-C cases mutate and judge; without it the verifier cannot parse the report at all (json-parses fails)"
+      ]
+    },
+    {
+      "path": "pr4a-ledger-Arm-0.jsonl",
+      "source": "work/pr4a-ledger-Arm-0.jsonl",
+      "bytes": 137930,
+      "sha256": "9c182a32b880039f55dee5a67a93cd65f32cddda5b92867312ffb1e25ce303ee",
+      "optional": true,
+      "eol": "lf",
+      "servesAssertions": [
+        "ledger-exists:Arm-0",
+        "ledger-rows-180:Arm-0",
+        "ledger-parses:Arm-0",
+        "ledger-arm-tag:Arm-0",
+        "ledger-payload-free:Arm-0",
+        "ledger-row-schema:Arm-0",
+        "ledger-row-track-rederived:Arm-0",
+        "ledger-write-tally-consistent:Arm-0",
+        "audit-only-rows-are-unwritten:Arm-0",
+        "audit-only-only-on-quality-arms:Arm-0",
+        "md-ledger-digest-matches:Arm-0",
+        "justification: serves the verifier ledger assertions named above; NOT an input to the five P3-C cost/token cases (deletion experiment: still green)"
+      ]
+    },
+    {
+      "path": "pr4a-ledger-Arm-1.jsonl",
+      "source": "work/pr4a-ledger-Arm-1.jsonl",
+      "bytes": 151523,
+      "sha256": "cb0066107443534ea17a138e8da55c689dd410a782c0bbf0d7a30c29b7f49911",
+      "optional": true,
+      "eol": "lf",
+      "servesAssertions": [
+        "ledger-exists:Arm-1",
+        "ledger-rows-180:Arm-1",
+        "ledger-parses:Arm-1",
+        "ledger-arm-tag:Arm-1",
+        "ledger-payload-free:Arm-1",
+        "ledger-row-schema:Arm-1",
+        "ledger-row-track-rederived:Arm-1",
+        "ledger-write-tally-consistent:Arm-1",
+        "audit-only-rows-are-unwritten:Arm-1",
+        "audit-only-only-on-quality-arms:Arm-1",
+        "md-ledger-digest-matches:Arm-1",
+        "justification: serves the verifier ledger assertions named above; NOT an input to the five P3-C cost/token cases (deletion experiment: still green)"
+      ]
+    },
+    {
+      "path": "pr4a-ledger-Arm-2.jsonl",
+      "source": "work/pr4a-ledger-Arm-2.jsonl",
+      "bytes": 152493,
+      "sha256": "12335caabdadf08ffb0d06d480f341e59f88746586e8cb98f5dcd0944266262f",
+      "optional": true,
+      "eol": "lf",
+      "servesAssertions": [
+        "ledger-exists:Arm-2",
+        "ledger-rows-180:Arm-2",
+        "ledger-parses:Arm-2",
+        "ledger-arm-tag:Arm-2",
+        "ledger-payload-free:Arm-2",
+        "ledger-row-schema:Arm-2",
+        "ledger-row-track-rederived:Arm-2",
+        "ledger-write-tally-consistent:Arm-2",
+        "audit-only-rows-are-unwritten:Arm-2",
+        "audit-only-only-on-quality-arms:Arm-2",
+        "md-ledger-digest-matches:Arm-2",
+        "justification: serves the verifier ledger assertions named above; NOT an input to the five P3-C cost/token cases (deletion experiment: still green)"
+      ]
+    },
+    {
+      "path": "pr4a-ledger-Arm-3.jsonl",
+      "source": "work/pr4a-ledger-Arm-3.jsonl",
+      "bytes": 152721,
+      "sha256": "3e0257753aec88cd413e99786c78b35c275e29bd713bc1f29ff459f053888b1c",
+      "optional": true,
+      "eol": "lf",
+      "servesAssertions": [
+        "ledger-exists:Arm-3",
+        "ledger-rows-180:Arm-3",
+        "ledger-parses:Arm-3",
+        "ledger-arm-tag:Arm-3",
+        "ledger-payload-free:Arm-3",
+        "ledger-row-schema:Arm-3",
+        "ledger-row-track-rederived:Arm-3",
+        "ledger-write-tally-consistent:Arm-3",
+        "audit-only-rows-are-unwritten:Arm-3",
+        "audit-only-only-on-quality-arms:Arm-3",
+        "md-ledger-digest-matches:Arm-3",
+        "justification: serves the verifier ledger assertions named above; NOT an input to the five P3-C cost/token cases (deletion experiment: still green)"
+      ]
+    },
+    {
+      "path": "pr4a-ledger-Arm-4.jsonl",
+      "source": "work/pr4a-ledger-Arm-4.jsonl",
+      "bytes": 152721,
+      "sha256": "301b7976366e5ad41ad8d964b232056050aa47bbd5923978eb9f5f5bfbf527a4",
+      "optional": true,
+      "eol": "lf",
+      "servesAssertions": [
+        "ledger-exists:Arm-4",
+        "ledger-rows-180:Arm-4",
+        "ledger-parses:Arm-4",
+        "ledger-arm-tag:Arm-4",
+        "ledger-payload-free:Arm-4",
+        "ledger-row-schema:Arm-4",
+        "ledger-row-track-rederived:Arm-4",
+        "ledger-write-tally-consistent:Arm-4",
+        "audit-only-rows-are-unwritten:Arm-4",
+        "audit-only-only-on-quality-arms:Arm-4",
+        "md-ledger-digest-matches:Arm-4",
+        "justification: serves the verifier ledger assertions named above; NOT an input to the five P3-C cost/token cases (deletion experiment: still green)"
+      ]
+    }
+  ],
+  "fileCounts": {
+    "dataFiles": 6,
+    "required": [
+      "pr4a-five-arm-eval.json"
+    ],
+    "optional": [
+      "pr4a-ledger-Arm-0.jsonl",
+      "pr4a-ledger-Arm-1.jsonl",
+      "pr4a-ledger-Arm-2.jsonl",
+      "pr4a-ledger-Arm-3.jsonl",
+      "pr4a-ledger-Arm-4.jsonl"
+    ]
+  }
+}

@@ -52,10 +52,38 @@ export type { JitRuntimeControl, JitSurface } from '../../../src/jitrl/runtime-c
 export { parseEvoHarnessConfig } from '../../../src/config';
 export type { EvoHarnessConfig } from '../../../src/config';
 export type { ExperienceRecord, IExperienceStore, JitStatsAggregate } from '../../../src/types/contracts';
+// Host-adapter resolution is exercised as PRODUCTION code: the eight-surface
+// matrix must classify the adapter the plugin would actually resolve, not one
+// the smoke invents. These three helpers are the only reason src/index is in
+// the harness bundle, and importing them cannot change production behaviour.
+export {
+  createCordisHostFromContext,
+  hostAdapterSeamCount,
+  resolveHostAdapter,
+  surfaceStatusSnapshot
+} from '../../../src/index';
+export type { EvoHarnessHostAdapterSource, EvoHarnessSurfaceStatus } from '../../../src/index';
 
 // --- harness modules (structural assertions, no production effect) --------
 export { probeHost, probeGateMode, createAlwaysAdvisingAdvisor, createRecordingStore } from '../../../tests/e2e/host-smoke/probe';
 export type { HostProbeReport, HostModules, PluginModules } from '../../../tests/e2e/host-smoke/probe';
+export {
+  classifySurfaceMatrix,
+  countSurfaceAvailability,
+  renderSurfaceMatrix,
+  renderSurfaceStatusSnapshot,
+  validateSurfaceMatrix,
+  validateSurfaceStatusSnapshot,
+  HOOK_NATIVE_METHODS
+} from '../../../tests/e2e/host-smoke/surface-matrix';
+export type {
+  SurfaceAvailability,
+  SurfaceFaceEvidence,
+  SurfaceMatrixInput,
+  SurfaceMatrixReport,
+  SurfaceMechanism,
+  SurfaceStatusEntry
+} from '../../../tests/e2e/host-smoke/surface-matrix';
 export { probeMcpBackend, MIRROR_DIAG_PREFIX } from '../../../tests/e2e/host-smoke/mcp-smoke';
 export type { McpSmokeReport, MirrorStoreLike } from '../../../tests/e2e/host-smoke/mcp-smoke';
 export { createStdioMcpClient } from '../../../tests/e2e/host-smoke/mcp-client';

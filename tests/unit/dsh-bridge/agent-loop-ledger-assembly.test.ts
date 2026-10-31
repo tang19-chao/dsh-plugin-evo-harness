@@ -37,6 +37,7 @@ import {
 } from '../../../src/dsh-bridge';
 import {
   createLedgerReservationManager,
+  twoPhaseSettlementFor,
   type LedgerAssemblyOptions
 } from '../../../src/ledger';
 import {
@@ -207,10 +208,11 @@ describe('agentLoop.ledger: the validated assembly path', () => {
 
   it('refuses both wiring styles at once instead of silently preferring one', () => {
     const manager = createLedgerReservationManager({ enabled: true });
+    const settlement = twoPhaseSettlementFor(manager, { consumer: 'test' });
     expect(() =>
       createAgentLoopExecutor({
         ledger: { enabled: true },
-        ledgerManager: manager
+        ledgerSettlement: settlement
       })
     ).toThrow(/not both/);
   });
@@ -270,17 +272,25 @@ describe('no ledger: unmetered, never "metered with nothing"', () => {
     expect(result.status).toBe('succeeded');
   });
 
-  it('keeps the legacy pre-built manager injection optional and working', async () => {
-    // Backward compatibility (captain instruction): ledgerManager stays an
-    // OPTIONAL injection point; callers that use it are unaffected by P3-A.
+  it('keeps the pre-built settlement injection optional and working', async () => {
+    // P3-4 (rev5 t12): the injection point stays OPTIONAL but now carries the
+    // BUILT settlement — the bridge never holds the mutable manager.
     const manager = createLedgerReservationManager({ enabled: true, generalBudgetMicros: 1_000_000 });
+    const settlement = twoPhaseSettlementFor(manager, { consumer: 'agent-loop-executor' });
     const planner = scriptedPlanner(TWO_ITERATIONS);
     const tools = recordingTools();
-    const executor = createAgentLoopExecutor({ model: planner, tools, ledgerManager: manager }, makeClock());
+    const executor = createAgentLoopExecutor({ model: planner, tools, ledgerSettlement: settlement }, makeClock());
 
-    expect(executor.describe().join('\n')).toContain('pre-built manager injected');
+    expect(executor.describe().join('\n')).toContain('pre-built settlement injected');
     const result = await executor.runBranch(makeContext());
     expect(result.status).toBe('succeeded');
+    // The settlement really is the wired one: two model calls, two identities,
+    // both attributed to the executor (the label travels with beginCall).
+    expect(executor.callIdentities()).toHaveLength(2);
+    expect(executor.callIdentities().map((identity) => identity.consumer)).toEqual([
+      'agent-loop-executor',
+      'agent-loop-executor'
+    ]);
   });
 });
 

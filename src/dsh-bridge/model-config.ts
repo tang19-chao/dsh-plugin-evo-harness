@@ -19,22 +19,43 @@
  *  - Defaults here follow the verified DSH default route qodercn / dfmodel
  *    (DeepSeek-Flash; reasoning efforts high | max | low, default max).
  *
+ * CURRENT FACTS (measured 2026-10-30, rev5 P0-6; see the correction register
+ * below): this repository DECLARES the dependency
+ * (`package.json` dependencies: `@deepseek-ai/schemastery@3.18.4`), and in THIS
+ * checkout a plain `import('@deepseek-ai/schemastery')` resolves (exit 0). The
+ * next paragraph describes the HOST INSTALL case - a symlinked plugin directory
+ * without its own `node_modules` - which is why the structural loader is kept.
+ * It is NOT a claim that the dependency is missing from this repository; an
+ * earlier revision of this header said the integrator still had to install it,
+ * which is the stale wording this comment records.
+ *
  * WHY THIS FILE DOES NOT IMPORT SCHEMASTERY STATICALLY (verified, not a guess):
  * ESM resolution for a bare specifier walks up from the REAL path of the
- * importing file. This plugin's DSH install is a SYMLINK
- * (<profile>/node_modules/dsh-plugin-evo-harness -> E:\DS\插件\dsh-plugin-evo-harness),
- * so resolution starts at E:\DS\插件\dsh-plugin-evo-harness, where
- * `@deepseek-ai/schemastery` is NOT installed; a static import fails with
+ * importing file. A host may install this plugin as a SYMLINK
+ * (<profile>/node_modules/dsh-plugin-evo-harness -> <plugin checkout>), where
+ * `@deepseek-ai/schemastery` is NOT installed; a static import then fails with
  * ERR_MODULE_NOT_FOUND at load time AND breaks `pnpm run build` (esbuild
  * --bundle cannot resolve it). A runtime probe confirmed the failure for both
- * the real path and the symlinked path.
+ * the real path and the symlinked path in that install layout.
  *
  * Therefore the fragment is built through an injected, structurally typed
  * schemastery instance (`createModelRouteSchema(z)`) and the module exposes a
  * guarded dynamic loader (`loadSchemastery()`) for hosts that resolve the
  * package. The integrator attaches the result where DSH reads the plugin Config
- * and installs `@deepseek-ai/schemastery` as a dependency to make it
- * resolvable; both of those files are outside src/dsh-bridge/**.
+ * and must make `@deepseek-ai/schemastery` resolvable from the installed copy
+ * (it is already a declared dependency of this repository); both of those files
+ * are outside src/dsh-bridge/**.
+ *
+ * DOC-DRIFT REGISTER (bidirectional pointer, rev5 P0-6 / P1-4):
+ *   forward: `docs/reports/p0-evidence-correction.md` §C-5 records the stale
+ *            "install it" phrasing, the measured resolution evidence and this
+ *            file's header range.
+ *   reverse: this header names that register (the edge the register points back
+ *            to is here). The H-3 terminology drift that the register also
+ *            covers is registered in ADR 0007 §4; that ADR is sha256-pinned by
+ *            `tests/unit/jitrl/p6-pareto-budget.test.ts`, so its own pointer
+ *            edges are frozen and cannot be edited - the register documents the
+ *            pair instead of rewriting the pinned file.
  */
 
 /** Verified default route for the secondary model page. */

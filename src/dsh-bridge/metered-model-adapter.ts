@@ -58,7 +58,6 @@ import {
   assembleAgentLoopLedger,
   dshUsageToProviderPayload,
   TwoPhaseLedgerError,
-  twoPhaseSettlementFor,
   type CountingSemantics,
   type ExecutionOutcome,
   type LateUsageEvent,
@@ -66,7 +65,6 @@ import {
   type LedgerAssemblyOptions,
   type LedgerCallIdentity,
   type LedgerPhase,
-  type LedgerReservationManager,
   type ProviderUsagePayload,
   type RawDshUsageLike,
   type TwoPhaseSettlement
@@ -249,8 +247,15 @@ export function globalModelCallRegistry(): ModelCallRegistry {
 export interface MeteredModelOptions {
   /** Ledger assembly config (P3-A); absent keeps cost unknown, never "measured". */
   readonly ledger?: LedgerAssemblyOptions;
-  /** A pre-built manager to share across stages; mutually exclusive with `ledger`. */
-  readonly ledgerManager?: LedgerReservationManager;
+  /**
+   * A pre-built two-phase settlement to share across stages; mutually exclusive
+   * with `ledger`.
+   *
+   * P3-4 (rev5 t12, structural debt B): replaces the old `ledgerManager`
+   * injection. The adapter must never hold the mutable manager; callers migrate
+   * with `twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:<stage>' })`.
+   */
+  readonly ledgerSettlement?: TwoPhaseSettlement;
   /** Shared call registry (the runtime count gate). Defaults to a private one. */
   readonly registry?: ModelCallRegistry;
   /** Injected clock for deterministic records. */
@@ -349,15 +354,15 @@ export function createMeteredModelAdapter(
   stage: MeteringStage,
   options: MeteredModelOptions = {}
 ): MeteredModelAdapter {
-  if (options.ledger !== undefined && options.ledgerManager !== undefined) {
+  if (options.ledger !== undefined && options.ledgerSettlement !== undefined) {
     throw new MeteredModelError(
       'METERED_MODEL_AMBIGUOUS_LEDGER',
-      'pass either ledger configuration or a pre-built manager, not both'
+      'pass either ledger configuration or a pre-built settlement, not both'
     );
   }
   const assembly = assembleAgentLoopLedger(options.ledger);
-  const manager = options.ledgerManager ?? assembly?.manager;
-  const metering: 'unmetered' | 'observed' = manager === undefined ? 'unmetered' : 'observed';
+  const metering: 'unmetered' | 'observed' =
+    options.ledgerSettlement !== undefined || assembly !== undefined ? 'observed' : 'unmetered';
   const purpose = STAGE_PURPOSE[stage];
   const ledgerPhase = STAGE_LEDGER_PHASE[stage];
   const now = options.now ?? ((): number => Date.now());
@@ -371,13 +376,10 @@ export function createMeteredModelAdapter(
   // P3-C: the ONE sanctioned call lifecycle for this stage. It owns the durable
   // callId -> reservationId mapping and decides interim vs final from the outcome,
   // so this adapter cannot settle an unconfirmed remote termination as final.
+  // P3-4 (structural debt B): the coordinator arrives PRE-BUILT from the assembly
+  // (or from the caller); no manager is held here.
   const settlement: TwoPhaseSettlement | undefined =
-    manager === undefined
-      ? undefined
-      : twoPhaseSettlementFor(manager, {
-          consumer: 'metered-model-adapter:' + stage,
-          ...(assembly?.options.storageDir === undefined ? {} : { storageDir: assembly.options.storageDir })
-        });
+    options.ledgerSettlement ?? assembly?.settlement;
 
   /**
    * Authoritative BOOKED figure per callId. An interim settlement books nothing,
@@ -484,7 +486,10 @@ export function createMeteredModelAdapter(
       if (settlement !== undefined) {
         // beginCall records the durable callId -> reservationId mapping BEFORE the
         // provider is called, so late usage can always be joined back (contract 1).
+        // P3-4: the consumer label travels with the call (the assembly-built
+        // settlement no longer hard-codes the first bridge's name).
         const decision = settlement.beginCall({
+          consumer: 'metered-model-adapter:' + stage,
           callId,
           phase: ledgerPhase,
           pool: 'general',

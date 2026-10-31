@@ -9,19 +9,32 @@
  * data appear, and then it MUST appear (zero measured calls under a declaration
  * is a broken capture, never a silent pass).
  *
+ * TEST INPUTS ARE TRACKED (rev5 P0-1). The inputs used to live in the gitignored
+ * `work/` scratch directory, so a clean checkout failed all five cases with
+ * `ENOENT … work/pr4a-five-arm-eval.json`. They now live in
+ * `tests/fixtures/pr4a/`, described by `fixture-manifest.json` with a per-file
+ * sha256. The manifest is the CONTRACT, not documentation: every listed file is
+ * read from disk, its size and sha256 are re-measured, and any mismatch (or a
+ * missing file) THROWS. A missing input is never a skip, a `return` or an
+ * empty-result pass.
+ *
+ * `PR4A_FIXTURE_DIR` may point the suite at another copy of the set (used by the
+ * A-t8-2 minimality deletion experiment); the manifest travels with the copy, so
+ * the same integrity check applies. The default is the in-repo fixture set.
+ *
  * Every case runs the REAL verifier in a throw-away repo root (the verifier
  * anchors on process.cwd()), with a copy of the frozen artifact + report +
  * ledgers. Unrelated assertions fail because the fixture has no src/ tree; the
  * assertions under test are read from the verifier's own status file.
  */
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   rmSync,
   writeFileSync
 } from 'node:fs';
@@ -32,8 +45,12 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const VERIFIER = join(REPO_ROOT, 'scripts', 'eval', 'verify-pr4a-artifacts.mjs');
-const ARTIFACT = join(REPO_ROOT, 'work', 'pr4a-five-arm-eval.json');
 const REPORT_MD = join(REPO_ROOT, 'docs', 'reports', 'pr4a-five-arm-eval-report.md');
+
+/** The tracked fixture set: the only place the P3-C inputs may come from. */
+const FIXTURE_ROOT = resolve(process.env.PR4A_FIXTURE_DIR ?? join(REPO_ROOT, 'tests', 'fixtures', 'pr4a'));
+const MANIFEST = join(FIXTURE_ROOT, 'fixture-manifest.json');
+
 const tempRoots: string[] = [];
 
 afterAll(() => {
@@ -42,19 +59,141 @@ afterAll(() => {
   }
 });
 
-interface Failure { readonly id: string; readonly detail?: string }
+/** A verifier check failure, as the verifier writes it to its status file. */
+interface Failure {
+  readonly id: string;
+  readonly detail?: string;
+}
+
+interface FixtureEntry {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly optional: boolean;
+}
+
+interface FixtureManifest {
+  readonly fileCount: number;
+  readonly totalBytes: number;
+  readonly files: readonly FixtureEntry[];
+}
+
+/** sha256 over the RAW bytes: what the manifest freezes, never a re-encoding. */
+function sha256(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/**
+ * Read the fixture manifest and verify EVERY listed file against it.
+ *
+ * This is deliberately eager (called once at module load) and deliberately
+ * fatal: a missing manifest, a missing REQUIRED file, a size or digest mismatch,
+ * or a non-plain-LF byte all throw at import time, so the suite cannot report a
+ * green pass it did not earn. There is no `if (!exists) return`.
+ *
+ * `optional` is MEASURED, not decorative: it marks a file whose deletion leaves
+ * these five cases green (A-t8-2 deletion experiment, recorded in the manifest's
+ * `deletionExperiment`). Such a file is kept because it is the reproducible
+ * input for the verifier assertions named in its `servesAssertions`, so its
+ * ABSENCE is tolerated here while its DRIFT is still fatal: a present file must
+ * always match the frozen bytes. A checkout must still carry the WHOLE set —
+ * tests/unit/meta/no-work-dependency.test.ts asserts exactly that — so
+ * `optional` can never be read as "may be missing from the repository".
+ */
+function loadVerifiedFixtures(): Map<string, string> {
+  if (!existsSync(MANIFEST)) {
+    throw new Error(
+      'PR-4A fixture manifest is missing: ' + MANIFEST + '. The P3-C inputs are TRACKED fixtures; ' +
+        'a checkout that lacks them cannot judge the artifact. Restore tests/fixtures/pr4a/ (never re-point the test at a gitignored work/ path).'
+    );
+  }
+  const manifest = JSON.parse(readFileSync(MANIFEST, 'utf8')) as FixtureManifest;
+  if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
+    throw new Error('PR-4A fixture manifest lists no files: ' + MANIFEST);
+  }
+  if (manifest.fileCount !== manifest.files.length) {
+    throw new Error(
+      'PR-4A fixture manifest is inconsistent: fileCount=' +
+        String(manifest.fileCount) +
+        ' but files[] carries ' +
+        String(manifest.files.length)
+    );
+  }
+  const byName = new Map<string, string>();
+  for (const entry of manifest.files) {
+    const absolute = join(FIXTURE_ROOT, entry.path);
+    if (!existsSync(absolute)) {
+      if (entry.optional) {
+        // A file the deletion experiment proved is NOT an input to these five
+        // cases may be absent here (A-t8-2). Its presence is still required in a
+        // checkout, which the fixture-set completeness case in
+        // tests/unit/meta/no-work-dependency.test.ts enforces.
+        continue;
+      }
+      throw new Error(
+        'PR-4A fixture is missing: ' +
+          entry.path +
+          ' (expected at ' +
+          absolute +
+          '). A missing REQUIRED fixture input FAILS this suite; it is never skipped.'
+      );
+    }
+    const bytes = readFileSync(absolute);
+    if (bytes.length !== entry.bytes) {
+      throw new Error(
+        'PR-4A fixture byte length drifted: ' + entry.path + ' expected ' + String(entry.bytes) + ', measured ' + String(bytes.length)
+      );
+    }
+    const digest = sha256(bytes);
+    if (digest !== entry.sha256) {
+      throw new Error(
+        'PR-4A fixture sha256 drifted: ' + entry.path + ' expected ' + entry.sha256 + ', measured ' + digest
+      );
+    }
+    // The frozen bytes are plain LF text. A digest mismatch already fails above,
+    // but a `core.autocrlf` checkout or a BOM should be NAMED as the cause
+    // instead of surfacing only as an opaque hash difference. Any CR at all is a
+    // violation here, not merely a CRLF pair, and a BOM is checked explicitly.
+    if (bytes.includes(0)) {
+      throw new Error('PR-4A fixture is not plain LF text: ' + entry.path + ' carries a NUL byte');
+    }
+    if (bytes.includes(0x0d)) {
+      throw new Error(
+        'PR-4A fixture is not plain LF text: ' + entry.path + ' carries a CR byte (a CRLF checkout would rewrite the frozen digest)'
+      );
+    }
+    if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+      throw new Error('PR-4A fixture is not plain LF text: ' + entry.path + ' starts with a UTF-8 BOM');
+    }
+    byName.set(entry.path, absolute);
+  }
+  return byName;
+}
+
+const FIXTURES = loadVerifiedFixtures();
+/** The artifact under judgement: required by the manifest, verified above. */
+const ARTIFACT: string = (() => {
+  const resolved = FIXTURES.get('pr4a-five-arm-eval.json');
+  if (resolved === undefined) {
+    throw new Error('PR-4A fixture manifest must list pr4a-five-arm-eval.json (the artifact under judgement)');
+  }
+  return resolved;
+})();
+/** Every ledger the manifest declares, keyed by its file name. */
+const LEDGERS = [...FIXTURES.entries()].filter(([name]) => /^pr4a-ledger-.+[.]jsonl$/.test(name));
 
 function makeRoot(): string {
   const root = mkdtempSync(join(tmpdir(), 'p4a-provenance-gate-'));
   tempRoots.push(root);
   mkdirSync(join(root, 'work'), { recursive: true });
   mkdirSync(join(root, 'docs', 'reports'), { recursive: true });
+  // The throw-away root is the verifier's cwd, so IT is what must hold work/:
+  // the frozen inputs are COPIED INTO the temp root, never read from the repo's
+  // gitignored work/.
   copyFileSync(ARTIFACT, join(root, 'work', 'pr4a-five-arm-eval.json'));
   copyFileSync(REPORT_MD, join(root, 'docs', 'reports', 'pr4a-five-arm-eval-report.md'));
-  for (const file of readdirSync(join(REPO_ROOT, 'work'))) {
-    if (/^pr4a-ledger-.*[.]jsonl$/.test(file)) {
-      copyFileSync(join(REPO_ROOT, 'work', file), join(root, 'work', file));
-    }
+  for (const [name, source] of LEDGERS) {
+    copyFileSync(source, join(root, 'work', name));
   }
   return root;
 }

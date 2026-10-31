@@ -204,7 +204,8 @@ describe('status: no-ledger / zero-calls / unknown-semantics are distinguishable
   it('reports metered=true with zero calls once the ledger is assembled', () => {
     const assembly = assembleAgentLoopLedger({ enabled: true });
     expect(assembly).toBeDefined();
-    const status = assembly?.manager.getMeteringStatus();
+    // P3-4 (rev5 t12): the assembly exposes the live status, not the manager.
+    const status = assembly?.meteringStatus();
     expect(status).toEqual({
       mode: 'observe',
       metered: true,

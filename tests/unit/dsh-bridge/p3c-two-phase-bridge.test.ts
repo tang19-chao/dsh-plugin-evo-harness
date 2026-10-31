@@ -26,6 +26,7 @@ import {
 import {
   createLedgerReservationManager,
   createUsagePayload,
+  twoPhaseSettlementFor,
   type LedgerCallIdentity,
   type LedgerReservationManager,
   type ModelRateCard
@@ -172,13 +173,18 @@ function makeExecutor(
   model: IModelAdapter,
   options: { readonly probeTimeoutMs?: number } = {}
 ): ReturnType<typeof createAgentLoopExecutor> {
+  // P3-4 (rev5 t12): the bridge receives a PRE-BUILT settlement; the manager is
+  // only used here, at the test's assembly point.
+  const settlement = manager === undefined
+    ? undefined
+    : twoPhaseSettlementFor(manager, { consumer: 'agent-loop-executor' });
   return createAgentLoopExecutor(
     {
       model: asAgentLoopModel(model),
       tools: recordingTools(),
-      ...(manager === undefined
+      ...(settlement === undefined
         ? {}
-        : { ledgerManager: manager, ledgerPhase: 'probe', ledgerRateCard: RATE_CARD }),
+        : { ledgerSettlement: settlement, ledgerPhase: 'probe', ledgerRateCard: RATE_CARD }),
       ...(options.probeTimeoutMs === undefined ? {} : { probeTimeoutMs: options.probeTimeoutMs })
     },
     makeClock()
@@ -424,7 +430,7 @@ describe('executor: restart joins late usage without re-booking', () => {
           }
         },
         tools: recordingTools(),
-        ledgerManager: manager,
+        ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'agent-loop-executor' }),
         ledgerPhase: 'probe',
         ledgerRateCard: RATE_CARD
       },
@@ -537,7 +543,7 @@ describe('metered adapter: cancellation is interim, late usage books once', () =
   it('holds the cost on an AbortError and books it from the late usage', async () => {
     const manager = makeManager();
     const adapter = createMeteredModelAdapter(abortingModel(), 'compose', {
-      ledgerManager: manager,
+      ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:compose' }),
       idFactory: () => 'mcall_cancel_1'
     });
 
@@ -572,7 +578,7 @@ describe('metered adapter: cancellation is interim, late usage books once', () =
   it('does not settle the same callId twice when the id factory repeats it', async () => {
     const manager = makeManager();
     const adapter = createMeteredModelAdapter(measuredModel(), 'compose', {
-      ledgerManager: manager,
+      ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:compose' }),
       idFactory: () => 'mcall_fixed'
     });
 
@@ -608,7 +614,7 @@ describe('metered adapter: cancellation is interim, late usage books once', () =
   it('keeps the confirmed-call path final (no interim round for a normal answer)', async () => {
     const manager = makeManager();
     const adapter = createMeteredModelAdapter(measuredModel(), 'compose', {
-      ledgerManager: manager,
+      ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:compose' }),
       idFactory: () => 'mcall_final'
     });
     await adapter.call(requestFor('compose'));

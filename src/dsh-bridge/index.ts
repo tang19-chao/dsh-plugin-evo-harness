@@ -370,3 +370,19 @@ export async function resolveDshCollaborators(
 // ---------------------------------------------------------------------------
 
 export * from './agent-loop-executor';
+// rev5 P2-3/P2-4: the composed probe-call safety gate. Exported so a host can
+// build it once, attach it to `agentLoop.safety`, and read its counters.
+export {
+  PROBE_SAFETY_CODES,
+  createProbeSafetyGate,
+  validateProbeSafetyCounters
+} from './probe-safety';
+export type {
+  ProbeSafetyCode,
+  ProbeSafetyCounters,
+  ProbeSafetyDecision,
+  ProbeSafetyGate,
+  ProbeSafetyPolicy,
+  ProbeSafetyRequest,
+  ProbeSafetyTier
+} from './probe-safety';

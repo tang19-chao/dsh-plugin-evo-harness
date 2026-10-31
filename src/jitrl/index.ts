@@ -1366,6 +1366,10 @@ export * from './jit-active-policy';
 export * from './host-advisor';
 export * from './stores/memory.store';
 export * from './stores/bridge.store';
+// rev5 P2-2: the explicit `not-evaluable` verdict for text-only probes.
+export * from './text-probe-evaluation';
+// rev6 R1-2 (t9): the write-back EVIDENCE gate and its preregistered routes.
+export * from './writeback-gate';
 export type {
   DreamJitDiagnostics,
   JitReplayAdjustment,

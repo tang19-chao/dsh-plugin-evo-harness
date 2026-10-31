@@ -31,14 +31,20 @@ import {
   createDshHookHostAdapter,
   createInMemoryCordisHost,
   detectDshHookHost,
+  SURFACE_HOST_METHOD,
   type CordisHostAdapter,
   type DshHookDetection,
   type DshHookHostAdapter,
+  type DshHookSurfaceMountStats,
   type HostDisposer
 } from './cordis-seams';
+import { HARNESS_COMPONENT_KEYS, type HarnessComponentKey } from './types/contracts';
 import {
   createMemoryBridge,
-  type McpClient
+  resolveMemoryWritableStatus,
+  type AutoDiscoveryResult,
+  type McpClient,
+  type MemoryBridgeStatus
 } from './memory-bridge';
 import {
   createAnonymousComposer,
@@ -96,6 +102,7 @@ import {
   aggregateExperienceStats,
   createJitRl,
   createJitActivePolicy,
+  evaluateTextProbe as evaluateTextOnlyProbe,
   halfLifeMsFromConfig,
   jitMetaEnabled,
   type BridgeMirrorStore,
@@ -107,7 +114,9 @@ import {
   type JitReplayHook,
   type JitRl,
   type JitRlDiagnostic,
-  type DualTrackConsumptionOptions
+  type DualTrackConsumptionOptions,
+  type TextProbeEvaluation,
+  type TextProbeInput
 } from './jitrl';
 import {
   createScopeRegistry,
@@ -154,6 +163,7 @@ import type {
   HostAdvisorObservabilityCounters,
   IActivePolicy,
   IExperienceStore,
+  IMemoryBridge,
   IOfflineDreamer,
   EvoHarnessRunResult,
   IModelAdapter,
@@ -470,6 +480,62 @@ function isPluginOptionKey(key: string): boolean {
 /** Attribute of the mounted host adapter, in probing order. */
 export type EvoHarnessHostAdapterSource = 'injected' | 'dsh-hooks' | 'context' | 'in-memory';
 /**
+ * rev5 P1-2: read-only per-surface status, one entry per HARNESS_COMPONENT_KEYS.
+ *
+ * This exists because "enabled in config" was the only thing a host page could
+ * read: an enabled-but-unmountable surface looked exactly like a healthy one.
+ * The honesty rules are the point of the type:
+ *   - `enabled` is CONFIG truth (surface listed in `config.enabledSurfaces`);
+ *   - `mountable` is ADAPTER truth (the resolved adapter exposes the host
+ *     method); `enabled && !mountable` is precisely the state this status is
+ *     for, and it is never smoothed over;
+ *   - `lastMountResult` / `seamUnavailable` are OBSERVED mount facts, so they
+ *     follow the collect-or-omit rule: an adapter that keeps no per-surface
+ *     record omits them instead of fabricating `0` (F-15). A present `0` means a
+ *     real measurement of zero;
+ *   - `cacheRead` has no measurement point in this process, so it is always
+ *     `'unknown'` — never a guessed hit rate.
+ */
+export interface EvoHarnessSurfaceStatus {
+  readonly surface: HarnessComponentKey;
+  readonly enabled: boolean;
+  readonly mountable: boolean;
+  /** Outcome of the newest mount attempt; omitted when the adapter keeps none. */
+  readonly lastMountResult?: { readonly ok: boolean; readonly code?: string };
+  /** Attempts refused with the structured `seam_unavailable` code; omitted when unmeasured. */
+  readonly seamUnavailable?: number;
+  /** Always `'unknown'`: read-cache hit rate is not measured in this process. */
+  readonly cacheRead: 'unknown';
+}
+/**
+ * Read the adapter's per-surface mount records, if it keeps any.
+ *
+ * Deliberately structural: any adapter exposing `stats().surfaceMounts` is
+ * accepted, so the entrypoint does not depend on the hook adapter's class. A
+ * malformed record list is treated as "no records" rather than trusted.
+ */
+function readSurfaceMountRecords(adapter: CordisHostAdapter | undefined): readonly DshHookSurfaceMountStats[] | undefined {
+  if (adapter === undefined) {
+    return undefined;
+  }
+  const stats = (adapter as { readonly stats?: () => unknown }).stats;
+  if (typeof stats !== 'function') {
+    return undefined;
+  }
+  const snapshot = stats.call(adapter);
+  if (snapshot === null || typeof snapshot !== 'object') {
+    return undefined;
+  }
+  const mounts = (snapshot as { readonly surfaceMounts?: unknown }).surfaceMounts;
+  if (!Array.isArray(mounts)) {
+    return undefined;
+  }
+  return mounts.filter(
+    (entry): entry is DshHookSurfaceMountStats =>
+      entry !== null && typeof entry === 'object' && typeof (entry as { surface?: unknown }).surface === 'string'
+  );
+}
+/**
  * One Dream-RSI x JitRL replay observation (plan section 7.3, Phase 4).
  *
  * Reported through the real plugin path: the wired dreamer records the JitRL
@@ -604,6 +670,25 @@ export interface EvoHarnessPlugin {
    * JitRL status. When the feature is off this reports { enabled: false } and
    * the plugin behaves exactly as it did before JitRL existed.   */
   readonly jitrl: EvoHarnessJitRlStatus;
+  /**
+   * rev5 P1-2: per-surface status (enabled / mountable / lastMountResult /
+   * seamUnavailable / cacheRead). Read-only projection; calling it never mounts
+   * anything. Always has exactly one entry per HARNESS_COMPONENT_KEYS.
+   */
+  readonly surfaces: readonly EvoHarnessSurfaceStatus[];
+  /**
+   * rev5 P4-1 (C-7): the memory write-capability handshake, aggregated from the
+   * bridge's last auto-discovery result and the SAME resolved execution profile
+   * the orchestrator enforces. Reading it calls no tool and writes nothing;
+   * every non-'yes' verdict renders `Recall-Only`, and the production default
+   * stays `Recall-Only`.
+   */
+  readonly memory: MemoryBridgeStatus;
+  /**
+   * rev5 P2-2: evaluate a text-only probe. Always `not-evaluable` — never a
+   * score, never a pass — so task benefit can never be manufactured from prose.
+   */
+  evaluateTextProbe(input?: TextProbeInput): TextProbeEvaluation;
   run(request: EvoHarnessRunRequest): Promise<EvoHarnessRunResult>;
   runFromCommand(args: unknown,
     context?: unknown): Promise<EvoHarnessCommandRunResult>;
@@ -912,6 +997,45 @@ export function hostAdapterSeamCount(adapter: CordisHostAdapter): number {
     }
   }
   return count;
+}
+/**
+ * rev5 P1-2: per-surface status snapshot (read-only, no mount side effects).
+ *
+ * Pure projection of two real sources — `config.enabledSurfaces` and the
+ * resolved adapter's method presence (plus the adapter's own mount records when
+ * it keeps them). It never mounts, patches, or talks to the host, so a status
+ * page can call it on any tick.
+ *
+ * @param config  the parsed config; only `enabledSurfaces` is read
+ * @param adapter the adapter the plugin resolved (undefined before resolution)
+ */
+export function surfaceStatusSnapshot(
+  config: Pick<EvoHarnessConfig, 'enabledSurfaces'>,
+  adapter: CordisHostAdapter | undefined
+): readonly EvoHarnessSurfaceStatus[] {
+  const enabled = new Set<string>(config.enabledSurfaces);
+  const records = readSurfaceMountRecords(adapter);
+  return HARNESS_COMPONENT_KEYS.map((surface): EvoHarnessSurfaceStatus => {
+    const hostMethod = SURFACE_HOST_METHOD[surface];
+    const mountable = adapter !== undefined && typeof (adapter as unknown as Record<string, unknown>)[hostMethod] === 'function';
+    const base: EvoHarnessSurfaceStatus = {
+      surface,
+      enabled: enabled.has(surface),
+      mountable,
+      cacheRead: 'unknown'
+    };
+    const record = records?.find((entry) => entry.surface === surface);
+    if (record === undefined || record.lastResult === undefined) {
+      // No attempt observed: omit BOTH observed keys. A fabricated
+      // `seamUnavailable: 0` would claim a measurement that never happened.
+      return base;
+    }
+    return {
+      ...base,
+      lastMountResult: record.lastResult,
+      seamUnavailable: record.seamUnavailable
+    };
+  });
 }
 /** Stable reason codes for a rejected plugin-options shape (ADR 0005 section 3.3). */
 export type PluginOptionsShapeErrorCode =
@@ -1875,6 +1999,19 @@ function joinPath(dir: string,
   file: string): string {
   const separator = dir.includes('\\') ? '\\' : '/';
   return dir.endsWith('/') || dir.endsWith('\\') ? dir + file : dir + separator + file;
+}
+/**
+ * rev5 P4-1 (C-7): read the last auto-discovery result off a memory bridge.
+ *
+ * The public `IMemoryBridge` contract does not require the diagnostic accessor
+ * (only the concrete `UniversalMemoryBridge` publishes it), so the lookup is
+ * structural. An injected bridge that does not expose one reports "no discovery
+ * yet", which the handshake renders as Recall-Only instead of guessing a
+ * writable state.
+ */
+function memoryDiscoveryOf(bridge: IMemoryBridge): AutoDiscoveryResult | null {
+  const accessor = (bridge as { discoveryResult?: () => AutoDiscoveryResult | null }).discoveryResult;
+  return typeof accessor === 'function' ? accessor.call(bridge) : null;
 }
 /** Build the orchestrator collaborators from the resolved plugin config. */
 export function buildOrchestratorDeps(config: EvoHarnessConfig,
@@ -2945,6 +3082,25 @@ export function createEvoHarnessPlugin(
     },
     get jitrl(): EvoHarnessJitRlStatus {
       return currentJitRlStatus();
+    },
+    get surfaces(): readonly EvoHarnessSurfaceStatus[] {
+      return surfaceStatusSnapshot(resolved, hostAdapter);
+    },
+    /**
+     * rev5 P4-1 (C-7): aggregate the pure module handshake into the handle.
+     * The discovery result is the bridge's last one (null before start-up) and
+     * the profile is the one the orchestrator enforces, so a handle read can
+     * never claim writability the runtime would deny.
+     */
+    get memory(): MemoryBridgeStatus {
+      return resolveMemoryWritableStatus({
+        discovery: memoryDiscoveryOf(deps.memory),
+        profile: deps.executionProfile
+      });
+    },
+    /** rev5 P2-2: text-only probes are never scored; the verdict is explicit. */
+    evaluateTextProbe(input?: TextProbeInput): TextProbeEvaluation {
+      return evaluateTextOnlyProbe(input);
     },
     async run(request: EvoHarnessRunRequest): Promise<EvoHarnessRunResult> {
       return executeRun(request);

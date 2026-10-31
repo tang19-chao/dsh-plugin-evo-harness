@@ -1,0 +1,28 @@
+# FROZEN BYTE FIXTURES - do not let a checkout rewrite them.
+#
+# WHY THIS FILE EXISTS (rev5 P0-1)
+# --------------------------------
+# `tests/fixtures/pr4a/` holds the frozen PR-4A eval artifacts (one JSON report
+# and five `.jsonl` ledgers) that
+# `tests/unit/eval/pr4a-cost-provenance-gate.test.ts` judges. The test
+# re-measures each file's sha256 and FAILS on any mismatch, so the bytes on disk
+# are part of the contract.
+#
+# The repository root `.gitattributes` declares `*.json text eol=lf` but says
+# nothing about `*.jsonl`. On a Windows checkout with `core.autocrlf=true` (this
+# workstation's setting) an undeclared text file is converted to CRLF in the
+# worktree, which would change the sha256 of every ledger and turn all five gate
+# cases red in a clean clone. Measured, not assumed: an undeclared `.jsonl`
+# checked out under `core.autocrlf=true` becomes CRLF, while a `.jsonl` declared
+# `text eol=lf` here keeps its LF bytes.
+#
+# This rule is deliberately NARROW (one directory, the two frozen extensions) and
+# it only REINFORCES the repository policy - it does not renormalise anything
+# else, and it does not mark these files `-text` (they are plain LF text, so
+# `text eol=lf` is the honest declaration).
+# Patterns in THIS file are relative to this directory (git's rule for a
+# subdirectory .gitattributes), so they are written without the leading path.
+# `*.json` restates the root rule for this directory only; `*.jsonl` is the one
+# the root policy does not cover.
+*.json   text eol=lf
+*.jsonl  text eol=lf

@@ -8,16 +8,31 @@
  *   - build the harness bundle (never into the repository);
  *   - run the in-host smoke with a hard deadline and a hang check;
  *   - verify the timeout/unload invariants on the produced result;
- *   - copy the generated markdown to `docs/reports/p61-host-smoke-rc.md`.
+ *   - copy the generated markdown to the requested report path.
  *
  * Every failure mode here degrades to `not-run` with a reason rather than
  * inventing a pass: a missing installation, a missed deadline, a thrown harness
  * or a validation problem all leave the report in place with the failure kept.
  *
+ * Report targets (rev5 C-3/C-9):
+ *   - `--out <path>` (or `HOSTSMOKE_OUT_PATH`) writes the report to that path;
+ *     the path resolves against the repository root, not the process cwd;
+ *   - the DEFAULT target is still `docs/reports/p61-host-smoke-rc.md` for
+ *     backwards compatibility, but that file is FROZEN evidence: writing it is
+ *     REFUSED unless `--force` is passed. New runs must use `--out`.
+ *
  * Usage:
- *   node scripts/host-smoke/run.mjs                # full run (writes the report)
+ *   node scripts/host-smoke/run.mjs --out docs/reports/host-smoke-rc4.md
  *   node scripts/host-smoke/run.mjs --check        # harness readiness only
  *   node scripts/host-smoke/run.mjs --no-write     # run, print, do not copy
+ *   node scripts/host-smoke/run.mjs --force        # ONLY to replace the frozen rc1
+ *
+ * NOTE (t31, from t30 finding): rc1 (`docs/reports/p61-host-smoke-rc.md`) AND
+ * rc2 (`docs/reports/host-smoke-rc2.md`) are BOTH frozen evidence and must not be
+ * used as an `--out` target. The guard in ./report-path.mjs currently protects
+ * rc1 only (`FROZEN_RC1_RELATIVE`); `RC2_RELATIVE` is exported but not consulted
+ * by the guard, so nothing stops an accidental write to rc2 except this note.
+ * Treat both paths as read-only.
  */
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -25,10 +40,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
+import { assertReportTargetWritable, parseReportArgs, resolveReportPath } from './report-path.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..', '..');
-const REPORT_PATH = path.join(repoRoot, 'docs', 'reports', 'p61-host-smoke-rc.md');
 const BUNDLE_ENTRY = 'tests/e2e/host-smoke/bundle-entry.ts';
 const IN_HOST = path.join(__dirname, 'in-host.mjs');
 /** Hard deadline for the whole in-host run (harness + backend spawn). */
@@ -140,6 +155,48 @@ async function buildBundle(outFile) {
 }
 
 /**
+ * Build the APPLY bundle (rev6 R2-1).
+ *
+ * WHY A SECOND BUNDLE: rc3 must observe the plugin's own `apply()` on a real
+ * apply context, but `tests/e2e/host-smoke/bundle-entry.ts` does not export
+ * `apply` and is not in t11's write scope. Building from `stdin` gets `apply`
+ * without editing that file. Only PRODUCTION symbols are exported, so this
+ * bundle cannot change production behaviour.
+ *
+ * A build failure is NOT fatal: the in-host probe reports the apply-context rows
+ * as `not-run` with the reason, rather than the runner pretending they passed.
+ */
+const APPLY_BUNDLE_EXPORTS = [
+  "export { apply, createEvoHarnessPlugin, plugin, PLUGIN_NAME, parseEvoHarnessConfig,",
+  "         surfaceStatusSnapshot, resolveHostAdapter, createCordisHostFromContext,",
+  "         hostAdapterSeamCount } from './src/index.ts';",
+  "export { detectDshHookHost, createDshHookHostAdapter, readHookScope, hookScopeMatches,",
+  "         DSH_HOOK_EVENT_NAMES } from './src/cordis-seams/dsh-hook-host-adapter.ts';",
+  "export { HARNESS_COMPONENT_KEYS } from './src/types/contracts.ts';",
+  "export { SURFACE_HOST_METHOD } from './src/cordis-seams/eight-surfaces.ts';",
+  "export { resolveExecutionProfile } from './src/runtime/execution-profile.ts';"
+].join('\n');
+
+async function buildApplyBundle(outFile) {
+  fs.mkdirSync(path.dirname(outFile), { recursive: true });
+  await build({
+    stdin: {
+      contents: APPLY_BUNDLE_EXPORTS,
+      resolveDir: repoRoot,
+      loader: 'ts'
+    },
+    bundle: true,
+    format: 'cjs',
+    platform: 'node',
+    target: 'node20',
+    outfile: outFile,
+    logLevel: 'warning',
+    sourcemap: false
+  });
+  return fs.statSync(outFile).size;
+}
+
+/**
  * Run the in-host smoke with a hard deadline.
  *
  * The deadline is enforced here rather than inside the harness so a hung host
@@ -164,6 +221,7 @@ function runInHost(input) {
         HOSTSMOKE_ELECTRON_VERSION: input.electronVersion,
         HOSTSMOKE_PLUGIN_VERSION: input.pluginVersion,
         HOSTSMOKE_BUNDLE_ENTRY: BUNDLE_ENTRY,
+        HOSTSMOKE_APPLY_BUNDLE: input.applyBundlePath ?? '',
         HOSTSMOKE_RUN_ID: input.runId,
         HOSTSMOKE_CANARY: input.canary,
         HOSTSMOKE_MCP_SERVER: input.mcpServer,
@@ -280,6 +338,7 @@ export function checkHarnessReadiness() {
     'tests/e2e/host-smoke/mcp-smoke.ts',
     'tests/e2e/host-smoke/mcp-backend-server.mjs',
     'scripts/host-smoke/in-host.mjs',
+    'scripts/host-smoke/apply-context.mjs',
     'scripts/host-smoke/run.mjs'
   ];
   for (const relative of required) {
@@ -298,6 +357,14 @@ async function main() {
   const args = process.argv.slice(2);
   const readinessOnly = args.includes('--check');
   const writeReport = !args.includes('--no-write');
+  const parsed = parseReportArgs(args);
+  for (const problem of parsed.problems) {
+    console.error('[host-smoke] ' + problem);
+  }
+  if (parsed.problems.length > 0) {
+    process.exitCode = 1;
+    return;
+  }
 
   if (readinessOnly) {
     const readiness = checkHarnessReadiness();
@@ -309,6 +376,31 @@ async function main() {
       process.exitCode = 1;
     }
     return;
+  }
+
+  const report = resolveReportPath(repoRoot, {
+    ...(parsed.out === undefined ? {} : { out: parsed.out }),
+    env: process.env
+  });
+  console.log('[host-smoke] report target: ' + path.relative(repoRoot, report.path) + ' (from ' + report.source + ')');
+  if (writeReport) {
+    // Fail-closed BEFORE the (expensive) host run: a run that would overwrite
+    // the frozen P6.1-F report must be refused up front, not after the smoke.
+    try {
+      const writable = assertReportTargetWritable({
+        repoRoot,
+        targetPath: report.path,
+        force: parsed.force
+      });
+      if (writable.forced) {
+        console.log('[host-smoke] WARNING: --force replaces the frozen P6.1-F report (' + path.relative(repoRoot, writable.path) + ')');
+      }
+    } catch (error) {
+      console.error('[host-smoke] REFUSED: ' + (error instanceof Error ? error.message : String(error)));
+      console.error('[host-smoke] no report was written; pass --out <new path> for a new run');
+      process.exitCode = 1;
+      return;
+    }
   }
 
   const host = locateDshHost();
@@ -326,18 +418,31 @@ async function main() {
     // every real-host row `not-run`) so the gap is visible rather than absent.
     console.log('[host-smoke] ' + host.reason);
     if (writeReport) {
-      writeNotRunReport({ plugin, git, reason: host.reason, runId });
+      writeNotRunReport({ plugin, git, reason: host.reason, runId, outPath: report.path });
     }
     process.exitCode = 0;
     return;
   }
 
-  commands.push(commandLine('node scripts/host-smoke/run.mjs', [], repoRoot));
+  commands.push(commandLine('node scripts/host-smoke/run.mjs', args, repoRoot));
   commands.push(commandLine('pnpm run typecheck', [], repoRoot));
   commands.push(commandLine('git rev-parse HEAD', [], repoRoot));
 
   const bundleBytes = await buildBundle(bundlePath);
   console.log('[host-smoke] bundle ready (' + String(bundleBytes) + ' bytes)');
+
+  // rev6 R2-1: the apply-context bundle. A failed build is recorded and the
+  // in-host probe degrades those rows to `not-run`; it must not abort the run.
+  const applyBundlePath = path.join(outDir, 'apply-harness.cjs');
+  let applyBundleBytes;
+  let applyBundleError;
+  try {
+    applyBundleBytes = await buildApplyBundle(applyBundlePath);
+    console.log('[host-smoke] apply bundle ready (' + String(applyBundleBytes) + ' bytes)');
+  } catch (error) {
+    applyBundleError = error instanceof Error ? error.message : String(error);
+    console.error('[host-smoke] apply bundle FAILED: ' + applyBundleError);
+  }
 
   const spawnOutcome = await runInHost({
     executable: host.executable,
@@ -349,6 +454,7 @@ async function main() {
     hostVersion: host.version,
     electronVersion: host.electronVersion,
     bundlePath,
+    applyBundlePath: applyBundleError === undefined ? applyBundlePath : '',
     outDir,
     commit: git.commit,
     worktreeDirty: git.worktreeDirty,
@@ -391,7 +497,8 @@ async function main() {
         git,
         reason: (problem ?? 'in-host run produced no result') + (boundaryProblems.length > 0 ? '; ' + boundaryProblems.join('; ') : ''),
         runId,
-        host
+        host,
+        outPath: report.path
       });
     }
     process.exitCode = 1;
@@ -424,9 +531,9 @@ async function main() {
 
   const markdown = result.reportMarkdown + boundarySection.join('\n');
   if (writeReport) {
-    fs.mkdirSync(path.dirname(REPORT_PATH), { recursive: true });
-    fs.writeFileSync(REPORT_PATH, markdown, 'utf8');
-    console.log('[host-smoke] report written to ' + path.relative(repoRoot, REPORT_PATH));
+    fs.mkdirSync(path.dirname(report.path), { recursive: true });
+    fs.writeFileSync(report.path, markdown, 'utf8');
+    console.log('[host-smoke] report written to ' + path.relative(repoRoot, report.path));
   }
 
   const failedRows = result.rows.filter((row) => row.state === 'failed').length;
@@ -498,12 +605,13 @@ function writeNotRunReport(input) {
     '',
     '1. 安装 DeepSeek Harness（或设置 `HOSTSMOKE_DSH_HOME` 指向安装目录）；',
     '2. `node scripts/host-smoke/run.mjs --check` 应报告 `readiness ok=true`；',
-    '3. `node scripts/host-smoke/run.mjs` 生成真实报告；真实模型调用/真实 memory 写入需额外显式授权。',
+    '3. `node scripts/host-smoke/run.mjs --out <新报告路径>` 生成真实报告（默认目标是冻结的 rc1，未加 `--force` 时拒绝覆盖）；真实模型调用/真实 memory 写入需额外显式授权。',
     ''
   ];
-  fs.mkdirSync(path.dirname(REPORT_PATH), { recursive: true });
-  fs.writeFileSync(REPORT_PATH, lines.join('\n'), 'utf8');
-  console.log('[host-smoke] not-run report written to ' + path.relative(repoRoot, REPORT_PATH));
+  const outPath = input.outPath;
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, lines.join('\n'), 'utf8');
+  console.log('[host-smoke] not-run report written to ' + path.relative(repoRoot, outPath));
 }
 
 await main();

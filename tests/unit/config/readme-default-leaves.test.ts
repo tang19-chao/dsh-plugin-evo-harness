@@ -278,6 +278,14 @@ describe('readme default-leaf docs gate (ADR 0005 §4 D4)', () => {
         numPassedTests: 3,
         numFailedTests: 1,
         numPendingTests: 0,
+        // rev5 J-1: the gate reads the run-level fields too. Only FIELDS are
+        // added here (the assertions below are unchanged): this fixture
+        // describes a run that really failed, so success=false is the honest
+        // value. The failure is named by the failed/pending branch first.
+        success: false,
+        numFailedTestSuites: 1,
+        unhandledErrors: [],
+        numTodoTests: 0,
         testResults: [
           {
             name: fixtureReportFile,
@@ -318,6 +326,11 @@ describe('readme default-leaf docs gate (ADR 0005 §4 D4)', () => {
         numPassedTests: 1,
         numFailedTests: 0,
         numPendingTests: 1,
+        // rev5 J-1 fields (fields only; the pending assertion is unchanged).
+        success: true,
+        numFailedTestSuites: 0,
+        unhandledErrors: [],
+        numTodoTests: 0,
         testResults: [
           {
             name: fixtureReportFile,
@@ -348,6 +361,11 @@ describe('readme default-leaf docs gate (ADR 0005 §4 D4)', () => {
         numPassedTests: 2,
         numFailedTests: 0,
         numPendingTests: 0,
+        // rev5 J-1 run-level fields (fields only; no assertion changed).
+        success: true,
+        numFailedTestSuites: 0,
+        unhandledErrors: [],
+        numTodoTests: 0,
         testResults: [
           {
             name: fixtureReportFile,
@@ -470,6 +488,11 @@ describe('count closure and test-root attribution (R-04)', () => {
         numPassedTests: 4,
         numFailedTests: 0,
         numPendingTests: 0,
+        // rev5 J-1 run-level fields (fields only; no assertion changed).
+        success: true,
+        numFailedTestSuites: 0,
+        unhandledErrors: [],
+        numTodoTests: 0,
         testResults: [
           {
             name: fixtureReportFile,
@@ -517,6 +540,11 @@ describe('count closure and test-root attribution (R-04)', () => {
         numPassedTests: 2,
         numFailedTests: 0,
         numPendingTests: 0,
+        // rev5 J-1 run-level fields (fields only; no assertion changed).
+        success: true,
+        numFailedTestSuites: 0,
+        unhandledErrors: [],
+        numTodoTests: 0,
         testResults: [
           {
             name: fixtureReportFile,
@@ -545,6 +573,11 @@ describe('count closure and test-root attribution (R-04)', () => {
         numPassedTests: 2,
         numFailedTests: 0,
         numPendingTests: 0,
+        // rev5 J-1 run-level fields (fields only; no assertion changed).
+        success: true,
+        numFailedTestSuites: 0,
+        unhandledErrors: [],
+        numTodoTests: 0,
         testResults: [
           {
             name: fixtureReportFile,

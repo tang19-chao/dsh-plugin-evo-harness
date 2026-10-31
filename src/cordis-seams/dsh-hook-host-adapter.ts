@@ -114,6 +114,8 @@ import type {
   HostPromptSegmentSpec
 } from './host-adapter';
 import type { ToolFaceDecision, ToolFaceRegistry } from './tool-face';
+import { HARNESS_COMPONENT_KEYS } from '../types/contracts';
+import { SURFACE_HOST_METHOD } from './eight-surfaces';
 
 /** The four DSH hook events this adapter owns. */
 export const DSH_HOOK_EVENT_NAMES = [
@@ -473,6 +475,34 @@ export interface DshHookScopeCounters {
   readonly anonymousSuppressed: number;
 }
 
+/**
+ * rev5 P1-2: per-surface mount observability on the hook adapter.
+ *
+ * WHY: `activeMounts()` shows what is mounted RIGHT NOW, but a status reader
+ * also needs to know whether a surface can be mounted at all
+ * (`seamAvailable`), what the LAST attempt produced (including the structured
+ * `seam_unavailable` code), and how many attempts were refused. Without this,
+ * "enabled in config" is the only thing a status page can see, and an enabled
+ * but unmountable surface looks identical to a healthy one.
+ *
+ * `seamAvailable` is the adapter's own method presence: the three hook-shaped
+ * surfaces are always available on a live hook adapter; the five forwarded
+ * surfaces are available only when the structural fallback exposes them.
+ */
+export interface DshHookSurfaceMountStats {
+  readonly surface: HarnessComponentKey;
+  /** The CordisHostAdapter method a mount would call. */
+  readonly hostMethod: string;
+  readonly seamAvailable: boolean;
+  readonly attempts: number;
+  readonly ok: number;
+  readonly failed: number;
+  /** Structured count of attempts refused with `seam_unavailable`. */
+  readonly seamUnavailable: number;
+  /** Outcome of the newest attempt; absent until the first attempt. */
+  readonly lastResult?: { readonly ok: boolean; readonly code?: string };
+}
+
 /** Observable adapter statistics used by diagnostics and tests. */
 export interface DshHookAdapterStats {
   readonly assemble: DshHookCounter;
@@ -500,6 +530,8 @@ export interface DshHookAdapterStats {
     readonly decisions: number;
     readonly denials: number;
   };
+  /** rev5 P1-2: per-surface mount observability, in HARNESS_COMPONENT_KEYS order. */
+  readonly surfaceMounts: readonly DshHookSurfaceMountStats[];
 }
 
 /**
@@ -841,6 +873,59 @@ export function createDshHookHostAdapter(
   let toolFaceDenials = 0;
   // Bounded host-contract note: emitted once per adapter (see the assemble listener).
   let unusableAssemblyNoted = false;
+
+  // --- rev5 P1-2: per-surface mount observability ----------------------------
+  /**
+   * One record per surface that was ever asked for. Absence is meaningful: a
+   * surface with no record has never been mounted OR refused, so a status
+   * reader must report it as "unobserved", not "failed" and not "healthy".
+   */
+  const surfaceMountRecords = new Map<
+    HarnessComponentKey,
+    { attempts: number; ok: number; failed: number; seamUnavailable: number; lastResult?: { ok: boolean; code?: string } }
+  >();
+  /**
+   * Which surface methods this adapter actually exposes (set once, right before
+   * it is returned). The three hook-shaped faces are always exposed; the five
+   * forwarded faces only when the structural fallback provides them.
+   */
+  const surfaceSeamAvailable = new Map<HarnessComponentKey, boolean>();
+
+  /** Stable code of a seam-layer error; undefined for a plain Error. */
+  const surfaceMountErrorCode = (error: unknown): string | undefined => {
+    if (error !== null && typeof error === 'object' && 'code' in error) {
+      const code = (error as { code?: unknown }).code;
+      return typeof code === 'string' ? code : undefined;
+    }
+    return undefined;
+  };
+
+  /** Record one mount attempt around an async seam call without changing its result. */
+  const recordSurfaceMount = <T>(surface: HarnessComponentKey, run: () => Promise<T>): Promise<T> => {
+    let record = surfaceMountRecords.get(surface);
+    if (record === undefined) {
+      record = { attempts: 0, ok: 0, failed: 0, seamUnavailable: 0 };
+      surfaceMountRecords.set(surface, record);
+    }
+    const current = record;
+    current.attempts += 1;
+    return run().then(
+      (value) => {
+        current.ok += 1;
+        current.lastResult = { ok: true };
+        return value;
+      },
+      (error: unknown) => {
+        current.failed += 1;
+        const code = surfaceMountErrorCode(error) ?? 'surface_mount_failed';
+        if (code === 'seam_unavailable') {
+          current.seamUnavailable += 1;
+        }
+        current.lastResult = { ok: false, code };
+        throw error;
+      }
+    );
+  };
 
   // --- L3 host advisor (P5-a) ------------------------------------------------
   let advisor: HostAdvisor | undefined = options.hostAdvisor;
@@ -1709,7 +1794,20 @@ export function createDshHookHostAdapter(
       toolFace: {
         decisions: toolFaceDecisions,
         denials: toolFaceDenials
-      }
+      },
+      surfaceMounts: HARNESS_COMPONENT_KEYS.map((surface): DshHookSurfaceMountStats => {
+        const record = surfaceMountRecords.get(surface);
+        const base = {
+          surface,
+          hostMethod: String(SURFACE_HOST_METHOD[surface]),
+          seamAvailable: surfaceSeamAvailable.get(surface) ?? false,
+          attempts: record?.attempts ?? 0,
+          ok: record?.ok ?? 0,
+          failed: record?.failed ?? 0,
+          seamUnavailable: record?.seamUnavailable ?? 0
+        };
+        return record?.lastResult === undefined ? base : { ...base, lastResult: record.lastResult };
+      })
     }),
     advisories: (): readonly string[] => diagnostics.slice(),
     get hostAdvisor(): HostAdvisor | undefined {
@@ -1934,6 +2032,23 @@ export function createDshHookHostAdapter(
       uninstallAll();
     }
   };
+
+  // rev5 P1-2: wrap every exposed surface method ONCE, uniformly, so a mount
+  // attempt is observable whichever path it takes (hook listener, forwarded
+  // fallback, or a seam_unavailable refusal). The wrapper rethrows the original
+  // error unchanged: with no status reader, behaviour is identical to before.
+  const surfaceMethods = adapter as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+  for (const surface of HARNESS_COMPONENT_KEYS) {
+    const hostMethod = SURFACE_HOST_METHOD[surface];
+    const original = surfaceMethods[hostMethod];
+    if (typeof original !== 'function') {
+      surfaceSeamAvailable.set(surface, false);
+      continue;
+    }
+    surfaceSeamAvailable.set(surface, true);
+    surfaceMethods[hostMethod] = (...args: unknown[]) =>
+      recordSurfaceMount(surface, () => original.apply(adapter, args));
+  }
 
   return adapter;
 }

@@ -31,13 +31,16 @@
     }
   },
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --format=esm --platform=node --target=node20 --outfile=lib/index.js --sourcemap=external --log-level=warning",
+    "build": "node scripts/build.mjs",
+    "build:status": "node scripts/build-manifest.mjs --status",
+    "prepare": "pnpm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
     "test:e2e": "vitest run tests/e2e",
     "check:docs": "node scripts/verify-readme-counts.mjs",
     "check:encoding": "node scripts/eval/check-encoding-policy.mjs",
+    "check:clean-tree": "node scripts/eval/check-clean-tree.mjs",
     "check:build-smoke": "node scripts/eval/smoke-build.mjs",
     "check:negative-result": "node scripts/eval/negative-result-diag.mjs --assert",
     "check:mutation": "node scripts/eval/mutation-gate.mjs --run",

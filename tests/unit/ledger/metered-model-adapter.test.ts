@@ -16,7 +16,7 @@ import {
   STAGE_PURPOSE,
   type MeteringStage
 } from '../../../src/dsh-bridge';
-import { createLedgerReservationManager } from '../../../src/ledger';
+import { createLedgerReservationManager, twoPhaseSettlementFor } from '../../../src/ledger';
 import type { IModelAdapter, ModelRequest, ModelResponse } from '../../../src/types/contracts';
 
 const RATE_CARD = {
@@ -202,7 +202,7 @@ describe('honest provenance: no ledger never claims measured', () => {
   it('records measured provenance only when usage AND semantics are provider-declared', async () => {
     const manager = createLedgerReservationManager({ enabled: true, defaultRateCard: RATE_CARD });
     const { model } = fakeModel({ rawUsage: { inputTokens: 10, outputTokens: 5 }, semantics: SEMANTICS });
-    const adapter = createMeteredModelAdapter(model, 'compose', { ledgerManager: manager });
+    const adapter = createMeteredModelAdapter(model, 'compose', { ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:test' }) });
     await adapter.call(requestFor('compose'));
     expect(adapter.metering).toBe('observed');
     const record = adapter.records()[0];
@@ -215,7 +215,7 @@ describe('honest provenance: no ledger never claims measured', () => {
   it('records UNKNOWN (never measured) when the provider declares no semantics', async () => {
     const manager = createLedgerReservationManager({ enabled: true, defaultRateCard: RATE_CARD });
     const { model } = fakeModel({ rawUsage: { inputTokens: 10, outputTokens: 5 } });
-    const adapter = createMeteredModelAdapter(model, 'compose', { ledgerManager: manager });
+    const adapter = createMeteredModelAdapter(model, 'compose', { ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:test' }) });
     await adapter.call(requestFor('compose'));
     const record = adapter.records()[0];
     expect(record?.provenance).toBe('unknown');
@@ -234,7 +234,7 @@ describe('failure paths remain auditable', () => {
       generalBudgetMicros: 0
     });
     const { model, calls } = fakeModel();
-    const adapter = createMeteredModelAdapter(model, 'probe', { ledgerManager: manager });
+    const adapter = createMeteredModelAdapter(model, 'probe', { ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:test' }) });
     await expect(adapter.call(requestFor('probe'))).rejects.toMatchObject({
       code: 'METERED_MODEL_BUDGET_DENIED'
     });
@@ -246,7 +246,7 @@ describe('failure paths remain auditable', () => {
   it('records and rethrows a model failure, settling what was incurred', async () => {
     const manager = createLedgerReservationManager({ enabled: true, defaultRateCard: RATE_CARD });
     const { model, calls } = fakeModel({ fail: true });
-    const adapter = createMeteredModelAdapter(model, 'reflect', { ledgerManager: manager });
+    const adapter = createMeteredModelAdapter(model, 'reflect', { ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:test' }) });
     await expect(adapter.call(requestFor('reflect'))).rejects.toThrow('provider boom');
     expect(calls).toHaveLength(1);
     const record = adapter.records()[0];
@@ -260,7 +260,7 @@ describe('failure paths remain auditable', () => {
     expect(() =>
       createMeteredModelAdapter(fakeModel().model, 'probe', {
         ledger: { enabled: true },
-        ledgerManager: manager
+        ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:probe' })
       })
     ).toThrow(MeteredModelError);
   });

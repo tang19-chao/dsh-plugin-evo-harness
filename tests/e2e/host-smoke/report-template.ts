@@ -9,7 +9,9 @@
  * host. A scenario that did not run must be visible as `not-run` with a reason,
  * and a scenario that failed must keep its failure.
  *
- * Ownership: tests/e2e/host-smoke/**. Consumed by scripts/host-smoke/report.mjs.
+ * Ownership: tests/e2e/host-smoke/**. Consumed by the in-host runner
+ * (scripts/host-smoke/in-host.mjs, which calls renderReport) — there is no
+ * standalone report.mjs; the runner owns writing.
  */
 
 /** The five per-scenario states. Exactly one of passed/failed/not-run is set. */

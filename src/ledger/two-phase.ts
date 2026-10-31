@@ -577,7 +577,18 @@ export interface TwoPhaseSettlementOptions {
  * may open a NEW callId, and only with an explicit marker.
  */
 export class TwoPhaseSettlement {
-  readonly manager: LedgerReservationManager;
+  /**
+   * P3-4 (rev5 t12, structural debt B): the manager is PRIVATE ON PURPOSE.
+   *
+   * The register (`docs/reports/p3-c-structural-debt-register.md` §3 B) requires
+   * the production bridges to hold no live manager reference: a public
+   * `settlement.manager` would be exactly the "get the manager back through the
+   * assembly's return value, then settle directly" bypass the AST gate exists to
+   * stop. Keeping it private makes that path a TYPE ERROR rather than a lint
+   * warning, while the sanctioned lifecycle (`beginCall`/`settleCall`/
+   * `reconcileLateUsage`/`bookNewAttempt`) stays public.
+   */
+  private readonly manager: LedgerReservationManager;
   readonly index: LedgerCallIndex;
   private readonly defaultConsumer: string;
 
@@ -619,8 +630,15 @@ export class TwoPhaseSettlement {
    * Settle a wired call. The interim/final choice is made from the OUTCOME:
    * anything that does not prove the remote terminated settles interim, holding
    * the money and the seat until reconciliation (ADR-0004 §5.1/§5.3).
+   *
+   * P3-4 (rev5 t12, structural debt A): the parameter type is
+   * `Omit<SettleRequest,'interim'>`. A caller that passes `interim` now gets
+   * `TS2353` instead of silently having the flag ignored (the pre-fix behaviour
+   * the register reproduced: `settleCall({..., interim:false})` compiled and was
+   * overridden at runtime). The runtime decision is still made from the outcome —
+   * this type removes the misleading knob, it does not add a policy switch.
    */
-  settleCall(request: SettleRequest): TwoPhaseSettleOutcome {
+  settleCall(request: Omit<SettleRequest, 'interim'>): TwoPhaseSettleOutcome {
     const identity = this.index.lookup(request.callId);
     if (identity === undefined) {
       throw new TwoPhaseLedgerError(

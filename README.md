@@ -102,7 +102,7 @@ transpiles on the fly.
 | `pnpm run check:mutation` | `node scripts/eval/mutation-gate.mjs --run` | ADR 0005 D5: reintroduces four pinned defects inside a throwaway copy and requires the pinned test **names** to go red — a surviving mutant fails the gate |
 | `pnpm run verify` | `pnpm run typecheck && pnpm run test` | The full gate: typecheck, then every suite |
 
-A green checkout currently reports `130` test files and `2493` passing tests for `pnpm run test`
+A green checkout currently reports `163` test files and `2956` passing tests for `pnpm run test`
 (see [Testing](#testing) for the breakdown). This package is `private` and is not published to
 any registry, so there are no publication steps.
 
@@ -426,9 +426,9 @@ cross-session promotion, and the offline dream trigger and model wiring.
 
 | Command | Scope | Suites at the time of writing |
 | :--- | :--- | :--- |
-| `pnpm run test:unit` | `tests/unit` | 116 files, 2325 tests |
-| `pnpm run test:e2e` | `tests/e2e` | 14 files, 168 tests |
-| `pnpm run test` | everything | 130 files, 2493 tests |
+| `pnpm run test:unit` | `tests/unit` | 140 files, 2632 tests |
+| `pnpm run test:e2e` | `tests/e2e` | 23 files, 324 tests |
+| `pnpm run test` | everything | 163 files, 2956 tests |
 | `pnpm run verify` | typecheck + everything | the gate to run before a change lands |
 
 Individual files can be run the usual Vitest way, for example

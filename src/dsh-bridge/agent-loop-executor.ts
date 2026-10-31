@@ -62,6 +62,10 @@
  */
 
 import { TrajectoryCollector, toTrajectoryError } from '../cordis-seams/trajectory-collector';
+// rev5 P2-3/P2-4: the composed probe-call safety gate (allowlist + grants).
+// The gate is OPTIONAL and inert when absent, so a host that never opted in
+// keeps the pre-rev5 behaviour byte for byte.
+import type { ProbeSafetyGate } from './probe-safety';
 // P3-A: the ledger is reached ONLY through its module entry. The executor no
 // longer deep-imports './reservation-manager.js', and its config path never
 // constructs a manager itself (that was the "direct new" bypass):
@@ -71,14 +75,12 @@ import {
   describeLedgerAssembly,
   dshUsageToProviderPayload,
   TwoPhaseLedgerError,
-  twoPhaseSettlementFor,
   type CountingSemantics,
   type LateUsageEvent,
   type LateUsageSettlement,
   type LedgerAssemblyOptions,
   type LedgerCallIdentity,
   type LedgerPhase,
-  type LedgerReservationManager,
   type ModelRateCard,
   type RawDshUsageLike,
   type SettleRequest,
@@ -305,15 +307,30 @@ export interface AgentLoopAdapters {
    */
   readonly ledger?: LedgerAssemblyOptions;
   /**
-   * Optional already-built manager, kept for backward compatibility.
+   * Optional tool-call safety gate (rev5 P2-3/P2-4).
    *
-   * This is the pre-P3-A injection point and stays OPTIONAL exactly as before:
-   * a caller that passes nothing keeps working and stays unmetered (never
-   * "metered with nothing"). When both this and `ledger` are supplied the
-   * wiring is ambiguous and construction fails loudly instead of silently
-   * preferring one of them.
+   * Absent = inert: every call runs exactly as before and the gate reports no
+   * measurements. Present = fail-closed: the probe's tool runtime is only called
+   * after the gate allows the call, so a JitRL-recommended tool call can never
+   * bypass the branch allowlist or the explicit authorization ledger. A refusal
+   * becomes a structured tool error the planner sees; it never throws and never
+   * falls back to executing.
    */
-  readonly ledgerManager?: LedgerReservationManager;
+  readonly safety?: ProbeSafetyGate;
+  /**
+   * Optional already-built two-phase settlement, kept for callers that resolve
+   * the ledger themselves.
+   *
+   * P3-4 (rev5 t12, structural debt B): this replaces the pre-P3-A
+   * `ledgerManager` injection. A production bridge must never hold the mutable
+   * `LedgerReservationManager` — only this coordinator, whose `settleCall`
+   * derives interim/final from the outcome and whose manager field is private.
+   * Callers that passed `ledgerManager` migrate with
+   * `twoPhaseSettlementFor(manager, { consumer: 'agent-loop-executor' })`.
+   * When both this and `ledger` are supplied the wiring is ambiguous and
+   * construction fails loudly instead of silently preferring one of them.
+   */
+  readonly ledgerSettlement?: TwoPhaseSettlement;
   /** Phase context for the pre-built-manager path; defaults to 'probe'. */
   readonly ledgerPhase?: LedgerPhase;
   /** Rate card for the pre-built-manager path (the config path carries its own). */
@@ -488,19 +505,20 @@ export function createAgentLoopExecutor(
   const createTrajectoryId = adapters.createTrajectoryId ?? ((): string => 'agent-traj-' + String(now()));
 
   // P3-A: resolve the optional ledger ONCE, through the validated module entry.
+  // P3-4 (rev5 t12, structural debt B): the assembly hands over a BUILT
+  // settlement, so this file holds no manager reference at all.
   // Precedence is explicit (no silent preference):
   //   - neither given          -> unmetered (undefined), the pre-P3-A default;
   //   - `ledger` config only    -> assembled HERE, at construction; a bad budget
   //                               throws now instead of midway through a probe;
-  //   - `ledgerManager` only    -> legacy injection, used verbatim;
+  //   - `ledgerSettlement` only -> pre-built coordinator, used verbatim;
   //   - both                   -> refused as ambiguous.
-  if (adapters.ledger !== undefined && adapters.ledgerManager !== undefined) {
+  if (adapters.ledger !== undefined && adapters.ledgerSettlement !== undefined) {
     throw new Error(
-      'ledger and ledgerManager were both supplied: pass either the ledger configuration or a pre-built manager, not both'
+      'ledger and ledgerSettlement were both supplied: pass either the ledger configuration or a pre-built settlement, not both'
     );
   }
   const ledgerAssembly = assembleAgentLoopLedger(adapters.ledger);
-  const ledgerManager = adapters.ledgerManager ?? ledgerAssembly?.manager;
   const ledgerPhase = ledgerAssembly?.options.phase ?? adapters.ledgerPhase ?? 'probe';
   const ledgerRateCard = ledgerAssembly?.options.defaultRateCard ?? adapters.ledgerRateCard;
   const ledgerEstimatedCostMicros = ledgerAssembly?.options.estimatedCostMicros ?? 10_000;
@@ -511,12 +529,7 @@ export function createAgentLoopExecutor(
   // from the outcome, so this executor cannot book a locally-abandoned call as if
   // the remote had terminated (ADR-0004 §5.1/§5.3).
   const settlement: TwoPhaseSettlement | undefined =
-    ledgerManager === undefined
-      ? undefined
-      : twoPhaseSettlementFor(ledgerManager, {
-          consumer: 'agent-loop-executor',
-          ...(ledgerAssembly?.options.storageDir === undefined ? {} : { storageDir: ledgerAssembly.options.storageDir })
-        });
+    adapters.ledgerSettlement ?? ledgerAssembly?.settlement;
 
   /** Per-probe max steps: context metadata wins, then the adapter default. */
   const resolveMaxSteps = (context: IsolatedBranchContext): number =>
@@ -537,6 +550,8 @@ export function createAgentLoopExecutor(
     const canLoop = model !== undefined && typeof model.planNext === 'function' && tools !== undefined;
     const mode: AgentExecutionMode = canLoop ? 'agent_loop' : 'single_call';
     const report = adapters.onDiagnostic;
+    // rev5 P2-3/P2-4: optional fail-closed gate for this probe's tool calls.
+    const safety = adapters.safety;
 
     const collector = new TrajectoryCollector({
       id: createTrajectoryId(),
@@ -785,7 +800,10 @@ export function createAgentLoopExecutor(
           singleCallId = 'call_' + context.branchId + '_0_' + String(now());
           // beginCall writes the durable callId -> reservationId mapping BEFORE the
           // provider is invoked, so late usage can always be joined (contract 1).
+          // P3-4: the consumer label travels with the call (the assembly-built
+          // settlement no longer hard-codes one bridge's name).
           const reserveRes = settlement.beginCall({
+            consumer: 'agent-loop-executor',
             callId: singleCallId,
             phase: ledgerPhase,
             pool: 'general',
@@ -955,6 +973,7 @@ export function createAgentLoopExecutor(
           if (settlement !== undefined) {
             loopCallId = 'call_' + context.branchId + '_' + String(iteration) + '_' + String(now());
             const reserveRes = settlement.beginCall({
+              consumer: 'agent-loop-executor',
               callId: loopCallId,
               phase: ledgerPhase,
               pool: 'general',
@@ -1144,6 +1163,52 @@ export function createAgentLoopExecutor(
           const toolStartedAt = now();
           let outcome: AgentToolCallOutcome;
           try {
+            // ---- rev5 P2-3/P2-4: gate BEFORE execute (fail-closed) --------
+            if (safety !== undefined) {
+              const verdict = safety.decide({
+                toolName: decision.toolName,
+                branchId: context.branchId,
+                sessionId: context.sessionId
+              });
+              if (verdict.allowed !== true) {
+                // Structured refusal, visible to the planner as a tool error.
+                // The tool runtime is NEVER called; nothing is executed.
+                report?.(
+                  'probe-safety denied tool "' + verdict.toolName + '" (' + verdict.tier + '/' + verdict.code + ')'
+                );
+                const refusalMessage =
+                  'probe-safety denied tool "' + verdict.toolName + '": ' + verdict.code +
+                  (verdict.reason === undefined ? '' : ' (' + verdict.reason + ')');
+                const refusalStep = collector.appendStep({
+                  kind: 'error',
+                  text: refusalMessage,
+                  metadata: { mode, iteration, toolName: decision.toolName, safetyCode: verdict.code, safetyTier: verdict.tier }
+                });
+                emit({
+                  kind: 'error',
+                  stepIndex: refusalStep.index,
+                  iteration,
+                  at: refusalStep.at,
+                  toolName: decision.toolName,
+                  text: refusalMessage
+                });
+                collector.recordToolError({
+                  toolName: decision.toolName,
+                  message: refusalMessage,
+                  code: 'probe_safety_denied',
+                  retryable: false,
+                  stepIndex: toolStep.index
+                });
+                transcript.push({
+                  iteration,
+                  kind: 'result',
+                  toolName: decision.toolName,
+                  isError: true,
+                  text: refusalMessage
+                });
+                continue;
+              }
+            }
             outcome = await guarded(
               runtime.execute({
                 toolName: decision.toolName,
@@ -1320,12 +1385,13 @@ export function createAgentLoopExecutor(
         : 'model exposes no planNext(): every probe degrades to a single model call'
   );
   // P3-A: make the metering state OBSERVABLE, so "off" can never be mistaken
-  // for "metered". An unmetered executor says so explicitly.
+  // for "metered". An unmetered executor says so explicitly. P3-4: the signal is
+  // the settlement (there is no manager in scope any more).
   capabilities.push(
-    ledgerManager === undefined
+    settlement === undefined
       ? 'ledger: OFF (unmetered; no cost is recorded or claimed)'
       : ledgerAssembly === undefined
-        ? 'ledger: pre-built manager injected (cost recording only; hard bounds not enforced in this build)'
+        ? 'ledger: pre-built settlement injected (cost recording only; hard bounds not enforced in this build)'
         : describeLedgerAssembly(ledgerAssembly)
   );
   // P3-C: the two-phase wiring is observable too, including whether the call
