@@ -7,7 +7,14 @@
  */
 
 import type { CanonicalLesson, MemoryBackendCapabilities } from '../../types/contracts';
-import { detectBackendRejection, lessonDocument, recordsFromPayload, resolveFields } from './shared';
+import {
+  dedupeRecordsById,
+  detectBackendRejection,
+  lessonDocument,
+  recallNamespaceScoped,
+  recordsFromPayload,
+  resolveFields
+} from './shared';
 import type {
   IMemoryDriver,
   JsonObject,
@@ -72,19 +79,31 @@ export function createVectorFactDriver(binding: MemoryDriverToolBinding): IMemor
       input: MemoryDriverRecallInput
     ): Promise<MemoryDriverRecallOutput> {
       const fields = resolveFields(context, binding.recall);
-      const primary = input.namespaces[0] ?? input.namespace;
-      const args: JsonObject = { [fields.query]: input.fingerprint };
-      args[fields.limit] = input.limit;
-      args[fields.namespace] = input.namespaces.length > 1 ? [...input.namespaces] : primary;
-      args[fields.metadata] = namespaceFilter(input.namespaces);
-      const result = await context.call(binding.recall, args);
-      const records = recordsFromPayload(parseToolPayload(result), {
-        namespace: input.namespace,
-        limit: input.limit
+      // MEM-3: one scalar-filtered call per visible namespace unless the tool
+      // declares the filter field as an array; the metadata bag still mirrors
+      // the full namespace list for metadata-filtering backends.
+      const results = await recallNamespaceScoped(context, binding.recall, fields.namespace, input.namespaces, (
+        namespaceFilterValue
+      ) => {
+        const args: JsonObject = { [fields.query]: input.fingerprint };
+        args[fields.limit] = input.limit;
+        args[fields.namespace] = namespaceFilterValue;
+        args[fields.metadata] = namespaceFilter(input.namespaces);
+        return args;
       });
+      const records: ReturnType<typeof recordsFromPayload> = [];
+      for (const result of results) {
+        records.push(
+          ...recordsFromPayload(parseToolPayload(result), {
+            namespace: input.namespace,
+            limit: input.limit
+          })
+        );
+      }
+      const deduped = dedupeRecordsById(records).slice(0, input.limit);
       return {
-        records,
-        diagnostics: ['vector_fact recall via ' + binding.recall + ' returned ' + records.length + ' lesson(s)']
+        records: deduped,
+        diagnostics: ['vector_fact recall via ' + binding.recall + ' returned ' + deduped.length + ' lesson(s)']
       };
     },
     async commit(

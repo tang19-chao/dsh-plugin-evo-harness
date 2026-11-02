@@ -449,6 +449,119 @@ describe('Harness² reflector / evidence edge cases', () => {
   });
 });
 
+describe('CORE-9: the duplicate-key diagnostic names the lesson that SURVIVED', () => {
+  /**
+   * Both candidates collide on `duplicateKey` (same polarity, same
+   * subFunctions, same first applicability cue), so exactly one whole lesson
+   * survives. Pre-fix the diagnostic was emitted BEFORE the confidence
+   * comparison and always said "merged into <existing.id>" - naming an id the
+   * incoming, higher-confidence lesson had just REPLACED - although no fields
+   * are ever merged.
+   */
+  function duplicatePair(firstAdoption: number, secondAdoption: number) {
+    const patchFor = (suffix: string) =>
+      makePatch({
+        id: 'patch_dup_' + suffix,
+        branchId: 'branch_dup_' + suffix,
+        edits: { guardrails: { kind: 'guardrails', appendRules: ['rule-' + suffix] } }
+      });
+    const trajectoryFor = (suffix: string, steps: number) =>
+      makeTrajectory({
+        id: 'traj_dup_' + suffix,
+        nodeId: 'node_dup_' + suffix,
+        branchId: 'branch_dup_' + suffix,
+        branchNamespace: 'probe_sess_1_branch_dup_' + suffix,
+        patchId: 'patch_dup_' + suffix,
+        surfaceKeys: ['guardrails'],
+        status: 'succeeded',
+        metrics: { steps, toolCalls: 2, toolErrors: 0, durationMs: 700 },
+        deliverable: { content: 'guardrail tightening for ' + suffix, format: 'text' }
+      });
+    return {
+      request: baseRequest({
+        tree: makeTree([
+          makeNode({
+            id: 'node_dup_first',
+            branchId: 'branch_dup_first',
+            patchId: 'patch_dup_first',
+            status: 'succeeded',
+            slot: 'explore_domain'
+          }),
+          makeNode({
+            id: 'node_dup_second',
+            branchId: 'branch_dup_second',
+            patchId: 'patch_dup_second',
+            status: 'succeeded',
+            slot: 'explore_domain'
+          })
+        ]),
+        composition: makeComposition({
+          selectedBranchId: 'branch_dup_first',
+          selectedNodeId: 'node_dup_first',
+          selectedTrajectoryId: 'traj_dup_first',
+          selectedPatch: patchFor('first'),
+          assessments: [
+            makeAssessment({
+              alias: 'candidate_A',
+              branchId: 'branch_dup_first',
+              nodeId: 'node_dup_first',
+              selected: true,
+              adoptionRatio: firstAdoption
+            }),
+            makeAssessment({
+              alias: 'candidate_B',
+              branchId: 'branch_dup_second',
+              nodeId: 'node_dup_second',
+              selected: false,
+              adoptionRatio: secondAdoption,
+              rejectedReason: 'lower adoption'
+            })
+          ],
+          adoptionRatios: { candidate_A: firstAdoption, candidate_B: secondAdoption }
+        }),
+        trajectories: [
+          referenceTrajectory(),
+          trajectoryFor('first', 3),
+          trajectoryFor('second', 4)
+        ],
+        metadata: { candidatePatches: [patchFor('first'), patchFor('second')] }
+      })
+    };
+  }
+
+  it('reports the REPLACEMENT pair when the incoming lesson wins on confidence', async () => {
+    const { request } = duplicatePair(0.2, 0.95);
+    const { reflector } = makeReflector([HEADERS]);
+    const result = await reflector.reflect(request);
+
+    expect(result.lessons).toHaveLength(1);
+    const survivor = result.lessons[0] as CanonicalLesson;
+    const line = result.diagnostics.find((entry) => entry.startsWith('duplicate lesson key'));
+    expect(line).toBeDefined();
+    expect(line).toContain('replaced');
+    // The reported pair must be (dead id -> surviving id), never the reverse.
+    expect(line).toContain('with ' + survivor.id);
+    expect(line?.length).toBeGreaterThan(0);
+    expect(line).not.toContain('merged into');
+    expect(survivor.metadata?.nodeId).toBe('node_dup_second');
+  });
+
+  it('reports KEPT with the surviving id when the incoming lesson loses', async () => {
+    const { request } = duplicatePair(0.95, 0.2);
+    const { reflector } = makeReflector([HEADERS]);
+    const result = await reflector.reflect(request);
+
+    expect(result.lessons).toHaveLength(1);
+    const survivor = result.lessons[0] as CanonicalLesson;
+    const line = result.diagnostics.find((entry) => entry.startsWith('duplicate lesson key'));
+    expect(line).toBeDefined();
+    expect(line).toContain('kept ' + survivor.id);
+    expect(line).toContain('discarded');
+    expect(line).not.toContain('merged into');
+    expect(survivor.metadata?.nodeId).toBe('node_dup_first');
+  });
+});
+
 function positiveConfidence(result: { lessons: readonly CanonicalLesson[] }): number {
   const positive = result.lessons.find((lesson) => lesson.polarity === 'positive');
   return positive?.confidence ?? 0;

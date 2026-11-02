@@ -262,8 +262,16 @@ export function namespacesFromArgs(args: Record<string, unknown>): string[] | un
       }
     }
   };
+  // MEM-3: the schemas declare these filter fields as scalars — an array value
+  // on them is a driver contract violation, not a filter, so it is NOT read
+  // (a regression would surface as an unfiltered result instead of passing).
+  // Only genuinely array-typed fields (group_ids) and the metadata bag carry
+  // namespace lists.
   for (const key of ['user_id', 'userId', 'namespace', 'group_id', 'groupId', 'container', 'my_scope']) {
-    push(args[key]);
+    const value = args[key];
+    if (typeof value === 'string' && value.length > 0) {
+      list.push(value);
+    }
   }
   push(args.group_ids);
   for (const key of ['metadata', 'meta', 'my_meta', 'filters', 'filter']) {
@@ -510,7 +518,7 @@ export function markdownNoteServer(options: MockServerOptions = {}): MockServer 
 export function lingshuServer(options: MockServerOptions = {}): MockServer {
   const tools: McpToolDescriptor[] = [
     { name: 'cg', description: '灵枢 cognitive graph', inputSchema: props({ op: 'string', query: 'string', content: 'string', limit: 'number', ids: 'array', namespace: 'string' }) },
-    { name: 'stg', inputSchema: props({ op: 'string', limit: 'number' }) },
+    { name: 'stg', inputSchema: props({ op: 'string', limit: 'number', namespace: 'string' }) },
     { name: 'mdcg_remember', inputSchema: props({ content: 'string', namespace: 'string' }) },
     { name: 'mdcg_recall', inputSchema: props({ query: 'string', limit: 'number', namespace: 'string' }) }
   ];
@@ -542,7 +550,17 @@ export function lingshuServer(options: MockServerOptions = {}): MockServer {
           results: server.store.map((record) => ({ content: record.text, namespace: record.namespace }))
         };
       },
-      stg: (_args, server) => ({ episodes: server.store.map((record) => ({ content: record.text })) }),
+      // MEM-2: the timeline honours the namespace filter the driver sends, and
+      // the mock schema declares it (a scalar), so an unscoped timeline query
+      // can no longer hide behind an array-tolerant mock.
+      stg: (args, server) => {
+        const namespaces = namespacesFromArgs(args);
+        return {
+          episodes: server.store
+            .filter((record) => visibleFor(record, namespaces, options))
+            .map((record) => ({ content: record.text, namespace: record.namespace }))
+        };
+      },
       mdcg_remember: (args, server) => {
         const record = storeLesson(server, args, namespaceFromArgs(args));
         return { ok: true, id: record?.id };

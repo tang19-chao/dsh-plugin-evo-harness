@@ -697,9 +697,23 @@ export function createEvidenceReflector(options: HarnessReflectorOptions): IHarn
           continue;
         }
         const existing = deduped[existingIndex];
-        diagnostics.push('duplicate lesson key ' + key + ' merged into ' + String(existing?.id));
-        if (existing !== undefined && (lesson.confidence ?? 0) > (existing.confidence ?? 0)) {
+        // CORE-9: the diagnostic reports the ACTUAL outcome after the confidence
+        // comparison. Emitted before it (the pre-fix position), it named
+        // `existing.id` even when the incoming lesson replaced that entry
+        // wholesale - pointing auditors at a lesson id that no longer exists in
+        // the result - and called it "merged" although no fields are merged.
+        // Exactly one of the two survives, so exactly one id is reported.
+        const replaced =
+          existing !== undefined && (lesson.confidence ?? 0) > (existing.confidence ?? 0);
+        if (replaced) {
           deduped[existingIndex] = lesson;
+          diagnostics.push(
+            'duplicate lesson key ' + key + ' replaced ' + String(existing?.id) + ' with ' + lesson.id
+          );
+        } else {
+          diagnostics.push(
+            'duplicate lesson key ' + key + ' kept ' + String(existing?.id) + '; discarded ' + lesson.id
+          );
         }
       }
 

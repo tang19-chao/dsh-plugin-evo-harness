@@ -93,6 +93,25 @@ describe('profile data directory resolution', () => {
     expect(resolved.startsWith(path.resolve('root') + path.sep)).toBe(true);
     expect(resolved.includes('..')).toBe(false);
   });
+
+  it('never yields a Windows reserved device name (SEC-6)', () => {
+    // The character allowlist admits these unchanged; on Windows `profiles/CON`
+    // resolves to the console device, so the sanitizer prefixes them instead.
+    for (const reserved of ['CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM9', 'LPT1', 'LPT9']) {
+      expect(sanitizeProfileName(reserved)).toBe('_' + reserved);
+      expect(sanitizeProfileName(reserved.toLowerCase())).toBe('_' + reserved.toLowerCase());
+    }
+    // The filesystem ignores everything after the first dot, so a suffixed form
+    // is just as reserved ('CON.txt' opens the console).
+    expect(sanitizeProfileName('CON.txt')).toBe('_CON.txt');
+    // A longer real name is NOT a device name and keeps its directory.
+    expect(sanitizeProfileName('console')).toBe('console');
+    expect(sanitizeProfileName('COM10')).toBe('COM10');
+    const resolved = resolveProfileDataDir({
+      env: { EVO_HARNESS_DATA_DIR: path.join('root'), DSH_PROFILE: 'NUL' }
+    });
+    expect(path.basename(resolved)).toBe('_NUL');
+  });
 });
 
 describe('atomic file IO', () => {
@@ -141,10 +160,15 @@ describe('atomic file IO', () => {
   it('sweeps interrupted atomic-write temp files only', async () => {
     const dir = await tempDir('sweep');
     await writeFileAtomic(path.join(dir, 'keep.jsonl'), 'kept\n');
-    await writeFileAtomic(path.join(dir, 'stale.jsonl' + TEMP_FILE_MARKER + '999-dead'), 'partial');
+    // The exact name shape writeFileAtomic mints: '<target>.tmp-<pid>-<12 hex>'.
+    const stale = 'stale.jsonl' + TEMP_FILE_MARKER + '999-' + 'a'.repeat(12);
+    await writeFileAtomic(path.join(dir, stale), 'partial');
+    // A look-alike that merely contains the marker must survive the sweep.
+    await writeFileAtomic(path.join(dir, 'notes.tmp-backup.json'), 'kept too');
     const removed = await sweepTempFiles(dir);
-    expect(removed).toEqual(['stale.jsonl' + TEMP_FILE_MARKER + '999-dead']);
+    expect(removed).toEqual([stale]);
     expect(await readTextIfExists(path.join(dir, 'keep.jsonl'))).toBe('kept\n');
+    expect(await readTextIfExists(path.join(dir, 'notes.tmp-backup.json'))).toBe('kept too');
     expect(await sweepTempFiles(path.join(dir, 'missing'))).toEqual([]);
   });
 

@@ -790,3 +790,120 @@ describe('c2a attach: persisted audit marks', () => {
     ).toBeUndefined();
   });
 });
+
+/**
+ * VERIF-2 / VNEW-1 / VERIF-8 (audit round 1 + round 2): the stale-artifact row
+ * was the only `authenticated: true` path that skipped the registry identity
+ * check, and its verdict was paired with the digest of the artifact presented
+ * NOW instead of the one it was computed over. The seam deadline must also be
+ * shared with the runner so a late receipt cannot reverse a runner-timeout.
+ */
+describe('c2a attach: VERIF-2 / VNEW-1 / VERIF-8 hardening', () => {
+  it('VERIF-2: a lying runner cannot claim authenticated:true through a forged stale-artifact outcome', async () => {
+    const host = runner();
+    const forged: HostVerificationReceipt = {
+      status: 'passed',
+      verifierId: HOST_ID,
+      verifierVersion: HOST_VERSION,
+      evidenceHash: artifactDigestOf(artifactOf(candidate())!),
+      checks: [{ id: 'json-ok', passed: true }],
+      verificationId: 'forged-stale',
+      binding: {
+        runId: RUN,
+        sessionId: 'sess-attach',
+        trajectoryId: 'traj-candidate',
+        role: 'candidate',
+        taskId: TASK,
+        testSetId: TEST_SET,
+        envId: ENV,
+        artifactDigest: artifactDigestOf(artifactOf(candidate())!)
+      },
+      kind: 'host-runner'
+    };
+    // A runner that never registers the receipt but labels the outcome
+    // stale-artifact: the old code answered authenticated:true BEFORE the
+    // registry identity check, so the forged verdict reached the reward marks.
+    const lying: HostVerificationRunner = {
+      ...host,
+      verify: async () => ({
+        receipt: forged,
+        reasonCode: 'stale-artifact',
+        reason: 'the registered receipt was computed over an earlier artifact digest'
+      }),
+      receiptFor: () => undefined
+    };
+    const { trajectory: verified, disposition } = await verifyAndAttach({
+      seam: { runner: lying },
+      trajectory: candidate(),
+      runId: RUN,
+      taskId: TASK
+    });
+    expect(disposition?.authenticated).toBe(false);
+    expect(disposition?.reasonCode).toBe('unregistered-receipt');
+    expect(verified.metadata?.['verification']).toBeUndefined();
+  });
+
+  it('VERIF-2: an honest stale-artifact receipt stays authenticated (identity first, then the stale row)', async () => {
+    const host = runner();
+    const first = candidate({ id: 'traj-stale-honest', deliverable: { content: '{"ok":true}', format: 'json' } });
+    await verifyAndAttach({ seam: seam(host), trajectory: first, runId: RUN, taskId: TASK });
+    const second = candidate({ id: 'traj-stale-honest', deliverable: { content: '{"ok":false}', format: 'json' } });
+    const { disposition } = await verifyAndAttach({ seam: seam(host), trajectory: second, runId: RUN, taskId: TASK });
+    // The production runner returns the REGISTERED receipt object for this
+    // outcome, so identity still holds and the stale row keeps its facts.
+    expect(disposition?.reasonCode).toBe('stale-artifact');
+    expect(disposition?.authenticated).toBe(true);
+    expect(disposition?.attached).toBe(false);
+  });
+
+  it('VNEW-1: the stale-artifact audit mark pairs the verdict with the digest it was computed over', async () => {
+    const host = runner();
+    const first = candidate({ id: 'traj-stale-pair', deliverable: { content: '{"ok":true}', format: 'json' } });
+    const firstAttach = await verifyAndAttach({ seam: seam(host), trajectory: first, runId: RUN, taskId: TASK });
+    expect(firstAttach.disposition?.attached).toBe(true);
+    const registered = host.receiptFor(RUN, 'traj-stale-pair', 'candidate');
+    expect(registered).toBeDefined();
+    const second = candidate({ id: 'traj-stale-pair', deliverable: { content: '{"ok":false}', format: 'json' } });
+    const secondAttach = await verifyAndAttach({ seam: seam(host), trajectory: second, runId: RUN, taskId: TASK });
+    expect(secondAttach.disposition?.reasonCode).toBe('stale-artifact');
+    const mark = secondAttach.trajectory.metadata?.['verificationAudit'] as Record<string, unknown>;
+    // The verdict in the mark was computed over the EARLIER artifact; the mark
+    // must carry THAT digest instead of labelling it with the digest of the
+    // artifact presented now ("verdict=<earlier>, artifactDigest=<current>"
+    // was the contradictory pairing an auditor had to disambiguate).
+    expect(mark['artifactDigest']).toBe(registered!.binding.artifactDigest);
+    expect(mark['artifactDigest']).not.toBe(artifactDigestOf(artifactOf(second)!));
+    expect(mark['verdict']).toBe(registered!.status);
+  });
+
+  it('VERIF-8: a runner that settles after the seam deadline never registers its receipt', async () => {
+    const host = runner();
+    const slow: HostVerificationRunner = {
+      ...host,
+      verify: async (request) => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return host.verify(request);
+      }
+    };
+    const first = await verifyAndAttach({
+      seam: { runner: slow, timeoutMs: 5 },
+      trajectory: candidate({ id: 'traj-late-seam' }),
+      runId: RUN,
+      taskId: TASK
+    });
+    expect(first.disposition?.reasonCode).toBe('runner-timeout');
+    expect(first.disposition?.attached).toBe(false);
+    // The abandoned in-flight verify settles late: its receipt must not have
+    // been registered, or a retry would silently reverse the timeout decision.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(host.receiptFor(RUN, 'traj-late-seam', 'candidate')).toBeUndefined();
+    const retry = await verifyAndAttach({
+      seam: { runner: slow, timeoutMs: 5000 },
+      trajectory: candidate({ id: 'traj-late-seam' }),
+      runId: RUN,
+      taskId: TASK
+    });
+    expect(retry.disposition?.reasonCode).toBe('runner-timeout');
+    expect(retry.disposition?.attached).toBe(false);
+  });
+});

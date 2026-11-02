@@ -190,6 +190,21 @@ export interface CostCalculation {
    */
   cacheReadUnavailable?: boolean;
 
+  /**
+   * True when cache-write usage was not reported (LEDGER-10). The cacheWrite
+   * cost is then UNKNOWN — the provider may still bill cache writes — and the
+   * priced 0 is never evidence that cache writes were free.
+   */
+  cacheWriteUnavailable?: boolean;
+
+  /**
+   * True when the rate card bills reasoning separately but the provider never
+   * reported reasoning tokens (LEDGER-10). The reasoning cost is then UNKNOWN:
+   * the output-rate figure booked in its place is not evidence of what the
+   * provider will charge for the reasoning dimension.
+   */
+  reasoningUnavailable?: boolean;
+
   /** Whether conservative fallback or unknown upper bound was applied */
   conservative: boolean;
 

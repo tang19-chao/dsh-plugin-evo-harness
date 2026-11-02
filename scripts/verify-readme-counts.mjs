@@ -55,7 +55,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -99,12 +99,12 @@ function cleanup() {
       fs.unlinkSync(rootTestResultsPath);
     } catch {}
   }
-  // Safety check: ensure repository root has no lingering test-results.json
-  if (fs.existsSync(rootTestResultsPath)) {
-    try {
-      fs.unlinkSync(rootTestResultsPath);
-    } catch {}
-  }
+  // The root `test-results.json` is deleted ONLY when this run consumed it
+  // (the branch above). The former unconditional "safety check" deletion here
+  // destroyed an unconsumed - possibly freshly produced, wanted - root report
+  // whenever `--report <path>` or `--docs-only` was used, contradicting the
+  // cleanup invariants in the header. Reports this run did not produce or
+  // consume are not ours to delete.
 }
 
 process.on('exit', cleanup);
@@ -166,6 +166,16 @@ export function extractReadmeLeafRows(readmeContent) {
     rows.push({ path: match[1].trim(), defaultValueText: match[2].trim() });
   }
   return rows;
+}
+
+/**
+ * Absolute path of the installed Vitest entry point (SEC-3). Resolving it here
+ * lets the gate run the suite with `node <entry>` instead of `pnpm exec`, so no
+ * `.cmd` shim and no shell ever sees the arguments.
+ */
+function vitestEntry() {
+  const require = createRequire(import.meta.url);
+  return require.resolve('vitest/vitest.mjs');
 }
 
 /**
@@ -380,9 +390,13 @@ async function main() {
       rootReportConsumed = true;
     } else {
       console.log(`[docs-verify] test-results.json not in root; generating test report in temporary location...`);
-      const normalizedTemp = tempReportFile.replace(/\\/g, '/');
       try {
-        execSync(`pnpm exec vitest run --reporter=json --outputFile="${normalizedTemp}"`, {
+        // SEC-3: shell-free argv form (the only child-process call of this gate).
+        // `pnpm` is a `.cmd` shim on Windows, so running it would re-enter cmd.exe
+        // and let TMP/TEMP metacharacters reach the command line again; invoking
+        // the resolved vitest entry with the current node binary keeps every
+        // argument (the temp report path included) opaque to any shell.
+        execFileSync(process.execPath, [vitestEntry(), 'run', '--reporter=json', '--outputFile=' + tempReportFile], {
           cwd: rootDir,
           stdio: 'inherit'
         });

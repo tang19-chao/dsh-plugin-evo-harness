@@ -99,6 +99,48 @@ describe('redactSecrets', () => {
   });
 });
 
+describe('header-form credentials (JINFRA-1/P0-2 keyword_secret bypass)', () => {
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6y';
+
+  it('redacts "Authorization: Bearer <jwt>" as a whole', () => {
+    const once = redactSecrets('Authorization: Bearer ' + jwt);
+    expect(once).toBe(SECRET_PLACEHOLDER);
+    expect(once).not.toContain(jwt);
+  });
+
+  it('redacts "authorization: Basic <b64>" as a whole', () => {
+    const once = redactSecrets('authorization: Basic dXNlcjphYmNkZWZnaGlqaw==');
+    expect(once).toBe(SECRET_PLACEHOLDER);
+    expect(once).not.toContain('dXNlcjphYmNkZWZnaGlqaw==');
+  });
+
+  it('redacts "token = Bearer <jwt>" as a whole', () => {
+    const once = redactSecrets('token = Bearer ' + jwt);
+    expect(once).toBe(SECRET_PLACEHOLDER);
+    expect(once).not.toContain(jwt);
+  });
+
+  it('keeps "x-api-key: AKIA..." fully redacted (leftmost keyword match must not regress)', () => {
+    const once = redactSecrets('x-api-key: AKIAIOSFODNN7EXAMPLE');
+    expect(once).toBe('x-' + SECRET_PLACEHOLDER);
+    expect(once).not.toContain('AKIAIOSFODNN7EXAMPLE');
+  });
+
+  it('folds header-form credentials into the same placeholder and stays idempotent', () => {
+    const first = redactSecrets('Authorization: Bearer ' + jwt);
+    const second = redactSecrets(
+      'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIyIn0.QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWY'
+    );
+    expect(first).toBe(second);
+    expect(redactSecrets(first)).toBe(first);
+  });
+
+  it('consumes a bare scheme word unchanged and does not split bearer-prefixed words', () => {
+    expect(redactSecrets('authorization: Bearer')).toBe(SECRET_PLACEHOLDER);
+    expect(redactSecrets('token: Bearerish value')).toBe(SECRET_PLACEHOLDER + ' value');
+  });
+});
+
 describe('redactAbsolutePaths', () => {
   it('strips absolute windows and posix paths', () => {
     expect(redactAbsolutePaths('see /usr/local/bin/x and C:\\Temp\\a')).toBe('see <path> and <path>');

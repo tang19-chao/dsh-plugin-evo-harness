@@ -103,6 +103,13 @@ const ADVICE_CLOSE = '</' + ADVISORY_TAG + '>';
 const RENDER_LIMIT = 64;
 
 /**
+ * Retained-diagnostic cap (JINFRA-12), mirroring MAX_STORE_DIAGNOSTICS in
+ * ./stores/bridge.store.ts: the advisor pushes one-plus lines per decision
+ * point for the process lifetime, so the retained history must stay bounded.
+ */
+const MAX_STORE_DIAGNOSTICS = 100;
+
+/**
  * Compile-time proof that the advisor can never deny a tool call: were 'deny'
  * ever added to HostAdvisorDecisionKind, Extract<...> would yield 'deny', this
  * type would collapse to `never` and this assignment would stop compiling.
@@ -220,7 +227,7 @@ export interface HostAdvisorOptions {
 export interface HostAdvisor {
   /** Evaluate one host decision point. Never throws; degrades to noop. */
   evaluate(request: HostAdvisorRequest): Promise<HostAdvisorDecision>;
-  /** Append-only diagnostic lines (failures, truncation, disabled skips). */
+  /** Recent diagnostic lines (failures, truncation, skips), bounded to the most recent 100. */
   diagnostics(): readonly string[];
 }
 
@@ -362,18 +369,33 @@ function focusActionKeys(request: HostAdvisorRequest): readonly string[] {
 
 /**
  * Apply the section 7.3 drift factor to neighbours whose record was written by
- * a superseded policy. A store that already reported driftWeight wins: the
- * factor is never applied twice.
+ * a superseded policy. The store query already applies the same factor BEFORE
+ * its top-k slice and reports it as `driftWeight`, so on the store path this is
+ * a no-op (driftWeight present wins: the factor is never applied twice). It
+ * remains the safety net for foreign seams (an injected retriever) that return
+ * un-drifted neighbours, and it mirrors the store's saturation stop: once the
+ * window already holds k current-policy records, the penalty stops
+ * (driftFactorFor, retriever.ts).
  */
 function applyDrift(
   neighbors: readonly ScoredExperience[],
   policyId: string | undefined,
-  driftRho: number | undefined
+  driftRho: number | undefined,
+  k: number
 ): readonly ScoredExperience[] {
   if (policyId === undefined || driftRho === undefined || driftRho >= 1) {
     return neighbors;
   }
   const rho = driftRho < 0 ? 0 : driftRho;
+  let currentPolicyCount = 0;
+  for (const neighbor of neighbors) {
+    if (neighbor.record.policyId === policyId) {
+      currentPolicyCount += 1;
+    }
+  }
+  if (currentPolicyCount >= k) {
+    return neighbors;
+  }
   return neighbors.map((neighbor) => {
     if (neighbor.driftWeight !== undefined || neighbor.record.policyId === policyId) {
       return neighbor;
@@ -547,6 +569,13 @@ export function createHostAdvisor(options: HostAdvisorOptions): HostAdvisor {
   const rng = options.rng ?? Math.random;
   const injectedNow = options.now;
   const diagnostics: string[] = [];
+  /** Push one diagnostic line, dropping the oldest past the bounded history. */
+  const note = (line: string): void => {
+    diagnostics.push(line);
+    if (diagnostics.length > MAX_STORE_DIAGNOSTICS) {
+      diagnostics.splice(0, diagnostics.length - MAX_STORE_DIAGNOSTICS);
+    }
+  };
 
   /** Build the store query; `toExperienceQuery` owns the numeric validation. */
   const buildQuery = (
@@ -576,11 +605,11 @@ export function createHostAdvisor(options: HostAdvisorOptions): HostAdvisor {
     request: HostAdvisorRequest
   ): Promise<HostAdvisorDecision> => {
     if (!isRequestLike(request)) {
-      diagnostics.push('invalid_request: no abstract state and no recentTools');
+      note('invalid_request: no abstract state and no recentTools');
       return noopDecision('invalid_request');
     }
     if (options.retriever === undefined && options.store === undefined) {
-      diagnostics.push('no_experience_source: neither store nor retriever injected');
+      note('no_experience_source: neither store nor retriever injected');
       return noopDecision('no_experience_source');
     }
 
@@ -617,21 +646,21 @@ export function createHostAdvisor(options: HostAdvisorOptions): HostAdvisor {
       // Failure safety: a broken seam degrades to "do nothing", never a throw
       // into the host turn and never a blocked tool call. P6.1-B2: the
       // diagnostic carries only a bounded error class - no body, no name.
-      diagnostics.push('retrieval_failed: ' + describeError(error));
+      note('retrieval_failed: ' + describeError(error));
       return noopDecision('retrieval_failed');
     }
     if (!Array.isArray(fetched)) {
-      diagnostics.push('retrieval_failed: source returned a non-array');
+      note('retrieval_failed: source returned a non-array');
       return noopDecision('retrieval_failed');
     }
 
-    const drifted = applyDrift(fetched, query.policyId, query.driftRho);
+    const drifted = applyDrift(fetched, query.policyId, query.driftRho, query.k);
     const selected = selectNeighbors(
       state,
       filterBySimilarity(drifted, config.similarityThreshold)
     );
     if (selected.length === 0) {
-      diagnostics.push('no_neighbors: no host_tool experience within similarityThreshold');
+      note('no_neighbors: no host_tool experience within similarityThreshold');
       return noopDecision('no_neighbors');
     }
 
@@ -674,7 +703,7 @@ export function createHostAdvisor(options: HostAdvisorOptions): HostAdvisor {
       });
     }
     if (evidence.length === 0) {
-      diagnostics.push('no_supported_action: no evidenced tool action to judge');
+      note('no_supported_action: no evidenced tool action to judge');
       return noopDecision('no_supported_action');
     }
 
@@ -728,7 +757,7 @@ export function createHostAdvisor(options: HostAdvisorOptions): HostAdvisor {
     if (target.normalizedAdvantage < adviseThreshold) {
       const rendered = renderAdvice(evidence, options.tokenizer);
       if (rendered.truncated) {
-        diagnostics.push(
+        note(
           options.tokenizer !== undefined
             ? 'advisory_truncated: evidence trimmed to fit tokenizer budget (' +
                 String(MAX_ADVISORY_TOKENS) +
@@ -768,7 +797,7 @@ export function createHostAdvisor(options: HostAdvisorOptions): HostAdvisor {
         // Failure safety: a broken seam degrades to "do nothing", never a throw
         // into the host turn and never a blocked tool call. P6.1-B2: bounded
         // error class only - the thrown body never reaches this surface.
-        diagnostics.push('advisor_failed: ' + describeError(error));
+        note('advisor_failed: ' + describeError(error));
         return noopDecision('advisor_failed');
       }
     },

@@ -153,7 +153,7 @@ const MAX_STORE_DIAGNOSTICS = 100;
 
 /** Argument field names resolved against the selected tool descriptor. */
 interface ResolvedWriteFields {
-  /** Text/document field; always present (falls back to 'text'). */
+  /** Text/document field (the whole resolution fails without one). */
   readonly text: string;
   /** Path-like field, or null when the schema shows no such property. */
   readonly path: string | null;
@@ -236,9 +236,12 @@ export interface MirrorDiagnostic {
 
 /**
  * Classify an unknown thrown value into one bounded error class (P6.1-B1).
- * The error message itself is NEVER read or echoed; only structural facts
- * (prototype name, DOMException-ish `name`, MCP `isError` markers) feed the
- * classification, and everything unmapped folds into `unknown`.
+ * The error text is NEVER rendered; classification reads structural facts
+ * (prototype name, DOMException-ish `name`, MCP `isError` markers) plus one
+ * sanctioned content probe (JINFRA-15): the fixed undici fetch envelope
+ * `fetch failed`, which is how node's fetch surfaces network failures and
+ * stays retryable `transport`, while every other TypeError - a programming
+ * or contract bug - maps to the non-retryable `invalid_input`.
  */
 function classifyError(error: unknown): DiagErrorClass {
   if (error instanceof BackendRejectionError) {
@@ -252,8 +255,11 @@ function classifyError(error: unknown): DiagErrorClass {
       return 'timeout';
     }
     // Node/undici-style structural signals carried as typed names.
-    if (error.name === 'TypeError' || error.name === 'RangeError') {
-      return error.name === 'TypeError' ? 'transport' : 'invalid_input';
+    if (error.name === 'TypeError') {
+      return /fetch failed/i.test(error.message) ? 'transport' : 'invalid_input';
+    }
+    if (error.name === 'RangeError') {
+      return 'invalid_input';
     }
     return 'unknown';
   }
@@ -525,12 +531,35 @@ function schemaPropertyNames(schema: unknown): Set<string> | null {
 }
 
 /**
+ * The degradation line for a backend without a usable write tool - either
+ * none advertised by name (resolveWriteTool) or none whose schema can carry
+ * the document (JINFRA-14).
+ */
+function noWriteToolDiagnostic(
+  client: JitMirrorMcpClient,
+  correlation: (code: DiagCode) => string
+): string {
+  return renderDiagnostic({
+    code: 'no_write_tool',
+    phase: 'discovery',
+    operation: 'listTools',
+    retryable: false,
+    errorClass: 'backend_rejection',
+    correlationId: correlation('no_write_tool'),
+    serverRef: maskServerId(client.serverId)
+  });
+}
+
+/**
  * Resolve argument field names against the tool schema. With no schema
  * (null) the conservative defaults are used; with a schema that shows none
  * of the optional candidates the argument is omitted entirely so a strict
- * backend is never handed unknown properties.
+ * backend is never handed unknown properties. JINFRA-14: the document has no
+ * omission option - a write needs somewhere to put the text - so a schema
+ * naming none of the text candidates resolves to null and the caller skips
+ * the write (no_write_tool) instead of forcing a guessed 'text' property.
  */
-function resolveWriteFields(schema: unknown): ResolvedWriteFields {
+function resolveWriteFields(schema: unknown): ResolvedWriteFields | null {
   const names = schemaPropertyNames(schema);
   const pick = (candidates: readonly string[], fallback: string | null): string | null => {
     if (names === null) {
@@ -543,8 +572,12 @@ function resolveWriteFields(schema: unknown): ResolvedWriteFields {
     }
     return null;
   };
+  const text = pick(TEXT_FIELD_CANDIDATES, 'text');
+  if (text === null) {
+    return null;
+  }
   return {
-    text: pick(TEXT_FIELD_CANDIDATES, 'text') ?? 'text',
+    text,
     path: pick(PATH_FIELD_CANDIDATES, 'path'),
     tags: pick(TAGS_FIELD_CANDIDATES, 'tags'),
     metadata: pick(METADATA_FIELD_CANDIDATES, 'metadata')
@@ -651,6 +684,16 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
       return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics };
     }
     const fields = resolveWriteFields(tool.schema);
+    if (fields === null) {
+      // JINFRA-14: the chosen tool's schema names none of the text candidates,
+      // so there is no field to carry the document. Forcing the literal 'text'
+      // property would hand a strict backend an unknown property - exactly
+      // what resolveWriteFields promises never to do - so the mirror degrades
+      // to zero writes like a backend without a usable write tool.
+      diagnostics.push(noWriteToolDiagnostic(client, correlation));
+      record(diagnostics);
+      return { written: 0, skipped: aggregates.length, namespaces: [], degraded: true, diagnostics };
+    }
 
     let written = 0;
     const namespaces = new Set<string>();
@@ -736,17 +779,7 @@ export function createJitBridgeMirrorStore(options: BridgeMirrorStoreOptions): B
         return { name: match.name, schema: match.inputSchema };
       }
     }
-    diagnostics.push(
-      renderDiagnostic({
-        code: 'no_write_tool',
-        phase: 'discovery',
-        operation: 'listTools',
-        retryable: false,
-        errorClass: 'backend_rejection',
-        correlationId: correlation('no_write_tool'),
-        serverRef: maskServerId(client.serverId)
-      })
-    );
+    diagnostics.push(noWriteToolDiagnostic(client, correlation));
     return null;
   }
 

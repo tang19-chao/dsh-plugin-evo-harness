@@ -99,9 +99,19 @@ export type BackfillTreeSource =
   | Pick<IDiscoveryTreePool, 'list'>
   | readonly DiscoveryTreeSnapshot[];
 
-/** The only store capability backfill needs. */
+/**
+ * The only store capability backfill needs.
+ *
+ * `append` MAY resolve to the number of records the store actually accepted
+ * (a store that deduplicates by id accepts fewer than it was handed). Audit
+ * JITRL-9: the sink used to be `Promise<void>`, so the backfill could only
+ * report the batch size - which contradicted its own "records the store
+ * accepted" docstring on exactly the re-backfill path the idempotency design
+ * invites. Every existing `Promise<void>` implementation stays assignable;
+ * only an implementation that returns a count is read.
+ */
 export interface ExperienceAppendSink {
-  append(records: readonly ExperienceRecord[]): Promise<void>;
+  append(records: readonly ExperienceRecord[]): Promise<number | void>;
 }
 
 /** Options accepted by backfillFromTreePool. */
@@ -131,7 +141,12 @@ export interface BackfillResult {
   readonly records: readonly ExperienceRecord[];
   /** Number of records attempted for append (records.length). */
   readonly recordCount: number;
-  /** Number of records the store accepted (0 when the append failed). */
+  /**
+   * Number of records the store accepted (0 when the append failed). A store
+   * that deduplicates by id reports fewer than `recordCount`; a store that
+   * returns nothing (the `Promise<void>` shape) falls back to `recordCount`,
+   * because "no ack" means "nothing was reported rejected" (audit JITRL-9).
+   */
   readonly appended: number;
   /** Scored-node count that could not be converted (malformed node). */
   readonly skipped: number;
@@ -505,8 +520,16 @@ export async function backfillFromTreePool(
   let appended = 0;
   if (records.length > 0) {
     try {
-      await options.store.append(records);
-      appended = records.length;
+      // Prefer the store's own ack (audit JITRL-9): a deduplicating store
+      // accepts fewer records than the batch on a re-backfill, and the field
+      // promises "records the store accepted". The `Promise<void>` shape
+      // (every pre-existing implementation) reports nothing, which means
+      // "nothing was rejected", so the batch size is the honest fallback.
+      const ack = await options.store.append(records);
+      appended =
+        typeof ack === 'number' && Number.isFinite(ack) && ack >= 0
+          ? Math.min(records.length, Math.floor(ack))
+          : records.length;
     } catch (error) {
       const reason = error instanceof Error ? error.name : 'unknown error';
       diagnostics.push(

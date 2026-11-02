@@ -385,6 +385,15 @@ export async function verifyAndAttach(input: VerifyAndAttachInput): Promise<Veri
   }
   const digest = artifactDigestOf(artifact);
 
+  // VERIF-8 (audit round 1): share the seam budget with the runner. The runner
+  // discards (never registers) a receipt computed after this instant, so a
+  // runner-timeout rejection cannot be reversed by the abandoned in-flight
+  // work settling late (see host-runner.ts). Same validity rule as raceTimeout.
+  const deadlineAt =
+    seam.timeoutMs !== undefined && Number.isFinite(seam.timeoutMs) && seam.timeoutMs > 0
+      ? Date.now() + seam.timeoutMs
+      : undefined;
+
   let outcome: Awaited<ReturnType<HostVerificationSeam['runner']['verify']>> | typeof TIMEOUT_SENTINEL;
   try {
     outcome = await raceTimeout(
@@ -395,7 +404,8 @@ export async function verifyAndAttach(input: VerifyAndAttachInput): Promise<Veri
         role,
         taskId: input.taskId,
         executionStatus: trajectory.status,
-        artifact
+        artifact,
+        deadlineAt
       }),
       seam.timeoutMs
     );
@@ -410,7 +420,15 @@ export async function verifyAndAttach(input: VerifyAndAttachInput): Promise<Veri
   const receipt = outcome.receipt;
   const verdictInfo = (value: HostVerificationReceipt): Partial<VerificationDisposition> => ({
     verdict: value.status,
-    artifactDigest: digest,
+    // VNEW-1 (audit round 2): pair the verdict with the digest it was computed
+    // over - the receipt's own binding - never with the digest recomputed from
+    // the artifact presented now. On a stale-artifact row the two differ, and
+    // the old pairing wrote "verdict=<earlier artifact>, artifactDigest=
+    // <current>" into the audit mark. On every attached row the digest check
+    // below has already proved the two equal, so those rows are value-identical.
+    ...(isRecord(value.binding) && nonEmptyString(value.binding['artifactDigest'])
+      ? { artifactDigest: value.binding['artifactDigest'] as string }
+      : {}),
     verifierId: value.verifierId,
     verifierVersion: value.verifierVersion,
     verificationId: value.verificationId,
@@ -429,6 +447,20 @@ export async function verifyAndAttach(input: VerifyAndAttachInput): Promise<Veri
       outcome.reason ?? 'the host runner produced no receipt'
     );
   }
+  // VERIF-2 (audit round 1): the registry identity check runs BEFORE every
+  // `authenticated: true` row - including the stale-artifact branch below. The
+  // production runner returns the registered object for that outcome, but a
+  // runner that forges `{ receipt, reasonCode: 'stale-artifact' }` must land
+  // here, unauthenticated, instead of writing a runner-chosen verdict into the
+  // reward marks.
+  const registered = seam.runner.receiptFor(input.runId, trajectory.id, role);
+  if (registered === undefined || registered !== receipt) {
+    return reject(
+      'unregistered-receipt',
+      'the receipt is not the object registered by this host runner for this run/trajectory/role',
+      verdictInfo(receipt)
+    );
+  }
   if (outcome.reasonCode === 'stale-artifact') {
     // The receipt is real but belongs to an EARLIER artifact of this
     // trajectory: never attached to the artifact presented now (ADR §4.7.1).
@@ -437,14 +469,6 @@ export async function verifyAndAttach(input: VerifyAndAttachInput): Promise<Veri
       outcome.reason ?? 'the registered receipt was computed over an earlier artifact digest',
       verdictInfo(receipt),
       { receipt, authenticated: true }
-    );
-  }
-  const registered = seam.runner.receiptFor(input.runId, trajectory.id, role);
-  if (registered === undefined || registered !== receipt) {
-    return reject(
-      'unregistered-receipt',
-      'the receipt is not the object registered by this host runner for this run/trajectory/role',
-      verdictInfo(receipt)
     );
   }
   if ((receipt as unknown as Record<string, unknown>)['implicit'] === true) {

@@ -136,7 +136,7 @@ export interface HostToolExperienceCollector extends HostToolExperienceSink {
    * learned from (`scope_unknown_skipped`). Counter only; no payload stored.
    */
   scopeUnknownSkipped(): number;
-  /** Payload-free diagnostics (append failures, invalid observations). */
+  /** Recent payload-free diagnostics (append failures, invalid observations), bounded to the most recent 100. */
   diagnostics(): readonly string[];
   /** Prune inactive scope buckets older than TTL. Returns count of pruned scopes. */
   prune(now?: number): number;
@@ -216,6 +216,14 @@ interface ResolvedScopeInfo {
 }
 
 /**
+ * Retained-diagnostic cap (JINFRA-12), mirroring MAX_STORE_DIAGNOSTICS in
+ * ./stores/bridge.store.ts: note() fires per observation (skips, evictions,
+ * append failures), so the retained history must stay bounded for the
+ * process lifetime. The onDiagnostic sink still sees every event.
+ */
+const MAX_STORE_DIAGNOSTICS = 100;
+
+/**
  * Create the host-tool experience producer with scope isolation.
  */
 export function createHostToolExperienceCollector(
@@ -257,6 +265,9 @@ export function createHostToolExperienceCollector(
 
   const note = (message: string): void => {
     diagnostics.push(message);
+    if (diagnostics.length > MAX_STORE_DIAGNOSTICS) {
+      diagnostics.splice(0, diagnostics.length - MAX_STORE_DIAGNOSTICS);
+    }
     options.onDiagnostic?.(message);
   };
 

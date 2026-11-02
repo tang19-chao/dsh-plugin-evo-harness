@@ -16,7 +16,7 @@
 | 文件 | 内容 | 用途 |
 | --- | --- | --- |
 | `lib/index.js` | ESM bundle（esbuild 参数与旧 package.json 逐字一致：bundle / format=esm / node20 / sourcemap external / log-level warning） | `package.json` 的 `main`/`exports` |
-| `lib/build-stamp.json` | `srcTreeSha256`、`srcFileCount`、逐文件 `{path,bytes,sha256}`、`artifact {path,bytes,sha256}`、`commit`（`git rev-parse HEAD`，不可得时为 `null` + `commitError`）、`builtAt`、node/platform/arch、冻结的算法说明 | 新鲜度证据（机读） |
+| `lib/build-stamp.json` | `srcTreeSha256`、`srcFileCount`、逐文件 `{path,bytes,sha256}`、`dependencySha256`（schema 1.1.0：`package.json` + `pnpm-lock.yaml`）、`artifact {path,bytes,sha256}`、`commit`（`git rev-parse HEAD`，不可得时为 `null` + `commitError`）、`builtAt`、node/platform/arch、冻结的算法说明 | 新鲜度证据（机读） |
 
 ### 1.2 冻结的 `srcTreeSha256` 定义（不要改）
 
@@ -28,7 +28,8 @@ srcTreeSha256 = SHA256( concat over files of
 - 文件集：`src/**/*.ts`（递归；不含 `.js`、不含 `node_modules`）；
 - 路径：相对仓库根的 POSIX 路径（`src/a/b.ts`），按 **ordinal**（UTF-16 code unit）排序；
 - 字节：读盘原始字节。仓库内容策略是 LF（`check:encoding` 对**提交的 blob** 强制），但 Windows 的 `core.autocrlf=true` 可能让工作树呈现 CRLF；此时摘要描述的是**这次构建实际消费的字节**，这是诚实的新鲜度问题，不是跨机产物指纹（跨机指纹由 attestation 对 **object database blob** 计算，见 §4）；
-- `commit` 只是**来源**（provenance），不是判据：HEAD 前移但 `src` 未改 → `stale: false`，只报 `commit.matches: false`；
+- **schema 1.1.0**：同一行配方另算一份 `dependencySha256`，文件集是 `package.json` + `pnpm-lock.yaml`——esbuild 把依赖**打进** `lib/index.js`（`build.mjs` 没有 `external`/`packages`），所以依赖升级不重建必须判 stale；
+- `commit` 在 1.1.0 中是**判据**：HEAD 前移而产物未重建 → `stale: true [commit-mismatch]`（stamp 描述的是"在该提交上构建出的产物"）。git 在某一侧答不出来时（如无 `.git` 的 tarball）跳过比较，`commit.matches: null`，不据此判 stale；
 - 判据是**内容**，永远不是 mtime。
 
 ### 1.3 状态与 stale 原因（fail-closed）
@@ -45,9 +46,11 @@ pnpm run check:build-smoke           # 构建 + ESM 冒烟 + 新鲜度
 | --- | --- | --- |
 | `artifact-missing` | `lib/index.js` 不存在 | `pnpm run build` |
 | `stamp-missing` | `lib/build-stamp.json` 不存在 | `pnpm run build` |
-| `stamp-invalid` | stamp 不是 JSON / 形状不对 | `pnpm run build` |
+| `stamp-invalid` | stamp 不是 JSON / 形状不对（含未知的 `schemaVersion`，fail-closed） | `pnpm run build` |
 | `src-tree-mismatch` | 记录的 `srcTreeSha256` ≠ 当前值（改/增/删/改名） | `pnpm run build` |
+| `dependency-mismatch` | `package.json` / `pnpm-lock.yaml` 变了（1.1.0：依赖被 bundle 内联，不重建也是旧产物） | `pnpm run build` |
 | `artifact-mismatch` | 产物的 sha256/bytes 与 stamp 不一致 | 重新构建，**不要**手改 stamp |
+| `commit-mismatch` | stamp 记录的提交不再是 HEAD（1.1.0）；任一侧无法给出提交时跳过 | `pnpm run build` |
 
 `lib/index.js` 缺失时状态必须同时给出 `stale: true` 与 `artifact: absent`，不得当 0 或 unknown 混过去（由 `tests/unit/p62/build-freshness.test.ts` 钉住）。
 

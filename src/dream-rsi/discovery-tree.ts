@@ -53,6 +53,32 @@ export class UnknownDiscoveryNodeError extends Error {
 }
 
 /**
+ * Thrown when a parent-chain walk revisits a node, i.e. the tree's parent links
+ * form a cycle. addNode cannot create one (the parent must exist before the
+ * child and cannot be the node itself), so a cycle can only arrive through a
+ * rebuilt snapshot — rejected there (see isDiscoveryTreeGraphValid) and guarded
+ * against here so a poisoned tree can never hang the walk.
+ */
+export class DiscoveryTreeCycleError extends Error {
+  readonly code = 'DISCOVERY_TREE_CYCLE';
+  readonly treeId: string;
+  readonly nodeId: string;
+
+  constructor(treeId: string, nodeId: string) {
+    super(
+      "Cyclic parent link detected at node '" +
+        nodeId +
+        "' in discovery tree '" +
+        treeId +
+        "'"
+    );
+    this.name = 'DiscoveryTreeCycleError';
+    this.treeId = treeId;
+    this.nodeId = nodeId;
+  }
+}
+
+/**
  * Thrown when a prefix-scoped view is asked about a node that is not part of
  * the anchor's causal prefix. This is the hard rejection that keeps replay from
  * seeing the future (or a parallel branch).
@@ -433,11 +459,18 @@ class DiscoveryTreeImpl implements DiscoveryTree {
   ancestorsOf(nodeId: string): readonly DiscoveryNode[] {
     let current = this.requireNode(nodeId);
     const chain: DiscoveryNode[] = [];
+    // The walk must terminate even if the parent links were poisoned into a
+    // cycle outside addNode (a rebuilt snapshot), hence the visited set.
+    const visited = new Set<string>([current.id]);
     while (current.parentId !== null) {
       const parent = this.nodes.get(current.parentId);
       if (parent === undefined) {
         break;
       }
+      if (visited.has(parent.id)) {
+        throw new DiscoveryTreeCycleError(this.id, parent.id);
+      }
+      visited.add(parent.id);
       chain.push(toDiscoveryNode(parent));
       current = parent;
     }
@@ -519,11 +552,63 @@ export function createDiscoveryTree(options: DiscoveryTreeOptions): DiscoveryTre
   return new DiscoveryTreeImpl(options);
 }
 
+/**
+ * Validate the parent graph of a snapshot before it is rebuilt or persisted:
+ * every parentId and childIds entry must resolve inside the snapshot and the
+ * parent links must be acyclic. Snapshots produced by snapshot() always satisfy
+ * this; a hand-edited or damaged snapshot with a loop would otherwise hang a
+ * later ancestorsOf/causalPrefix walk forever (DREAM-3). Prefix-view snapshots
+ * (which intentionally hide children) are not valid inputs for a rebuild.
+ */
+export function isDiscoveryTreeGraphValid(
+  snapshot: Pick<DiscoveryTreeSnapshot, 'nodes'>
+): boolean {
+  const nodes = snapshot.nodes;
+  for (const node of Object.values(nodes)) {
+    if (node.parentId !== null && nodes[node.parentId] === undefined) {
+      return false;
+    }
+    for (const childId of node.childIds) {
+      if (nodes[childId] === undefined) {
+        return false;
+      }
+    }
+  }
+  // Walk every parent chain once; a node that reappears inside its own chain is
+  // a cycle, even in a component disconnected from the root.
+  const settled = new Set<string>();
+  for (const start of Object.keys(nodes)) {
+    if (settled.has(start)) {
+      continue;
+    }
+    const chain = new Set<string>();
+    let currentId: string | null = start;
+    while (currentId !== null && !settled.has(currentId)) {
+      if (chain.has(currentId)) {
+        return false;
+      }
+      chain.add(currentId);
+      currentId = nodes[currentId]?.parentId ?? null;
+    }
+    for (const id of chain) {
+      settled.add(id);
+    }
+  }
+  return true;
+}
+
 /** Rebuild a mutable tree from an immutable snapshot (used by replay). */
 export function treeFromSnapshot(
   snapshot: DiscoveryTreeSnapshot,
   options: { readonly id?: string; readonly clock?: () => number } = {}
 ): DiscoveryTree {
+  if (!isDiscoveryTreeGraphValid(snapshot)) {
+    throw new Error(
+      "Snapshot graph of discovery tree '" +
+        snapshot.id +
+        "' is malformed (dangling parent/child reference or cyclic parent link)"
+    );
+  }
   const clock = options.clock ?? ((): number => Date.now());
   const seed: TreeSeed = {
     nodes: snapshot.nodes,
@@ -808,7 +893,11 @@ export function createDiscoveryTreePool(
 export function bestNodeOf(tree: IDiscoveryTree): DiscoveryNode | undefined {
   let best: DiscoveryNode | undefined;
   for (const node of tree.allNodes()) {
-    if (node.score === undefined) {
+    // A non-finite score (NaN/Infinity injected through updateNode/recordProbe)
+    // must not be eligible: encountered first it would poison every later
+    // comparison (NaN < x is false) and shadow all finite scores. Mirrors
+    // replayNodeScore's Number.isFinite check (DREAM-6).
+    if (node.score === undefined || !Number.isFinite(node.score)) {
       continue;
     }
     if (best === undefined || (best.score ?? 0) < node.score) {

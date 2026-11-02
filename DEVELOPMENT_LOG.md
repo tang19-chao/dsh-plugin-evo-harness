@@ -356,13 +356,15 @@ typecheck / check:encoding / **check:docs（README 97 files / 1979 tests 机械�
 4. **mutation gate 与远端 CI**：`mutation-gate`、`attestation-target`、`node24-compat` 及三平台 parity 的远端结果一律以推送后 Actions 日志为准。
 5. **P2–P6**：未开始。
 
-### 12.6 登记的非阻塞观察（原观察保留；t11 O1 与 t13 O1 已闭环，见 §12.7）
+### 12.6 登记的非阻塞观察（原观察保留；t11 O1、t13 O1、t13 O2、t20 与 t14 O2 已闭环，见 §12.7）
 
-`contracts.ts` 的 `skipped` 注释措辞与实测累加点不符（t13 O1，建议一行注释修复，属 t5 文件、不在本批 integration 写范围）——**已闭环（见 §12.7，t19 修复）**，原文字保留；`mapHostAdvisorStatus` 的 `{...stats}` 原样转发（t13 O2，建议按键白名单，**仍开放**）；`check:docs` 未断言 `unit + e2e == total`（t14 O2，**仍开放**）；PR-4A 摘要段重复推入断言使等价命中时计数 +1（t11 O1，退出码不受影响、无假绿）——**已闭环（见 §12.7，t18 修复）**，原文字保留；`{config:null}` 语义未定义（t12 O2，**仍开放**）；M3 红数 3 与注册 2 的口径（t15 O1，第 3 条为 extraRed 观察，已在 §12.2 口径注明）。README 命令表缺 `check:mutation` 一条已在 t16 补齐。
+`contracts.ts` 的 `skipped` 注释措辞与实测累加点不符（t13 O1，建议一行注释修复，属 t5 文件、不在本批 integration 写范围）——**已闭环（见 §12.7，t19 修复）**，原文字保留；`mapHostAdvisorStatus` 的 `{...stats}` 原样转发（t13 O2，建议按键白名单）——**已闭环（见 §12.7，P2 批 R-01 修复）**，原文字保留；`check:docs` 未断言 `unit + e2e == total`（t14 O2）——**已闭环（见 §12.7，P2 批 R-04 修复）**，原文字保留；PR-4A 摘要段重复推入断言使等价命中时计数 +1（t11 O1，退出码不受影响、无假绿）——**已闭环（见 §12.7，t18 修复）**，原文字保留；`{config:null}` 语义未定义（t12 O2，**仍开放**）；M3 红数 3 与注册 2 的口径（t15 O1，第 3 条为 extraRed 观察，已在 §12.2 口径注明）。README 命令表缺 `check:mutation` 一条已在 t16 补齐。
 
 ### 12.7 P1 批后续收口（t18/t19 闭环）与仍开放残余（2026-10-29，t24 追加）
 
 > 本节只追加，不回写 §12.1–§12.6。t21 最终发布审核的 F1 要求在此登记：§12.6 中两个记为未修的 low 观察已在 t18/t19 收口，其原观察文字保留在 §12.6（该处状态已改为「已闭环」并回指本节）。
+>
+> **2026-11-01 追加（审计第 1 批文档校正，DOCS-2）**：下表追加 t13 O2、t20、t14 O2 三条——三者已由 P2 批 R-01/R-02/R-04 在代码层收口（随 `a50bd3f`/`49c2a44` 落地，交付报告 `docs/reports/p2-r-leftovers.md`）；本表与 §12.6 对应行的「未修/仍开放」状态字样回指为「已闭环」，原观察文字一律保留。t12 O2 仍开放不变。
 
 **已闭环**
 
@@ -370,14 +372,17 @@ typecheck / check:encoding / **check:docs（README 97 files / 1979 tests 机械�
 | --- | --- | --- |
 | t11 O1（low）：等价命中时 `checked/passed` 虚增 1，且混合态下同一 id 同时进入 failures 与 passed | **t18** | 删除报告段对 `provenance-executed-sources-eol-equivalent` 的第二次 `results.push`（全文仅剩 1 处 assert），断言语义收窄为「仅描述等价命中本身」，真实 drift 仍由 `provenance-executed-sources-match-disk` 独立失败。证据：t20 §6.2 自建夹具 A/C 对照（checked 643 vs 642、passed 627 vs 626、failed 不变）、混合态 exit 1 且等价 id 不入 failures、checked=passed+failed（14/14）；t21 §7 真实 LF 检出实测 **checked=692 / passed=692 / failed=0**、`eolEquivalents=2`、混合态仅 match-disk；专属套件 21/21；真实工作树 691/691（`eolEquivalents=[]`） |
 | t13 O1（low）：`contracts.ts` 的 `skipped` 注释称跳过「never reached the eligibility decision」，与实测累加点相反 | **t19** | `src/types/contracts.ts` 注释重写为「判定之前的跳过 + 部分资格判定之后的 out-of-scope / 无名工具路径（已计入 `considered`）」，并声明与 outcome 计数每 dispatch 互斥。证据：t20 §6.2/§6.3 逐点核对 5 个累加点（adapter 1096/1099/1120/1173/1177，其中 1099/1120/1177 在 `considered += 1`（880 行）之后）；t21 探针 34/34 复跑；类型面零改动、tsc exit 0 |
+| t13 O2（low）：`mapHostAdvisorStatus` 以 `{...stats}` 原样转发，额外适配器字段可进入公开 status | **P2 批 R-01**（2026-11-01 审计第 1 批文档校正追加指针；随 `a50bd3f`/`49c2a44` 落地） | `src/host-triggers.ts`：`mapHostAdvisorStatus` 不再 `{...stats}`，改经 `pickHostAdvisorCounters` 按 `HOST_ADVISOR_COUNTER_KEYS` 七键白名单挑字段（模块级单一事实源 + 编译期见证），白名单注释点名 R-01/t13 O2；专属契约测试 `tests/unit/contracts/host-advisor-status-mapping.test.ts`（canary 注入后公开 counters 恰为 7 个公开键）；见 `docs/reports/p2-r-leftovers.md` §1 |
+| t20 新登记（low/info）：t19 新注释把判定前跳过写成「advisor off or the runtime gate closed」，但 advisor 未挂载（`advisor === undefined`）时本适配器根本不计数 | **P2 批 R-02**（2026-11-01 审计第 1 批文档校正追加指针） | `src/types/contracts.ts`：`skipped` 注释改写为 **COUNTING BOUNDARY (R-02)**——该计数是适配器观测、不是宿主派发量，未挂载/已 dispose 时累加点不触发、计数保持实测 0，禁止把 0 读成派发数；仅注释、零行为改动；见 `docs/reports/p2-r-leftovers.md` §2 |
+| t14 O2（info）：`check:docs` 未断言 `unit + e2e == total`，未来出现第三类测试目录时不会报红 | **P2 批 R-04**（2026-11-01 审计第 1 批文档校正追加指针） | `scripts/verify-readme-counts.mjs`：三方闭合断言（README 侧与报告侧 `unit + e2e == total`，files 与 tests 双维，`count-closure`）+ `unattributed-root` 对 `/tests/unit/`、`/tests/e2e/` 之外测试根的点名拒绝；配套测试 `tests/unit/config/readme-default-leaves.test.ts`；见 `docs/reports/p2-r-leftovers.md` §4 |
 
 **仍开放（如实登记，未修，不误称已修）**
 
 | 残余 | 归属 | 现状 |
 | --- | --- | --- |
-| t13 O2（low）：`mapHostAdvisorStatus` 以 `{...stats}` 原样转发，额外适配器字段可进入公开 status | t5 文件（`src/host-triggers.ts`） | **未修**；真实 hook 适配器只返回 7 个计数，现状无泄漏；建议按键白名单加固 |
-| t20 新登记（low/info）：t19 新注释把判定前跳过写成「advisor off or the runtime gate closed」，但 advisor 未挂载（`advisor === undefined`）时本适配器根本不计数 | t5 文件（`src/types/contracts.ts` 注释） | **未修**；可观测到的判定前跳过只有运行时闸门（`/evo jit off`）一种；建议一行措辞收敛。附注：t19 未在台账留下 output 记录，本条结论来自 t20/t21 对工作树与代码的独立核对 |
+| t13 O2（low）：`mapHostAdvisorStatus` 以 `{...stats}` 原样转发，额外适配器字段可进入公开 status | t5 文件（`src/host-triggers.ts`） | **已闭环（见上方已闭环表，P2 批 R-01，2026-11-01 追加指针）**；真实 hook 适配器只返回 7 个计数，现状无泄漏；原建议文字保留：按键白名单加固 |
+| t20 新登记（low/info）：t19 新注释把判定前跳过写成「advisor off or the runtime gate closed」，但 advisor 未挂载（`advisor === undefined`）时本适配器根本不计数 | t5 文件（`src/types/contracts.ts` 注释） | **已闭环（见上方已闭环表，P2 批 R-02，2026-11-01 追加指针）**；可观测到的判定前跳过只有运行时闸门（`/evo jit off`）一种；原建议文字保留：一行措辞收敛。附注：t19 未在台账留下 output 记录，本条结论来自 t20/t21 对工作树与代码的独立核对 |
 | t12 O2（info）：`{config: null}` 语义未在 ADR 0005 定义（回落宿主配置，无安全降级） | ADR 0005 / t4 入口 | **未修**；登记项 |
-| t14 O2（info）：`check:docs` 未断言 `unit + e2e == total`，未来出现第三类测试目录时不会报红 | `scripts/verify-readme-counts.mjs` | **未修**；登记项 |
+| t14 O2（info）：`check:docs` 未断言 `unit + e2e == total`，未来出现第三类测试目录时不会报红 | `scripts/verify-readme-counts.mjs` | **已闭环（见上方已闭环表，P2 批 R-04，2026-11-01 追加指针）**；原登记文字保留：登记项 |
 
 其余 info 级残余（t10 O1–O5、t12 O1、t14 O1、t15 O2–O7）与 t11/t13/t14 的完整观察列表分别保留在 `docs/reports/t10…t15` 六份审核报告与 `docs/reports/t21-final-p1-release-review.md` §7，本文件不重复展开、也不声称已修。

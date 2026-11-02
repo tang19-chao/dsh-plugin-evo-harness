@@ -16,9 +16,18 @@
  * -------------------------------------------------------------------
  *   srcTreeSha256 = SHA256( concat over files of
  *                     "<posix-path>" + "\0" + SHA256(canonical LF bytes) + "\n" )
+ *   dependencySha256 = SHA256( concat over files of
+ *                     "<posix-path>" + "\0" + SHA256(raw bytes) + "\n" )
+ *                     over `package.json` and `pnpm-lock.yaml` (schema 1.1.0)
  *
  *   - the file set is every `src/**\/*.ts` file (recursive), so a new module,
  *     a deletion, a rename and a content edit all change the digest;
+ *   - (1.1.0) the DEPENDENCY file set is `package.json` + `pnpm-lock.yaml`:
+ *     esbuild bundles the dependencies INTO `lib/index.js` (build.mjs has no
+ *     `external`/`packages` field), so a dependency bump without a rebuild
+ *     changes the artifact identity while leaving the src tree untouched -
+ *     the stamp must see it too, or "dep bump + smoke, no rebuild" passes
+ *     as fresh;
  *   - paths are POSIX-relative to the repository root (`src/a/b.ts`), sorted by
  *     ordinal (UTF-16 code-unit) comparison, so the digest is locale- and
  *     OS-independent;
@@ -34,11 +43,14 @@
  *     also records the file count and the per-file digests so a reviewer can
  *     re-derive it.
  *
- * `commit` is `git rev-parse HEAD` at build time. It is PROVENANCE, not the
- * freshness criterion: a HEAD move without a source edit does not invalidate
- * the bytes (the stamp reports `commit.matches` separately). When git cannot
- * answer (a tarball without `.git`), the stamp records `commit: null` with the
- * reason instead of failing the build.
+ * `commit` is `git rev-parse HEAD` at build time. (1.1.0) a recorded commit
+ * that no longer matches HEAD is a staleness reason (`commit-mismatch`): the
+ * stamp describes the artifact AS BUILT AT THAT COMMIT, so an old artifact
+ * presented under a moved HEAD is the same "self-consistent evidence about
+ * the wrong bytes" failure this module exists to catch. When git cannot
+ * answer on either side (a tarball without `.git`), there is nothing to
+ * compare against: the comparison is skipped (`commit.matches: null`) and the
+ * stamp records `commit: null` with the reason instead of failing the build.
  *
  * STAMP: `lib/build-stamp.json` (machine-readable, written by `scripts/build.mjs`
  * and read by `scripts/eval/smoke-build.mjs --status`).
@@ -58,11 +70,17 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
 
 /** Schema version of the stamp written by this module. */
-export const BUILD_STAMP_SCHEMA_VERSION = '1.0.0';
+export const BUILD_STAMP_SCHEMA_VERSION = '1.1.0';
 /** POSIX-relative path of the machine-readable stamp inside a repository. */
 export const BUILD_STAMP_PATH = 'lib/build-stamp.json';
 /** POSIX-relative path of the build artifact asserted by the smoke gate. */
 export const BUILD_ARTIFACT_PATH = 'lib/index.js';
+
+/**
+ * Dependency identity files folded into the stamp (schema 1.1.0): the bundle
+ * inlines them, so their bytes are part of the artifact's identity.
+ */
+const DEPENDENCY_MANIFEST_FILES = Object.freeze(['package.json', 'pnpm-lock.yaml']);
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const COMMIT_HEX = /^[0-9a-f]{40}$/;
@@ -129,6 +147,39 @@ export function computeSrcTreeSha256(options = {}) {
 }
 
 /**
+ * Compute the 1.1.0 dependency digest over `package.json` + `pnpm-lock.yaml`
+ * (same line recipe as the src tree, over the dependency file set). A file
+ * that does not exist is skipped on BOTH sides, so the comparison stays
+ * defined for stripped-down trees; a file present on one side only still
+ * changes the digest and reports a mismatch (fail-closed).
+ *
+ * @param {{cwd?: string}} [options]
+ * @returns {{dependencySha256: string, fileCount: number, files: {path: string, bytes: number, sha256: string}[]}}
+ */
+export function computeDependencySha256(options = {}) {
+  const cwd = options.cwd ?? rootDir;
+  /** @type {{path: string, bytes: number, sha256: string}[]} */
+  const files = [];
+  /** @type {string[]} */
+  const lines = [];
+  for (const relative of DEPENDENCY_MANIFEST_FILES) {
+    const absolute = path.join(cwd, relative);
+    if (!fs.existsSync(absolute)) {
+      continue;
+    }
+    const bytes = fs.readFileSync(absolute);
+    const digest = sha256Hex(bytes);
+    files.push({ path: relative, bytes: bytes.length, sha256: digest });
+    lines.push(relative + '\u0000' + digest + '\n');
+  }
+  return {
+    dependencySha256: sha256Hex(Buffer.from(lines.join(''), 'utf8')),
+    fileCount: files.length,
+    files
+  };
+}
+
+/**
  * Resolve `HEAD` without letting an ambient GIT_DIR/GIT_WORK_TREE redirect the
  * answer, and without throwing: a missing repository is recorded, not fatal.
  *
@@ -170,6 +221,7 @@ export function buildStamp(options = {}) {
   const cwd = options.cwd ?? rootDir;
   const artifactRelative = (options.artifactPath ?? BUILD_ARTIFACT_PATH).split(path.sep).join('/');
   const source = computeSrcTreeSha256({ cwd });
+  const dependencies = computeDependencySha256({ cwd });
   const artifactAbsolute = path.join(cwd, artifactRelative);
   let artifact = null;
   if (fs.existsSync(artifactAbsolute)) {
@@ -183,12 +235,16 @@ export function buildStamp(options = {}) {
     srcTreeSha256: source.srcTreeSha256,
     srcFileCount: source.fileCount,
     srcFiles: source.files,
+    dependencySha256: dependencies.dependencySha256,
+    dependencyFileCount: dependencies.fileCount,
+    dependencyFiles: dependencies.files,
     artifact,
     commit: head.commit,
     commitError: head.error,
     commitSource: 'git rev-parse --verify HEAD^{commit}',
     algorithm: {
       fileSet: 'src/**/*.ts (recursive)',
+      dependencyFileSet: 'package.json + pnpm-lock.yaml (schema 1.1.0)',
       pathFormat: 'POSIX relative to the repository root',
       sorting: 'ordinal by path (UTF-16 code unit order, locale-independent)',
       lineFormat: '<path> NUL <sha256(raw bytes)> LF',
@@ -250,11 +306,27 @@ function readStamp(absolutePath) {
   if (stamp.kind !== 'build-stamp') {
     return { stamp: null, error: 'stamp-invalid: kind is ' + JSON.stringify(stamp.kind) };
   }
+  if (stamp.schemaVersion !== BUILD_STAMP_SCHEMA_VERSION) {
+    // An unknown stamp schema cannot be interpreted by this reader: refuse it
+    // (fail-closed) instead of silently comparing a subset of the evidence.
+    return {
+      stamp: null,
+      error:
+        'stamp-invalid: schemaVersion ' +
+        JSON.stringify(stamp.schemaVersion ?? null) +
+        ' is not the known version ' +
+        BUILD_STAMP_SCHEMA_VERSION +
+        ' (rebuild to regenerate the stamp)'
+    };
+  }
   if (typeof stamp.srcTreeSha256 !== 'string' || !SHA256_HEX.test(stamp.srcTreeSha256)) {
     return { stamp: null, error: 'stamp-invalid: srcTreeSha256 is not a 64-hex digest' };
   }
   if (typeof stamp.srcFileCount !== 'number' || !Number.isInteger(stamp.srcFileCount) || stamp.srcFileCount < 0) {
     return { stamp: null, error: 'stamp-invalid: srcFileCount is not a non-negative integer' };
+  }
+  if (typeof stamp.dependencySha256 !== 'string' || !SHA256_HEX.test(stamp.dependencySha256)) {
+    return { stamp: null, error: 'stamp-invalid: dependencySha256 is not a 64-hex digest' };
   }
   if (stamp.commit !== null && (typeof stamp.commit !== 'string' || !COMMIT_HEX.test(stamp.commit))) {
     return { stamp: null, error: 'stamp-invalid: commit is neither null nor a 40-hex id' };
@@ -279,14 +351,21 @@ function readStamp(absolutePath) {
  * Stale reasons are named codes, never a bare boolean:
  *   - `artifact-missing`      `lib/index.js` does not exist;
  *   - `stamp-missing`         `lib/build-stamp.json` does not exist;
- *   - `stamp-invalid`         the stamp cannot be parsed/shape-checked;
+ *   - `stamp-invalid`         the stamp cannot be parsed/shape-checked (this
+ *                             includes an unknown stamp schemaVersion);
  *   - `src-tree-mismatch`     the recorded srcTreeSha256 != the current one
  *                             (content edit, add, delete or rename);
+ *   - `dependency-mismatch`   the recorded dependencySha256 (package.json +
+ *                             pnpm-lock.yaml, schema 1.1.0) != the current one
+ *                             (a dependency bump without a rebuild);
  *   - `artifact-mismatch`     the artifact's sha256/bytes differ from the stamp
- *                             (the file was replaced without a rebuild).
+ *                             (the file was replaced without a rebuild);
+ *   - `commit-mismatch`       the stamp names a commit that is no longer HEAD
+ *                             (schema 1.1.0): an old artifact presented under
+ *                             a moved HEAD is stale evidence. Skipped when
+ *                             either side has no commit to compare.
  *
- * `stale` is TRUE whenever any reason is present. `commit.matches` is reported
- * separately: moving HEAD does not change the source bytes.
+ * `stale` is TRUE whenever any reason is present.
  *
  * @param {{cwd?: string, artifactPath?: string, stampPath?: string}} [options]
  * @returns {{
@@ -300,6 +379,7 @@ function readStamp(absolutePath) {
  *   stampPath: string,
  *   stampPresent: boolean,
  *   srcTreeSha256: {current: string, recorded: string|null, currentFileCount: number},
+ *   dependencySha256: {current: string, recorded: string|null, currentFileCount: number},
  *   commit: {recorded: string|null, head: string|null, matches: boolean|null},
  *   detail: string
  * }}
@@ -312,6 +392,7 @@ export function computeBuildStatus(options = {}) {
   const stampAbsolute = path.join(cwd, stampRelative);
 
   const source = computeSrcTreeSha256({ cwd });
+  const dependencies = computeDependencySha256({ cwd });
   /** @type {string[]} */
   const reasons = [];
 
@@ -333,6 +414,9 @@ export function computeBuildStatus(options = {}) {
     if (stamp.srcTreeSha256 !== source.srcTreeSha256) {
       reasons.push('src-tree-mismatch');
     }
+    if (stamp.dependencySha256 !== dependencies.dependencySha256) {
+      reasons.push('dependency-mismatch');
+    }
     if (
       artifactPresent &&
       (stamp.artifact === null ||
@@ -345,7 +429,11 @@ export function computeBuildStatus(options = {}) {
 
   const head = readHeadCommit(cwd);
   const recordedCommit = stamp !== null && typeof stamp.commit === 'string' ? stamp.commit : null;
-  const commitMatches = recordedCommit !== null && head.commit !== null ? recordedCommit === head.commit : null;
+  const commitComparable = recordedCommit !== null && head.commit !== null;
+  const commitMatches = commitComparable ? recordedCommit === head.commit : null;
+  if (commitMatches === false) {
+    reasons.push('commit-mismatch');
+  }
 
   const detailParts = [];
   if (reasons.includes('artifact-missing')) {
@@ -366,11 +454,29 @@ export function computeBuildStatus(options = {}) {
         '…); run `pnpm run build`'
     );
   }
+  if (reasons.includes('dependency-mismatch')) {
+    detailParts.push(
+      'package.json/pnpm-lock.yaml changed since the last build (recorded ' +
+        String(stamp?.dependencySha256).slice(0, 12) +
+        '…, current ' +
+        dependencies.dependencySha256.slice(0, 12) +
+        '…); the bundle inlines the dependencies, so run `pnpm run build`'
+    );
+  }
   if (reasons.includes('artifact-mismatch')) {
     detailParts.push('lib/index.js does not match the stamp; run `pnpm run build`');
   }
+  if (reasons.includes('commit-mismatch')) {
+    detailParts.push(
+      'HEAD is ' +
+        String(head.commit) +
+        ' but the stamp names ' +
+        String(recordedCommit) +
+        '; the artifact was built at another commit, so run `pnpm run build`'
+    );
+  }
   if (detailParts.length === 0) {
-    detailParts.push('lib/index.js was built from the current src/ tree');
+    detailParts.push('lib/index.js matches the current src tree, dependency set and commit');
   }
 
   return {
@@ -387,6 +493,11 @@ export function computeBuildStatus(options = {}) {
       current: source.srcTreeSha256,
       recorded: stamp === null ? null : String(stamp.srcTreeSha256),
       currentFileCount: source.fileCount
+    },
+    dependencySha256: {
+      current: dependencies.dependencySha256,
+      recorded: stamp === null ? null : String(stamp.dependencySha256),
+      currentFileCount: dependencies.fileCount
     },
     commit: { recorded: recordedCommit, head: head.commit, matches: commitMatches },
     detail: detailParts.join('; ')
@@ -418,11 +529,11 @@ export function formatBuildStatus(status) {
   ];
   if (status.commit.matches === false) {
     lines.push(
-      '[build-status] note: HEAD is ' +
+      '[build-status] commit-mismatch: HEAD is ' +
         String(status.commit.head) +
         ', the stamp names ' +
         String(status.commit.recorded) +
-        '; source bytes are the freshness criterion, so this is provenance only'
+        ' (schema 1.1.0 counts this as stale evidence)'
     );
   }
   lines.push('[build-status] ' + status.detail);
@@ -430,20 +541,23 @@ export function formatBuildStatus(status) {
 }
 
 const usage = [
-  'Build freshness evidence (src tree digest + build stamp).',
+  'Build freshness evidence (src tree digest + dependency digest + build stamp).',
   '',
   'USAGE',
   '  node scripts/build-manifest.mjs [--status] [--json] [--cwd <dir>]',
   '',
-  'FRESHNESS RECIPE (frozen)',
+  'FRESHNESS RECIPE (frozen, schema 1.1.0)',
   '  srcTreeSha256 = SHA256(concat("<posix-path>\\0<SHA256(raw bytes)>\\n"))',
   '  over every src/**/*.ts file, sorted ordinally by path.',
-  '  The stamp names the commit it was built at (provenance only).',
+  '  dependencySha256 = same recipe over package.json + pnpm-lock.yaml',
+  '  (the bundle inlines the dependencies, so their bytes are identity).',
+  '  The stamp names the commit it was built at; a moved HEAD is stale.',
   '',
   'EXIT CODES',
-  '  0  fresh (artifact exists and matches the current src tree)',
+  '  0  fresh (artifact matches the current src tree, dependency set and commit)',
   '  1  stale, with named reasons (artifact-missing, stamp-missing,',
-  '     stamp-invalid, src-tree-mismatch, artifact-mismatch)'
+  '     stamp-invalid, src-tree-mismatch, dependency-mismatch,',
+  '     artifact-mismatch, commit-mismatch)'
 ].join('\n');
 
 const isDirectExecution = process.argv[1] !== undefined && path.resolve(process.argv[1]) === path.resolve(__filename);

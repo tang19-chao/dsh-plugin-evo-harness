@@ -20,10 +20,12 @@
 import z from '@deepseek-ai/schemastery';
 import {
   CONFIG_SCHEMA_VERSION,
+  LOG_LEVELS,
   parseEvoHarnessConfig,
   validateEvoHarnessConfig,
   type EvoHarnessConfig,
-  type JitRlConfig
+  type JitRlConfig,
+  type LogLevel
 } from './config';
 import type { UsageLedgerEvent } from './ledger';
 import {
@@ -77,9 +79,10 @@ import {
   createModelRouteSchema,
   MODEL_ROUTE_DEFAULTS,
   MODEL_ROUTE_EFFORTS,
-  resolveDshCollaborators,
-  resolveModelRouteConfig,
-  type DshCollaborators
+    resolveDshCollaborators,
+    resolveModelRouteConfig,
+    type DshCollaborators,
+    type MeteredModelOptions
 } from './dsh-bridge';
 import {
   DSH_AGENT_ERROR,
@@ -311,8 +314,10 @@ export interface EvoHarnessPluginOptions {
   /**
    * Absolute path of the JitRL experience log (JSONL). When persistence is
    * enabled its data directory is used automatically; this option overrides it
-   * and lets a test or a custom host place the log elsewhere. Absent (and no
-   * persistence) keeps the experience store in memory only.   */
+   * and lets a test or a custom host place the log elsewhere inside that data
+   * directory (SEC-5: a path resolving outside it is refused with a named
+   * error). Absent (and no persistence) keeps the experience store in memory
+   * only.   */
   readonly experienceFilePath?: string;
   /**
    * Run the cold-start backfill of L1 experiences from the persisted tree pool.
@@ -1744,6 +1749,15 @@ export function buildJitRlWiring(input: {
   readonly diagnostics: string[];
   readonly now: () => number;
   /**
+   * LEDGER-9b: P3-B metering wiring for the kernel's TWO model-consuming
+   * stages (the logit capability probe and the LLM step judge). The shape is the
+   * same `MeteredModelOptions` the proposer/composer/reflector stages take, so a
+   * host that already shares one settlement across stages shares it here too.
+   * Absent keeps the previous behaviour exactly: those two calls are recorded in
+   * the call registry with provenance 'none' but never reserve or settle.
+   */
+  readonly metering?: MeteredModelOptions;
+  /**
    * t12/R1c (t11 finding): the resolved effective execution profile. The L1
    * interception switch below is derived from THIS, not from
    * `config.execution.mode`, so an injected profile cannot leave the decorator
@@ -1802,6 +1816,10 @@ export function buildJitRlWiring(input: {
       } : {
         model: input.options.model
       }),
+      // LEDGER-9b: the kernel's logit probe and step judge spend real provider
+      // calls; without this they reach the ledger as provenance 'none' and no
+      // reserve/settle ever happens. Absent leaves the previous behaviour intact.
+      ...(input.metering === undefined ? {} : { metering: input.metering }),
       onDiagnostic: (diagnostic) => {
         input.diagnostics.push('jitrl: ' + diagnostic.message);
       }
@@ -1985,7 +2003,27 @@ export function shouldHydrateJitRl(options: EvoHarnessPluginOptions): boolean {
 /** Resolve the experience log path, or undefined for a memory-only kernel. */
 export function resolveExperienceFilePath(options: EvoHarnessPluginOptions): string | undefined {
   if (options.experienceFilePath !== undefined) {
-    return options.experienceFilePath;
+    const explicit = options.experienceFilePath;
+    const dataDir = options.persistence?.dataDir;
+    // Without a wired persistence data dir there is no container to escape (and
+    // hydrateJitRl never consumes the value then), so the option passes through.
+    if (dataDir === undefined || dataDir.length === 0) {
+      return explicit;
+    }
+    // SEC-5: the JSONL store appends with mode 0o600, so a config-supplied log
+    // path is resolved against the data dir and containment-checked; a
+    // traversal-bearing override throws a named error (surfaced by hydrateJitRl
+    // as a cold-start diagnostic) instead of aiming the durable log elsewhere.
+    const resolved =
+      /^[A-Za-z]:[\\/]/.test(explicit) || explicit.startsWith('/') || explicit.startsWith('\\')
+        ? explicit
+        : joinPath(dataDir, explicit);
+    if (!resolvesInsideDir(dataDir, resolved)) {
+      throw new Error(
+        'experienceFilePath "' + explicit + '" resolves outside the persistence data directory "' + dataDir + '"'
+      );
+    }
+    return resolved;
   }
   const dataDir = options.persistence?.dataDir;
   if (dataDir === undefined || dataDir.length === 0) {
@@ -1993,6 +2031,34 @@ export function resolveExperienceFilePath(options: EvoHarnessPluginOptions): str
   }
   return joinPath(dataDir,
     JITRL_EXPERIENCE_FILE);
+}
+/**
+ * SEC-5 containment (lexical, no node:path in the entry module): true when
+ * `candidate` resolves inside `dir`. Both sides are normalized to forward
+ * slashes and compared segment by segment, so a '..' segment or a sibling
+ * directory can never pass; a relative candidate resolves against `dir`.
+ */
+function resolvesInsideDir(dir: string,
+  candidate: string): boolean {
+  const base = dir.replace(/\\/g, '/').replace(/\/+$/, '');
+  const raw = candidate.replace(/\\/g, '/');
+  const joined = /^[A-Za-z]:\//.test(raw) || raw.startsWith('/') ? raw : base + '/' + raw;
+  const resolved: string[] = [];
+  for (const segment of joined.split('/')) {
+    if (segment === '' || segment === '.') {
+      continue;
+    }
+    if (segment === '..') {
+      resolved.pop();
+      continue;
+    }
+    resolved.push(segment);
+  }
+  const baseSegments = base.split('/').filter((segment) => segment !== '');
+  return (
+    resolved.length >= baseSegments.length &&
+    baseSegments.every((segment, index) => resolved[index] === segment)
+  );
 }
 /** Minimal POSIX/Windows join that does not pull node:path into the entry module. */
 function joinPath(dir: string,
@@ -2017,14 +2083,20 @@ function memoryDiscoveryOf(bridge: IMemoryBridge): AutoDiscoveryResult | null {
 export function buildOrchestratorDeps(config: EvoHarnessConfig,
   options: EvoHarnessPluginOptions,
   ctx: unknown,
-  diagnostics: string[]): {
+  diagnostics: string[],
+  holder: CollaboratorHolder = {}): {
     deps: EvoHarnessOrchestratorDeps;
     hostAdapter: CordisHostAdapter;
     hostAdapterSource: EvoHarnessHostAdapterSource;
     jitrl: JitRlWiring;
   } {
   const now = options.now ?? ((): number => Date.now());
-  let sequence = 0;
+  // P1-7 (DREAM-1): with persistence on, continue the id sequence from the
+  // durable task counter instead of restarting at 1. A restarted host would
+  // otherwise mint tree-evo-1 again and the tree pool's upsert would overwrite
+  // the persisted tree of the same id (deterministic replay-corpus loss).
+  // Without persistence the sequence starts at 0 exactly as before.
+  let sequence = options.persistence?.policyStore.counters.completedTasks ?? 0;
   const newId = options.newId ?? ((): string => {
     sequence += 1;
     return 'evo-' + String(sequence);
@@ -2052,15 +2124,23 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
   const treePool = options.deps?.treePool ?? persistence?.treePool ?? createDiscoveryTreePool({
     maxTrees: config.dreamRsi.maxTreePoolSize
   });
+  // P1-9 (VCI-1): when the host supplies neither clients nor a client provider,
+  // the tools-backed MCP client only exists once collaborator detection settles.
+  // The bridge reads the provider once at initialize() - after detection - so a
+  // holder-backed lazy provider forwards the resolved clients without a race.
+  const deferredListClients = options.listClients ??
+    (options.clients === undefined
+      ? async (): Promise<readonly McpClient[]> => holder.clients ?? []
+      : undefined);
   const memory = options.deps?.memory ?? createMemoryBridge({
     config: config.memoryBridge,
     ... (options.clients === undefined ? {
     } : {
       clients: options.clients
     }),
-    ... (options.listClients === undefined ? {
+    ... (deferredListClients === undefined ? {
     } : {
-      listClients: options.listClients
+      listClients: deferredListClients
     }),
     now
   });
@@ -2106,6 +2186,24 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
   const configProfile = resolveExecutionProfile({ mode: config.execution.mode });
   const effectiveProfile = options.deps?.executionProfile ?? configProfile;
   const injectedProfile = options.deps?.executionProfile !== undefined;
+  /**
+   * LEDGER-9b: the host-available metering for the JitRL kernel's two model
+   * stages. The ONE metering a plugin assembly already owns is the pre-built
+   * two-phase settlement a host supplies through `agentLoop.ledgerSettlement`
+   * (the documented "pass a pre-built settlement to share across stages" path),
+   * so it is shared here instead of assembled a second time: a second
+   * `assembleAgentLoopLedger` over the same storage/budget would create a
+   * SECOND manager (the LEDGER-11 double-grant shape), which is exactly what
+   * this must not do.
+   *
+   * Absent - the default for every host that configures no ledger - keeps the
+   * previous behaviour byte-identically: the logit probe and the step judge are
+   * recorded with provenance 'none' and reserve/settle nothing.
+   */
+  const hostMetering: MeteredModelOptions | undefined =
+    options.agentLoop?.ledgerSettlement === undefined
+      ? undefined
+      : { ledgerSettlement: options.agentLoop.ledgerSettlement };
   const jitWiring = buildJitRlWiring({
     config,
     policy,
@@ -2114,22 +2212,29 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     persistence,
     diagnostics,
     now,
+    ...(hostMetering === undefined ? {} : { metering: hostMetering }),
     executionProfile: effectiveProfile
   });
   const activePolicy = jitWiring.policy;
-  const model = options.deps?.proposer === undefined ? options.model ?? missingModelAdapter() : undefined;
+  // P0-1 + P1-1 (INT-2): the model is resolved INDEPENDENTLY of whether
+  // `deps.proposer` is injected, and it is a FORWARDING collaborator: an
+  // options.model is served immediately, and the ctx.llm-backed adapter lands
+  // once detection settles. The previous ternary forced `model` to undefined
+  // whenever deps.proposer was present, so composer/reflector dereferenced an
+  // undefined adapter and a supplied options.model was silently discarded.
+  const model = forwardingModel(holder, () => options.model ?? missingModelAdapter());
   const proposer = options.deps?.proposer ?? createDualTrackProposer({
-    model: model as IModelAdapter,
+    model,
     now,
     newId
   });
   const composer = options.deps?.composer ?? createAnonymousComposer({
-    model: model as IModelAdapter,
+    model,
     now,
     newId
   });
   const reflector = options.deps?.reflector ?? createEvidenceReflector({
-    model: model as IModelAdapter,
+    model,
     now,
     newId
   });
@@ -2187,6 +2292,12 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
   if (agentExecutor !== undefined) {
     diagnostics.push('multi-step agent probe executor is active: ' + agentExecutor.describe().join('; '));
   }
+  // INT-10: the four-level fallback chain is resolved ONCE and shared by the
+  // deps entry and the forwarder, so the two default resolutions can never
+  // diverge. The forwarder still prefers the holder, so the same-process
+  // executor resolved from the host (P0-1) takes over once detection settles;
+  // an injected `deps.runBranch` wins anyway through the deps spread below.
+  const resolvedRunBranch = options.deps?.runBranch ?? options.runBranch ?? agentExecutor?.runBranch ?? unconfiguredBranchExecutor(now);
   const deps: EvoHarnessOrchestratorDeps = {
     config,
     memory,
@@ -2199,7 +2310,7 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     taxonomy,
     dreamer,
     treePool,
-    runBranch: options.deps?.runBranch ?? options.runBranch ?? agentExecutor?.runBranch ?? unconfiguredBranchExecutor(now),
+    runBranch: forwardingBranch(holder, resolvedRunBranch),
     // Phase 3: hand the kernel to the orchestrator so L2 can select among K
     // proposals and online L1/L2 samples are recorded. A host without JitRL (or
     // with it disabled) simply leaves this absent and both stages stay silent.
@@ -2341,10 +2452,20 @@ export function unconfiguredBranchExecutor(now: () => number): BranchExecutor {
  * message instead of silently succeeding, and a later call uses the real
  * adapter. No run can observe a half-configured collaborator, because the
  * forwarding target is assigned before the first run can start.
+ *
+ * `clients` carries the same story for the MCP clients: the tools-backed client
+ * only exists once detection settles, while the memory bridge and the JitRL
+ * mirror are built synchronously, so both read the holder lazily (bridge) or are
+ * rebuilt once (mirror) instead of never seeing the resolved clients.
+ *
+ * Exported because `buildOrchestratorDeps` takes it as a parameter; a caller
+ * that does not have one gets the default `{}`, which degrades every forwarder
+ * to its explicit-injection or loud-failure fallback.
  */
-interface CollaboratorHolder {
+export interface CollaboratorHolder {
   model?: IModelAdapter;
   runBranch?: BranchExecutor;
+  clients?: readonly McpClient[];
 }
 
 function forwardingModel(holder: CollaboratorHolder, missing: () => IModelAdapter): IModelAdapter {
@@ -2519,7 +2640,8 @@ export function createEvoHarnessPlugin(
   } = buildOrchestratorDeps(resolved,
     options,
     ctx,
-    diagnostics);
+    diagnostics,
+    holder);
   const orchestrator = createEvoHarnessOrchestrator(deps);
   // JitRL cold start (plan section 8 Phase 2): attach the durable experience log
   // when persistence is on and convert the recovered tree pool into L1
@@ -2549,7 +2671,21 @@ export function createEvoHarnessPlugin(
     return run;
   };
 
-  const log = (level: 'info' | 'warn', message: string): void => {
+  /**
+   * INT-5: `config.logging.level` is the plugin's own threshold, so the two
+   * logging leaves are live configuration instead of validated no-ops:
+   * `silent` drops everything, `error` keeps only errors, and so on. The host
+   * logger receives what passes the gate; without one the line goes to
+   * `diagnostics` exactly as before.
+   */
+  const LOG_LEVEL_RANK: Readonly<Record<LogLevel, number>> = Object.fromEntries(
+    LOG_LEVELS.map((level, index) => [level, index])
+  ) as Record<LogLevel, number>;
+  const logThreshold = LOG_LEVEL_RANK[resolved.logging.level];
+  const log = (level: 'debug' | 'info' | 'warn' | 'error', message: string): void => {
+    if (LOG_LEVEL_RANK[level] < logThreshold) {
+      return;
+    }
     const logger = asRecord(safeGet(ctx, 'logger'));
     const sink = logger === undefined ? undefined : safeGet(logger, level);
     if (typeof sink === 'function') {
@@ -2921,8 +3057,35 @@ export function createEvoHarnessPlugin(
       if (holder.model === undefined && resolvedCollaborators.model !== undefined) {
         holder.model = resolvedCollaborators.model;
       }
-      if (holder.runBranch === undefined) {
+      // P0-1: an explicitly injected executor keeps priority over the resolved
+      // same-process one. options.runBranch already seeds the holder above, and
+      // an injected agentLoop executor stays authoritative (it carries its own
+      // adapters), so the resolved executor only fills a genuinely empty holder.
+      if (holder.runBranch === undefined && options.agentLoop === undefined) {
         holder.runBranch = resolvedCollaborators.runBranch;
+      }
+      // P1-9 (VCI-1): publish the resolved MCP clients (the tools-backed one
+      // plus caller extras) for the deferred memory-bridge provider below.
+      if (resolvedCollaborators.clients.length > 0) {
+        holder.clients = resolvedCollaborators.clients;
+      }
+      // P1-9 (VCI-1): the JitRL mirror was built synchronously from options
+      // alone, so on the documented default mount (no options.clients) it had no
+      // backend. Rebuild it once around the resolved client; syncJitMirror reads
+      // the wiring per call, so every later run picks the rebuilt store up.
+      if (
+        resolved.jitrl.store.mirrorToMemoryBridge &&
+        jitWiring.kernel !== undefined &&
+        jitWiring.mirror !== undefined &&
+        options.mirrorClient === undefined &&
+        pickMirrorClient(options.clients) === undefined
+      ) {
+        const mirrorClient = pickMirrorClient(holder.clients);
+        if (mirrorClient !== undefined) {
+          const rebuilt = jitWiring.kernel.createMirrorStore({ client: mirrorClient });
+          (jitWiring as { mirror?: BridgeMirrorStore }).mirror = rebuilt;
+          report('jitrl mirror: DSH-resolved MCP client attached (server ' + mirrorClient.serverId + ')');
+        }
       }
       report(
         'model route in effect: '
@@ -2949,6 +3112,34 @@ export function createEvoHarnessPlugin(
 
   /** Build the recovery prompt from a verified failure observation. */
   const failurePrompt = (failure: DshFailureEvent): string => failure.summary;
+
+  /**
+   * INT-5: `logging.includeTrajectorySummaries` is consumed HERE - the run
+   * outcome line carries the run's own trajectory summary (stage trace +
+   * stopReason) only when the host opted in. Without the flag the line keeps
+   * the bare counts, so the default log shape is unchanged.
+   */
+  const logRunSummary = (run: EvoHarnessRunResult): void => {
+    log(
+      run.outcome === 'failed' ? 'warn' : 'info',
+      'evo-harness: run ' +
+        run.runId +
+        ' outcome=' +
+        run.outcome +
+        ' probes=' +
+        String(run.probesRun) +
+        ' lessons=' +
+        String(run.lessonsCommitted) +
+        (resolved.logging.includeTrajectorySummaries
+          ? ' trajectory=' +
+            JSON.stringify({
+              lifecycle: run.metadata?.lifecycle ?? [],
+              stopReason: run.metadata?.stopReason,
+              referenceStatus: run.metadata?.referenceStatus
+            })
+          : '')
+    );
+  };
 
   /**
    * Unified run execution and teardown helper (L4 governance repair).
@@ -2978,6 +3169,9 @@ export function createEvoHarnessPlugin(
     try {
       await jitReady;
       const runResult = await orchestrator.run(request);
+      // Intentional: log the run's outcome BEFORE the mirror sync, which is
+      // subject to the mirror policy.
+      logRunSummary(runResult);
       // Synchronize mirror only after a successful run.
       // Mirror sync is conditioned on isRuntimeOn('mirror') inside syncJitMirror().
       // It is NEVER executed unconditionally in finally so failure/off policy is respected.
@@ -3184,7 +3378,12 @@ export function createEvoHarnessPlugin(
         Array.isArray(supplied) && supplied.length > 0
           ? (supplied as readonly { kind: string; message: string }[])
           : [{ kind: 'unknown', message: prompt }];
-      return runFallback({
+      // INT-7: this is a trigger-initiated run like the other two entries, so it
+      // goes through `trackRun` too. Untracked, an in-flight fallback run was
+      // invisible to BOTH join points: `settle()` returned early and `dispose()`
+      // tore the runtime control and orchestrator down while the run was still
+      // mid-`executeRun`, aborting its probes.
+      return trackRun(runFallback({
         source: 'session/event',
         kind: 'agent_error',
         dshEvent: 'handleFallbackEvent',
@@ -3195,7 +3394,7 @@ export function createEvoHarnessPlugin(
           ...(typeof taskRecord?.id === 'string' ? { taskId: taskRecord.id } : {}),
           transport: 'direct'
         }
-      });
+      }));
     },
     handleTriggerFailure: (failure) => trackRun(runFallback(failure)),
     handleTurnCompleted: (turn) => trackRun(runCompletedTurn(turn)),
@@ -3273,6 +3472,11 @@ export function createEvoHarnessPlugin(
   // DSH's own command service takes precedence: ctx.commands.register({ name,
   // description, handler }) validates the definition and returns the exact
   // effect disposer that unregisters it when the fiber unloads.
+  //
+  // INT-4: the fallback below is an `else if` on the SAME condition, so a host
+  // that exposes BOTH shapes never mounts /evo twice (the pre-fix shape was an
+  // independent `if` that pushed the name a second time, leaving two live
+  // handlers and a doubled `registeredCommands` entry).
   const commandsService = asRecord(safeGet(ctx, 'commands'));
   const dshRegister = pickFunction(commandsService, ['register']);
   if (dshRegister !== undefined) {
@@ -3291,12 +3495,11 @@ export function createEvoHarnessPlugin(
       diagnostics.push('failed to register /evo with ctx.commands: ' + String(error));
     }
   }
-
   const registerCommand = pickFunction(asRecord(ctx),
     ['registerCommand',
       'command',
       'addCommand']);
-  if (registerCommand !== undefined) {
+  if (dshRegister === undefined && registerCommand !== undefined) {
     try {
       const result = registerCommand.call(ctx,
         EVO_COMMAND_NAME,
@@ -3311,7 +3514,7 @@ export function createEvoHarnessPlugin(
     } catch (error) {
       diagnostics.push('failed to register the /evo command: ' + String(error));
     }
-  } else if (registeredCommands.length === 0) {
+  } else if (registerCommand === undefined && registeredCommands.length === 0) {
     diagnostics.push(
       'the host context exposes no command registrar; plugin.runFromCommand(args) is the fallback entrypoint for /evo'
     );

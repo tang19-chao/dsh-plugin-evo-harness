@@ -113,6 +113,7 @@ import {
 import { conservativeAdvantage } from './jitrl/value-estimator';
 import {
   accumulateWritebackSummary,
+  applyWritebackVerdict,
   emptyWritebackGateSummary,
   indexWritebackHistory,
   judgeWriteback,
@@ -120,12 +121,15 @@ import {
   writebackRefusalCode,
   writebackRouteCode,
   type WritebackGateSummary,
+  type WritebackGateVerdict,
   type WritebackHistoryEntry
 } from './jitrl/writeback-gate';
 import { CURRENT_PROVENANCE_VERSION, EXPERIENCE_SCHEMA_VERSION } from './jitrl/experience-store';
 import {
   REWARD_CONTRACT,
+  REWARD_CONTRACT_VERIFIER_FIRST,
   estimatorTargetLine,
+  isLearningEligibleRecord,
   scoreUnderRewardContract
 } from './jitrl/reward-contract';
 import type { JitRuntimeControl, JitSurface } from './jitrl/runtime-control';
@@ -979,17 +983,11 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
    * Dedup ledger for online experience (plan section 6.2). Scoped to this
    * orchestrator instance: it prevents re-entering the recorder from appending
    * the same execution twice, and it is bounded by the number of probes the
-   * process actually ran.
+   * process actually ran. Register-on-success (CORE-5): a key enters this set
+   * only after the store append for its batch resolved, so a failed append
+   * stays retryable.
    */
   private readonly appendedExperienceKeys: Set<string> = new Set();
-  /**
-   * C2b F4: quality records whose pre-commit registration must be ROLLED BACK
-   * if the append fails or the batch is discarded. Register-then-commit means a
-   * failed append could otherwise leave a never-persisted record trusted in the
-   * process-global registry; the rollback list is consumed by the recorder's
-   * commit step (register-on-success).
-   */
-  private readonly unregisteredQualityRecords: ExperienceRecord[] = [];
   /**
    * P6.2 PR-B / F4-5: the EXPLICIT, revocable exploration budget.
    *
@@ -1429,6 +1427,9 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         }
         if (batch.slots.length === 0) {
           diagnostics.push('round ' + String(rounds) + ': the active policy selected no slots');
+          // CORE-8: a break WITHOUT `stop = true` - the loop ends because the
+          // policy produced nothing to probe, not because a round completed.
+          stopReason = 'policy_no_slots';
           break;
         }
 
@@ -1762,6 +1763,9 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
 
         if (candidates.length === 0) {
           diagnostics.push('no candidate probe completed; probing stops');
+          // CORE-8: the other stop-free exit - every admitted slot failed to
+          // produce a candidate, so there is nothing to compose.
+          stopReason = 'no_candidates';
           break;
         }
 
@@ -1851,9 +1855,13 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         }
       }
 
-      if (stopReason === 'not_started') {
-        stopReason = stop ? 'stopped' : 'rounds_completed';
-      }
+      // CORE-8: every exit of the round loop names its own reason. The six
+      // `stop = true` sites set budget_exhausted / first_success /
+      // failure_taxonomy:* / diminishing_returns / max_depth, and the two
+      // stop-free breaks set policy_no_slots / no_candidates. The pre-fix
+      // `stopReason = stop ? 'stopped' : 'rounds_completed'` fallback was dead
+      // (no `stop = true` site left `not_started` behind) and its
+      // 'rounds_completed' arm mislabelled both real exits.
 
       let selectedNodeId: string | undefined;
       let selectedBranchId: string | undefined;
@@ -2175,8 +2183,12 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       //     similarity-ranked, so it would only see neighbours of ONE decision and
       //     would silently miss evidence stored under a different bucket token.
       // `export()` yields every persisted record; the gate then applies the
-      // causal cutoff and the same learning-eligibility filter the decision's
-      // own filter uses, so "visible to L2" and "counted by the gate" agree.
+      // causal cutoff and the SAME eligibility predicate the decision's own
+      // filter uses (`isLearningEligibleRecord`: learning eligibility, schema
+      // floor and the exact current rewardVersion), so "visible to L2" and
+      // "counted by the gate" agree - a stale/foreign rewardVersion record
+      // must not vote here while being permanently invisible to the decision
+      // it gates.
       const entries: WritebackHistoryEntry[] = [];
       const exportFn = kernel.store.export;
       if (exportFn === undefined) {
@@ -2193,15 +2205,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         if (!Number.isFinite(record.createdAt) || record.createdAt > before) {
           continue;
         }
-        if (record.learningEligible === false) {
-          continue;
-        }
-        const schemaVersion = record.experienceSchemaVersion;
-        if (
-          typeof schemaVersion !== 'number' ||
-          !Number.isFinite(schemaVersion) ||
-          schemaVersion < EXPERIENCE_SCHEMA_VERSION
-        ) {
+        // One shared rule with the L2 neighbourhood filter (experience-store
+        // `isLearningEligible` delegates to this same predicate), so the two
+        // sides cannot drift apart again.
+        if (!isLearningEligibleRecord(record, REWARD_CONTRACT.version)) {
           continue;
         }
         const actionKey = typeof record.actionKey === 'string' ? record.actionKey : '';
@@ -2620,8 +2627,9 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       // record's reward - a high reward is exactly the thing the gate must not be
       // impressed by (that is the historical failure this gate exists for).
       let writebackAudited = false;
+      let gateVerdict: WritebackGateVerdict | undefined;
       if (this.writebackGate) {
-        const gateVerdict = judgeWriteback(
+        gateVerdict = judgeWriteback(
           {
             actionKey: probe.selection?.actionKey ?? probe.actionKey,
             trustedSource: evaluation.verification.trustedSource === true,
@@ -2673,10 +2681,14 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       }
 
       // The gate may only LOWER eligibility; it never grants learning a record
-      // the scorer refused. `&& !writebackAudited` is therefore a no-op when the
-      // gate is off (writebackAudited stays false).
-      const learningTarget =
-        eligible && !writebackAudited ? clamp(observedReturn - baseline, -3, 3) : 0;
+      // the scorer refused. The record is assembled with the scorer's own
+      // disposition (`eligible`/`outcomeEligible`) and the gate verdict - when
+      // the gate ran - is applied through the SHARED helper below, so the online
+      // path executes the same rule set as the eval script and the unit tests
+      // instead of a second inline copy (audit JITRL-3). When the gate is off
+      // no verdict exists and these fields are byte-identical to the
+      // historical shape.
+      const learningTarget = eligible ? clamp(observedReturn - baseline, -3, 3) : 0;
       const decisionId = probe.selection?.decisionId ?? 'jit-meta-decision-' + input.runId + '-r' + String(probe.round);
       const association = {
         round: probe.round,
@@ -2712,12 +2724,21 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         // conjunction (in this branch both gates are true, i.e. exactly
         // `evaluation.learningEligible`); the audit branch wrote `false` above.
         //
-        // rev6 R1-2 (t9): `!writebackAudited` is the gate's ONLY effect on this
-        // flag (see the gate block above the association). The gate can lower
-        // eligibility, never raise it, and when it is off `writebackAudited`
-        // stays false so this expression is byte-identical to the pre-t9 shape.
-        learningEligible: eligible && outcomeEligible && !writebackAudited
+        // rev6 R1-2 (t9) / audit JITRL-3: the writeback gate's ONLY effect on
+        // this flag now lives in the shared verdict helper applied to each
+        // record below - a refused record comes back `learningEligible: false`
+        // with `learningTarget: 0` (its scored reward kept for audit), and with
+        // no verdict (gate off) the helper returns the record unchanged, so
+        // this field is byte-identical to the pre-t9 shape.
+        learningEligible: eligible && outcomeEligible
       } as const;
+
+      // One application rule (rev6 R1-2 t9 / audit JITRL-3): the gate verdict is
+      // folded into the record through `applyWritebackVerdict` - the same helper
+      // the eval script and the unit tests execute. Quality registration happens
+      // AFTER the verdict so the registered digest covers the persisted shape.
+      const applyGateVerdict = (record: ExperienceRecord): ExperienceRecord =>
+        gateVerdict === undefined ? record : applyWritebackVerdict(record, gateVerdict);
 
       const isTaskQualityRecord = learningTrack === 'task-quality' && eligible && outcomeEligible;
       // C2b F11 (ADR 0004 §2.2/§2.3 + ADR 0003 T3/T4): a quality record is only
@@ -2745,7 +2766,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         : undefined;
       // L1: this executed action's own record, in the L1 candidate key vocabulary
       // and with the guidance provenance of the slot that actually ran it.
-      const l1Record: ExperienceRecord = {
+      const l1Record: ExperienceRecord = applyGateVerdict({
         id: 'online-' + this.newId(),
         level: 'meta',
         state: probe.l1State,
@@ -2760,7 +2781,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         ...association,
         createdAt,
         redacted: true
-      };
+      });
       if (qualityBindingContext !== undefined) {
         registerAuthenticatedQualityRecord(l1Record, qualityBindingContext);
       }
@@ -2770,7 +2791,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       // actually executed. The node/trajectory pair is the one that ran, never
       // the run's final winner (plan section 6.2).
       if (probe.selection !== undefined) {
-        const l2Record: ExperienceRecord = {
+        const l2Record: ExperienceRecord = applyGateVerdict({
           id: 'online-' + this.newId(),
           level: 'proposal',
           state: probe.selection.state,
@@ -2785,7 +2806,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           ...association,
           createdAt,
           redacted: true
-        };
+        });
         if (qualityBindingContext !== undefined) {
           registerAuthenticatedQualityRecord(l2Record, qualityBindingContext);
         }
@@ -2797,13 +2818,21 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     // trajectory, round) must never be appended twice, even if the recorder is
     // re-entered. Node ids are unique per tree, so this cannot suppress a
     // legitimate repeat across runs.
+    //
+    // CORE-5 / INT-8: register-on-success. The keys are collected here and added
+    // to the ledger only after `kernel.store.append` RESOLVES; the append catch
+    // releases whatever this batch would have added. Pre-fix the keys were added
+    // before the append, so one transient store failure permanently suppressed
+    // the retry for this orchestrator instance's lifetime - the opposite of the
+    // register-on-success discipline the quality registrations below follow.
     const deduped: ExperienceRecord[] = [];
+    const appendedKeys: string[] = [];
     for (const record of records) {
       const key = experienceDedupKey(record);
       if (this.appendedExperienceKeys.has(key)) {
         continue;
       }
-      this.appendedExperienceKeys.add(key);
+      appendedKeys.push(key);
       deduped.push(record);
     }
     if (deduped.length === 0) {
@@ -2882,7 +2911,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         // verdict fields are shape-validated, not trusted-source.
         rewardVersion: REWARD_CONTRACT.version,
         rewardScale: REWARD_CONTRACT.aggregation,
-        verifierFirstRule: 'verifier-first-completion-v1',
+        verifierFirstRule: REWARD_CONTRACT_VERIFIER_FIRST,
         // C2a (ADR 0003 §4.5): with no seam this stays the exact pre-C2a
         // literal (default-assembly equivalence); with a seam it reports what
         // actually happened this run (trusted / audit-only counts + reasons).
@@ -2953,19 +2982,28 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       }
       pendingQualityRegistrations.push({ record, context: entry.context });
       // Roll back the pre-commit registration: until the append succeeds the
-      // record is NOT trusted evidence (register-on-success semantics).
-      this.unregisteredQualityRecords.push(record);
+      // record is NOT trusted evidence (register-on-success semantics). The
+      // authoritative rollback state is `pendingQualityRegistrations` above -
+      // the commit step below re-registers from it - so no separate record
+      // list is kept (INT-9: the former `unregisteredQualityRecords` array was
+      // write-only and its comment claimed a consumption that never existed).
       unregisterAuthenticatedQualityRecord(record.id, recordRunId);
     }
     try {
       await kernel.store.append(deduped);
     } catch (error) {
+      // CORE-5 / INT-8: this batch never reached the store, so nothing about it
+      // may be remembered. The keys were only CANDIDATES for registration; the
+      // ledger is updated after the append resolves.
       input.diagnostics.push('record_experience failed: ' + errorMessage(error));
       return 0;
     }
-    // Commit succeeded: (re-)register every quality record that shipped. The
-    // pre-commit entries were rolled back above, so this is the single point
-    // where the batch becomes trusted.
+    // Commit succeeded: this is the single point where the batch becomes
+    // remembered. The dedup ledger and the quality registry both register here
+    // and only here (register-on-success).
+    for (const key of appendedKeys) {
+      this.appendedExperienceKeys.add(key);
+    }
     for (const pending of pendingQualityRegistrations) {
       registerAuthenticatedQualityRecord(pending.record, pending.context);
     }
@@ -3659,9 +3697,11 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     let committed = 0;
     for (const lesson of lessons) {
       try {
+        // MEM-10: the bridge runs the deterministic pre-write gate on every
+        // commit unconditionally (fail-closed; there is no bypass option), so
+        // the commit options carry no governance switch.
         const outcome = await this.deps.memory.commit(lesson, {
-          scope,
-          enforceGovernance: true
+          scope
         });
         if (outcome.accepted && outcome.persisted) {
           committed += 1;

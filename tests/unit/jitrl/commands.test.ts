@@ -235,13 +235,30 @@ describe('/evo jit reset', () => {
     expect((result.json as Record<string, unknown>)['dropped']).toBe(3);
   });
 
-  it('clears one bucket without a confirmation', async () => {
+  it('requires --confirm before clearing ONE bucket as well (JITRL-10)', async () => {
+    // The pre-fix guard fired only for the global reset (`bucket === undefined`),
+    // so `reset bucket-a` dropped a whole bucket - the learning-evidence pool
+    // the writeback gate and value estimator read - with no confirmation. The
+    // asymmetry was also undocumented in the usage line. One rule now: a
+    // destructive reset always needs the flag.
+    const reset = vi.fn(async () => ({ dropped: 2, supported: true }));
+    const result = await executeJitCommand(['reset', 'bucket-a'], makeController({ reset }));
+    expect(result.ok).toBe(false);
+    expect(reset).not.toHaveBeenCalled();
+    expect(result.text).toContain('--confirm');
+    expect(result.text).toContain('bucket bucket-a');
+    expect((result.json as Record<string, unknown>)['requiresConfirmation']).toBe(true);
+    expect((result.json as Record<string, unknown>)['dropped']).toBe(0);
+    expect(result.usage).toBe(JIT_COMMAND_USAGE);
+  });
+
+  it('clears one bucket WITH a confirmation', async () => {
     const reset = vi.fn(async (bucket?: string) => ({
       dropped: bucket === 'bucket-a' ? 2 : 0,
       supported: true
     }));
     const result = await executeJitCommand(
-      ['reset', 'bucket-a'],
+      ['reset', 'bucket-a', '--confirm'],
       makeController({ reset })
     );
     expect(reset).toHaveBeenCalledWith('bucket-a');

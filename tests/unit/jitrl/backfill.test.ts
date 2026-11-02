@@ -329,6 +329,38 @@ describe('backfillFromTreePool', () => {
     expect(result.diagnostics.join(' ')).toContain('rejected the cold-start batch');
   });
 
+  it('reports what the store ACTUALLY accepted, not the batch size (JITRL-9)', async () => {
+    // The documented idempotency contract ("a second backfill produces the
+    // same ids and the store keeps a single copy") means a re-run stores
+    // nothing new. `appended` used to be `records.length` regardless, so the
+    // counter said 4 accepted on a run that accepted 0 - contradicting the
+    // field's own docstring ("records the store accepted") and inflating
+    // `backfilled` in src/jitrl/index.ts. A store that dedupes by id and
+    // returns its ack must therefore be read, not assumed.
+    const stored = new Set<string>();
+    const dedupingSink: ExperienceAppendSink = {
+      async append(batch) {
+        let accepted = 0;
+        for (const record of batch) {
+          if (!stored.has(record.id)) {
+            stored.add(record.id);
+            accepted += 1;
+          }
+        }
+        return accepted;
+      }
+    };
+    const first = await backfillFromTreePool({ pool: [fixtureTree()], store: dedupingSink });
+    expect(first.recordCount).toBe(4);
+    expect(first.appended).toBe(4);
+
+    // Re-running over the same pool: same ids, nothing new stored.
+    const second = await backfillFromTreePool({ pool: [fixtureTree()], store: dedupingSink });
+    expect(second.recordCount).toBe(4);
+    expect(second.appended).toBe(0);
+    expect(stored.size).toBe(4);
+  });
+
   it('is a no-op on an empty pool', async () => {
     const sink = recordingSink();
     const result = await backfillFromTreePool({ pool: [], store: sink });

@@ -26,7 +26,11 @@ export function artifactOf(trajectory: ProbeTrajectory): HostArtifact | undefine
   if (deliverable === undefined) {
     return undefined;
   }
-  const producedFiles = [...(deliverable.producedFiles ?? [])].sort();
+  // VERIF-12: dedupe BEFORE sorting/digesting — producedFiles names a file SET,
+  // and a set has no duplicates, so ['a','a'] must digest like ['a'] (a
+  // duplicated upstream listing must not produce a different digest for the
+  // same logical artifact).
+  const producedFiles = Array.from(new Set(deliverable.producedFiles ?? [])).sort();
   if (deliverable.content.length === 0 && producedFiles.length === 0) {
     return undefined;
   }
@@ -36,12 +40,13 @@ export function artifactOf(trajectory: ProbeTrajectory): HostArtifact | undefine
 /**
  * Canonical bytes the digest is computed over (deterministic framing).
  *
- * `producedFiles` is canonicalised (sorted) here as well as in `artifactOf`, so
- * a caller passing an unsorted list still gets the same digest for the same file
- * SET - one digest per artifact, not one per ordering.
+ * `producedFiles` is canonicalised (deduplicated, then sorted) here as well as
+ * in `artifactOf`, so a caller passing an unsorted or duplicated list still
+ * gets the same digest for the same file SET - one digest per artifact, not one
+ * per ordering or per duplicate entry.
  */
 export function artifactBytes(artifact: HostArtifact): Buffer {
-  const files = [...artifact.producedFiles].sort();
+  const files = Array.from(new Set(artifact.producedFiles)).sort();
   const fileCount = files.length;
   const parts: Buffer[] = [
     Buffer.from(ARTIFACT_FRAMING_VERSION + '\n', 'utf8'),

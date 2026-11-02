@@ -63,7 +63,25 @@ function history(
   for (let index = 0; index < support; index += 1) {
     entries.push({
       actionKey,
+      // Unverified entries carry NO verdict by default: they are `unknown`
+      // (never-verified observations), not failures. G-A prior failures need
+      // the explicit `failed` helper below.
+      status: index < verified ? 'passed' : 'unknown',
       verified: index < verified,
+      counterexample: index < counterexamples
+    });
+  }
+  return entries;
+}
+
+/** Build EXPLICIT prior-failure entries: `verification.status === 'failed'`. */
+function failedHistory(actionKey: string, support: number, counterexamples = 0): WritebackHistoryEntry[] {
+  const entries: WritebackHistoryEntry[] = [];
+  for (let index = 0; index < support; index += 1) {
+    entries.push({
+      actionKey,
+      status: 'failed',
+      verified: false,
       counterexample: index < counterexamples
     });
   }
@@ -102,7 +120,7 @@ describe('rev6 R1-2: G-A verified fail->pass (the specific evidence)', () => {
   it('admits a trusted pass that repairs a recorded failure of the same action', () => {
     const verdict = judgeWriteback(
       view({ verificationStatus: 'passed', trustedSource: true }),
-      indexWritebackHistory(history('action-a', 2, 0))
+      indexWritebackHistory(failedHistory('action-a', 2))
     );
     expect(verdict.admitted).toBe(true);
     expect(verdict.route).toBe('kept-fail-to-pass');
@@ -113,7 +131,7 @@ describe('rev6 R1-2: G-A verified fail->pass (the specific evidence)', () => {
   it('REFUSES a pass whose receipt is not host-trusted (half-evidence)', () => {
     const verdict = judgeWriteback(
       view({ verificationStatus: 'passed', trustedSource: false }),
-      indexWritebackHistory(history('action-a', 2, 0))
+      indexWritebackHistory(failedHistory('action-a', 2))
     );
     expect(verdict.admitted).toBe(false);
     expect(verdict.refusal).toBe('rejected-untrusted-receipt');
@@ -141,6 +159,59 @@ describe('rev6 R1-2: G-A verified fail->pass (the specific evidence)', () => {
     expect(verdict.refusal).toBe('rejected-no-prior-failure');
     // ...and the support the verdict reports is for ITS key, not the neighbour's.
     expect(verdict.support).toBe(0);
+  });
+
+  it('REFUSES a trusted pass whose priors carry NO verdict (unknown is not failed)', () => {
+    // Preregistration §5: G-A needs a prior record whose verification left
+    // `status === 'failed'`. Verdict-less records (the gate-off capture pool:
+    // every verdictCode 0) are not failures, so a first trusted `passed`
+    // receipt over them has nothing to repair - the exact half-evidence case
+    // the header refuses. This is red against the pre-fix rule that counted
+    // any `verified: false` entry as a prior failure.
+    const verdict = judgeWriteback(
+      view({ verificationStatus: 'passed', trustedSource: true }),
+      indexWritebackHistory(history('action-a', 2, 0))
+    );
+    expect(verdict.admitted).toBe(false);
+    expect(verdict.refusal).toBe('rejected-no-prior-failure');
+    expect(verdict.priorFailure).toBe(false);
+  });
+
+  it('REFUSES a trusted pass whose only priors are UNTRUSTED passes', () => {
+    // An untrusted `passed` in history (status 'passed', verified false) is
+    // still not a failure: "trusted-but-never-failed" is refused even when the
+    // bucket is full of passes no host ever vouched for.
+    const untrustedPasses: WritebackHistoryEntry[] = [
+      { actionKey: 'action-a', status: 'passed', verified: false, counterexample: false },
+      { actionKey: 'action-a', status: 'passed', verified: false, counterexample: false }
+    ];
+    const verdict = judgeWriteback(
+      view({ verificationStatus: 'passed', trustedSource: true }),
+      indexWritebackHistory(untrustedPasses)
+    );
+    expect(verdict.admitted).toBe(false);
+    expect(verdict.refusal).toBe('rejected-no-prior-failure');
+    expect(verdict.priorFailure).toBe(false);
+  });
+
+  it('a prior PARTIAL verdict reads as unknown and does not satisfy G-A', () => {
+    // §5 freezes G-A on `verification.status === 'failed'` exactly: `partial`
+    // is neither a pass nor a failure, so it maps to `unknown` and cannot
+    // vouch for a repair.
+    const partial = writebackHistoryEntryOf('action-a', {
+      trustedSource: true,
+      verificationStatus: 'partial',
+      verifierRewardMismatch: false,
+      forceAuditOnly: false
+    });
+    expect(partial.status).toBe('unknown');
+    const verdict = judgeWriteback(
+      view({ verificationStatus: 'passed', trustedSource: true }),
+      indexWritebackHistory([partial])
+    );
+    expect(verdict.admitted).toBe(false);
+    expect(verdict.refusal).toBe('rejected-no-prior-failure');
+    expect(verdict.priorFailure).toBe(false);
   });
 });
 
@@ -233,6 +304,31 @@ describe('rev6 R1-2: fail-closed edges', () => {
     expect(verdict.refusal).toBe('rejected-no-verdict');
   });
 
+  it('a CURRENT-run counterexample (verifier mismatch or force-audit-only) vetoes every route', () => {
+    // JITRL-6: the two host-disposition channels were declared on the
+    // trajectory view but never read by the judge, while their HISTORY
+    // counterparts (writebackHistoryEntryOf) veto G-B. One is enough, the same
+    // "a counterexample is not outvoted" asymmetry: even a trusted pass that
+    // would satisfy G-A is refused when the current execution itself carries
+    // the poisoning shape. Production cannot reach the veto today (the reward
+    // contract clamps a failed verification to reward 0, and forceAuditOnly
+    // already forces recordLearningEligible:false), so this pins the declared
+    // surface as defence in depth, not a new production refusal.
+    const mismatch = judgeWriteback(
+      view({ verificationStatus: 'passed', trustedSource: true, verifierRewardMismatch: true }),
+      indexWritebackHistory(failedHistory('action-a', 2))
+    );
+    expect(mismatch.admitted).toBe(false);
+    expect(mismatch.refusal).toBe('rejected-verifier-mismatch');
+
+    const forced = judgeWriteback(
+      view({ verificationStatus: 'passed', trustedSource: true, forceAuditOnly: true }),
+      indexWritebackHistory(failedHistory('action-a', 2))
+    );
+    expect(forced.admitted).toBe(false);
+    expect(forced.refusal).toBe('rejected-verifier-mismatch');
+  });
+
   it('UNREADABLE history is not empty history: G-B is refused, not silently evaluated', () => {
     // `undefined` records means "could not read", and the difference is the whole
     // point: an empty history would report `rejected-insufficient-support`, which
@@ -251,15 +347,23 @@ describe('rev6 R1-2: fail-closed edges', () => {
     expect(coldVerdict.support).toBe(0);
   });
 
-  it('G-A still works on unusable history (G-B is the route that needs the denominator)', () => {
-    // A fail->pass pair needs no history, so refusing it because the store could
-    // not be enumerated would be over-strict rather than fail-closed.
+  it('a genuinely UNUSABLE history refuses a trusted pass as rejected-no-prior-failure', () => {
+    // JITRL-5: this test used to be named "G-A still works on unusable history"
+    // while feeding a USABLE two-entry index - name, fixture and behaviour
+    // disagreed. With a genuinely unreadable snapshot (`undefined`), the G-A
+    // branch runs BEFORE the `history.usable` check, the bucket is empty, so a
+    // trusted `passed` is REFUSED (`rejected-no-prior-failure`): the prior
+    // failed record must live IN the snapshot (preregistration §5), and
+    // `history-unusable` stays reserved for G-B, which is the route that needs
+    // the denominator.
     const verdict = judgeWriteback(
       view({ verificationStatus: 'passed', trustedSource: true }),
-      indexWritebackHistory(history('action-a', 2, 0))
+      indexWritebackHistory(undefined)
     );
-    expect(verdict.admitted).toBe(true);
-    expect(verdict.route).toBe('kept-fail-to-pass');
+    expect(verdict.admitted).toBe(false);
+    expect(verdict.refusal).toBe('rejected-no-prior-failure');
+    expect(verdict.trustedReceipt).toBe(true);
+    expect(verdict.priorFailure).toBe(false);
   });
 
   it('an untrusted "passed" in HISTORY is not a verified pass', () => {
@@ -280,6 +384,10 @@ describe('rev6 R1-2: fail-closed edges', () => {
     });
     expect(verifiedEntry.verified).toBe(true);
     expect(untrustedEntry.verified).toBe(false);
+    // The verdict itself is carried on the entry regardless of trust, so G-A
+    // can tell "failed" apart from "unknown" (preregistration §5).
+    expect(verifiedEntry.status).toBe('passed');
+    expect(untrustedEntry.status).toBe('passed');
   });
 
   it('forceAuditOnly and verifier mismatch both count as counterexamples', () => {
@@ -297,6 +405,8 @@ describe('rev6 R1-2: fail-closed edges', () => {
     });
     expect(forced.counterexample).toBe(true);
     expect(mismatch.counterexample).toBe(true);
+    // ...and the failed verdict survives as `status: 'failed'` on the entry.
+    expect(mismatch.status).toBe('failed');
   });
 });
 
@@ -322,7 +432,7 @@ describe('rev6 R1-2: the summary is the evidence the report quotes', () => {
     let summary = emptyWritebackGateSummary(true);
     const admitted = judgeWriteback(
       view({ verificationStatus: 'passed', trustedSource: true }),
-      indexWritebackHistory(history('action-a', 2, 0))
+      indexWritebackHistory(failedHistory('action-a', 2))
     );
     const refused = judgeWriteback(
       view({ actionKey: 'action-b', verificationStatus: 'unknown' }),
@@ -358,7 +468,7 @@ describe('rev6 R1-2: applying a verdict never mints a positive reward', () => {
     const record = { reward: 1.25, learningEligible: true };
     const applied = applyWritebackVerdict(record, judgeWriteback(
       view({ verificationStatus: 'passed', trustedSource: true }),
-      indexWritebackHistory(history('action-a', 2, 0))
+      indexWritebackHistory(failedHistory('action-a', 2))
     ));
     expect(applied.reward).toBe(1.25);
     expect(applied.learningEligible).toBe(true);
@@ -376,11 +486,40 @@ describe('rev6 R1-2: applying a verdict never mints a positive reward', () => {
     expect(applied.learningEligible).toBe(false);
   });
 
+  it('an audited record is forced to a ZERO learning target (preregistration §5)', () => {
+    // JITRL-3: the helper's contract (and the frozen refused-record encoding
+    // "`learningEligible: false`, `learningTarget: 0`, keep `reward`") promise a
+    // zeroed target. The pre-fix body never touched `learningTarget`, so a
+    // consumer trusting this helper - e.g. the documented ablation arm, which
+    // reads the gain field - trained on a gate-refused record at full strength.
+    const record = { reward: 2.5, learningEligible: true, learningTarget: 2.5 };
+    const applied = applyWritebackVerdict(record, judgeWriteback(
+      view({ verificationStatus: 'unknown' }),
+      indexWritebackHistory([])
+    ));
+    expect(applied.reward).toBe(2.5);
+    expect(applied.learningEligible).toBe(false);
+    expect(applied.learningTarget).toBe(0);
+  });
+
+  it('an admitted record keeps its own learning target (the gate is not a scorer)', () => {
+    // The zeroing must not leak into the admitted branch: only a REFUSED record
+    // is forced to the audit-only encoding.
+    const record = { reward: 1.25, learningEligible: true, learningTarget: 1.0 };
+    const applied = applyWritebackVerdict(record, judgeWriteback(
+      view({ verificationStatus: 'passed', trustedSource: true }),
+      indexWritebackHistory(failedHistory('action-a', 2))
+    ));
+    expect(applied.reward).toBe(1.25);
+    expect(applied.learningEligible).toBe(true);
+    expect(applied.learningTarget).toBe(1.0);
+  });
+
   it('an already-ineligible record can never be RAISED by an admitted verdict', () => {
     const record = { reward: 0, learningEligible: false };
     const applied = applyWritebackVerdict(record, judgeWriteback(
       view({ verificationStatus: 'passed', trustedSource: true, recordLearningEligible: false }),
-      indexWritebackHistory(history('action-a', 2, 0))
+      indexWritebackHistory(failedHistory('action-a', 2))
     ));
     expect(applied.learningEligible).toBe(false);
   });

@@ -6,9 +6,10 @@
  * export order, size accounting, the in-memory index cap surviving a reload,
  * and that diagnostics never carry record payloads.
  */
-import { promises as fs } from 'node:fs';
+import { promises as fs, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ExperienceStoreFs } from '../../../src/jitrl/stores/jsonl.store';
 import type { ExperienceRecord, JitLevel } from '../../../src/types/contracts';
@@ -191,6 +192,35 @@ describe('jsonl experience store (injected fs)', () => {
     expect(serialized).not.toContain('"id"');
   });
 
+  it('JINFRA-11: reports a torn tail in UTF-8 bytes, not UTF-16 code units', async () => {
+    const file = new FakeFs();
+    // Three CJK characters: 3 UTF-16 units in the JS string but 9 bytes on
+    // the UTF-8 disk log that forensics would measure.
+    file.files.set('evoharness/experience.jsonl', JSON.stringify(record({ id: 'healthy' })) + '\n' + '中中中');
+    const store = await makeStore(file);
+    expect(await store.size()).toBe(1);
+    const diagnostic = store.diagnostics().find((entry) => entry.code === 'experience_store_truncated_tail');
+    expect(diagnostic?.level).toBe('warn');
+    expect(diagnostic?.message).toContain('of 9 byte(s)');
+    expect(diagnostic?.message).not.toContain('of 3 byte(s)');
+  });
+
+  it('JINFRA-12: bounds the retained diagnostic history to the newest 100', async () => {
+    const file = new FakeFs();
+    const lines: string[] = [];
+    for (let index = 1; index <= 150; index += 1) {
+      lines.push('not-json-' + String(index));
+    }
+    file.files.set('evoharness/experience.jsonl', lines.join('\n') + '\n');
+    const store = await makeStore(file);
+    expect(await store.size()).toBe(0);
+    const diagnostics = store.diagnostics();
+    expect(diagnostics).toHaveLength(100);
+    // The ring keeps the newest lines: 1..50 were dropped, 51..150 retained.
+    expect(diagnostics[0]?.message).toContain('line 51');
+    expect(diagnostics[99]?.message).toContain('line 150');
+  });
+
   it('reports an unreadable log without throwing and keeps the index empty', async () => {
     const file = new FakeFs();
     file.readError = new Error('EACCES');
@@ -251,6 +281,41 @@ describe('jsonl experience store (injected fs)', () => {
     expect(await store.size()).toBe(3);
     expect(store.snapshot().map((entry) => entry.id).sort()).toEqual(['p1', 'p2', 'p3']);
     expect((file.files.get('evoharness/experience.jsonl') ?? '').trimEnd().split('\n')).toHaveLength(3);
+  });
+
+  it('keeps an append issued during a compact rewrite durable (P1-2 append-vs-rewrite)', async () => {
+    const file = new FakeFs();
+    const store = await makeStore(file);
+    await store.append([record({ id: 'stale', createdAt: NOW - 100 * HALF_LIFE })]);
+    // Park the compaction inside its rename, then fire an append while the
+    // rewrite holds the log: exactly the interleaving that used to drop the
+    // appended bytes under the rename (JINFRA-2 / P1-2).
+    let releaseReplace: (() => void) | undefined;
+    const replaceGate = new Promise<void>((resolve) => {
+      releaseReplace = resolve;
+    });
+    let parked!: () => void;
+    const parkedPromise = new Promise<void>((resolve) => {
+      parked = resolve;
+    });
+    const originalReplace = file.replaceAtomic.bind(file);
+    file.replaceAtomic = async (filePath: string, contents: string): Promise<void> => {
+      parked();
+      await replaceGate;
+      return originalReplace(filePath, contents);
+    };
+    const compacting = store.compact({ maxPerBucket: 2, halfLifeMs: HALF_LIFE });
+    const appending = store.append([record({ id: 'late' })]);
+    await parkedPromise;
+    releaseReplace!();
+    expect(await compacting).toBe(1);
+    await appending;
+    // The index and the durable log still agree after both settle: the appended
+    // record is in the file the rewrite produced, not lost under its rename.
+    expect(store.snapshot().map((entry) => entry.id)).toEqual(['late']);
+    expect(file.files.get('evoharness/experience.jsonl') ?? '').toContain('late');
+    const reopened = await makeStore(file);
+    expect(reopened.snapshot().map((entry) => entry.id)).toEqual(['late']);
   });
 
   it('respects the bucket cap across a reload', async () => {
@@ -451,5 +516,38 @@ describe('jsonl experience store (node fs)', () => {
     const raw = await fs.readFile(filePath, 'utf8');
     expect(raw).toContain('complete');
     expect(dir.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// JINFRA-10: the header states the durability it actually provides
+// ---------------------------------------------------------------------------
+
+describe('JINFRA-10: claim accuracy for the rename/creation durability', () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(
+    path.resolve(here, '../../../src/jitrl/stores/jsonl.store.ts'),
+    'utf8'
+  );
+  // Collapse the comment's line wrapping so the assertions read as prose and
+  // stay true across harmless rewording of where a line breaks.
+  const header = source.slice(0, source.indexOf('*/')).replace(/\s*\*\s*/g, ' ').replace(/\s+/g, ' ');
+
+  it('labels the rename/creation as best-effort durable, not as full durability', () => {
+    // No parent-directory fsync exists after the create or the rename, so on
+    // a POSIX filesystem a power loss can drop the new directory entry. The
+    // header must say so instead of claiming unconditional durability.
+    expect(header).toContain('best-effort durable (JINFRA-10)');
+    expect(header).toContain('the parent directory entry is not fsynced');
+    expect(header).toContain('revert to the previous complete file');
+  });
+
+  it('never claims unconditional durability of a completed rewrite', () => {
+    // The one thing the header may still promise is the atomicity that the
+    // rename itself gives: a crash cannot surface a partially written log.
+    expect(header).toContain('a crash can never expose a half-written snapshot');
+    // ... but any absolute "is durable" wording would be a false claim again.
+    expect(header).not.toContain('is durably renamed');
+    expect(header).not.toContain('the rename is durable');
   });
 });

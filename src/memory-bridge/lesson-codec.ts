@@ -115,7 +115,7 @@ function verificationEvidenceJson(evidence: LessonVerificationEvidence): JsonVal
  */
 export function renderLessonMarkdown(lesson: CanonicalLesson): string {
   const lines: string[] = [];
-  lines.push(RENDERED_TITLE_PREFIX + lesson.title);
+  lines.push(...indentedValueLines(RENDERED_TITLE_PREFIX + lesson.title));
   lines.push('');
   lines.push('## 生效条件 / whenToApply');
   lines.push(...bulletLines(lesson.whenToApply, '（未声明）'));
@@ -124,23 +124,25 @@ export function renderLessonMarkdown(lesson: CanonicalLesson): string {
   lines.push(...bulletLines(lesson.subFunctions, '（未声明）'));
   lines.push('');
   lines.push('## 执行动作 / executionPatch');
-  lines.push(lesson.executionPatch.summary);
+  lines.push(...indentedValueLines(lesson.executionPatch.summary));
   if (lesson.executionPatch.componentDiffs !== undefined) {
     for (const [key, value] of Object.entries(lesson.executionPatch.componentDiffs)) {
       lines.push('');
       lines.push('### componentDiff: ' + key);
-      lines.push(value);
+      lines.push(...indentedValueLines(value));
     }
   }
   lines.push('');
   lines.push('## 验证方式 / verificationEvidence');
-  lines.push('- 参考分支失败: ' + lesson.verificationEvidence.referenceFailure);
-  lines.push('- 候选分支成功: ' + lesson.verificationEvidence.candidateSuccess);
+  lines.push(...indentedValueLines('- 参考分支失败: ' + lesson.verificationEvidence.referenceFailure));
+  lines.push(...indentedValueLines('- 候选分支成功: ' + lesson.verificationEvidence.candidateSuccess));
   lines.push(
-    '- 指标变化: stepsDiff=' +
-      lesson.verificationEvidence.metricsDelta.stepsDiff +
-      ', toolErrorsDiff=' +
-      lesson.verificationEvidence.metricsDelta.toolErrorsDiff
+    ...indentedValueLines(
+      '- 指标变化: stepsDiff=' +
+        lesson.verificationEvidence.metricsDelta.stepsDiff +
+        ', toolErrorsDiff=' +
+        lesson.verificationEvidence.metricsDelta.toolErrorsDiff
+    )
   );
   lines.push('');
   lines.push('## 不适用条件 / whenNotToApply');
@@ -148,6 +150,25 @@ export function renderLessonMarkdown(lesson: CanonicalLesson): string {
   lines.push('');
   lines.push('<!-- ' + renderTrailer(lesson) + ' -->');
   return lines.join('\n');
+}
+
+/**
+ * MEM-4: a value whose text spans several lines keeps its FIRST line inline and
+ * indents every continuation line by {@link CONTINUATION_INDENT}, so value
+ * content can never render as a section heading, a bullet, the trailer or a new
+ * step. `parseRenderedLesson` strips exactly that prefix, so a multi-line
+ * summary/evidence/cue round-trips verbatim instead of being truncated, split
+ * into extra clauses, or injecting a phantom `whenNotToApply` section.
+ */
+const CONTINUATION_INDENT = '  ';
+
+function indentedValueLines(value: string): string[] {
+  const parts = value.split(/\r?\n/);
+  const lines: string[] = [];
+  parts.forEach((part, index) => {
+    lines.push(index === 0 ? part : CONTINUATION_INDENT + part);
+  });
+  return lines;
 }
 
 /**
@@ -175,7 +196,17 @@ function bulletLines(values: readonly string[], emptyText: string): string[] {
   if (values.length === 0) {
     return ['- ' + emptyText];
   }
-  return values.map((value) => '- ' + value);
+  // MEM-4: one bullet per cue; a multi-line cue keeps its continuations
+  // indented so they cannot become separate cues (or section headings).
+  const lines: string[] = [];
+  for (const value of values) {
+    const parts = value.split(/\r?\n/);
+    lines.push('- ' + parts[0]);
+    for (const part of parts.slice(1)) {
+      lines.push(CONTINUATION_INDENT + part);
+    }
+  }
+  return lines;
 }
 
 // ---------------------------------------------------------------------------
@@ -423,25 +454,71 @@ export function parseRenderedLesson(text: string): ParsedLessonEnvelope | undefi
   const componentDiffs: Record<string, string> = {};
   let trailer = '';
   let title: string | undefined;
+  let titleOpen = false;
   let current: string | undefined;
   let diffKey: string | undefined;
 
+  const appendSectionLine = (key: string, value: string, continuation: boolean): void => {
+    const entries = sections.get(key);
+    if (entries === undefined) {
+      return;
+    }
+    const last = entries[entries.length - 1];
+    if (continuation && last !== undefined) {
+      entries[entries.length - 1] = last + '\n' + value;
+      return;
+    }
+    entries.push(value);
+  };
+  const appendDiffLine = (value: string): void => {
+    if (diffKey === undefined) {
+      return;
+    }
+    const existing = componentDiffs[diffKey] ?? '';
+    componentDiffs[diffKey] = existing === '' ? value : existing + '\n' + value;
+  };
+
   for (const rawLine of text.split(/\r?\n/)) {
+    const continuation = rawLine.startsWith(CONTINUATION_INDENT);
     const line = rawLine.trimEnd();
     const trimmed = line.trim();
+    if (continuation) {
+      // MEM-4: an indented line is VALUE content (the renderer indents every
+      // continuation line). It must never switch a section, add a bullet, or
+      // close the trailer — otherwise a multi-line summary could inject a
+      // phantom whenNotToApply clause and a multi-line cue would split.
+      const value = line.slice(CONTINUATION_INDENT.length);
+      if (current === undefined) {
+        if (titleOpen && title !== undefined) {
+          title = title + '\n' + value;
+        }
+        continue;
+      }
+      if (diffKey !== undefined) {
+        appendDiffLine(value);
+        continue;
+      }
+      appendSectionLine(current, value, true);
+      continue;
+    }
     if (trimmed.length === 0) {
       continue;
     }
     if (trimmed.startsWith('<!--') && trimmed.endsWith('-->')) {
       trailer = trimmed.slice(4, -3).trim();
-      continue;
-    }
-    if (line.startsWith(RENDERED_TITLE_PREFIX)) {
-      title = line.slice(RENDERED_TITLE_PREFIX.length).trim();
+      titleOpen = false;
       current = undefined;
       diffKey = undefined;
       continue;
     }
+    if (line.startsWith(RENDERED_TITLE_PREFIX)) {
+      title = line.slice(RENDERED_TITLE_PREFIX.length).trim();
+      titleOpen = true;
+      current = undefined;
+      diffKey = undefined;
+      continue;
+    }
+    titleOpen = false;
     if (line.startsWith('### ')) {
       const heading = line.slice(4).trim();
       const marker = 'componentDiff:';
@@ -473,10 +550,10 @@ export function parseRenderedLesson(text: string): ParsedLessonEnvelope | undefi
       continue;
     }
     if (diffKey !== undefined) {
-      componentDiffs[diffKey] = componentDiffs[diffKey] === '' ? line : componentDiffs[diffKey] + '\n' + line;
+      appendDiffLine(line);
       continue;
     }
-    sections.get(current)?.push(line);
+    appendSectionLine(current, line, false);
   }
 
   if (title === undefined) {
@@ -496,11 +573,13 @@ export function parseRenderedLesson(text: string): ParsedLessonEnvelope | undefi
     return undefined;
   }
   const verificationLines = sections.get('verificationEvidence') ?? [];
-  const referenceFailure = firstMatch(verificationLines, /参考分支失败[:：]\s*(.*)$/);
-  const candidateSuccess = firstMatch(verificationLines, /候选分支成功[:：]\s*(.*)$/);
-  const deltaLine = verificationLines.find((line) => line.includes('stepsDiff=')) ?? '';
-  const stepsDiff = Number.parseInt(/stepsDiff=(-?\d+)/.exec(deltaLine)?.[1] ?? '0', 10);
-  const toolErrorsDiff = Number.parseInt(/toolErrorsDiff=(-?\d+)/.exec(deltaLine)?.[1] ?? '0', 10);
+  const referenceFailure = firstLabelledValue(verificationLines, /参考分支失败[:：]\s*(.*)$/);
+  const candidateSuccess = firstLabelledValue(verificationLines, /候选分支成功[:：]\s*(.*)$/);
+  const deltaEntry = verificationLines.find((entry) => entry.includes('stepsDiff=')) ?? '';
+  // MEM-4: fractional metricsDelta values must survive the rendered-only parse
+  // (the frontmatter envelope path was already lossless; parseInt truncated).
+  const stepsDiff = Number.parseFloat(/stepsDiff=(-?\d+(?:\.\d+)?)/.exec(deltaEntry)?.[1] ?? '0');
+  const toolErrorsDiff = Number.parseFloat(/toolErrorsDiff=(-?\d+(?:\.\d+)?)/.exec(deltaEntry)?.[1] ?? '0');
   const summaryLines = sections.get('executionPatch') ?? [];
   const lesson: CanonicalLesson = {
     id: trailerFields.id ?? 'rendered-' + djb2Hex(title),
@@ -542,9 +621,14 @@ function bullets(lines: readonly string[] | undefined): string[] {
     return [];
   }
   const result: string[] = [];
-  for (const line of lines) {
-    const match = /^-\s*(.*)$/.exec(line);
-    const value = (match?.[1] ?? line).trim();
+  for (const entry of lines) {
+    // MEM-4: an entry may span continuation lines; the bullet marker applies to
+    // its first line only and the rest is the same cue's continuation.
+    const parts = entry.split('\n');
+    const first = parts[0] ?? '';
+    const match = /^-\s*(.*)$/.exec(first);
+    const head = (match?.[1] ?? first).trim();
+    const value = parts.length === 1 ? head : [head, ...parts.slice(1)].join('\n').trim();
     if (value.length === 0 || value === '（未声明）') {
       continue;
     }
@@ -553,12 +637,18 @@ function bullets(lines: readonly string[] | undefined): string[] {
   return result;
 }
 
-function firstMatch(lines: readonly string[], pattern: RegExp): string | undefined {
-  for (const line of lines) {
-    const match = pattern.exec(line);
-    if (match?.[1] !== undefined) {
-      return match[1].trim();
+function firstLabelledValue(lines: readonly string[], pattern: RegExp): string | undefined {
+  for (const entry of lines) {
+    // The pattern is anchored per line, so match the label on the entry's first
+    // line and keep its continuation lines as part of the value (MEM-4).
+    const parts = entry.split('\n');
+    const first = parts[0] ?? '';
+    const match = pattern.exec(first);
+    if (match?.[1] === undefined) {
+      continue;
     }
+    const head = match[1].trim();
+    return parts.length === 1 ? head : [head, ...parts.slice(1)].join('\n').trim();
   }
   return undefined;
 }
@@ -671,9 +761,15 @@ export function collectLessonRecords(value: unknown, options: CollectLessonOptio
     if (parsed === undefined) {
       return;
     }
+    // A namespace the payload itself declares (envelope frontmatter or an
+    // enclosing object's metadata) is a verified origin. Only the hint/default
+    // fallbacks attribute the REQUESTED namespace to untagged content — the
+    // fail-open hole P1-6 (MEM-1) closes — so such records carry
+    // unverifiedOrigin and the firewall restricts them to global visibility.
+    const declaredNamespace =
+      emptyToUndefined(parsed.namespace) ?? emptyToUndefined(inheritedNamespace);
     const namespace =
-      emptyToUndefined(parsed.namespace) ??
-      emptyToUndefined(inheritedNamespace) ??
+      declaredNamespace ??
       emptyToUndefined(options.namespaceHint) ??
       emptyToUndefined(options.defaultNamespace) ??
       '';
@@ -682,7 +778,12 @@ export function collectLessonRecords(value: unknown, options: CollectLessonOptio
       return;
     }
     seen.add(key);
-    records.push({ lesson: parsed.lesson, namespace, backendRef: parsed.lesson.id });
+    records.push({
+      lesson: parsed.lesson,
+      namespace,
+      backendRef: parsed.lesson.id,
+      ...(declaredNamespace === undefined ? { unverifiedOrigin: true } : {})
+    });
   }
 }
 

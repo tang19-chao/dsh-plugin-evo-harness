@@ -534,12 +534,18 @@ describe('A-R3-2: canary records carry the full field set', () => {
     expect(
       (result.budget.generalRemainingMicros ?? 0) + (result.budget.settledMicros ?? 0)
     ).toBe(1_000_000);
-    // T4: the token budget report carries the measured gross per arm and the
-    // caps; the client kill switch is reported as wired (a real client ran).
+    // T4/VERIF-10: the token budget report carries the NET measured tokens per
+    // arm (each logical token counted once) plus the caps; the client kill switch
+    // is reported as wired (a real client ran). Under the DECLARED semantics
+    // (inputIncludesCacheRead / outputIncludesReasoning) the treatment's
+    // cacheRead 80 is already inside input 100, so 100+15 = 115 — the old gross
+    // 195 counted the cache hit twice. The per-call record keeps the gross
+    // `measuredTokens` because that is what the kill switch judges.
     expect(result.tokenBudget.caps.perCallTokens).toBe(200_000);
     expect(result.tokenBudget.measuredBaselineTokens).toBe(120);
-    expect(result.tokenBudget.measuredTreatmentTokens).toBe(195);
-    expect(result.tokenBudget.measuredTotalTokens).toBe(315);
+    expect(result.tokenBudget.measuredTreatmentTokens).toBe(115);
+    expect(result.tokenBudget.measuredTotalTokens).toBe(235);
+    expect(result.calls[1]?.measuredTokens).toBe(195);
     expect(result.tokenBudget.allUsageMeasured).toBe(true);
   });
 

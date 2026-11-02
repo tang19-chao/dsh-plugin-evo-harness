@@ -325,7 +325,11 @@ export function retrieve(
  * Build the store-facing ExperienceQuery for the same retrieval parameters.
  * Half-life decay is intentionally not part of the query contract: the store
  * filters, this module re-weights the returned snapshot. The drift inputs are
- * forwarded, because the store applies the same section 7.3-4 factor itself.
+ * forwarded: the store applies the same section 7.3-4 factor itself (saturating,
+ * before its top-k slice) and reports it as `driftWeight`. This module only
+ * re-weights locally because a snapshot path runs on already-fetched records
+ * with no store in between; when both paths run, the store's `driftWeight` on
+ * a neighbour marks it as already down-weighted.
  */
 export function toExperienceQuery(
   state: AbstractState,

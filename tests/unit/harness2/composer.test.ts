@@ -665,6 +665,163 @@ describe('Harness² composer / pure contrast scoring', () => {
     expect(score).toBeLessThanOrEqual(1);
   });
 });
+describe('CORE-2: the committed "dimension wins" sentence is direction-aware', () => {
+  /**
+   * The pre-fix filter kept `delta > 0` for EVERY dimension, but `delta` is
+   * always `candidate - reference`: for steps / tool_errors / cost / robustness
+   * a positive delta means the winner did WORSE. The assertion below pins the
+   * exact dimensions the winner actually improved on, so the old filter (which
+   * would list the regressed ones instead) fails.
+   */
+  it('names the improved dimensions, not the regressed ones', async () => {
+    const reference = referenceTrajectory();
+    const { composer, request } = composeRequest([JUDGE_VERDICT]);
+    const result = await composer.compose(request);
+    const winner = request.candidates.find(
+      (candidate) => candidate.nodeId === result.selectedNodeId
+    );
+    expect(winner).toBeDefined();
+
+    // The reference failed, the winner succeeded with fewer steps, no tool
+    // errors, fewer tokens and no failure signals: every dimension improved.
+    const contrasts = computeBehavioralContrasts(reference, winner!.trajectory);
+    const improved = contrasts
+      .filter((contrast) => {
+        const delta = contrast.delta;
+        if (delta === undefined || delta === 0) {
+          return false;
+        }
+        return contrast.dimension === 'task_completion' ||
+          contrast.dimension === 'deliverable_quality'
+          ? delta > 0
+          : delta < 0;
+      })
+      .map((contrast) => contrast.dimension);
+    expect(improved.length).toBeGreaterThan(0);
+
+    const rationale = result.composedPatch?.rationale ?? '';
+    expect(rationale).toContain('dimension wins: ' + improved.join(', '));
+    // The metadata carries the SAME filtered set (CORE-2 second half).
+    expect(result.composedPatch?.metadata?.contrastDimensions).toEqual(improved);
+  });
+
+  it('omits a dimension the winner regressed on from both the sentence and the metadata', async () => {
+    // A winner that succeeded but burned MORE steps than the reference: `steps`
+    // is a regression, so it must not appear as a "win".
+    const candidate = makeCandidate({
+      nodeId: 'node_regressed',
+      branchId: 'branch_regressed',
+      patch: makePatch({ id: 'patch_regressed', branchId: 'branch_regressed' }),
+      trajectory: makeTrajectory({
+        id: 'traj_regressed',
+        nodeId: 'node_regressed',
+        branchId: 'branch_regressed',
+        patchId: 'patch_regressed',
+        status: 'succeeded',
+        metrics: { steps: 40, toolCalls: 30, toolErrors: 0, durationMs: 1000 },
+        deliverable: { content: 'a deliverable', format: 'text' }
+      })
+    });
+    const { composer, request } = composeRequest([JUDGE_VERDICT], [candidate]);
+    const result = await composer.compose(request);
+
+    const rationale = result.composedPatch?.rationale ?? '';
+    expect(rationale).toContain('dimension wins:');
+    expect(rationale).not.toContain('steps');
+    expect(result.composedPatch?.metadata?.contrastDimensions).not.toContain('steps');
+  });
+});
+
+describe('CORE-3: an unusable judge ranking never manufactures a score', () => {
+  it('treats a parseable verdict with NO usable ranking as judge-unavailable', async () => {
+    // `readStringList` rejects a non-array `ranking`, so this parses to `[]`.
+    // Pre-fix the empty ranking was padded with `aliases` in branchId/nodeId
+    // order, handing the lexicographically-first candidate a full judge bonus.
+    const { composer, request } = composeRequest([
+      JSON.stringify({ ranking: 'A > B > C', assessments: [] })
+    ]);
+    const result = await composer.compose(request);
+
+    expect(result.rationale).toContain('judge unavailable -> evidence-only adoption ratios');
+    expect(result.rationale).toContain('no usable ranking');
+    for (const assessment of result.assessments) {
+      const candidate = request.candidates.find(
+        (entry) => entry.nodeId === assessment.nodeId
+      );
+      expect(candidate).toBeDefined();
+      expect(assessment.adoptionRatio).toBeCloseTo(
+        scoreCandidateEvidence(request.reference, candidate!.trajectory),
+        10
+      );
+    }
+  });
+
+  it('blends only the aliases the judge actually ranked, leaving the rest evidence-only', async () => {
+    const { composer, request } = composeRequest([
+      JSON.stringify({ ranking: ['candidate_B'], assessments: [] })
+    ]);
+    const result = await composer.compose(request);
+
+    // candidate_B is the ranked one: it carries the judge share on top of its
+    // evidence score. Every unranked alias keeps its evidence-only ratio.
+    for (const assessment of result.assessments) {
+      const candidate = request.candidates.find(
+        (entry) => entry.nodeId === assessment.nodeId
+      );
+      const evidence = scoreCandidateEvidence(request.reference, candidate!.trajectory);
+      if (assessment.alias === 'candidate_B') {
+        expect(assessment.adoptionRatio).toBeCloseTo(
+          0.85 * evidence + 0.15 * 1,
+          10
+        );
+      } else {
+        expect(assessment.adoptionRatio).toBeCloseTo(evidence, 10);
+      }
+    }
+    expect(result.rationale).not.toContain('judge unavailable');
+  });
+});
+
+describe('CORE-7: the header bound is an invariant, not a default', () => {
+  it('RE-NORMALIZES a drifted evidence/judge pair and says so', async () => {
+    // Pre-fix `{evidence: 0.9, judge: 0.9}` blended to up to 1.8 pre-clamp, so
+    // the judge dominated. Normalized, the judge share stays 0.5 of sum 1.8.
+    const { composer, request } = composeRequest([JUDGE_VERDICT]);
+    const legacy = createAnonymousComposer({
+      model: scriptedModel([JUDGE_VERDICT]),
+      now: fixedClock(),
+      newId: createDeterministicIdFactory('compose-drift'),
+      evidenceWeight: 0.9,
+      judgeWeight: 0.9
+    });
+    const normalized = createAnonymousComposer({
+      model: scriptedModel([JUDGE_VERDICT]),
+      now: fixedClock(),
+      newId: createDeterministicIdFactory('compose-normalized'),
+      evidenceWeight: 0.5,
+      judgeWeight: 0.5
+    });
+
+    const legacyResult = await legacy.compose(request);
+    const normalizedResult = await normalized.compose(request);
+
+    // `0.9/0.9` and `0.5/0.5` are the SAME convex pair once normalized.
+    for (const assessment of legacyResult.assessments) {
+      const twin = normalizedResult.assessments.find(
+        (entry) => entry.nodeId === assessment.nodeId
+      );
+      expect(assessment.adoptionRatio).toBeCloseTo(twin?.adoptionRatio ?? -1, 10);
+      expect(assessment.adoptionRatio).toBeLessThanOrEqual(1);
+    }
+    expect(legacyResult.rationale).toContain('adoption blend repaired');
+    expect(legacyResult.rationale).toContain('normalized by 1.800000');
+
+    // `composer` (the default pair) stays un-repaired: no note for 0.85/0.15.
+    const defaultResult = await composer.compose(request);
+    expect(defaultResult.rationale).not.toContain('adoption blend repaired');
+  });
+});
+
 describe('L2 composer input stripping and free-text canary risk recording', () => {
   it('strips structured <jitrl_advice> and <anti_patterns_to_avoid> blocks from steps and deliverables', async () => {
     const rawStepText = 'running task <jitrl_advice mode="advisory" level="host_tool" neighbors="4">recommend write_note</jitrl_advice> done';

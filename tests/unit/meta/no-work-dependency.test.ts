@@ -43,7 +43,7 @@ import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import {
@@ -394,6 +394,9 @@ describe('work-path scanner: this repository', () => {
 describe('the P3-C suite fails closed instead of skipping', () => {
   /** Run vitest on the gate test with `env` overrides; returns exit code + output. */
   function runGateSuite(env: Record<string, string> = {}): { status: number | null; output: string } {
+    // A moved vitest entry must be a NAMED failure here, not an opaque spawn
+    // ENOENT surfacing from inside the child run.
+    expect(existsSync(VITEST_ENTRY), 'the nested vitest entry is missing: ' + VITEST_ENTRY).toBe(true);
     const result = spawnSync(process.execPath, [VITEST_ENTRY, 'run', GATE_TEST], {
       cwd: REPO_ROOT,
       encoding: 'utf8',
@@ -411,7 +414,22 @@ describe('the P3-C suite fails closed instead of skipping', () => {
     expect(hits, 'the gate must FAIL on a missing input, never be skipped').toEqual([]);
   });
 
-  it('exits NON-ZERO when the fixture manifest is missing', () => {
+  /**
+   * The manifest mutation keeps the one child-process case: it MEASURES the
+   * gate's real vitest exit code instead of trusting a keyword. The remaining
+   * two mutations share the same import-time `loadVerifiedFixtures()` throw, so
+   * they are driven in-process (fresh module evaluation per query string) and
+   * assert the named errors without two more nested vitest runs.
+   */
+  const GATE_MODULE_URL = pathToFileURL(join(REPO_ROOT, ...GATE_TEST.split('/'))).href;
+
+  async function importGateFixtureModule(mutation: string): Promise<unknown> {
+    // A distinct query string per mutation forces a fresh module evaluation, so
+    // each import re-runs the gate's own import-time fixture verification.
+    return import(GATE_MODULE_URL + '?fail-closed=' + mutation);
+  }
+
+  it('exits NON-ZERO when the fixture manifest is missing (the one nested vitest run)', () => {
     const copy = makeTemp('work-gate-nomanifest-');
     cpSync(FIXTURE_DIR, copy, { recursive: true });
     rmSync(join(copy, 'fixture-manifest.json'));
@@ -420,23 +438,29 @@ describe('the P3-C suite fails closed instead of skipping', () => {
     expect(result.output).toContain('PR-4A fixture manifest is missing');
   });
 
-  it('exits NON-ZERO when the REQUIRED artifact is missing', () => {
+  it('fails closed when the REQUIRED artifact is missing (import-time throw, in process)', async () => {
     const copy = makeTemp('work-gate-noartifact-');
     cpSync(FIXTURE_DIR, copy, { recursive: true });
     rmSync(join(copy, 'pr4a-five-arm-eval.json'));
-    const result = runGateSuite({ PR4A_FIXTURE_DIR: copy });
-    expect(result.status, result.output).not.toBe(0);
-    expect(result.output).toContain('PR-4A fixture is missing');
+    process.env.PR4A_FIXTURE_DIR = copy;
+    try {
+      await expect(importGateFixtureModule('artifact-missing')).rejects.toThrow('PR-4A fixture is missing');
+    } finally {
+      delete process.env.PR4A_FIXTURE_DIR;
+    }
   });
 
-  it('exits NON-ZERO when a fixture byte drifts (sha256 mismatch)', () => {
+  it('fails closed when a fixture byte drifts (sha256 mismatch, import-time throw, in process)', async () => {
     const copy = makeTemp('work-gate-drift-');
     cpSync(FIXTURE_DIR, copy, { recursive: true });
     const target = join(copy, 'pr4a-five-arm-eval.json');
     writeFileSync(target, readFileSync(target, 'utf8').replace('PR4A-EVAL-PREREG-20261027-V2', 'PR4A-EVAL-PREREG-20261027-V3'), 'utf8');
-    const result = runGateSuite({ PR4A_FIXTURE_DIR: copy });
-    expect(result.status, result.output).not.toBe(0);
-    expect(result.output).toMatch(/sha256 drifted|byte length drifted/);
+    process.env.PR4A_FIXTURE_DIR = copy;
+    try {
+      await expect(importGateFixtureModule('byte-drift')).rejects.toThrow(/sha256 drifted|byte length drifted/);
+    } finally {
+      delete process.env.PR4A_FIXTURE_DIR;
+    }
   });
 });
 

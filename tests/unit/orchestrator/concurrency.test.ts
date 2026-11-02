@@ -577,11 +577,15 @@ describe('orchestrator concurrent probe wave', () => {
     });
     const elapsedMs = Date.now() - startedAt;
 
-    // 1. real overlap: 4 probes of ~100ms complete well under the 200ms bar.
+    // 1. real overlap: maxActive === 4 proves the four ~100ms slots were in
+    //    flight simultaneously, and the wall-clock lower bound proves the slots
+    //    really awaited their delay instead of returning instantly. There is no
+    //    wall-clock UPPER bound: serial-vs-parallel is decided by maxActive,
+    //    and shared-runner load is the variable, not the test (vitest.config.ts).
     expect(result.outcome).toBe('composed');
     expect(candidateExecutions).toHaveLength(4);
     expect(maxActive).toBe(4);
-    expect(elapsedMs).toBeLessThan(200);
+    expect(elapsedMs).toBeGreaterThanOrEqual(100);
     expect(result.probesRun).toBe(5); // reference anchor + 4 candidates
 
     // 2. admission/proposals follow slotIndex, not the scrambled array order.

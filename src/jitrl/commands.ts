@@ -98,7 +98,7 @@ export interface JitCommandResult {
 }
 
 export const JIT_COMMAND_USAGE =
-  'usage: /evo jit <status | explain <runId> | reset [bucket] [--confirm] | on | off>';
+  'usage: /evo jit <status | explain <runId> | reset [bucket] --confirm | on | off>';
 
 const EXPLAIN_COLUMNS = [
   'candidate',
@@ -389,13 +389,26 @@ async function resetResult(
   controller: JitCommandController,
   parsed: ParsedJitCommand
 ): Promise<JitCommandResult> {
-  if (parsed.bucket === undefined && !parsed.confirm) {
+  // Audit JITRL-10: the guard used to cover only the global reset
+  // (`bucket === undefined`), so `reset <bucket>` dropped an entire bucket -
+  // part of the learning-evidence pool the writeback gate and value estimator
+  // consume - with no confirmation, and the usage line did not say when the
+  // flag was required. Every destructive reset now needs `--confirm`.
+  if (!parsed.confirm) {
+    const scope = parsed.bucket === undefined ? 'all experience' : 'bucket ' + scrub(parsed.bucket);
     return {
       command: 'reset',
       ok: false,
       text:
-        'refusing to clear all experience without an explicit --confirm flag; nothing was dropped',
-      json: { bucket: null, dropped: 0, supported: true, requiresConfirmation: true },
+        'refusing to clear ' +
+        scope +
+        ' without an explicit --confirm flag; nothing was dropped',
+      json: {
+        bucket: parsed.bucket === undefined ? null : scrub(parsed.bucket),
+        dropped: 0,
+        supported: true,
+        requiresConfirmation: true
+      },
       usage: JIT_COMMAND_USAGE
     };
   }

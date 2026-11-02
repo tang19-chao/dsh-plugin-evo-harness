@@ -519,3 +519,88 @@ describe('describeCacheObservations is lossless and draws no conclusion', () => 
     expect(serialised).not.toContain('"enable"');
   });
 });
+
+/**
+ * VERIF-1 regression (audit round 1 + round 2): the two-sided sign test says
+ * only "the split is lopsided", never which way, and the float accumulation
+ * overflowed into NaN past 1023 discordant pairs - and `NaN > alpha` is false.
+ * The gate must open only on a significant REDUCTION, judged by an exact
+ * p-value.
+ */
+describe('VERIF-1: the gate checks direction and stays numerically exact', () => {
+  const pair = (taskId: string, baselineCacheRead: number, treatmentCacheRead: number) => ({
+    taskId,
+    baselineCacheRead,
+    treatmentCacheRead,
+    precision: 'measured' as const,
+    baselineCallIds: ['b-' + taskId],
+    treatmentCallIds: ['t-' + taskId],
+    complete: true
+  });
+
+  it('never opens on a significant WRONG-direction split (1 reduced / 47 increased)', () => {
+    // p = 2*(C(48,0)+C(48,1))/2^48 ~= 3.5e-13 <= alpha: significant, but
+    // TOWARD INCREASE (treatment significantly worse). The old gate only
+    // required `reduced >= 1`, so it opened and claimed "reduction is
+    // significant" for this data set.
+    const pairs = [
+      pair('r0', 100000, 0),
+      ...Array.from({ length: 47 }, (_unused, index) => pair('i' + String(index), 1000, 11000))
+    ];
+    const gate = cacheOptimizationGate(pairs);
+    expect(gate.status).toBe('measured-no-significant-reduction');
+    if (gate.status === 'measured-no-significant-reduction') {
+      expect(gate.meanReduction).toBeLessThan(0);
+    }
+  });
+
+  it('the mean direction must agree with the optimisation direction, not just the pair count', () => {
+    // 44 reductions of 1 token vs 16 increases of 10,000 tokens: the sign test
+    // is significant (p ~= 3.9e-4) toward the REDUCTION side and most pairs
+    // reduced, but the mean effect is a large increase. Only the
+    // mean-direction assertion can close this shape.
+    const pairs = [
+      ...Array.from({ length: 44 }, (_unused, index) => pair('r' + String(index), 101, 100)),
+      ...Array.from({ length: 16 }, (_unused, index) => pair('i' + String(index), 100, 10100))
+    ];
+    const gate = cacheOptimizationGate(pairs);
+    expect(gate.status).toBe('measured-no-significant-reduction');
+    if (gate.status === 'measured-no-significant-reduction') {
+      expect(gate.meanReduction).toBeLessThan(0);
+      expect(gate.reason).toContain('direction');
+    }
+  });
+
+  it('a balanced 1500-pair split no longer overflows the sign test into an applicable gate', () => {
+    // 750/750 over 1500 discordant pairs: the true two-sided p ~= 1. The old
+    // float accumulation produced NaN (both the accumulated tail x2 and the
+    // 2^n denominator leave the double range) and `NaN > alpha` is false, so
+    // the gate OPENED on it.
+    const pairs = Array.from({ length: 1500 }, (_unused, index) =>
+      index % 2 === 0 ? pair('t' + String(index), 100, 110) : pair('t' + String(index), 100, 90)
+    );
+    const gate = cacheOptimizationGate(pairs);
+    expect(gate.status).toBe('measured-no-significant-reduction');
+    if (gate.status === 'measured-no-significant-reduction') {
+      expect(gate.reason).toContain('sign test is not significant');
+      expect(gate.reason).not.toContain('NaN');
+    }
+  });
+
+  it('a reduction-direction split just past 1023 pairs is judged by its exact p-value', () => {
+    // 541 reduced (by 2 tokens) vs 483 increased (by 1 token): the exact
+    // p ~= 0.0748 > alpha, so the gate must stay closed. The float path
+    // returned NaN here (binomial tail and 2^1024 denominator overflow) and
+    // NaN silently opened it - the mean and pair-count directions both point
+    // the right way, so only the exact p-value closes this shape.
+    const pairs = [
+      ...Array.from({ length: 541 }, (_unused, index) => pair('r' + String(index), 102, 100)),
+      ...Array.from({ length: 483 }, (_unused, index) => pair('i' + String(index), 100, 101))
+    ];
+    const gate = cacheOptimizationGate(pairs);
+    expect(gate.status).toBe('measured-no-significant-reduction');
+    if (gate.status === 'measured-no-significant-reduction') {
+      expect(gate.reason).toContain('sign test is not significant');
+    }
+  });
+});

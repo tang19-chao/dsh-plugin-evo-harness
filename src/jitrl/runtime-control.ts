@@ -433,7 +433,15 @@ export function createProbeAuthorizationLedger(
           // identity (ADR 0006 D-P4-1).
           return denied('session-cannot-authorize-branch', kind, grant.grantId);
         }
-        if (grant.sessionId !== undefined && sessionId !== undefined && grant.sessionId !== sessionId) {
+        // A session-scoped grant covers exactly that session: the request must
+        // NAME the same session. Audit JITRL-8: the pre-fix condition skipped
+        // the check whenever the request carried no sessionId, so a COMPOUND
+        // {branchId, sessionId} grant silently authorized every branch-only
+        // request on that branch. Missing identity is fail-closed (ADR 0006
+        // D-P4-1/D-P4-5). A branch-only GRANT is unaffected (its sessionId is
+        // undefined, so this branch is not reached) - which is what keeps the
+        // shipped `real-benefit-controller` caller working.
+        if (grant.sessionId !== undefined && grant.sessionId !== sessionId) {
           continue;
         }
         if (grant.usedAt !== undefined) {

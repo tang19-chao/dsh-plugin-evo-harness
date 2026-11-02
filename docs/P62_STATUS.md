@@ -75,7 +75,9 @@
 | **C3 成本台账数据契约** | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ | `src/ledger/**` 定义 UsageLedgerEvent、防重复计费、三态计量传播；**全仓零生产业务接线，零外部 import**。 |
 | **C3 保守非零地板与生命周期** | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ | actualCost=0 强制 unknown provenance 与保守地板；已结算 callId 重复 reserve 明确拒绝（`call_already_settled`），总额度与席位零滞留（t11 F-1/F-2 关闭，t19 PASS）。 |
 | **C3 确定性离线 Fixture 覆盖** | ✓ | ✗ | ✗ | ✓ | ✗ | ✗ | 11 个离线场景函数（Scenario 1–8 与 9/10/11）由 `tests/unit/ledger/offline-fixtures.test.ts` 的 12 个 `it()` 测试 100% 实际调用（t19 Y-1 关闭，t21 PASS；含 11 场景测试 + 1 项 r4 边界测试）；全套件 36 项 ledger 单测全绿；零网络、零付费模型。 |
-| **C2b / C3 生产实施 / C4 / D** | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | **全部未做**。无付费模型调用、无真实 memory 写入、无自动发布、无部署、无 commit/push。 |
+| **C2b / C3 生产实施 / C4 / D** | ✓ (仅 C2b) | ✓ (仅 C2b) | ✗ | ✓ (仅 C2b) | ✗ | ✗ | **C2b（trusted quality consumption）已于 2026-10-28 commit `0410d78` 落地**：dual-track consumption 选项自 `src/index.ts` 贯通 `src/jitrl/jit-active-policy.ts`（消费门 `enableQualityTrackConsumption`，默认关闭、显式 opt-in），orchestrator 承载 C2b F4/F11 生产路径逻辑；单测 `tests/unit/jitrl/dual-track-consumption.test.ts` 与 e2e `tests/e2e/c2b-quality-consumption.test.ts` 齐备（2026-11-01 实测 22/22 全绿）。默认不启用、release 仍未授权、实际未应用；**C3 生产实施 / C4 / D 仍未做**：无付费模型调用、无真实 memory 写入、无自动发布、无部署、无 commit/push。注：ADR `0004-c2b` 仍为 **proposed / draft**（自述「不代表已接受或已在线启用能力」），生产代码按其裁决实现，ADR 状态未推进（2026-11-01 审计第 1 批 DOCS-3 校正）；上行「C2a 质量消费者接线」为 C2b 落地前的登记口径，消费接线现状以本行为准。 |
+
+> **2026-11-02 追加（审计第 2 批文档收尾，DOCS-3b）**：§1 矩阵第 74 行「C2a 质量消费者接线 ✗ × 6 / **未接线**」是 **C2b 落地前（2026-10-28 commit `0410d78` 之前）的登记口径**，不回写原文。自 C2b 落地起，消费接线的现行事实以本页第 78 行「C2b / C3 生产实施 / C4 / D」为准：`dualTrack` 选项自 `src/index.ts` 贯通 `src/jitrl/jit-active-policy.ts`（消费门 `enableQualityTrackConsumption`，默认关闭、显式 opt-in），orchestrator 承载 C2b F4/F11 生产路径逻辑，单测与 e2e 齐备；其中 default_enabled / release_authorized / actually_applied 仍为 ✗（默认不启用、未授权、未实际应用）。第 74 行的「消费门与事实门严格隔离」在 **opt-in 关闭时**仍然成立，故该行文字保留、只加本指针。
 
 ---
 
@@ -258,8 +260,8 @@
 | 来源 | 观察 | 影响 / 建议 |
 | --- | --- | --- |
 | t13 O1（low） | `src/types/contracts.ts` 的 `skipped` 注释写「never reached the eligibility decision」，实测 4 个累加点中有 2 个位于资格判定之后（匿名 gate `considered=1 / skipped=1` 可复现）；计数本身真实且彼此独立、未从别处推算 | **已闭环（见 §5.7，t19 修复）**——原建议文字保留：属措辞精度问题；建议由 t5 文件做一行注释修复，**不在本批 integration 写范围**（inScope 不含 `src/`） |
-| t13 O2（low） | `mapHostAdvisorStatus` 以 `{...stats}` 原样转发，额外适配器字段可进入公开 status（注入 `toolName` 可实证）；真实 hook 适配器只返回 7 个计数，现状无泄漏 | 建议按键白名单加固，留待后续批次 |
-| t14 O2（info） | `check:docs` 未断言 `unit + e2e == total`，未来出现第三类测试目录时不会报红 | 登记项，建议随下一轮文档门禁加固 |
+| t13 O2（low） | `mapHostAdvisorStatus` 以 `{...stats}` 原样转发，额外适配器字段可进入公开 status（注入 `toolName` 可实证）；真实 hook 适配器只返回 7 个计数，现状无泄漏 | **已闭环（见 §5.7，P2 批 R-01 收口，2026-11-01 追加指针）**——原建议文字保留：建议按键白名单加固，留待后续批次 |
+| t14 O2（info） | `check:docs` 未断言 `unit + e2e == total`，未来出现第三类测试目录时不会报红 | **已闭环（见 §5.7，P2 批 R-04 收口，2026-11-01 追加指针）**——原建议文字保留：登记项，建议随下一轮文档门禁加固 |
 | t11 O1（low） | 等价命中时摘要段重复推入断言使 `checked/passed` +1，混合态下同一 id 可同时出现在 `failures` 与 passed 计数中；**退出码不受影响，无假绿** | **已闭环（见 §5.7，t18 修复）**——原建议文字保留：建议删除重复推入 / 解耦分类条件 |
 | t10 O2/O4（info） | 浅克隆失败码精度；`attestation-target` job 中 `pnpm install`（门禁不依赖依赖树）非必需 | 登记项 |
 | t12 O2（info） | `{config: null}` 语义未在 ADR 0005 定义（回落宿主配置，无安全降级） | 登记项 |
@@ -269,6 +271,8 @@
 ### 5.7 P1 批后续收口（t18/t19 闭环）与仍开放残余（2026-10-29，t24 追加）
 
 > 本节只追加，不回写 §5.1–§5.6。t21 最终发布审核的 F1 要求在此登记：§5.6 中两个记为未修的 low 观察已在 t18/t19 收口，其原观察文字保留在 §5.6（该处状态列已改为「已闭环」并回指本节）。
+>
+> **2026-11-01 追加（审计第 1 批文档校正，DOCS-2）**：下表追加 t13 O2、t20、t14 O2 三条——三者已由 P2 批 R-01/R-02/R-04 在代码层收口（随 `a50bd3f`/`49c2a44` 落地，交付报告 `docs/reports/p2-r-leftovers.md`）；本表与 §5.6 对应行的「未修/仍开放」状态字样回指为「已闭环」，原观察文字一律保留。t12 O2 仍开放不变。
 
 **已闭环**
 
@@ -276,14 +280,17 @@
 | --- | --- | --- |
 | t11 O1（low）：等价命中时摘要段重复推入断言使 `checked/passed` 虚增 1，混合态下同一 id 同时进入 `failures` 与 passed 计数 | **t18** | 删除报告段对 `provenance-executed-sources-eol-equivalent` 的第二次 `results.push`（全文仅剩 1 处 assert），断言语义收窄为「仅描述等价命中本身」，真实 drift 仍由 `provenance-executed-sources-match-disk` 独立失败并驱动 exit 1。证据：t20 §6.2 自建夹具 A/C 对照（checked 643 vs 642、passed 627 vs 626、failed 不变）、混合态 exit 1 且等价 id 不入 failures、checked=passed+failed（14/14）；**t21 §7 真实 LF 检出实测 checked=692 / passed=692 / failed=0**、`eolEquivalents=2`、混合态仅 match-disk；专属套件 21/21；真实工作树 691/691（`eolEquivalents=[]`） |
 | t13 O1（low）：`src/types/contracts.ts` 的 `skipped` 注释称跳过「never reached the eligibility decision」，与实测累加点相反 | **t19** | `src/types/contracts.ts` 注释重写为「判定之前的跳过 + 部分资格判定之后的 out-of-scope / 无名工具路径（已计入 `considered`）」，并声明与 outcome 计数每 dispatch 互斥。证据：t20 §6.2/§6.3 逐点核对 5 个累加点（`dsh-hook-host-adapter.ts` 1096/1099/1120/1173/1177，其中 1099/1120/1177 在 `considered += 1`（880 行）之后）；t21 探针 34/34 复跑；类型面零改动、tsc exit 0 |
+| t13 O2（low）：`mapHostAdvisorStatus` 以 `{...stats}` 原样转发，额外适配器字段可进入公开 status（注入 `toolName` 可实证） | **P2 批 R-01**（2026-11-01 审计第 1 批文档校正追加指针；随 `a50bd3f`/`49c2a44` 落地） | `src/host-triggers.ts`：`mapHostAdvisorStatus` 不再 `{...stats}`，改经 `pickHostAdvisorCounters` 按 `HOST_ADVISOR_COUNTER_KEYS` 七键白名单挑字段（模块级单一事实源 + 编译期见证），白名单注释点名 R-01/t13 O2；专属契约测试 `tests/unit/contracts/host-advisor-status-mapping.test.ts`（canary 注入后公开 counters 恰为 7 个公开键）；见 `docs/reports/p2-r-leftovers.md` §1 |
+| t20 新登记（low/info）：t19 新注释把判定前跳过写成「advisor off or the runtime gate closed」，但 advisor 未挂载（`advisor === undefined`）时本适配器根本不计数 | **P2 批 R-02**（2026-11-01 审计第 1 批文档校正追加指针） | `src/types/contracts.ts`：`skipped` 注释改写为 **COUNTING BOUNDARY (R-02)**——该计数是适配器观测、不是宿主派发量，未挂载/已 dispose 时累加点不触发、计数保持实测 0，禁止把 0 读成派发数；仅注释、零行为改动；见 `docs/reports/p2-r-leftovers.md` §2 |
+| t14 O2（info）：`check:docs` 未断言 `unit + e2e == total`，未来出现第三类测试目录时不会报红 | **P2 批 R-04**（2026-11-01 审计第 1 批文档校正追加指针） | `scripts/verify-readme-counts.mjs`：三方闭合断言（README 侧与报告侧 `unit + e2e == total`，files 与 tests 双维，`count-closure`）+ `unattributed-root` 对 `/tests/unit/`、`/tests/e2e/` 之外测试根的点名拒绝；配套测试 `tests/unit/config/readme-default-leaves.test.ts`；见 `docs/reports/p2-r-leftovers.md` §4 |
 
 **仍开放（如实登记，未修，不误称已修）**
 
 | 残余 | 归属 | 现状 |
 | --- | --- | --- |
-| t13 O2（low）：`mapHostAdvisorStatus` 以 `{...stats}` 原样转发，额外适配器字段可进入公开 status（注入 `toolName` 可实证） | t5 文件（`src/host-triggers.ts`） | **未修**；真实 hook 适配器只返回 7 个计数，现状无泄漏；建议按键白名单加固（留待后续批次） |
-| t20 新登记（low/info）：t19 新注释把判定前跳过写成「advisor off or the runtime gate closed」，但 advisor 未挂载（`advisor === undefined`）时本适配器根本不计数 | t5 文件（`src/types/contracts.ts` 注释） | **未修**；可观测到的判定前跳过只有运行时闸门（`/evo jit off`）一种；建议一行措辞收敛。附注：t19 未在台账留下 output 记录，本条结论来自 t20/t21 对工作树与代码的独立核对 |
+| t13 O2（low）：`mapHostAdvisorStatus` 以 `{...stats}` 原样转发，额外适配器字段可进入公开 status（注入 `toolName` 可实证） | t5 文件（`src/host-triggers.ts`） | **已闭环（见上方已闭环表，P2 批 R-01，2026-11-01 追加指针）**；真实 hook 适配器只返回 7 个计数，现状无泄漏；原建议文字保留：按键白名单加固（留待后续批次） |
+| t20 新登记（low/info）：t19 新注释把判定前跳过写成「advisor off or the runtime gate closed」，但 advisor 未挂载（`advisor === undefined`）时本适配器根本不计数 | t5 文件（`src/types/contracts.ts` 注释） | **已闭环（见上方已闭环表，P2 批 R-02，2026-11-01 追加指针）**；可观测到的判定前跳过只有运行时闸门（`/evo jit off`）一种；原建议文字保留：一行措辞收敛。附注：t19 未在台账留下 output 记录，本条结论来自 t20/t21 对工作树与代码的独立核对 |
 | t12 O2（info）：`{config: null}` 语义未在 ADR 0005 定义（回落宿主配置，无安全降级） | ADR 0005 / t4 入口 | **未修**；登记项 |
-| t14 O2（info）：`check:docs` 未断言 `unit + e2e == total`，未来出现第三类测试目录时不会报红 | `scripts/verify-readme-counts.mjs` | **未修**；登记项 |
+| t14 O2（info）：`check:docs` 未断言 `unit + e2e == total`，未来出现第三类测试目录时不会报红 | `scripts/verify-readme-counts.mjs` | **已闭环（见上方已闭环表，P2 批 R-04，2026-11-01 追加指针）**；原登记文字保留：登记项 |
 
 其余 info 级残余（t10 O1–O5、t12 O1、t14 O1、t15 O2–O7）与 t11/t13/t14 的完整观察列表分别保留在 `docs/reports/t10…t15` 六份审核报告与 `docs/reports/t21-final-p1-release-review.md` §7，本表不重复展开、也不声称已修。

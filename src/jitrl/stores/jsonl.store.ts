@@ -9,11 +9,24 @@
  * reported as a payload-free diagnostic. Reading never throws because of
  * damaged persistence: the healthy prefix survives and the store starts from
  * it. compaction rewrites the log through a sibling temp file and an atomic
- * rename, so a crash can never expose a half-written snapshot.
+ * rename, so a crash can never expose a half-written snapshot. The rename
+ * itself is best-effort durable (JINFRA-10): the parent directory entry is
+ * not fsynced, so a power loss may still drop the newest rewrite (or a
+ * freshly created log) and revert to the previous complete file - never a
+ * half-written one.
  *
  * The index in ../experience-store.ts is the in-memory truth; the file is the
  * durable projection of it. File IO is injected through ExperienceStoreFs, so
  * tests can substitute an in-memory filesystem and production uses node:fs.
+ *
+ * Every index-mutating or log-rewriting operation (append/compact/purge/flush/
+ * load) runs on one internal promise chain (JINFRA-2 / P1-2). The rewrite paths
+ * snapshot the index and then rename a temp file over the whole log, so an
+ * append landing inside that window would have its bytes dropped by the rename
+ * while its index insert survived; serializing the mutations closes that window
+ * (an append issued during a rewrite settles after it, straight into the new
+ * file). A failed operation still rejects to its own caller, but the chain
+ * itself never rejects, so later mutations always run.
  */
 
 import type {
@@ -69,6 +82,15 @@ async function syncBestEffort(handle: { sync?: () => Promise<void> }): Promise<v
 
 /** Monotonic suffix that keeps two concurrent temp names distinct. */
 let tempCounter = 0;
+
+/**
+ * Retained-diagnostic cap (JINFRA-12), mirroring MAX_STORE_DIAGNOSTICS in
+ * ./bridge.store.ts: parseLog emits one diagnostic per damaged line, so a
+ * multi-megabyte corrupted log must not retain an object per line for the
+ * process lifetime. The onDiagnostic sink still sees every event; only this
+ * history is bounded.
+ */
+const MAX_STORE_DIAGNOSTICS = 100;
 
 /** Build the production ExperienceStoreFs on top of node:fs. */
 export async function createNodeExperienceFs(): Promise<ExperienceStoreFs> {
@@ -163,7 +185,7 @@ export interface JsonlExperienceStore {
   purge(options?: { readonly bucket?: string }): Promise<number>;
   /** Snapshot of the live records, newest first. */
   snapshot(): readonly ExperienceRecord[];
-  /** Diagnostics observed so far (payload free). */
+  /** Diagnostics observed so far, bounded to the most recent 100 (payload free). */
   diagnostics(): readonly ExperienceStoreDiagnostic[];
   /** Absolute path of the backing log. */
   readonly filePath: string;
@@ -173,7 +195,8 @@ function toScored(entry: ScoredStoredExperience): ScoredExperience {
   return {
     record: toExperienceRecord(entry.record),
     similarity: entry.similarity,
-    weight: entry.weight
+    weight: entry.weight,
+    ...(entry.driftWeight === undefined ? {} : { driftWeight: entry.driftWeight })
   };
 }
 
@@ -242,7 +265,11 @@ function parseLog(
       level: 'warn',
       code: 'experience_store_truncated_tail',
       message:
-        'ignored a torn trailing line of ' + String(lastLine.length) + ' byte(s) without a terminating newline'
+        // JINFRA-11: bytes on disk (UTF-8), not UTF-16 code units - the log is
+        // read as a string, so lastLine.length would undercount CJK tails.
+        'ignored a torn trailing line of ' +
+        String(Buffer.byteLength(lastLine, 'utf8')) +
+        ' byte(s) without a terminating newline'
     });
   }
   return out;
@@ -267,46 +294,63 @@ export async function createJsonlExperienceStore(
 
   const emit = (diagnostic: ExperienceStoreDiagnostic): void => {
     diagnostics.push(diagnostic);
+    if (diagnostics.length > MAX_STORE_DIAGNOSTICS) {
+      diagnostics.splice(0, diagnostics.length - MAX_STORE_DIAGNOSTICS);
+    }
     options.onDiagnostic?.(diagnostic);
+  };
+
+  // JINFRA-2 (P1-2): the mutation mutex. Ops are chained so that the snapshot a
+  // rewrite takes and the rename it commits cannot be split by an interleaved
+  // append; see the module header for the failure this closes.
+  let mutationQueue: Promise<unknown> = Promise.resolve();
+  const serialize = <T>(operation: () => Promise<T>): Promise<T> => {
+    const next = mutationQueue.then(operation);
+    mutationQueue = next.catch(() => undefined);
+    return next;
   };
 
   const store: JsonlExperienceStore = {
     filePath,
 
     async load(): Promise<number> {
-      let text: string | undefined;
-      try {
-        text = await fileFs.readText(filePath);
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        emit({
-          level: 'warn',
-          code: 'experience_store_unreadable',
-          message: 'could not read the experience log: ' + reason
-        });
-        return index.size();
-      }
-      if (text === undefined) {
-        return index.size();
-      }
-      const records = parseLog(text, emit);
-      for (const record of records) {
-        index.insert(record);
-      }
-      return records.length;
+      return serialize(async (): Promise<number> => {
+        let text: string | undefined;
+        try {
+          text = await fileFs.readText(filePath);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          emit({
+            level: 'warn',
+            code: 'experience_store_unreadable',
+            message: 'could not read the experience log: ' + reason
+          });
+          return index.size();
+        }
+        if (text === undefined) {
+          return index.size();
+        }
+        const records = parseLog(text, emit);
+        for (const record of records) {
+          index.insert(record);
+        }
+        return records.length;
+      });
     },
 
     async append(records: readonly ExperienceRecord[]): Promise<void> {
-      const normalized = normalizeExperienceRecords(records);
-      if (normalized.length === 0) {
-        return;
-      }
-      // Durable first: the index only changes once the bytes are on disk, so a
-      // failed append can never diverge from the log.
-      await fileFs.appendDurable(filePath, normalized.map(encodeRecord).join(''));
-      for (const record of normalized) {
-        index.insert(record);
-      }
+      return serialize(async (): Promise<void> => {
+        const normalized = normalizeExperienceRecords(records);
+        if (normalized.length === 0) {
+          return;
+        }
+        // Durable first: the index only changes once the bytes are on disk, so a
+        // failed append can never diverge from the log.
+        await fileFs.appendDurable(filePath, normalized.map(encodeRecord).join(''));
+        for (const record of normalized) {
+          index.insert(record);
+        }
+      });
     },
 
     async query(query: ExperienceQuery): Promise<readonly ScoredExperience[]> {
@@ -319,62 +363,68 @@ export async function createJsonlExperienceStore(
     },
 
     async compact(options2: { readonly maxPerBucket: number; readonly halfLifeMs?: number }): Promise<number> {
-      const removed = planCompaction(index.snapshotDescending(), {
-        maxPerBucket: options2.maxPerBucket,
-        ...(options2.halfLifeMs === undefined ? {} : { halfLifeMs: options2.halfLifeMs }),
-        now: now()
+      return serialize(async (): Promise<number> => {
+        const removed = planCompaction(index.snapshotDescending(), {
+          maxPerBucket: options2.maxPerBucket,
+          ...(options2.halfLifeMs === undefined ? {} : { halfLifeMs: options2.halfLifeMs }),
+          now: now()
+        });
+        if (removed.length === 0) {
+          return 0;
+        }
+        const removedIds = new Set(removed.map((record) => record.id));
+        const survivors = index.snapshotDescending().filter((record) => !removedIds.has(record.id));
+        await fileFs.replaceAtomic(filePath, survivors.map(encodeRecord).join(''));
+        for (const record of removed) {
+          index.remove(record.id);
+        }
+        emit({
+          level: 'info',
+          code: 'experience_store_compacted',
+          message: 'compaction removed ' + String(removed.length) + ' record(s)'
+        });
+        return removed.length;
       });
-      if (removed.length === 0) {
-        return 0;
-      }
-      const removedIds = new Set(removed.map((record) => record.id));
-      const survivors = index.snapshotDescending().filter((record) => !removedIds.has(record.id));
-      await fileFs.replaceAtomic(filePath, survivors.map(encodeRecord).join(''));
-      for (const record of removed) {
-        index.remove(record.id);
-      }
-      emit({
-        level: 'info',
-        code: 'experience_store_compacted',
-        message: 'compaction removed ' + String(removed.length) + ' record(s)'
-      });
-      return removed.length;
     },
 
     async purge(purgeOptions: { readonly bucket?: string } = {}): Promise<number> {
-      const snapshot = index.snapshotDescending();
-      const removed =
-        purgeOptions.bucket === undefined
-          ? snapshot
-          : snapshot.filter((record) => record.bucket === purgeOptions.bucket);
-      // An unknown bucket is a strict no-op: no rewrite, no diagnostic.
-      if (purgeOptions.bucket !== undefined && removed.length === 0) {
-        return 0;
-      }
-      const removedIds = new Set(removed.map((record) => record.id));
-      const survivors = snapshot.filter((record) => !removedIds.has(record.id));
-      // Global purge also rewrites an empty log, clearing torn/stale bytes.
-      if (removed.length > 0 || purgeOptions.bucket === undefined) {
-        await fileFs.replaceAtomic(filePath, survivors.map(encodeRecord).join(''));
-      }
-      for (const record of removed) {
-        index.remove(record.id);
-      }
-      emit({
-        level: 'info',
-        code: 'experience_store_purged',
-        message:
-          'purge removed ' +
-          String(removed.length) +
-          ' record(s)' +
-          (purgeOptions.bucket === undefined ? ' from every bucket' : ' from one bucket')
+      return serialize(async (): Promise<number> => {
+        const snapshot = index.snapshotDescending();
+        const removed =
+          purgeOptions.bucket === undefined
+            ? snapshot
+            : snapshot.filter((record) => record.bucket === purgeOptions.bucket);
+        // An unknown bucket is a strict no-op: no rewrite, no diagnostic.
+        if (purgeOptions.bucket !== undefined && removed.length === 0) {
+          return 0;
+        }
+        const removedIds = new Set(removed.map((record) => record.id));
+        const survivors = snapshot.filter((record) => !removedIds.has(record.id));
+        // Global purge also rewrites an empty log, clearing torn/stale bytes.
+        if (removed.length > 0 || purgeOptions.bucket === undefined) {
+          await fileFs.replaceAtomic(filePath, survivors.map(encodeRecord).join(''));
+        }
+        for (const record of removed) {
+          index.remove(record.id);
+        }
+        emit({
+          level: 'info',
+          code: 'experience_store_purged',
+          message:
+            'purge removed ' +
+            String(removed.length) +
+            ' record(s)' +
+            (purgeOptions.bucket === undefined ? ' from every bucket' : ' from one bucket')
+        });
+        return removed.length;
       });
-      return removed.length;
     },
 
     async flush(): Promise<void> {
-      const survivors = index.snapshotDescending();
-      await fileFs.replaceAtomic(filePath, survivors.map(encodeRecord).join(''));
+      return serialize(async (): Promise<void> => {
+        const survivors = index.snapshotDescending();
+        await fileFs.replaceAtomic(filePath, survivors.map(encodeRecord).join(''));
+      });
     },
 
     export(): AsyncIterable<ExperienceRecord> {

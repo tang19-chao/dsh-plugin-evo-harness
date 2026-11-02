@@ -21,12 +21,15 @@
  *      frozen recipe in `scripts/build-manifest.mjs`) and the same artifact
  *      sha256/bytes. A stamp that is missing, unreadable or describes other
  *      bytes FAILS with named reasons (`artifact-missing`, `stamp-missing`,
- *      `stamp-invalid`, `src-tree-mismatch`, `artifact-mismatch`) instead of
- *      letting an expired artifact pass the import smoke test. With
- *      `--skip-build` the SAME check runs, so an old `lib/` can no longer be
- *      certified by skipping the build;
+ *      `stamp-invalid`, `src-tree-mismatch`, `dependency-mismatch`,
+ *      `artifact-mismatch`, `commit-mismatch`) instead of letting an expired
+ *      artifact pass the import smoke test. With `--skip-build` the SAME check
+ *      runs, so an old `lib/` can no longer be certified by skipping the build;
  *   3. imports it with a plain `node` ESM import and asserts the documented
- *      public surface is present and callable;
+ *      public surface is present and callable - including the DEFAULT export
+ *      the host mount actually calls (cordis.patch.yml: "DSH resolves the entry
+ *      by the Node-resolvable package name below ... then calls its default
+ *      `{ name, inject, Config, apply }` export");
  *   4. asserts the import is side-effect-free enough to load without a host:
  *      importing must not throw, and `apply`/`createEvoHarnessPlugin` must be
  *      functions (the Cordis entry points);
@@ -214,6 +217,65 @@ export async function smokeBuild(options = {}) {
     return { ok: false, steps, exportCount: names.length, bytes, stale: false, freshness };
   }
   steps.push({ step: 'plugin-name', ok: true, detail: 'PLUGIN_NAME matches package name' });
+
+  // ---- default export (the mount surface, rev6 cross-audit GATE-1) ---------
+  // cordis.patch.yml mounts the plugin through its DEFAULT export: "DSH
+  // resolves the entry by the Node-resolvable package name below ... then
+  // calls its default `{ name, inject, Config, apply }` export"
+  // (src/index.ts: `export const plugin = { name: PLUGIN_NAME, inject,
+  // Config, apply }; export default plugin;`). A bundle that drops or
+  // reshapes the default export would pass every named-export check above
+  // while breaking exactly the mount path this gate exists to protect, so the
+  // default object is asserted member-by-member against the named exports.
+  const pluginDefault = namespace.default;
+  if (pluginDefault === null || typeof pluginDefault !== 'object') {
+    steps.push({
+      step: 'default-export',
+      ok: false,
+      detail:
+        'the default export is ' +
+        (pluginDefault === null ? 'null' : typeof pluginDefault) +
+        ', expected the { name, inject, Config, apply } plugin object (cordis.patch.yml mount contract)'
+    });
+    return { ok: false, steps, exportCount: names.length, bytes, stale: false, freshness };
+  }
+  const expectedDefaultMembers = {
+    name: namespace.PLUGIN_NAME,
+    inject: namespace.inject,
+    Config: namespace.Config,
+    apply: namespace.apply
+  };
+  // Two failures, named separately: a member can be ABSENT from the default
+  // object while the named export exists (the bundle dropped it), and an
+  // absent member would otherwise compare `undefined === undefined` and pass
+  // silently - exactly the shape of gap the round-2 audit found for `inject`.
+  const absent = Object.keys(expectedDefaultMembers).filter((member) => !(member in pluginDefault));
+  const drifted = Object.keys(expectedDefaultMembers).filter(
+    (member) => member in pluginDefault && pluginDefault[member] !== expectedDefaultMembers[member]
+  );
+  if (absent.length > 0 || drifted.length > 0) {
+    const problems = [];
+    if (absent.length > 0) {
+      problems.push('absent from the default export: ' + absent.join(', '));
+    }
+    if (drifted.length > 0) {
+      problems.push('not matching the named exports: ' + drifted.join(', '));
+    }
+    steps.push({
+      step: 'default-export',
+      ok: false,
+      detail:
+        'default export member(s) ' +
+        problems.join('; ') +
+        ' (cordis.patch.yml default { name, inject, Config, apply })'
+    });
+    return { ok: false, steps, exportCount: names.length, bytes, stale: false, freshness };
+  }
+  steps.push({
+    step: 'default-export',
+    ok: true,
+    detail: 'default export is the { name, inject, Config, apply } plugin object matching the named exports'
+  });
 
   return { ok: steps.every((step) => step.ok), steps, exportCount: names.length, bytes, stale: false, freshness };
 }

@@ -221,7 +221,9 @@ export class PolicyStore {
   private readonly diagnosticsSink: string[] = [];
   private readonly quarantinePaths: string[] = [];
   private currentValue: MetaSearchPolicy | undefined;
-  private historyValue: MetaSearchPolicy[] = [];
+  // Records (not bare policies) so a history trim can rewrite them verbatim
+  // and keep the original acceptance timestamps (DREAM-7).
+  private historyRecords: PolicyRevisionRecord[] = [];
   private countersValue: PersistedCounters;
   private queue: Promise<void> = Promise.resolve();
 
@@ -254,7 +256,7 @@ export class PolicyStore {
     const history = await readJsonlRecovering(store.historyPath, (value) =>
       parseRevisionRecord(value)
     );
-    store.historyValue = history.records.map((record) => record.policy).slice(-store.maxHistory);
+    store.historyRecords = history.records.slice(-store.maxHistory);
     store.collectRecovery(history.quarantinedPath, history.diagnostics);
 
     const counters = await readJsonRecovering(store.countersPath, parseCounters);
@@ -287,7 +289,7 @@ export class PolicyStore {
 
   /** Accepted revisions, oldest first. */
   get history(): readonly MetaSearchPolicy[] {
-    return this.historyValue;
+    return this.historyRecords.map((record) => record.policy);
   }
 
   /** Current counter snapshot. */
@@ -318,24 +320,16 @@ export class PolicyStore {
       at: this.now(),
       policy
     };
-    this.historyValue.push(policy);
+    this.historyRecords.push(record);
     await this.enqueue(async () => {
       await appendFileDurable(this.historyPath, encodeJsonlRecord(record));
-      if (this.historyValue.length > this.maxHistory) {
-        const retained = this.historyValue.slice(-this.maxHistory);
-        await writeFileAtomic(
-          this.historyPath,
-          retained
-            .map((entry) =>
-              encodeJsonlRecord({
-                schemaVersion: PERSISTENCE_SCHEMA_VERSION,
-                at: this.now(),
-                policy: entry
-              } satisfies PolicyRevisionRecord)
-            )
-            .join('')
-        );
-        this.historyValue = retained;
+      if (this.historyRecords.length > this.maxHistory) {
+        // The trim rewrites the retained records verbatim, so the audit log
+        // keeps the original acceptance timestamps instead of being re-stamped
+        // with the compaction time (DREAM-7).
+        const retained = this.historyRecords.slice(-this.maxHistory);
+        await writeFileAtomic(this.historyPath, retained.map(encodeJsonlRecord).join(''));
+        this.historyRecords = retained;
       }
     });
   }
@@ -355,15 +349,15 @@ export class PolicyStore {
     if (this.currentValue !== undefined) {
       return this.currentValue;
     }
-    const last = this.historyValue[this.historyValue.length - 1];
+    const last = this.historyRecords[this.historyRecords.length - 1];
     if (last !== undefined) {
       this.pushDiagnostic(
         'persistence: no current policy snapshot was found; resumed the newest persisted revision ' +
-          last.id +
+          last.policy.id +
           '@' +
-          String(last.version)
+          String(last.policy.version)
       );
-      return last;
+      return last.policy;
     }
     return fallback ?? createDefaultPolicy({}, this.now);
   }

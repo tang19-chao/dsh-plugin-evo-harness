@@ -762,6 +762,29 @@ describe('host advisor: state, query and drift seams', () => {
     }
   });
 
+  it('stops the stale-policy penalty once the window holds k current-policy records', async () => {
+    // A foreign seam (no store-side driftWeight): k=2 current-policy records
+    // plus one stale record. The penalty must stop (driftFactorFor's
+    // saturation rule) so the stale record keeps its weight and stays
+    // evidenced; without the stop, rho=0 would zero it out and silently drop
+    // its actionKey.
+    const config = enabledConfig();
+    config.k = 2;
+    const neighbors = scored([
+      makeRecord({ id: 'c1', actionKey: 'read', value: 2 }),
+      makeRecord({ id: 'c2', actionKey: 'read', value: 2 }),
+      makeRecord({ id: 's1', actionKey: 'edit', value: -2, policyId: 'policy-old' })
+    ]);
+    const advisor = createHostAdvisor({ config, store: stubStore(neighbors, []) });
+    const decision = await advisor.evaluate(
+      makeRequest({ policyId: 'policy-current', driftRho: 0 })
+    );
+    expect(decision.kind).toBe('advisory');
+    if (decision.kind === 'advisory') {
+      expect(decision.diagnostics?.actionKey).toBe('edit');
+    }
+  });
+
   it('reuses an injected snapshot retriever instead of the store', async () => {
     const storeCalls: ExperienceQuery[] = [];
     const retrieverCalls = { n: 0 };
@@ -820,6 +843,23 @@ describe('host advisor: diagnostics surface', () => {
       // P6.1-B2: zero body - not even a redacted remnant of it.
       expect(line).toBe('retrieval_failed: class=error');
     }
+  });
+
+  it('JINFRA-12: keeps only the newest 100 diagnostic lines', async () => {
+    const advisor = createHostAdvisor({ config: enabledConfig() });
+    // 30 decision points with a valid request but no experience source...
+    for (let index = 0; index < 30; index += 1) {
+      await advisor.evaluate(makeRequest());
+    }
+    // ...then 80 the advisor cannot even read: 110 lines in total, so the
+    // ring must drop the 10 oldest no_experience_source lines.
+    for (let index = 0; index < 80; index += 1) {
+      await advisor.evaluate({} as unknown as HostAdvisorRequest);
+    }
+    const diagnostics = advisor.diagnostics();
+    expect(diagnostics).toHaveLength(100);
+    expect(diagnostics.filter((line) => line.startsWith('no_experience_source'))).toHaveLength(20);
+    expect(diagnostics.filter((line) => line.startsWith('invalid_request'))).toHaveLength(80);
   });
 });
 

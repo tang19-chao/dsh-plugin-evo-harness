@@ -35,6 +35,10 @@ export interface UsageAccountingReport {
   readonly unknown: CostProvenanceBucket;
   /** Calls whose cacheRead dimension is unknown (not a measured zero). */
   readonly cacheReadUnknownCalls: number;
+  /** Calls whose cacheWrite dimension is unknown (not a measured zero, LEDGER-10). */
+  readonly cacheWriteUnknownCalls: number;
+  /** Calls whose reasoning is separately billed but was never reported (LEDGER-10). */
+  readonly reasoningUnknownCalls: number;
   /** Convenience totals: identical to the buckets' costMicros, kept explicit. */
   readonly measuredCostMicros: number;
   readonly estimatedCostMicros: number;
@@ -45,7 +49,7 @@ function emptyBucket(): { calls: number; costMicros: number } {
   return { calls: 0, costMicros: 0 };
 }
 
-function summarize(costs: readonly CostCalculation[], cacheReadUnknown: number): UsageAccountingReport {
+function summarize(costs: readonly CostCalculation[]): UsageAccountingReport {
   const buckets: Record<MeasurementPrecision, { calls: number; costMicros: number }> = {
     measured: emptyBucket(),
     estimated: emptyBucket(),
@@ -63,13 +67,19 @@ function summarize(costs: readonly CostCalculation[], cacheReadUnknown: number):
     costMicros: bucket.costMicros,
     share: totalCalls === 0 ? 0 : bucket.calls / totalCalls
   });
+  // Per-dimension unknowns (LEDGER-10): the flags live on the cost object, so
+  // the counts are derived from exactly the costs the buckets above summarize.
+  const countFlag = (flag: (cost: CostCalculation) => boolean): number =>
+    costs.filter(flag).length;
   return {
     totalCalls,
     totalCostMicros,
     measured: withShare(buckets.measured),
     estimated: withShare(buckets.estimated),
     unknown: withShare(buckets.unknown),
-    cacheReadUnknownCalls: cacheReadUnknown,
+    cacheReadUnknownCalls: countFlag((cost) => cost.cacheReadUnavailable === true),
+    cacheWriteUnknownCalls: countFlag((cost) => cost.cacheWriteUnavailable === true),
+    reasoningUnknownCalls: countFlag((cost) => cost.reasoningUnavailable === true),
     measuredCostMicros: buckets.measured.costMicros,
     estimatedCostMicros: buckets.estimated.costMicros,
     unknownCostMicros: buckets.unknown.costMicros
@@ -80,19 +90,30 @@ function summarize(costs: readonly CostCalculation[], cacheReadUnknown: number):
 export function summarizeUsageAccounting(
   events: readonly UsageLedgerEvent[]
 ): UsageAccountingReport {
-  const costs = events.map((event) => event.cost);
-  const cacheReadUnknownCalls = events.filter(
-    (event) => event.cost.cacheReadUnavailable === true
-  ).length;
-  return summarize(costs, cacheReadUnknownCalls);
+  // LEDGER-4 (audit rounds 1+2): `ledgerEvents` holds ONE EVENT PER
+  // settle/reconcile, and a reconciliation event carries the FULL new total
+  // (replacement semantics). Summing events therefore double-counted every
+  // reconciled call: an interim settle (1,000u) plus its reconcile (3,000u)
+  // reported 4,000u against a pool that had only ever booked 3,000u, and the
+  // buckets counted events where the field names promise calls. Aggregate by
+  // callId keeping only the LATEST event per call — the same `bookedByCall`
+  // idea the metered adapter uses because "summing the per-call records would
+  // double count" — so the report equals what the pools booked. "Latest" is the
+  // event appended last (booking order): reconcile is always pushed after the
+  // settle it replaces, never before.
+  const latestByCall = new Map<string, UsageLedgerEvent>();
+  for (const event of events) {
+    latestByCall.set(event.callId, event);
+  }
+  const latestEvents = [...latestByCall.values()];
+  return summarize(latestEvents.map((event) => event.cost));
 }
 
 /** Build the report directly from cost calculations (tests / non-event paths). */
 export function summarizeCostProvenance(
   costs: readonly CostCalculation[]
 ): UsageAccountingReport {
-  const cacheReadUnknownCalls = costs.filter((cost) => cost.cacheReadUnavailable === true).length;
-  return summarize(costs, cacheReadUnknownCalls);
+  return summarize(costs);
 }
 
 /**
@@ -127,6 +148,11 @@ export function validateUsageAccountingReport(
   }
   if (report.cacheReadUnknownCalls < 0 || report.cacheReadUnknownCalls > report.totalCalls) {
     issues.push('cacheReadUnknownCalls out of range');
+  }
+  for (const field of ['cacheWriteUnknownCalls', 'reasoningUnknownCalls'] as const) {
+    if (report[field] < 0 || report[field] > report.totalCalls) {
+      issues.push(field + ' out of range');
+    }
   }
   return issues;
 }

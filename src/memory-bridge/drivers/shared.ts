@@ -15,6 +15,57 @@ import type {
 } from '../spi';
 import { collectText, parseToolPayload } from '../spi';
 
+/**
+ * Declared JSON-Schema type of one tool property, when the tool publishes its
+ * input schema (MEM-3): resolveFields matches property NAMES only, so the
+ * drivers need the declared type to avoid handing a JSON array to a filter
+ * field the backend declares as a scalar string.
+ */
+export function declaredPropertyType(
+  context: MemoryDriverContext,
+  tool: string | undefined,
+  property: string
+): string | undefined {
+  if (tool === undefined) {
+    return undefined;
+  }
+  const descriptor = context.tools.find((entry) => entry.name === tool);
+  const properties = descriptor?.inputSchema?.properties;
+  if (properties === null || typeof properties !== 'object' || Array.isArray(properties)) {
+    return undefined;
+  }
+  const spec = (properties as Record<string, unknown>)[property];
+  const type = spec !== null && typeof spec === 'object' ? (spec as Record<string, unknown>).type : undefined;
+  return typeof type === 'string' ? type : undefined;
+}
+
+/**
+ * Issue the recall call(s) for one namespace filter field, conforming to the
+ * backend's declared schema (MEM-3). When the resolved field is array-typed, a
+ * single call carries every visible namespace; otherwise — the common
+ * mem0/supermemory scalar shape, and the no-schema case where an array would
+ * simply be rejected — one call per namespace is issued with a SCALAR filter,
+ * so a branch scope never sends an array where the schema declares a string
+ * (and never silently narrows to the primary namespace either).
+ * Returns the tool results in call order.
+ */
+export async function recallNamespaceScoped(
+  context: MemoryDriverContext,
+  tool: string,
+  namespaceField: string,
+  namespaces: readonly string[],
+  build: (namespaceFilter: JsonValue) => JsonObject
+): Promise<readonly McpToolCallResult[]> {
+  if (declaredPropertyType(context, tool, namespaceField) === 'array') {
+    return [await context.call(tool, build([...namespaces]))];
+  }
+  const results: McpToolCallResult[] = [];
+  for (const namespace of namespaces) {
+    results.push(await context.call(tool, build(namespace)));
+  }
+  return results;
+}
+
 /** Resolved argument field names for one MCP tool. */
 export interface DriverFields {
   readonly query: string;
@@ -173,4 +224,23 @@ export function detectBackendRejection(
 /** Serialized payload of a tool call, or undefined. */
 export function payloadOf(result: McpToolCallResult | undefined): JsonValue | undefined {
   return parseToolPayload(result);
+}
+
+/**
+ * Collapse records that more than one per-namespace call returned (a backend
+ * that ignores the namespace filter answers every call with the same store),
+ * keeping the first occurrence like collectLessonRecords does within a payload.
+ */
+export function dedupeRecordsById(records: readonly DriverLessonRecord[]): DriverLessonRecord[] {
+  const seen = new Set<string>();
+  const result: DriverLessonRecord[] = [];
+  for (const record of records) {
+    const key = record.namespace + '#' + record.lesson.id;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(record);
+  }
+  return result;
 }

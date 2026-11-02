@@ -23,6 +23,8 @@
  */
 
 import type { EvoHarnessConfig, JitRlConfig } from '../config';
+// LEDGER-9: the metering wiring shape shared by the probe and judge stages.
+import type { MeteredModelOptions } from '../dsh-bridge/metered-model-adapter';
 import { BATCH_SLOT_KINDS } from '../types/contracts';
 import type {
   AbstractState,
@@ -128,6 +130,13 @@ export interface JitRlFactoryOptions {
   readonly rng?: () => number;
   /** Optional model adapter for the token logprob probe and the step judge. */
   readonly model?: IModelAdapter;
+  /**
+   * P3-B metering wiring for the two model-consuming stages (LEDGER-9): the
+   * logit capability probe and the LLM step judge. Absent keeps the previous
+   * behaviour — the calls are recorded in the registry with provenance 'none'
+   * but never reserved or settled in any ledger.
+   */
+  readonly metering?: MeteredModelOptions;
   /** Surrogate value provider adapted from ISurrogateScorer by the caller. */
   readonly surrogate?: (
     trajectory: Parameters<IStepEvaluator['evaluate']>[0],
@@ -332,6 +341,7 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
       logitSource = createAutoLogitSource({
         logitSource: jitrl.logitSource,
         ...(options.model === undefined ? {} : { model: options.model }),
+        ...(options.metering === undefined ? {} : { metering: options.metering }),
         capabilities
       });
     }
@@ -342,6 +352,9 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
     reward: jitrl.reward,
     privacy: jitrl.privacy,
     ...(options.model === undefined ? {} : { model: options.model }),
+    // LEDGER-9: the judge's provider calls reserve/settle like the other five
+    // stages instead of bypassing every ledger.
+    ...(options.metering === undefined ? {} : { metering: options.metering }),
     ...(options.surrogate === undefined ? {} : { surrogate: options.surrogate }),
     clock: now,
     rng

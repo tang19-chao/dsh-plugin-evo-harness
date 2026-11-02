@@ -27,12 +27,13 @@
  *   node scripts/host-smoke/run.mjs --no-write     # run, print, do not copy
  *   node scripts/host-smoke/run.mjs --force        # ONLY to replace the frozen rc1
  *
- * NOTE (t31, from t30 finding): rc1 (`docs/reports/p61-host-smoke-rc.md`) AND
- * rc2 (`docs/reports/host-smoke-rc2.md`) are BOTH frozen evidence and must not be
- * used as an `--out` target. The guard in ./report-path.mjs currently protects
- * rc1 only (`FROZEN_RC1_RELATIVE`); `RC2_RELATIVE` is exported but not consulted
- * by the guard, so nothing stops an accidental write to rc2 except this note.
- * Treat both paths as read-only.
+ * NOTE (updated by the rev6 cross-audit CI-5; the t31 wording was stale):
+ * rc1 (`docs/reports/p61-host-smoke-rc.md`) AND rc2
+ * (`docs/reports/host-smoke-rc2.md`) are BOTH frozen evidence and must not be
+ * used as an `--out` target. This is enforced, not just noted: the guard in
+ * ./report-path.mjs consults the whole `FROZEN_REPORT_RELATIVES` list (the
+ * t33 fix), so an accidental write to either path is refused unless `--force`
+ * is passed. Treat both paths as read-only.
  */
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -40,6 +41,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
+import { killProcessTree } from './kill-tree.mjs';
 import { assertReportTargetWritable, parseReportArgs, resolveReportPath } from './report-path.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -200,13 +202,20 @@ async function buildApplyBundle(outFile) {
  * Run the in-host smoke with a hard deadline.
  *
  * The deadline is enforced here rather than inside the harness so a hung host
- * call cannot consume the whole budget: the child is killed and the run is
- * recorded as `not-run: deadline`.
+ * call cannot consume the whole budget: the child's WHOLE process tree is
+ * killed (`killProcessTree`, rev6 CI-4 - the in-host smoke spawns the MCP
+ * backend as a grandchild, which a single-pid `child.kill()` left orphaned)
+ * and the run is recorded as `not-run: deadline`.
+ *
+ * On POSIX the child is spawned `detached` so it leads a process group the
+ * reaper can signal; on win32 `taskkill /T /F` walks the OS parent-child tree,
+ * so no detachment is needed.
  */
 function runInHost(input) {
   return new Promise((resolve) => {
     const child = spawn(input.executable, [input.inHostScript], {
       cwd: input.cwd,
+      detached: process.platform !== 'win32',
       env: {
         ...process.env,
         ELECTRON_RUN_AS_NODE: '1',
@@ -239,6 +248,9 @@ function runInHost(input) {
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
+      killProcessTree(child.pid);
+      // Belt and braces: if the tree reaper could not act (taskkill missing,
+      // group already gone), still signal the direct child exactly as before.
       child.kill();
     }, input.timeoutMs);
 

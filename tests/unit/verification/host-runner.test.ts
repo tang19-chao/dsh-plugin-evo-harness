@@ -345,3 +345,49 @@ describe('c2a host runner: artifact extraction and side channels', () => {
     }
   });
 });
+
+/**
+ * VERIF-8 (audit round 1 + round 2): the attach side resolves its race at the
+ * seam deadline while the runner keeps working - and the old runner registered
+ * its receipt whenever it EVENTUALLY settled, making a runner-timeout decision
+ * reversible by a retry. A request that declares `deadlineAt` must therefore
+ * discard its late result, and the abandoned key stays closed.
+ */
+describe('c2a host runner: VERIF-8 late receipts are discarded, not registered', () => {
+  const base = {
+    sessionId: 's',
+    trajectoryId: 'traj-deadline',
+    role: 'candidate' as const,
+    taskId: 'task-c2a',
+    executionStatus: 'succeeded' as const,
+    artifact: { content: '{"ok":true}', producedFiles: [] }
+  };
+
+  it('a timely verification registers exactly as before (deadline in the future)', async () => {
+    const host = runner();
+    const outcome = await host.verify({ runId: 'run-deadline-ok', ...base, deadlineAt: Date.now() + 60_000 });
+    expect(outcome.receipt).toBeDefined();
+    expect(outcome.reasonCode).toBeUndefined();
+    expect(host.size).toBe(1);
+  });
+
+  it('a receipt computed after the deadline fired is discarded and never registered', async () => {
+    const host = runner();
+    const outcome = await host.verify({ runId: 'run-deadline-late', ...base, deadlineAt: Date.now() - 1 });
+    expect(outcome.receipt).toBeUndefined();
+    expect(outcome.reasonCode).toBe('runner-timeout');
+    expect(host.size).toBe(0);
+    expect(host.receiptFor('run-deadline-late', 'traj-deadline', 'candidate')).toBeUndefined();
+  });
+
+  it('a runner-timeout decision is irreversible: a retry of an abandoned key refuses too', async () => {
+    const host = runner();
+    await host.verify({ runId: 'run-deadline-abandon', ...base, deadlineAt: Date.now() - 1 });
+    // A later re-verification of the same key gets the refusal again - it can
+    // never find (and attach) a receipt the deadline abandoned.
+    const retry = await host.verify({ runId: 'run-deadline-abandon', ...base });
+    expect(retry.receipt).toBeUndefined();
+    expect(retry.reasonCode).toBe('runner-timeout');
+    expect(host.size).toBe(0);
+  });
+});

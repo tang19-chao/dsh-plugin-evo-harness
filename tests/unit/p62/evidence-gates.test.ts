@@ -559,6 +559,9 @@ describe('PR-1 build/ESM smoke gate', () => {
     expect(steps).toContain('esm-import');
     expect(steps).toContain('required-exports');
     expect(steps).toContain('entrypoints-callable');
+    // rev6 GATE-1: the DEFAULT export the host mount calls (cordis.patch.yml
+    // `{ name, inject, Config, apply }`) is asserted on the real bundle too.
+    expect(steps).toContain('default-export');
   }, 300_000);
 
   it('FAILS on a missing artifact instead of reporting success', async () => {

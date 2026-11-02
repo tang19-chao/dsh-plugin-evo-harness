@@ -156,6 +156,14 @@ export interface HostVerificationRequest {
   /** Execution status as recorded by the collector (never rewritten here). */
   readonly executionStatus: TrajectoryStatus;
   readonly artifact: HostArtifact | undefined;
+  /**
+   * VERIF-8: epoch-ms instant the attach side raced this request against (the
+   * seam's `timeoutMs`). A runner still working past it must DISCARD its
+   * result - never register the receipt - so a `runner-timeout` decision is
+   * irreversible rather than silently reversed by the late work. Absent means
+   * no deadline was declared.
+   */
+  readonly deadlineAt?: number;
 }
 
 /** The runner's answer: either a receipt, or a bounded refusal reason. */

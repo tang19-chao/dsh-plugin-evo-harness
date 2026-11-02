@@ -6,7 +6,14 @@
  */
 
 import type { MemoryBackendCapabilities } from '../../types/contracts';
-import { detectBackendRejection, lessonDocument, recordsFromPayload, resolveFields } from './shared';
+import {
+  dedupeRecordsById,
+  detectBackendRejection,
+  lessonDocument,
+  recallNamespaceScoped,
+  recordsFromPayload,
+  resolveFields
+} from './shared';
 import type {
   IMemoryDriver,
   JsonObject,
@@ -49,27 +56,41 @@ export function createTemporalGraphDriver(binding: MemoryDriverToolBinding): IMe
     ): Promise<MemoryDriverRecallOutput> {
       const fields = resolveFields(context, binding.recall);
       const windowStartMs = input.now - TEMPORAL_WINDOW_DAYS * 24 * 60 * 60 * 1000;
-      const args: JsonObject = { [fields.query]: input.fingerprint };
-      args[fields.limit] = input.limit;
-      args[fields.namespace] = input.namespaces.length > 1 ? [...input.namespaces] : input.namespace;
-      if (context.schemaProperties.get(binding.recall)?.has('group_ids') === true) {
-        args.group_ids = [...input.namespaces];
-      }
-      if (context.schemaProperties.get(binding.recall)?.has('start_time') === true) {
-        args.start_time = new Date(windowStartMs).toISOString();
-      }
-      const result = await context.call(binding.recall, args);
-      const records = recordsFromPayload(parseToolPayload(result), {
-        namespace: input.namespace,
-        limit: input.limit
+      // MEM-3: one scalar-filtered call per visible namespace unless the tool
+      // declares the filter field as an array. The array-typed group_ids window
+      // (declared by graphiti-style schemas) still carries every namespace.
+      const declaredProps = context.schemaProperties.get(binding.recall);
+      const results = await recallNamespaceScoped(context, binding.recall, fields.namespace, input.namespaces, (
+        namespaceFilterValue
+      ) => {
+        const args: JsonObject = { [fields.query]: input.fingerprint };
+        args[fields.limit] = input.limit;
+        args[fields.namespace] = namespaceFilterValue;
+        if (declaredProps?.has('group_ids') === true) {
+          args.group_ids = [...input.namespaces];
+        }
+        if (declaredProps?.has('start_time') === true) {
+          args.start_time = new Date(windowStartMs).toISOString();
+        }
+        return args;
       });
+      const records: ReturnType<typeof recordsFromPayload> = [];
+      for (const result of results) {
+        records.push(
+          ...recordsFromPayload(parseToolPayload(result), {
+            namespace: input.namespace,
+            limit: input.limit
+          })
+        );
+      }
+      const deduped = dedupeRecordsById(records).slice(0, input.limit);
       return {
-        records,
+        records: deduped,
         diagnostics: [
           'temporal_graph recall via ' +
             binding.recall +
             ' returned ' +
-            records.length +
+            deduped.length +
             ' episode lesson(s) within ' +
             TEMPORAL_WINDOW_DAYS +
             ' days'

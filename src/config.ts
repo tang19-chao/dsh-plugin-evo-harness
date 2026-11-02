@@ -194,6 +194,16 @@ export interface JitRlPrivacyConfig {
  * candidateJitBetas / candidateJitLambdas are the hyperparameter perturbation
  * grids generateCandidatePolicies draws from; driftRho down-weights experience
  * written by a superseded policy after a hot swap.
+ *
+ * INT-3: `resolveJitPerturbationGrid` (src/dream-rsi/offline-dreamer.ts) has
+ * always swept TWO more axes - k and the similarity threshold - straight out of
+ * `config.jitrl.dream`, but this schema rejected them as `unknown_key`, so they
+ * were unreachable from configuration and pinned to the built-in grids. They are
+ * accepted here as OPTIONAL leaves (the same shape as the optional
+ * `jitrl.budget` leaf): absent means "not configured" and the dreamer applies
+ * DEFAULT_JIT_KS / DEFAULT_JIT_SIMILARITY_THRESHOLDS untouched, so the resolved
+ * grid and the documented default leaf set are unchanged for every existing
+ * host.
  */
 export interface JitRlDreamConfig {
   /** Down-weight factor for stale-policy experience, in [0, 1]. */
@@ -202,7 +212,15 @@ export interface JitRlDreamConfig {
   hyperparamPerturbation: boolean;
   /** Candidate beta grid; non-empty, every entry finite and >= 0. */
   candidateJitBetas: number[];
-  /** Candidate lambda grid; non-empty, every entry in [0, 1]. */
+  /** Optional candidate k grid; positive integers only (retriever precondition). */
+  readonly candidateJitKs?: readonly number[];
+  /** Optional candidate similarity-threshold grid; every entry in [0, 1]. */
+  readonly candidateJitSimilarityThresholds?: readonly number[];
+  /**
+   * @deprecated Not swept since P6 PR5 (see JIT_IGNORED_DIMENSIONS in
+   * src/dream-rsi/offline-dreamer.ts). Accepted and reported for
+   * compatibility, but never used to generate candidates.
+   */
   candidateJitLambdas: number[];
 }
 
@@ -452,6 +470,11 @@ const DEFAULT_CONFIG_VALUES: EvoHarnessConfig = {
       driftRho: 0.7,
       hyperparamPerturbation: true,
       candidateJitBetas: [0.5, 1, 2],
+      // INT-3: candidateJitKs / candidateJitSimilarityThresholds are OPTIONAL
+      // leaves with NO default entry (see JitRlDreamConfig), so this object -
+      // and therefore the documented 78-leaf configuration reference - is
+      // unchanged. Absent, the dreamer keeps DEFAULT_JIT_KS /
+      // DEFAULT_JIT_SIMILARITY_THRESHOLDS.
       candidateJitLambdas: [0.02, 0.05, 0.1]
     },
     privacy: { redactSecrets: true, storeRawText: false }
@@ -598,6 +621,10 @@ const JITRL_DREAM_KEYS = new Set<string>([
   'driftRho',
   'hyperparamPerturbation',
   'candidateJitBetas',
+  // INT-3: the dreamer's k/threshold sweep axes, now reachable from config.
+  'candidateJitKs',
+  'candidateJitSimilarityThresholds',
+  // Deprecated (not swept since P6 PR5) but still accepted for compatibility.
   'candidateJitLambdas'
 ]);
 const JITRL_LEVELS: readonly JitLevel[] = ['meta', 'proposal', 'host_tool'];
@@ -744,6 +771,53 @@ function validateEnum(
       'Expected one of: ' + allowed.join(', ') + '.',
       value
     );
+  }
+}
+
+/**
+ * Validate a non-empty array of finite INTEGER numbers, each inside [min, max]
+ * and unique. Used by the k axis of jitrl.dream: the retriever requires a
+ * positive integer k, so a fractional entry would be dropped by the dreamer
+ * (a silent no-op axis) and is rejected here instead.
+ */
+function validateIntegerArray(
+  value: unknown,
+  path: string,
+  min: number,
+  max: number,
+  issues: ConfigValidationIssue[]
+): void {
+  if (!Array.isArray(value)) {
+    pushIssue(issues, path, 'invalid_type', 'Expected an array of integers.', value);
+    return;
+  }
+  if (value.length === 0) {
+    pushIssue(issues, path, 'invalid_value', 'Expected at least 1 item(s).', value);
+    return;
+  }
+  const seen = new Set<number>();
+  for (let index = 0; index < value.length; index += 1) {
+    const item: unknown = value[index];
+    const itemPath = path + '[' + index + ']';
+    if (typeof item !== 'number' || !Number.isFinite(item) || !Number.isInteger(item)) {
+      pushIssue(issues, itemPath, 'invalid_type', 'Expected a finite integer.', item);
+      continue;
+    }
+    if (item < min || item > max) {
+      pushIssue(
+        issues,
+        itemPath,
+        'out_of_range',
+        'Expected an integer in [' + min + ', ' + max + '].',
+        item
+      );
+      continue;
+    }
+    if (seen.has(item)) {
+      pushIssue(issues, itemPath, 'duplicate_value', 'Duplicate value ' + item + '.', item);
+      continue;
+    }
+    seen.add(item);
   }
 }
 
@@ -1335,6 +1409,25 @@ function validateJitRlGroup(root: Record<string, unknown>, issues: ConfigValidat
       issues
     );
     validateNumberArray(dream.candidateJitBetas, 'jitrl.dream.candidateJitBetas', 0, 100, issues);
+    // INT-3: both sweep axes are OPTIONAL (a host that omits them keeps the
+    // dreamer's built-in grid), so they are validated only when written - the
+    // same rule `jitrl.budget` follows. A present value must still be legal:
+    // k is a positive integer (the retriever rejects anything else) and a
+    // threshold stays inside [0, 1].
+    if (dream.candidateJitKs !== undefined) {
+      validateIntegerArray(dream.candidateJitKs, 'jitrl.dream.candidateJitKs', 1, 1000, issues);
+    }
+    if (dream.candidateJitSimilarityThresholds !== undefined) {
+      validateNumberArray(
+        dream.candidateJitSimilarityThresholds,
+        'jitrl.dream.candidateJitSimilarityThresholds',
+        0,
+        1,
+        issues
+      );
+    }
+    // Deprecated leaf: still validated so a host that carries it forward gets
+    // the same fail-fast on an illegal value, but it never reaches a candidate.
     validateNumberArray(
       dream.candidateJitLambdas,
       'jitrl.dream.candidateJitLambdas',

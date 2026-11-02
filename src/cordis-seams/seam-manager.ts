@@ -141,6 +141,14 @@ export class CordisSeamManager implements ICordisSeamManager {
   private readonly permanentPatches = new Map<string, PermanentPatchRecord>();
   private sequence = 0;
   private disposed = false;
+  /** Branches that passed the limit check but have not registered yet (MEM-5). */
+  private pendingBranches = 0;
+  /**
+   * Branch ids claimed by calls still acquiring their branch (MEM-6): the
+   * namespace is a pure function of the branchId, so two concurrent calls with
+   * one id would share a namespace and one activeBranches slot.
+   */
+  private readonly claimedBranchIds = new Set<string>();
 
   constructor(options: CordisSeamManagerOptions) {
     if (options === null || options === undefined || options.host === undefined) {
@@ -231,12 +239,31 @@ export class CordisSeamManager implements ICordisSeamManager {
       return collector.finalize({ status: 'aborted', endedAt: this.now() });
     }
 
-    if (this.activeBranches.size >= this.maxConcurrentBranches) {
+    if (this.activeBranches.size + this.pendingBranches >= this.maxConcurrentBranches) {
       throw new CordisSeamError(
         'Concurrent probe branch limit (' + this.maxConcurrentBranches + ') reached.',
         { code: 'branch_limit_exceeded', branchId, patchId: request.patch.id }
       );
     }
+    // MEM-6: a caller-supplied branchId that a live (or in-flight) branch
+    // already uses is rejected instead of silently sharing its namespace and
+    // overwriting its activeBranches record. The claim is made synchronously
+    // with the check, mirroring the MEM-5 slot reservation.
+    if (this.activeBranches.has(branchId) || this.claimedBranchIds.has(branchId)) {
+      throw new CordisSeamError(
+        'Branch id "' + branchId + '" is already in use by an active branch.',
+        { code: 'branch_id_conflict', branchId, patchId: request.patch.id }
+      );
+    }
+    // MEM-5: claim the slot in the same synchronous section as the check. The
+    // registration below only happens after the createIsolatedBranch await, and
+    // a second call fired in the same tick must observe this reservation when
+    // it runs the check, or N simultaneous calls all pass it (check-then-await
+    // TOCTOU). The reservation is dropped once the branch registers, and rolled
+    // back in the finally when acquiring or mounting fails.
+    this.pendingBranches += 1;
+    this.claimedBranchIds.add(branchId);
+    let reserved = true;
 
     let resources: IsolatedBranchResources | undefined;
     let result: ProbeExecutionResult | undefined;
@@ -269,6 +296,8 @@ export class CordisSeamManager implements ICordisSeamManager {
         mountedSurfaces: []
       });
       this.sequence += 1;
+      this.pendingBranches -= 1;
+      reserved = false;
 
       const isInvariant =
         resources.frozenPatch.guidance === 'guidance_free' ||
@@ -325,6 +354,11 @@ export class CordisSeamManager implements ICordisSeamManager {
       error = caught;
       status = 'failed';
     } finally {
+      if (reserved) {
+        this.pendingBranches -= 1;
+        reserved = false;
+      }
+      this.claimedBranchIds.delete(branchId);
       if (toolFaceInstalled !== undefined && this.toolFace !== undefined) {
         try {
           this.toolFace.remove(toolFaceInstalled);

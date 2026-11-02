@@ -256,7 +256,11 @@ export function createBranchExecutor(
 
     if (context.signal.aborted) {
       recorder.push('system', { text: 'probe cancelled before dispatch' });
-      recorder.fail('timeout', 'the probe branch was aborted before dispatch', { repairable: true });
+      // VERIF-3: cancellation deliberately does NOT claim the 'timeout' signal
+      // kind — the same discipline the agent-loop executor encodes. A user
+      // abort is not a wall-clock overrun, and the taxonomy counts 'timeout'
+      // in the timeout failure family.
+      recorder.fail('unknown', 'the probe branch was aborted before dispatch', { repairable: true });
       recorder.settle('aborted');
       return recorder.snapshot();
     }
@@ -357,7 +361,8 @@ export function createBranchExecutor(
         return recorder.snapshot();
       }
       if (cancelled) {
-        recorder.fail('timeout', 'the probe branch was aborted while the model call was in flight', {
+        // VERIF-3: an aborted call is not a timeout signal (see above).
+        recorder.fail('unknown', 'the probe branch was aborted while the model call was in flight', {
           repairable: true
         });
         recorder.settle('aborted');
@@ -400,7 +405,8 @@ export function createBranchExecutor(
         });
         recorder.settle('timeout', trajectoryError);
       } else if (cancelled) {
-        recorder.fail('timeout', 'the probe branch was cancelled: ' + trajectoryError.message, {
+        // VERIF-3: a cancelled call is not a timeout signal (see above).
+        recorder.fail('unknown', 'the probe branch was cancelled: ' + trajectoryError.message, {
           repairable: true,
           ...(trajectoryError.code === undefined ? {} : { code: trajectoryError.code })
         });

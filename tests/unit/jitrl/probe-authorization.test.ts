@@ -139,6 +139,30 @@ describe('ADR 0006 D-P4-5: grants are explicit, scoped and auditable', () => {
     expect(stats.grants).toBe(1);
   });
 
+  it('a session-scoped grant never authorizes a request that names no session (JITRL-8)', () => {
+    // The pre-fix condition skipped the session check whenever the REQUEST had
+    // no sessionId, so a COMPOUND grant {branchId, sessionId} authorized a
+    // branch-only request: the grant restricted to one session silently covered
+    // every request on that branch. Missing identity is fail-closed (ADR 0006
+    // D-P4-1/D-P4-5): a request must prove it belongs to the grant's session.
+    const { ledger } = freshLedger();
+    ledger.grant(grant({ kind: 'multi-step-probe', branchId: 'br-7', sessionId: 'sess-7' }));
+    const decision = ledger.authorize({ kind: 'multi-step-probe', branchId: 'br-7' });
+    expect(decision).toMatchObject({ allowed: false, code: 'no-grant' });
+  });
+
+  it('a branch-ONLY grant still authorizes its branch (the shipped caller keeps working)', () => {
+    // The guard must not over-tighten: `real-benefit-controller.ts` grants and
+    // authorizes with `branchId` only (no session), so a branch-only grant has
+    // to remain usable - only the compound grant gains the session requirement.
+    const { ledger } = freshLedger();
+    ledger.grant(grant({ kind: 'paid-model-call', branchId: 'br-shipped' }));
+    expect(ledger.authorize({ kind: 'paid-model-call', branchId: 'br-shipped' })).toMatchObject({
+      allowed: true,
+      code: 'authorized'
+    });
+  });
+
   it('refuses to let a session-only grant authorize a branch action (ADR 0006 D-P4-1)', () => {
     const { ledger } = freshLedger();
     ledger.grant(grant({ branchId: undefined, sessionId: 'sess-host' }));

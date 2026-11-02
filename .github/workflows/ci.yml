@@ -120,6 +120,28 @@ jobs:
       - name: Build and ESM-import smoke test (freshness included)
         run: node scripts/eval/smoke-build.mjs
 
+      # Audit round 2 (§9 batch-2): three structural gates that had no CI
+      # runner. `check:metering` existed but only one Vitest file invoked it, so
+      # a runner could pass without ever executing it. `check:orphans` catches an
+      # EXPORTED collaborator that loses its reader (dead code or an untested
+      # surface). It cannot see the actual P0-1 shape — `forwardingModel` /
+      # `forwardingBranch` were module-PRIVATE uncalled functions, which needs a
+      # call graph rather than an export scan, and the gate's header states that
+      # non-goal explicitly. `check:import-coverage` catches the TEST-1 shape (a
+      # whole host protocol module with zero test importers) and deliberately
+      # ignores an internal src-to-src import, so importing the plugin entry
+      # cannot launder coverage for the tree it pulls in. Each is fail-closed in
+      # both directions: an unlisted violation fails, and a stale allowlist row
+      # fails.
+      - name: Metering coverage gate
+        run: pnpm run check:metering
+
+      - name: Orphan-export gate
+        run: pnpm run check:orphans
+
+      - name: Test-import coverage gate
+        run: pnpm run check:import-coverage
+
   # ---------------------------------------------------------------------------
   # P0 (rev.4) evidence gates that no other job runs.
   #

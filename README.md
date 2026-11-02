@@ -35,7 +35,7 @@ including the module-by-module responsibilities and the end-to-end sequence, is 
 | :--- | :--- | :--- |
 | Node.js | `>=20.19.0` | `engines.node` in [package.json](package.json) |
 | pnpm | `11.7.0` | `packageManager` (`pnpm@11.7.0`) in [package.json](package.json) |
-| Runtime dependencies | none | the package declares no `dependencies`; only `devDependencies` (TypeScript, Vitest, `@types/node`) |
+| Runtime dependencies | `@deepseek-ai/schemastery` (config schema) | declared in `dependencies` in [package.json](package.json) and statically imported at module load in [src/index.ts](src/index.ts); devDependencies: TypeScript, Vitest, `@types/node`, esbuild |
 | Cordis host | supplied by the host | the package never imports `cordis`; all seams are structural ([src/index.ts](src/index.ts)) |
 | MCP memory server | supplied by the host | the bridge consumes an injectable MCP client, never a concrete server ([src/memory-bridge/spi.ts](src/memory-bridge/spi.ts)) |
 
@@ -100,9 +100,12 @@ transpiles on the fly.
 | `pnpm run check:negative-result` | `node scripts/eval/negative-result-diag.mjs --assert` | Fails if the recorded historical negative result (−0.250) drifts |
 | `pnpm run guarded-regression` | `node scripts/eval/guarded-regression.mjs --json` | ADR 0002 gate #7: release-surface, isolation and trusted-source probes over synthetic fixtures |
 | `pnpm run check:mutation` | `node scripts/eval/mutation-gate.mjs --run` | ADR 0005 D5: reintroduces four pinned defects inside a throwaway copy and requires the pinned test **names** to go red — a surviving mutant fails the gate |
+| `pnpm run check:metering` | `node scripts/eval/metering-coverage.mjs` | Every production `.complete(...)` / `.planNext(...)` call must route through the MeteredModelAdapter or be an allow-listed delegation; the allowlist pins an exact **count** per file, so a second call inside an allow-listed file fails too |
+| `pnpm run check:orphans` | `node scripts/eval/check-orphan-exports.mjs` | Every `src/**` exported symbol (function, class, const, interface, type alias, enum) needs a reader in `src/` or `tests/`; the allowlist is compared in both directions, so a fixed orphan leaves a stale row that fails. Deliberately blind to a module-**private** uncalled function — that needs a call graph, not an export scan |
+| `pnpm run check:import-coverage` | `node scripts/eval/check-test-import-coverage.mjs` | Every `src/**` module must be imported by a test, directly or through a **barrel** re-export. An internal `src`→`src` import does not count, so a module reachable only via the plugin entry is still a failure |
 | `pnpm run verify` | `pnpm run typecheck && pnpm run test` | The full gate: typecheck, then every suite |
 
-A green checkout currently reports `163` test files and `2956` passing tests for `pnpm run test`
+A green checkout currently reports `200` test files and `3290` passing tests for `pnpm run test`
 (see [Testing](#testing) for the breakdown). This package is `private` and is not published to
 any registry, so there are no publication steps.
 
@@ -252,8 +255,8 @@ in `cordis.yml` fails fast instead of silently disabling a safety feature.
 | `enabledSurfaces[]` | `["system_prompt","guardrails","memory","tool_guidance","skills","scripts","subagents","plugins"]` | Surfaces eligible for patching, in mounting order |
 | `execution.applyWinningPatch` | `false` | PERMANENT winning-patch mount after probing; only legal together with `execution.mode: guarded-active` (rejected fail-closed in every other mode) |
 | `execution.mode` | `"shadow"` | Declared execution mode: `shadow` (record suggestions with zero side effects), `baseline`, `guarded-active` (enables the patch layer's evidence-gated channel) or `off` |
-| `logging.includeTrajectorySummaries` | `false` | Include trajectory summaries in log output |
-| `logging.level` | `"info"` | `debug` / `info` / `warn` / `error` / `silent` |
+| `logging.includeTrajectorySummaries` | `false` | When true the run-outcome log line also carries the run's trajectory summary (`lifecycle` / `stopReason` / `referenceStatus`); false keeps the bare probe/lesson counts |
+| `logging.level` | `"info"` | Plugin log threshold: `debug` / `info` / `warn` / `error` / `silent` (`silent` drops every line, `error` keeps only errors) |
 | `memoryBridge.customMapping.commitToolName` | `"my_custom_upsert"` | Commit tool name used when `customMapping.enabled` is true |
 | `memoryBridge.customMapping.enabled` | `false` | Use explicit tool-name mapping for an unknown backend |
 | `memoryBridge.customMapping.recallToolName` | `"my_custom_search"` | Recall tool name used when `customMapping.enabled` is true |
@@ -293,7 +296,7 @@ in `cordis.yml` fails fast instead of silently disabling a safety feature.
 | `jitrl.beta` | `1` | KL temperature multiplying the normalized advantage |
 | `jitrl.candidateCount` | `3` | K candidates requested from proposers (proposal level) |
 | `jitrl.dream.candidateJitBetas[]` | `[0.5,1,2]` | Candidate beta grid drawn from when generating policies; non-empty, every entry finite and >= 0 |
-| `jitrl.dream.candidateJitLambdas[]` | `[0.02,0.05,0.1]` | Candidate lambda grid drawn from when generating policies; non-empty, every entry in [0, 1] |
+| `jitrl.dream.candidateJitLambdas[]` | `[0.02,0.05,0.1]` | Compatibility only: accepted, validated and reported, but **not swept since P6 PR5** (`JIT_IGNORED_DIMENSIONS` in [src/dream-rsi/offline-dreamer.ts](src/dream-rsi/offline-dreamer.ts)); candidates are generated from the beta/k/threshold grids only |
 | `jitrl.dream.driftRho` | `0.7` | Down-weight factor for stale-policy experience after a hot swap, in [0, 1] |
 | `jitrl.dream.hyperparamPerturbation` | `true` | Perturb the JitRL hyperparameters when generating candidate policies |
 | `jitrl.enabled` | `true` | Master switch of the JitRL dual loop |
@@ -335,8 +338,16 @@ plugin section before the frozen `EvoHarnessConfig` validation runs ([src/host-t
 consumed by the host glue, and writing it inside a programmatic `EvoHarnessConfig` section is rejected as
 `unknown_key`. Every field is `.volatile()`, so the settings UI can rewrite it without a restart.
 
-One optional key has no default and may be omitted: `memoryBridge.customMapping.pruneToolName` (plus the
-free-form `metadata` bags accepted by the internal APIs).
+Optional keys with no default may be omitted entirely: `memoryBridge.customMapping.pruneToolName`,
+`jitrl.budget` and the two JitRL dream sweep axes `jitrl.dream.candidateJitKs` (positive integers) and
+`jitrl.dream.candidateJitSimilarityThresholds` (entries in [0, 1]) — these are validated only when the
+host actually writes them; absent means "not configured", never "invalid". The two sweep axes are
+absent from the frozen defaults on purpose, so the leaf table above stays at its frozen size; when
+omitted the offline dreamer applies its built-in grids `[5,10,20]` and `[0.2,0.3,0.5]`
+(`DEFAULT_JIT_KS` / `DEFAULT_JIT_SIMILARITY_THRESHOLDS` in
+[src/dream-rsi/offline-dreamer.ts](src/dream-rsi/offline-dreamer.ts)), i.e. the resolved candidate
+grid is byte-identical to the pre-INT-3 behaviour. (The free-form `metadata` bags accepted by the
+internal APIs are also defaultless, but they are not configuration leaves.)
 
 ## How it works
 
@@ -393,15 +404,29 @@ dsh-plugin-evo-harness/
 ├── package.json             # engines, packageManager, scripts, devDependencies
 ├── tsconfig.json            # strict ES2022 / Bundler typecheck, noEmit
 ├── scripts/
-│   └── verify-readme-counts.mjs # mechanical verification of README metrics in CI
+│   ├── build.mjs            # esbuild bundle to lib/index.js
+│   ├── build-manifest.mjs   # build-freshness stamp (source + dependency digests)
+│   ├── verify-readme-counts.mjs # mechanical verification of README metrics in CI
+│   ├── eval-jitrl.mjs       # deterministic offline JitRL evaluation CLI (`pnpm run eval:jitrl`)
+│   ├── bench-jitrl-query.mjs # JitRL retrieval benchmark (`pnpm run bench:jitrl`)
+│   ├── eval/                # release gates: attestation, encoding, clean tree, mutation, parity, PR-4A, rev6
+│   ├── host-smoke/          # real-host smoke harness (run, in-host, kill-tree, budget binding)
+│   └── fixtures/            # offline ledger fixtures (rate cards, scenarios, payloads)
 ├── src/
 │   ├── index.ts             # Cordis entrypoint: apply(ctx), /evo command, auto_fallback hook, evoHarness service
 │   ├── config.ts            # schema, frozen defaults, deterministic validation
 │   ├── orchestrator.ts      # the 15-stage lifecycle
+│   ├── host-triggers.ts     # verified DSH event classification and payload normalization
 │   ├── types/contracts.ts   # frozen contracts shared by all modules
 │   ├── cordis-seams/        # eight-surface mounters, context forker, seam manager, trajectory collector
 │   ├── harness2/            # proposer, composer, reflector, shared helpers
 │   ├── dream-rsi/           # discovery tree, failure taxonomy, active policy, surrogate scorer, offline dreamer
+│   ├── jitrl/               # JIT-RL: decision kernel, rewards, logit sources, writeback gate, stores/
+│   ├── ledger/              # two-phase settlement, WAL, pricing, limits, reconciliation, usage report
+│   ├── verification/        # artifact digests, host runner, quality provenance, synthesized tests
+│   ├── dsh-bridge/          # DSH model/tool boundary, agent-loop executor, metered adapter, real-benefit
+│   ├── persistence/         # profile data dir, policy store, durable tree pool, atomic writes
+│   ├── runtime/             # execution profiles (baseline / shadow / guarded-active)
 │   └── memory-bridge/       # SPI, auto-discovery, governance polyfill, namespace isolation, drivers/
 └── tests/
     ├── unit/
@@ -426,9 +451,9 @@ cross-session promotion, and the offline dream trigger and model wiring.
 
 | Command | Scope | Suites at the time of writing |
 | :--- | :--- | :--- |
-| `pnpm run test:unit` | `tests/unit` | 140 files, 2632 tests |
-| `pnpm run test:e2e` | `tests/e2e` | 23 files, 324 tests |
-| `pnpm run test` | everything | 163 files, 2956 tests |
+| `pnpm run test:unit` | `tests/unit` | 175 files, 2963 tests |
+| `pnpm run test:e2e` | `tests/e2e` | 25 files, 327 tests |
+| `pnpm run test` | everything | 200 files, 3290 tests |
 | `pnpm run verify` | typecheck + everything | the gate to run before a change lands |
 
 Individual files can be run the usual Vitest way, for example

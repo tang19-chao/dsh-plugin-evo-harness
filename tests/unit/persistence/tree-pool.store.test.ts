@@ -11,6 +11,7 @@ import {
   minimizeTreePoolRecords,
   restoreTreePool
 } from '../../../src/persistence/tree-pool.store';
+import { createPersistenceRuntime } from '../../../src/persistence';
 import {
   encodeJsonlRecord,
   DIAGNOSTICS_FILE,
@@ -190,6 +191,51 @@ describe('TreePoolStore', () => {
     expect(Object.keys(restarted.get('tree-a')?.nodes ?? {})).toHaveLength(4);
   });
 
+  it('rejects a same-id add whose snapshot is older than the persisted tree', async () => {
+    const dir = await tempDir('treepool-stale-add');
+    const store = await TreePoolStore.open({ dataDir: dir });
+    const pool = await PersistentTreePool.fromStore(store, 10);
+    const persisted = sampleTree({ id: 'tree-a', childCount: 1 });
+    pool.add(persisted);
+    const stale = {
+      ...sampleTree({ id: 'tree-a', childCount: 3 }),
+      createdAt: persisted.createdAt - 10
+    };
+    pool.add(stale);
+    // The persisted tree survives untouched: the stale snapshot neither wins the
+    // upsert nor reaches the log.
+    expect(pool.size()).toBe(1);
+    expect(pool.get('tree-a')).toEqual(persisted);
+    expect(pool.diagnostics.some((line) => line.includes('rejected'))).toBe(true);
+    await pool.flush();
+    expect(await logLineCount(dir)).toBe(1);
+    const diagnosticsLog = (await readTextIfExists(path.join(dir, DIAGNOSTICS_FILE))) ?? '';
+    expect(diagnosticsLog).toContain('rejected');
+
+    const restarted = await PersistentTreePool.restore({ dataDir: dir, maxTrees: 10 });
+    expect(restarted.get('tree-a')).toEqual(persisted);
+  });
+
+  it('overwrites a same-id add whose snapshot is newer than the persisted tree', async () => {
+    const dir = await tempDir('treepool-newer-add');
+    const store = await TreePoolStore.open({ dataDir: dir });
+    const pool = await PersistentTreePool.fromStore(store, 10);
+    const persisted = sampleTree({ id: 'tree-a', childCount: 1 });
+    pool.add(persisted);
+    const newer = {
+      ...sampleTree({ id: 'tree-a', childCount: 3 }),
+      createdAt: persisted.createdAt + 10
+    };
+    pool.add(newer);
+    expect(pool.size()).toBe(1);
+    expect(pool.get('tree-a')).toEqual(newer);
+    expect(pool.diagnostics.some((line) => line.includes('collision'))).toBe(true);
+    await pool.flush();
+
+    const restarted = await PersistentTreePool.restore({ dataDir: dir, maxTrees: 10 });
+    expect(Object.keys(restarted.get('tree-a')?.nodes ?? {})).toHaveLength(4);
+  });
+
   it('restores through the injection seam with a persistent pool', async () => {
     const dir = await tempDir('treepool-seam');
     const store = await TreePoolStore.open({ dataDir: dir });
@@ -209,6 +255,23 @@ describe('TreePoolStore', () => {
     await restored.pool.flush();
     const third = await restoreTreePool({ dataDir: dir, maxTrees: 10 });
     expect(third.pool.list().map((tree) => tree.id)).toEqual(['tree-a', 'tree-b']);
+  });
+});
+
+describe('createPersistenceRuntime diagnostics', () => {
+  it('keeps post-creation store diagnostics reachable on the runtime handle', async () => {
+    const dir = await tempDir('persistence-runtime-diagnostics');
+    const runtime = await createPersistenceRuntime({ dataDir: dir });
+    const persisted = sampleTree({ id: 'tree-a', childCount: 1 });
+    runtime.treePool.add(persisted);
+    runtime.treePool.add({
+      ...sampleTree({ id: 'tree-a', childCount: 3 }),
+      createdAt: persisted.createdAt - 10
+    });
+    // The rejection is noted after the runtime was created, so the handle must
+    // expose it live instead of only the creation-time snapshot.
+    expect(runtime.diagnostics.some((line) => line.includes('rejected'))).toBe(true);
+    await runtime.dispose();
   });
 });
 

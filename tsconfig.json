@@ -6,6 +6,7 @@
     ],
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
     "types": [
       "node"
     ],
@@ -30,7 +31,8 @@
   },
   "include": [
     "src/**/*.ts",
-    "tests/**/*.ts"
+    "tests/**/*.ts",
+    "scripts/**/*.ts"
   ],
   "exclude": [
     "node_modules",

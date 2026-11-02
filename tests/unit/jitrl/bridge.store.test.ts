@@ -619,6 +619,98 @@ describe('tool discovery and argument shapes', () => {
     expect(String(args.path).startsWith('harness2/jitrl/meta/')).toBe(true);
     expect(args.tags).toEqual(['jitrl-stat']);
   });
+
+  it('JINFRA-14: skips the write when the schema names none of the text candidates', async () => {
+    // The docstring promises a strict backend is never handed unknown
+    // properties; guessing 'text' here used to violate exactly that.
+    const client = new FakeMirrorClient([
+      { name: 'write_note', inputSchema: { properties: { title: { type: 'string' } } } }
+    ]);
+    const store = makeStore(client);
+
+    const result = await store.mirror([aggregate(), aggregate({ bucket: 'task|two' })]);
+
+    expect(result.written).toBe(0);
+    expect(result.skipped).toBe(2);
+    expect(result.degraded).toBe(true);
+    // Not one call reaches the backend: no forced 'text' property anywhere.
+    expect(client.calls).toHaveLength(0);
+    expect(result.diagnostics).toHaveLength(1);
+    expectWhitelistLine(result.diagnostics[0]!);
+    expect(result.diagnostics[0]).toContain('code=no_write_tool');
+    expect(store.diagnostics()).toEqual(result.diagnostics);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// JINFRA-15: TypeError classification (programming bug vs undici envelope)
+// ---------------------------------------------------------------------------
+
+describe('JINFRA-15: mirror error classification', () => {
+  it('maps a plain TypeError to the non-retryable invalid_input class', async () => {
+    const client = new FakeMirrorClient();
+    client.callTool = async () => {
+      throw new TypeError('Cannot read properties of undefined (reading 0)');
+    };
+    const store = makeStore(client);
+
+    const result = await store.mirror([aggregate()]);
+
+    expect(result.degraded).toBe(true);
+    expectWhitelistLine(result.diagnostics[0]!);
+    expect(result.diagnostics[0]).toContain('errorClass=invalid_input');
+    expect(result.diagnostics[0]).toContain('retryable=false');
+  });
+
+  it('keeps the undici fetch-failed envelope a retryable transport error', async () => {
+    // node's fetch surfaces network failures as TypeError: fetch failed; that
+    // envelope keeps its transport class so real outages stay retryable.
+    const client = new FakeMirrorClient();
+    client.callTool = async () => {
+      throw new TypeError('fetch failed');
+    };
+    const store = makeStore(client);
+
+    const result = await store.mirror([aggregate()]);
+
+    expect(result.degraded).toBe(true);
+    expectWhitelistLine(result.diagnostics[0]!);
+    expect(result.diagnostics[0]).toContain('errorClass=transport');
+    expect(result.diagnostics[0]).toContain('retryable=true');
+  });
+
+  it('still maps RangeError to the non-retryable invalid_input class', async () => {
+    const client = new FakeMirrorClient();
+    client.callTool = async () => {
+      throw new RangeError('out of range');
+    };
+    const store = makeStore(client);
+
+    const result = await store.mirror([aggregate()]);
+
+    expect(result.diagnostics[0]).toContain('errorClass=invalid_input');
+    expect(result.diagnostics[0]).toContain('retryable=false');
+  });
+
+  it('JINFRA-15: the sanctioned message probe is never rendered into the diagnostic', async () => {
+    // JINFRA-15 made classifyError read `error.message` for the ONE sanctioned
+    // envelope probe. The classification may consume that text, but no path
+    // may pass it through: the envelope match and the payload canary are
+    // asserted together so a renderer change cannot hide behind the class.
+    const client = new FakeMirrorClient();
+    client.callTool = async () => {
+      throw new TypeError('fetch failed: backend said GHP_CANARY_PROBE_8421 at /usr/local/x');
+    };
+    const store = makeStore(client);
+
+    const result = await store.mirror([aggregate()]);
+
+    // transport (the envelope matched) with a payload-free line.
+    expect(result.diagnostics[0]).toContain('errorClass=transport');
+    expect(result.diagnostics[0]).not.toContain('GHP_CANARY_PROBE_8421');
+    expect(result.diagnostics[0]).not.toContain('backend said');
+    expect(result.diagnostics[0]).not.toContain('/usr/local');
+  });
 });
 
 // ---------------------------------------------------------------------------

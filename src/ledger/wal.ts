@@ -40,6 +40,33 @@ export interface LedgerSnapshotData {
   readonly seatOwners?: readonly string[];
 }
 
+/**
+ * Best-effort fsync of a directory entry (LEDGER-8).
+ *
+ * On POSIX the durability of a rename lives in the DIRECTORY entry, not the
+ * file: without fsync on the parent directory a power loss can lose the new
+ * snapshot (or resurrect the old one) even though the file itself was fsynced
+ * before the rename. Windows cannot fsync a directory descriptor (opening one
+ * read-only or fsyncing it fails with EPERM/EACCES), so every failure is
+ * swallowed by design: this is a durability aid, never a correctness gate, and
+ * it must never make a snapshot (or the accounting behind it) fail.
+ */
+function fsyncDirectoryBestEffort(directory: string): void {
+  let descriptor: number;
+  try {
+    descriptor = fs.openSync(directory, 'r');
+  } catch {
+    return;
+  }
+  try {
+    fs.fsyncSync(descriptor);
+  } catch {
+    // Windows: fsync is not supported on a directory handle. Best effort.
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
 export class LedgerWalWriter {
   private readonly storageDir?: string;
   private readonly eventsFilePath?: string;
@@ -148,6 +175,9 @@ export class LedgerWalWriter {
         fs.closeSync(fd);
       }
       fs.renameSync(temporary, this.snapshotFilePath);
+      // The rename itself is only as durable as its directory entry (POSIX):
+      // fsync the parent directory too, best effort (LEDGER-8; Windows skips it).
+      fsyncDirectoryBestEffort(path.dirname(this.snapshotFilePath));
     }
 
     return snapshot;

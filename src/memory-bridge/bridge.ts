@@ -72,6 +72,8 @@ export function createMemoryBridge(deps: MemoryBridgeDeps): UniversalMemoryBridg
   let descriptor: MemoryBridgeDescriptor = unboundDescriptor();
   let disposed = false;
   const handles = new Map<string, MemoryIsolationHandle>();
+  /** Live handle count per namespace (MEM-8): the last release drops the key. */
+  const handleRefs = new Map<string, number>();
   const seenLessonIds = new Map<string, Set<string>>();
 
   const bridge: UniversalMemoryBridge = {
@@ -316,10 +318,25 @@ export function createMemoryBridge(deps: MemoryBridgeDeps): UniversalMemoryBridg
           return;
         }
         state.active = false;
-        handles.delete(namespace);
+        // MEM-8: several handles may isolate one namespace; release decrements
+        // the shared count and only the LAST release removes the entry, so
+        // activeNamespaces() never reports a namespace released while another
+        // handle still holds it live.
+        const refs = (handleRefs.get(namespace) ?? 1) - 1;
+        if (refs <= 0) {
+          handleRefs.delete(namespace);
+          handles.delete(namespace);
+        } else {
+          handleRefs.set(namespace, refs);
+        }
       }
     };
-    handles.set(namespace, handle);
+    // The first handle stays mapped for the namespace; a second isolate over
+    // the same scope adds a count instead of overwriting it.
+    if (!handles.has(namespace)) {
+      handles.set(namespace, handle);
+    }
+    handleRefs.set(namespace, (handleRefs.get(namespace) ?? 0) + 1);
     return Promise.resolve(handle);
   }
 
@@ -403,20 +420,33 @@ export function createMemoryBridge(deps: MemoryBridgeDeps): UniversalMemoryBridg
       };
     }
     // Remove the branch/session copy so the winning lesson exists only globally.
-    if (from.kind !== 'global' && result.driver.capabilities.namespaces) {
-      try {
-        const pruned = await result.driver.prune(result.context, { namespace: fromNamespace, ids: [lessonId], now: at });
-        if (!pruned.removedIds.includes(lessonId)) {
+    // MEM-9: the gate is the driver's actual prune capability, not the
+    // namespaces flag — markdown-note (and graph-entity) prune exactly the
+    // namespace-derived source path even though they declare namespaces:false,
+    // so skipping them left a duplicate copy that recall silently deduped.
+    if (from.kind !== 'global') {
+      if (result.driver.capabilities.supportsPrune) {
+        try {
+          const pruned = await result.driver.prune(result.context, { namespace: fromNamespace, ids: [lessonId], now: at });
+          if (!pruned.removedIds.includes(lessonId)) {
+            violations.push(
+              warning(
+                'unsupported_operation',
+                'source copy in ' + fromNamespace + ' could not be removed for ' + lessonId
+              )
+            );
+          }
+        } catch (error) {
           violations.push(
-            warning(
-              'unsupported_operation',
-              'source copy in ' + fromNamespace + ' could not be removed for ' + lessonId
-            )
+            warning('unsupported_operation', 'source prune failed for ' + lessonId + ': ' + errorMessage(error))
           );
         }
-      } catch (error) {
+      } else {
         violations.push(
-          warning('unsupported_operation', 'source prune failed for ' + lessonId + ': ' + errorMessage(error))
+          warning(
+            'unsupported_operation',
+            'source copy in ' + fromNamespace + ' cannot be removed by this backend for ' + lessonId
+          )
         );
       }
     }

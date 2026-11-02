@@ -27,13 +27,13 @@
  *                      generation, calibrated on labelled cases, provenance not
  *                      baseline-frozen, generator/candidate isolated, holdout
  *                      not leaked into generation)
- *   execution trust    did the host RUNNER execute that exact content and produce
- *                      a receipt? (layer id + recomputed test-set digest + the
- *                      scope's full case list + receipt digest + verdict/check
- *                      consistency)
+ *   execution trust    did a receipt self-consistently attest that the frozen
+ *                      content was executed? (layer id + recomputed test-set
+ *                      digest + the scope's full case list + receipt digest +
+ *                      verdict/check consistency)
  *
  * The legal state "execution trusted, content NOT trusted" is expressible by
- * construction (see `ExecutionTrustedContentUntrusted`): a host-verified run of
+ * construction (see `ExecutionTrustedContentUntrusted`): a SELF-SEALED run of
  * an UNCALIBRATED suite. Collapsing the two into one boolean is the defect this
  * module exists to prevent - "the tests ran correctly" says NOTHING about
  * whether the tests are right.
@@ -80,8 +80,17 @@ export type SyntheticTestSource = (typeof SYNTHETIC_TEST_SOURCES)[number];
 export const SYNTHETIC_CONTENT_TRUST_STATES = ['uncalibrated', 'calibrated', 'revoked'] as const;
 export type SyntheticContentTrust = (typeof SYNTHETIC_CONTENT_TRUST_STATES)[number];
 
-/** Execution-trust states. */
-export const SYNTHETIC_EXECUTION_TRUST_STATES = ['unverified', 'host-verified'] as const;
+/**
+ * Execution-trust states.
+ *
+ * VERIF-11: the state asserts SELF-CONSISTENCY, not host provenance. A receipt
+ * verifies against an UNKEYED digest over its own content (no host registry, no
+ * object-identity binding like the C2a runner has), so anyone holding the suite
+ * data can mint one. Naming it 'self-sealed' keeps the label honest; the label
+ * must never be read as "a host authenticated this run" — v1 stays audit-only
+ * (`SYNTHETIC_TASK_QUALITY_ELIGIBLE = false`) precisely because of that.
+ */
+export const SYNTHETIC_EXECUTION_TRUST_STATES = ['unverified', 'self-sealed'] as const;
 export type SyntheticExecutionTrust = (typeof SYNTHETIC_EXECUTION_TRUST_STATES)[number];
 
 /** v1 is audit-only BY CONSTRUCTION: there is no enforce mode. */
@@ -1108,14 +1117,14 @@ export type ExecutionTrustedContentUntrusted = SyntheticTestAssessment & {
   readonly content: SyntheticContentAssessment & {
     readonly trust: 'uncalibrated' | 'revoked';
   };
-  readonly execution: SyntheticExecutionAssessment & { readonly trust: 'host-verified' };
+  readonly execution: SyntheticExecutionAssessment & { readonly trust: 'self-sealed' };
 };
 
 export function isExecutionTrustedContentUntrusted(
   assessment: SyntheticTestAssessment
 ): assessment is ExecutionTrustedContentUntrusted {
   return (
-    assessment.execution.trust === 'host-verified' &&
+    assessment.execution.trust === 'self-sealed' &&
     (assessment.content.trust === 'uncalibrated' || assessment.content.trust === 'revoked')
   );
 }
@@ -1195,7 +1204,9 @@ export function assessSyntheticTestResult(input: SyntheticAssessmentInput): Synt
   } else {
     const receiptCheck = verifySyntheticTestReceipt(input.receipt, suite);
     if (receiptCheck.ok) {
-      executionTrust = 'host-verified';
+      // VERIF-11: a self-consistent receipt proves self-consistency only — the
+      // state name must not claim host provenance it cannot back.
+      executionTrust = 'self-sealed';
       executionExtras = {
         receiptDigest: input.receipt.receiptDigest,
         runId: input.receipt.runId,
@@ -1300,11 +1311,11 @@ export function gateSyntheticResultForTaskQuality(
       layer: assessment.layer
     };
   }
-  if (assessment.execution.trust !== 'host-verified') {
+  if (assessment.execution.trust !== 'self-sealed') {
     return {
       allowed: false,
       reason: 'execution-unverified',
-      detail: 'no verified host receipt for this execution of the calibrated suite',
+      detail: 'no self-consistent receipt for this execution of the calibrated suite',
       layer: assessment.layer
     };
   }
@@ -1312,7 +1323,7 @@ export function gateSyntheticResultForTaskQuality(
     allowed: false,
     reason: 'audit-only-v1',
     detail:
-      'synthesized-tests/v1 is audit-only in v1; even calibrated content on a verified execution stays out of task-quality',
+      'synthesized-tests/v1 is audit-only in v1; even calibrated content on a self-sealed execution stays out of task-quality',
     layer: assessment.layer
   };
 }

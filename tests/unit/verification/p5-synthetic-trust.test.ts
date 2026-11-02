@@ -624,7 +624,9 @@ describe('P5 trust layer: content trust vs execution trust (never collapsed)', (
       candidate: CLEAN_CANDIDATE
     });
     expect(assessment.content.trust).toBe('calibrated');
-    expect(assessment.execution.trust).toBe('host-verified');
+    // VERIF-11: the receipt is self-consistent only (unkeyed digest) — the
+    // state is named 'self-sealed', not 'host-verified'.
+    expect(assessment.execution.trust).toBe('self-sealed');
     expect(assessment.auditOnly).toBe(true);
     expect(assessment.taskQualityEligible).toBe(false);
     expect(assessment.provenance.freezeOrderOk).toBe(true);
@@ -640,7 +642,7 @@ describe('P5 trust layer: content trust vs execution trust (never collapsed)', (
       receipt: makeReceipt(SUITE, true),
       candidate: CLEAN_CANDIDATE
     });
-    expect(assessment.execution.trust).toBe('host-verified');
+    expect(assessment.execution.trust).toBe('self-sealed');
     expect(assessment.content.trust).toBe('uncalibrated');
     expect(assessment.content.reasons).toContain('calibration-missing');
     expect(isExecutionTrustedContentUntrusted(assessment)).toBe(true);
@@ -812,7 +814,7 @@ describe('P5 trust layer: default OFF, explicit grant, rollback', () => {
       throw new Error('unreachable');
     }
     expect(result.assessment.content.trust).toBe('calibrated');
-    expect(result.assessment.execution.trust).toBe('host-verified');
+    expect(result.assessment.execution.trust).toBe('self-sealed');
     expect(result.taskQualityGate.allowed).toBe(false);
     expect(result.taskQualityGate.reason).toBe('audit-only-v1');
   });

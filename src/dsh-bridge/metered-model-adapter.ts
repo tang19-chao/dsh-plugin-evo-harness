@@ -54,6 +54,9 @@ import type {
   ModelResponse,
   TokenUsage
 } from '../types/contracts';
+// VERIF-9: abort-shaped stream errors are recognized by CLASS, so the mapping
+// cannot be fooled by an error name that carries no 'abort' substring.
+import { DshModelStreamError } from './model';
 import {
   assembleAgentLoopLedger,
   dshUsageToProviderPayload,
@@ -340,7 +343,31 @@ function outcomeOf(response: ModelResponse): ExecutionOutcome {
 
 function outcomeOfError(error: unknown): ExecutionOutcome {
   const name = error instanceof Error ? error.name.toLowerCase() : '';
-  return name.includes('abort') || name.includes('cancel') ? 'cancelled' : 'failed';
+  if (name.includes('abort') || name.includes('cancel')) {
+    return 'cancelled';
+  }
+  // VERIF-9: a DSH stream that settled with an 'aborted' finish throws
+  // DshModelStreamError — the same mid-stream abort shape the agent-loop
+  // executor books as 'cancelled' (INTERIM: the remote may still be producing,
+  // so late usage merges into the SAME callId). Its name carries no 'abort'
+  // substring, so without this recognition it fell through to
+  // 'infrastructure_error' below — already INTERIM after LEDGER-5, but with
+  // the wrong semantics (the call was aborted, not broken). The 'error'
+  // finishKind is a provider-RESPONDED outcome and stays on the
+  // infrastructure path, which LEDGER-5 keeps deliberately conservative.
+  if (error instanceof DshModelStreamError && error.finishKind === 'aborted') {
+    return 'cancelled';
+  }
+  // LEDGER-5: a non-abort transport exception (ECONNRESET, DNS failure, a raised
+  // 429/500) does NOT prove the provider stopped generating. 'failed' is a
+  // remote-confirmed outcome (REMOTE_TERMINATED_OUTCOMES), so mapping it there
+  // settled FINAL on the conservative floor and released the seat for a request
+  // that may still be running. 'infrastructure_error' (ADR-0004 §5.2: the
+  // harness/transport broke) is deliberately not remote-confirmed, so settleCall
+  // holds the money and the seat INTERIM until late usage or an external bill
+  // arrives; only a provider-RESPONDED terminal error (finishReason 'error',
+  // outcomeOf) keeps 'failed'. The error NAME still travels on the record.
+  return 'infrastructure_error';
 }
 
 /**
@@ -585,6 +612,7 @@ export function createMeteredModelAdapter(
       let incurred: number | undefined;
       let heldCostMicros: number | undefined;
       let settlementPhase: 'final' | 'interim' | 'none' = 'none';
+      let settleFailure = false;
       const outcome = outcomeOf(response);
       if (settlement !== undefined && reservationId !== undefined) {
         const rawUsage = response.metadata?.rawUsage as RawDshUsageLike | undefined;
@@ -608,6 +636,12 @@ export function createMeteredModelAdapter(
             bookedByCall.set(callId, incurred);
           }
         } catch {
+          // LEDGER-6: a failed settlement must not masquerade as a healthy
+          // unmetered success. Mirror the error path above: mark the record so
+          // stats().settleFailures counts it — the money may already have moved
+          // (the manager mutates pools before the WAL append), so the model
+          // outcome alone is not the full truth about this call.
+          settleFailure = true;
           provenance = 'unknown';
         }
       }
@@ -626,7 +660,8 @@ export function createMeteredModelAdapter(
         ...(heldCostMicros === undefined ? {} : { heldCostMicros }),
         settlement: settlementPhase,
         reservedMicros: estimatedCostMicros,
-        provenance
+        provenance,
+        ...(settleFailure ? { error: 'settle_failed' as const } : {})
       });
       return response;
     },

@@ -55,6 +55,9 @@ export function aggregatePrecision(
  *    reasoning is never double-charged with output!
  * 4. If any metric is unknown, or if the calculation results in 0 cost when unknown/conservative,
  *    conservativeFallbackCostMicros (> 0) is applied.
+ * 5. An unreported cacheRead/cacheWrite dimension — and separately-billed reasoning the
+ *    provider never reported — is flagged (`*Unavailable`) so the cost report can surface
+ *    the gap instead of passing a priced 0 off as a measured zero (LEDGER-10).
  */
 export function calculateUsageCost(
   usage: ProviderUsagePayload,
@@ -169,6 +172,25 @@ export function calculateUsageCost(
     const cacheNote = 'cacheRead unavailable; cacheRead cost is unknown, not a measured zero';
     auditNote = auditNote === undefined ? cacheNote : auditNote + '; ' + cacheNote;
   }
+  // LEDGER-10: the same honesty rule covers the other separately-priced
+  // dimensions. An unreported cacheWrite dimension may still be billed by the
+  // provider, and a card that bills reasoning separately leaves the reasoning
+  // cost unknown when the metric never arrived — the output-rate figure (or the
+  // priced 0) is not evidence of what that dimension will cost.
+  const cacheWriteUnavailable =
+    usage.cacheWriteTokens === undefined || usage.cacheWriteTokens.precision !== 'measured';
+  if (cacheWriteUnavailable) {
+    const cacheWriteNote = 'cacheWrite unavailable; cacheWrite cost is unknown, not a measured zero';
+    auditNote = auditNote === undefined ? cacheWriteNote : auditNote + '; ' + cacheWriteNote;
+  }
+  const reasoningUnavailable =
+    rateCard.reasoningSeparatelyBilled === true &&
+    (usage.reasoningTokens === undefined || usage.reasoningTokens.precision !== 'measured');
+  if (reasoningUnavailable) {
+    const reasoningNote =
+      'reasoning is separately billed but unreported; reasoning cost is unknown, not a measured zero';
+    auditNote = auditNote === undefined ? reasoningNote : auditNote + '; ' + reasoningNote;
+  }
 
   return {
     totalCostMicros,
@@ -188,6 +210,8 @@ export function calculateUsageCost(
     provenance,
     dimensionProvenance,
     cacheReadUnavailable,
+    cacheWriteUnavailable,
+    reasoningUnavailable,
     conservative,
     auditNote
   };

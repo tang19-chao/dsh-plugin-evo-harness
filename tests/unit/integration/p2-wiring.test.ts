@@ -128,13 +128,20 @@ describe('acceptance (f): enabled configuration', () => {
 
   it('reports a stable, JSON-safe status object', () => {
     const { plugin } = buildPlugin({ enabled: true, levels: ['meta'] });
-    expect(() => JSON.stringify(plugin.jitrl)).not.toThrow();
     const status = plugin.jitrl;
-    expect(typeof status.enabled).toBe('boolean');
-    expect(typeof status.storeSize).toBe('number');
-    expect(typeof status.backfilled).toBe('number');
-    expect(Array.isArray(status.levels)).toBe(true);
-    expect(Array.isArray(status.diagnostics)).toBe(true);
+    // The serialized round-trip carries the documented status keys with their
+    // JSON-native shapes (a plain stringify() succeeds for almost any object,
+    // so the keys are asserted on the parsed copy instead).
+    const serialized = JSON.parse(JSON.stringify(status)) as Record<string, unknown>;
+    expect(Object.keys(serialized)).toEqual(
+      expect.arrayContaining(['enabled', 'levels', 'storeSize', 'backfilled', 'diagnostics'])
+    );
+    expect(serialized['enabled']).toBe(true);
+    expect(serialized['levels']).toEqual(['meta']);
+    expect(typeof serialized['storeSize']).toBe('number');
+    expect(typeof serialized['backfilled']).toBe('number');
+    expect(Array.isArray(serialized['diagnostics'])).toBe(true);
+    expect(serialized['diagnostics']).not.toEqual([]);
   });
 
   it('wraps deps.policy in the decorator and keeps the base policy identity', () => {

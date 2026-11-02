@@ -66,7 +66,8 @@ function toScored(entry: ScoredStoredExperience): ScoredExperience {
   return {
     record: toExperienceRecord(entry.record),
     similarity: entry.similarity,
-    weight: entry.weight
+    weight: entry.weight,
+    ...(entry.driftWeight === undefined ? {} : { driftWeight: entry.driftWeight })
   };
 }
 

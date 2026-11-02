@@ -15,6 +15,10 @@ bridge-verify/
 f1-repro/
 asar-*.cjs
 
+# audit/diagnostic evidence dumps (host paths, session ids, screenshots);
+# committing them must stay a deliberate act, never a routine `git add -A`
+diagnostics/
+
 # build and test output
 #
 # NOTE (PR-1): these are ANCHORED with a leading slash on purpose. The old

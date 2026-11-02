@@ -45,7 +45,12 @@ import {
   EXPERIENCE_OUTCOMES,
   LEARNING_TRACKS
 } from '../types/contracts';
-import { isLearningEligibleRecord, isRewardVersionExact, REWARD_CONTRACT_VERSION } from './reward-contract';
+import {
+  isLearningEligibleRecord,
+  isRewardVersionExact,
+  rewardVersionGeneration,
+  REWARD_CONTRACT_VERSION
+} from './reward-contract';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -847,6 +852,20 @@ export function validateExperienceQuery(query: ExperienceQuery, halfLifeMs: numb
   ) {
     throw new RangeError('query: learningTrack must be one of ' + LEARNING_TRACKS.join(', '));
   }
+  // Section 7.3-4 drift inputs (same rules as the retriever's validateOptions):
+  // both are optional, but a present one must be well-formed - a malformed
+  // drift factor must fail loudly, not silently stop down-weighting.
+  if (query.policyId !== undefined && typeof query.policyId !== 'string') {
+    throw new TypeError('query: policyId must be a string when provided');
+  }
+  if (query.driftRho !== undefined) {
+    if (!Number.isFinite(query.driftRho)) {
+      throw new RangeError('query: driftRho must be finite when provided');
+    }
+    if (query.driftRho < 0 || query.driftRho > 1) {
+      throw new RangeError('query: driftRho must be in [0, 1]');
+    }
+  }
   if (!Number.isFinite(halfLifeMs) || halfLifeMs < 0) {
     throw new RangeError('query: halfLifeMs must be a finite number >= 0');
   }
@@ -1185,6 +1204,12 @@ export interface ScoredStoredExperience {
   readonly record: StoredExperience;
   readonly similarity: number;
   readonly weight: number;
+  /**
+   * Section 7.3-4 drift factor actually applied to this neighbour. Present
+   * only when a drift request changed the weight (same reporting rule as the
+   * retriever's snapshot path); absent means "no drift weighting applied".
+   */
+  readonly driftWeight?: number;
 }
 
 function deriveCandidateBudget(k: number, levelSize: number): number {
@@ -1202,6 +1227,12 @@ function deriveCandidateBudget(k: number, levelSize: number): number {
  * postings of the query tokens and, if that cannot be trusted to cover the
  * level, through a full level scan. Stage 2 computes the Jaccard similarity,
  * drops zero / below-threshold / fully decayed neighbours, sorts and takes k.
+ *
+ * When the query carries BOTH `policyId` and `driftRho`, the section 7.3-4
+ * drift factor is applied to foreign-policy weights BEFORE the top-k slice,
+ * with the same saturation stop as the retriever's snapshot path (drifting
+ * ends once the same bucket holds k current-policy records), and each drifted
+ * neighbour reports its factor as `driftWeight`.
  */
 export function executeExperienceQuery(
   index: ExperienceIndex,
@@ -1254,8 +1285,36 @@ export function executeExperienceQuery(
     pool = levelSize <= budget ? index.tokenCandidates(level, query.state.tokens, budget) : index.levelRecordsDescending(level);
   }
 
+  // Section 7.3-4 drift (same saturating rule as the retriever's snapshot
+  // path): foreign-policy records are down-weighted by driftRho BEFORE the
+  // top-k slice, and the down-weighting stops once the same (level, bucket)
+  // already holds k records from the current policy. Both inputs must be
+  // present; otherwise no drift weighting is applied (factor 1 everywhere).
+  const driftActive = query.policyId !== undefined && query.driftRho !== undefined;
+  let currentBucketCount = 0;
+  if (driftActive) {
+    for (const record of bucketRecords) {
+      if (
+        record !== undefined &&
+        record.policyId === query.policyId &&
+        matchesBaseFilters(
+          record,
+          level,
+          guidanceFilter,
+          before,
+          excludeLegacy,
+          minimumSchemaVersion,
+          learningEligibleOnly,
+          learningTrack
+        )
+      ) {
+        currentBucketCount += 1;
+      }
+    }
+  }
+
   // Stage 2: Jaccard ranking.
-  const scored: { record: StoredExperience; similarity: number; weight: number; order: number }[] = [];
+  const scored: { record: StoredExperience; similarity: number; weight: number; driftWeight?: number; order: number }[] = [];
   for (let order = 0; order < pool.length; order += 1) {
     const record = pool[order];
     if (record === undefined) {
@@ -1287,11 +1346,19 @@ export function executeExperienceQuery(
     if (similarity <= 0 || similarity < query.similarityThreshold) {
       continue;
     }
-    const weight = experienceWeight(similarity, record.createdAt, now, halfLifeMs);
+    // Drift composes with the half-life decay instead of replacing it, and it
+    // is decided per record so the factor is settled before ranking. The
+    // factor is reported only when it actually changed the weight.
+    let driftWeight: number | undefined;
+    let weight = experienceWeight(similarity, record.createdAt, now, halfLifeMs);
+    if (driftActive && record.policyId !== query.policyId && currentBucketCount < query.k) {
+      weight *= query.driftRho;
+      driftWeight = query.driftRho;
+    }
     if (!Number.isFinite(weight) || weight <= 0) {
       continue;
     }
-    scored.push({ record, similarity, weight, order });
+    scored.push(driftWeight === undefined ? { record, similarity, weight, order } : { record, similarity, weight, driftWeight, order });
   }
   scored.sort((left, right) => {
     const ordered = compareStoredExperiences(left, right);
@@ -1306,7 +1373,8 @@ export function executeExperienceQuery(
   return scored.slice(0, query.k).map((entry) => ({
     record: entry.record,
     similarity: entry.similarity,
-    weight: entry.weight
+    weight: entry.weight,
+    ...(entry.driftWeight === undefined ? {} : { driftWeight: entry.driftWeight })
   }));
 }
 
@@ -1469,6 +1537,37 @@ export function classifyExperienceVersion(
 }
 
 /**
+ * Ascending order by the numeric `r<N>/` generation with a lexicographic
+ * tiebreak (JINFRA-13): plain string order puts `r10/…` before `r2/…`, so the
+ * "newest" pick compares the reward-contract parser's numbers instead.
+ * Unparseable ids sort as generation 0, below every parseable one.
+ */
+function compareRewardVersionOrder(a: string, b: string): number {
+  const generationA = rewardVersionGeneration(a) ?? 0;
+  const generationB = rewardVersionGeneration(b) ?? 0;
+  if (generationA !== generationB) {
+    return generationA - generationB;
+  }
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * The newest id of a reward-version set: {@link compareRewardVersionOrder}
+ * ascending, last element; undefined for an empty set. Exported so the
+ * mirror-snapshot regression test can pin `r10 > r2` through the same
+ * ordering {@link mirrorVisibleRecords} uses.
+ */
+export function newestRewardVersion(versions: ReadonlySet<string>): string | undefined {
+  let newest: string | undefined;
+  for (const version of versions) {
+    if (newest === undefined || compareRewardVersionOrder(newest, version) < 0) {
+      newest = version;
+    }
+  }
+  return newest;
+}
+
+/**
  * Version isolation for the aggregate-statistics mirror (plan section 6.5
  * item 5: "mirror 中旧版本聚合也要隔离").
  *
@@ -1507,7 +1606,7 @@ export function mirrorVisibleRecords(
       versions.add(record.rewardVersion);
     }
   }
-  const rewardVersion = versions.size > 0 ? [...versions].sort()[versions.size - 1] : undefined;
+  const rewardVersion = newestRewardVersion(versions);
   return {
     current: learning,
     legacyExcluded: legacy.length,

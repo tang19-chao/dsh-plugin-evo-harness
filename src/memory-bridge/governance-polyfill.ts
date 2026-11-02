@@ -334,11 +334,15 @@ export function isLessonVisibleInScope(
   const fallbackNamespace = deriveNamespace(scope, namespacePrefix);
   if (record.length > 0) {
     const tier = classifyNamespace(record, namespacePrefix);
-    if (lesson.visibility === 'global' || tier === 'global') {
-      return {
-        visible: lesson.visibility === 'global' || tier === 'global',
-        detail: lesson.visibility === 'global' ? 'global lesson' : 'foreign record under the global namespace'
-      };
+    if (lesson.visibility === 'global') {
+      return { visible: true, detail: 'global lesson' };
+    }
+    if (tier === 'global') {
+      // P1-6 (MEM-1 mirror): a record filed under the global namespace is only
+      // actually global when the lesson itself claims that visibility; lesson
+      // metadata wins over a misfiled namespace, otherwise a branch-private
+      // lesson parked there would surface everywhere.
+      return { visible: false, detail: 'record ' + record + ' is not a globally visible lesson' };
     }
     if (scope.kind === 'global') {
       return { visible: false, detail: 'record ' + record + ' is not global' };
@@ -347,10 +351,29 @@ export function isLessonVisibleInScope(
       scope.kind === 'branch' &&
       namespaceIsBranch(record, namespacePrefix, scope.sessionId, scope.branchId)
     ) {
+      // P1-6 (MEM-1): a namespace match alone proves nothing about provenance.
+      // A lesson legitimately written into this branch namespace always carries
+      // this scope's sessionId, so requiring it never hurts bridge-authored
+      // records; it does stop untagged foreign lessons that hint attribution
+      // misfiled here from surfacing (their own sessionId belongs elsewhere).
+      if (lesson.sessionId !== scope.sessionId) {
+        return {
+          visible: false,
+          detail: 'record ' + record + ' carries sessionId ' + lesson.sessionId + ', not this branch'
+        };
+      }
       return { visible: true, detail: 'branch-private record of this branch' };
     }
     if (!namespaceBelongsToSession(record, namespacePrefix, scope.sessionId)) {
       return { visible: false, detail: 'record ' + record + ' belongs to another session' };
+    }
+    // P1-6 (MEM-1): a same-session namespace match still proves nothing about
+    // the lesson's own scope metadata.
+    if (lesson.sessionId !== scope.sessionId) {
+      return {
+        visible: false,
+        detail: 'record ' + record + ' carries sessionId ' + lesson.sessionId + ', not this session'
+      };
     }
     // Same session, but possibly a sibling branch: only session/global lessons travel.
     if (lesson.visibility === 'branch_private') {
@@ -590,6 +613,21 @@ export function applyPostRecallFirewall(input: FirewallInput): FirewallOutput {
   for (const record of records) {
     const lesson = record.lesson;
     if (lesson === null || typeof lesson !== 'object' || typeof lesson.id !== 'string') {
+      continue;
+    }
+    // P1-6 (MEM-1): a record whose namespace came only from the requested-scope
+    // hint/default (no tag, no inherited namespace in the payload) has an
+    // unverified origin — the backend content never declared where it belongs.
+    // Restrict it to globally visible lessons so untagged foreign content
+    // cannot ride the attribution into this scope.
+    if (record.unverifiedOrigin === true && lesson.visibility !== 'global') {
+      suppressedLessons.push({
+        lessonId: lesson.id,
+        title: lesson.title,
+        reason: 'scope_mismatch',
+        detail:
+          'unverified-origin record (namespace attributed from the requested scope; the payload carried none) is not globally visible'
+      });
       continue;
     }
     const visibility = isLessonVisibleInScope(lesson, record.namespace, scope, config.namespacePrefix);

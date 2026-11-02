@@ -101,11 +101,46 @@ describe('policyPriorLogit (plan section 3.1)', () => {
     expect(policyPriorLogit(WEIGHTS, 'explore_domain')).toBeCloseTo(Math.log(0.3), 6);
   });
 
-  it('divides by the exploration temperature', () => {
-    expect(policyPriorLogit(WEIGHTS, 'exploit', 2)).toBeCloseTo(Math.log(0.2), 6);
+  it('scales the logit by the exploration temperature (share^(1/T))', () => {
+    // JITRL-2: the pre-fix code divided the SHARE by T, i.e. subtracted the
+    // same constant log(T) from every slot's logit - a softmax no-op for
+    // all-positive shares (and fully erased by centerLogits). The plan section
+    // 3.1 prior is the temperature-scaled logit: log(share^(1/T)) =
+    // log(share) / T, which actually flattens (T > 1) or sharpens (T < 1) the
+    // softened prior distribution.
+    expect(policyPriorLogit(WEIGHTS, 'exploit', 2)).toBeCloseTo(Math.log(0.4) / 2, 10);
+    expect(policyPriorLogit(WEIGHTS, 'recover', 2)).toBeCloseTo(Math.log(0.1) / 2, 10);
+    expect(policyPriorLogit(WEIGHTS, 'exploit', 0.5)).toBeCloseTo(Math.log(0.4) / 0.5, 10);
+    // Temperature 1 (and the undefined/non-positive/non-finite cases that fall
+    // back to it) must stay byte-identical to the pre-fix default path.
+    expect(policyPriorLogit(WEIGHTS, 'exploit', 1)).toBeCloseTo(Math.log(0.4), 10);
     // Non-positive or non-finite temperatures are ignored (1).
     expect(policyPriorLogit(WEIGHTS, 'exploit', 0)).toBeCloseTo(Math.log(0.4), 6);
     expect(policyPriorLogit(WEIGHTS, 'exploit', Number.NaN)).toBeCloseTo(Math.log(0.4), 6);
+    expect(policyPriorLogit(WEIGHTS, 'exploit')).toBeCloseTo(Math.log(0.4), 6);
+  });
+
+  it('two temperatures produce DIFFERENT softmax priors (the temperature is not a no-op)', () => {
+    // The counterexample the audit asked for. A constant shift of every logit
+    // is invisible to softmax, so under the pre-fix `log(share / T)` both
+    // temperatures produced the SAME distribution. The gap between slots must
+    // change with T, and a warmer prior must be flatter (closer to uniform).
+    const kinds = ['exploit', 'explore_domain', 'explore_invariant', 'recover'] as const;
+    const softmax = (logits: readonly number[]): readonly number[] => {
+      const max = Math.max(...logits);
+      const exps = logits.map((logit) => Math.exp(logit - max));
+      const sum = exps.reduce((total, value) => total + value, 0);
+      return exps.map((value) => value / sum);
+    };
+    const warm = softmax(kinds.map((kind) => policyPriorLogit(WEIGHTS, kind, 2)));
+    const cold = softmax(kinds.map((kind) => policyPriorLogit(WEIGHTS, kind, 0.5)));
+    expect(warm).not.toEqual(cold);
+    // A gap that shrinks is the signature of a real temperature (not a shift).
+    expect(warm[0]! - warm[3]!).toBeLessThan(cold[0]! - cold[3]!);
+    // Gaps are exactly the pre-fix values when T = 1.
+    const unit = softmax(kinds.map((kind) => policyPriorLogit(WEIGHTS, kind)));
+    expect(unit[0]).toBeCloseTo(0.4, 10);
+    expect(unit[3]).toBeCloseTo(0.1, 10);
   });
 
   it('floors zero shares at log(1e-9)', () => {

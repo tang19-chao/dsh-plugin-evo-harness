@@ -280,7 +280,16 @@ export class TrajectoryCollector {
         : this.error ?? (input.error === undefined ? undefined : toTrajectoryError(input.error));
     const status: TrajectoryStatus =
       input.status ?? (result === undefined ? undefined : result.status) ?? (error === undefined ? 'succeeded' : 'failed');
-    const steps = result !== undefined && result.steps !== undefined ? reindexSteps(result.steps) : reindexSteps(this.steps);
+    // MEM-12: one merge policy for all three observed-event channels — the
+    // union of collector-recorded and executor-returned entries, in that order,
+    // with steps reindexed afterwards. Steps used to be REPLACED while tool
+    // errors and signals were CONCATENATED, so metrics could describe two
+    // different event sets and every collector-recorded step silently vanished
+    // once an executor returned its own steps.
+    const steps = reindexSteps([
+      ...this.steps,
+      ...(result !== undefined && result.steps !== undefined ? result.steps : [])
+    ]);
     const toolErrors =
       result !== undefined && result.toolErrors !== undefined
         ? [...this.toolErrors, ...result.toolErrors]

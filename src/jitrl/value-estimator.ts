@@ -145,8 +145,15 @@ function neighborWeight(neighbor: ScoredExperience): number {
 
 /**
  * Neighbours usable for a decision at `state`: same level (cross-level
- * experience must never leak into L1/L2/L3 decisions), finite return, and a
- * strictly positive retrieval weight.
+ * experience must never leak into L1/L2/L3 decisions), a finite CONTRACT
+ * target, and a strictly positive retrieval weight.
+ *
+ * Audit JITRL-7: the admission check used to test the legacy `return` field
+ * while estimateStateValue consumes `readLearningTarget` (observedReturn
+ * first, `return` only as the legacy fallback - reward-contract.ts). Gating on
+ * the same value the estimator reads means a record whose contract target is
+ * usable can never be dropped for a stale field, and a record can never be
+ * admitted on one field while contributing another.
  */
 export function selectNeighbors(
   state: AbstractState,
@@ -157,7 +164,7 @@ export function selectNeighbors(
     if (neighbor.record.level !== state.level) {
       continue;
     }
-    if (!Number.isFinite(neighbor.record.return)) {
+    if (!Number.isFinite(readLearningTarget(neighbor.record))) {
       continue;
     }
     if (!(neighborWeight(neighbor) > 0)) {

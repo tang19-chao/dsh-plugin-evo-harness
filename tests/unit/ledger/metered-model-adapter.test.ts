@@ -16,7 +16,7 @@ import {
   STAGE_PURPOSE,
   type MeteringStage
 } from '../../../src/dsh-bridge';
-import { createLedgerReservationManager, twoPhaseSettlementFor } from '../../../src/ledger';
+import { createLedgerReservationManager, createUsagePayload, twoPhaseSettlementFor } from '../../../src/ledger';
 import type { IModelAdapter, ModelRequest, ModelResponse } from '../../../src/types/contracts';
 
 const RATE_CARD = {
@@ -31,6 +31,10 @@ const SEMANTICS = { inputIncludesCacheRead: true, outputIncludesReasoning: true 
 
 function fakeModel(options: {
   readonly fail?: boolean;
+  /** Throws a non-abort transport exception (the ECONNRESET shape: name 'Error'). */
+  readonly transportError?: boolean;
+  /** Responds NORMALLY but with a provider-reported terminal error. */
+  readonly finishError?: boolean;
   readonly rawUsage?: { readonly inputTokens: number; readonly outputTokens: number };
   readonly semantics?: typeof SEMANTICS;
 } = {}): { model: IModelAdapter; calls: ModelRequest[] } {
@@ -41,9 +45,12 @@ function fakeModel(options: {
       if (options.fail === true) {
         throw new Error('provider boom');
       }
+      if (options.transportError === true) {
+        throw new Error('read ECONNRESET');
+      }
       return {
         text: 'ok',
-        finishReason: 'stop',
+        finishReason: options.finishError === true ? 'error' : 'stop',
         usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 },
         metadata: {
           ...(options.rawUsage === undefined ? {} : { rawUsage: options.rawUsage }),
@@ -243,16 +250,48 @@ describe('failure paths remain auditable', () => {
     expect(adapter.records()[0]?.error).toBe('budget_denied');
   });
 
-  it('records and rethrows a model failure, settling what was incurred', async () => {
-    const manager = createLedgerReservationManager({ enabled: true, defaultRateCard: RATE_CARD });
+  it('records and rethrows a thrown model failure, HOLDING the money interim (LEDGER-5)', async () => {
+    const manager = createLedgerReservationManager({
+      enabled: true,
+      enforceHardBounds: true,
+      generalBudgetMicros: 1_000_000,
+      defaultRateCard: RATE_CARD
+    });
     const { model, calls } = fakeModel({ fail: true });
     const adapter = createMeteredModelAdapter(model, 'reflect', { ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:test' }) });
     await expect(adapter.call(requestFor('reflect'))).rejects.toThrow('provider boom');
     expect(calls).toHaveLength(1);
+    // A thrown non-abort exception does not prove the provider stopped: the
+    // outcome is infrastructure_error (NOT remote-confirmed), so settleCall goes
+    // INTERIM and the conservative figure is HELD, never booked as settled spend.
+    const record = adapter.records()[0];
+    expect(record?.outcome).toBe('infrastructure_error');
+    expect(record?.settlement).toBe('interim');
+    expect(record?.heldCostMicros).toBe(RATE_CARD.conservativeFallbackCostMicros);
+    expect(record?.incurredCostMicros).toBeUndefined();
+    expect(record?.error).toBe('Error');
+    expect(adapter.stats().modelFailures).toBe(1);
+    // The money stays ring-fenced on the pool: reserved, not settled.
+    expect(manager.getBudgetStatus().generalPool.settledMicros).toBe(0);
+    expect(manager.getBudgetStatus().generalPool.reservedMicros).toBeGreaterThan(0);
+  });
+
+  it('keeps a provider-RESPONDED terminal error remote-confirmed and final (LEDGER-5)', async () => {
+    const manager = createLedgerReservationManager({
+      enabled: true,
+      enforceHardBounds: true,
+      generalBudgetMicros: 1_000_000,
+      defaultRateCard: RATE_CARD
+    });
+    const { model } = fakeModel({ finishError: true });
+    const adapter = createMeteredModelAdapter(model, 'reflect', { ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:test' }) });
+    await adapter.call(requestFor('reflect'));
     const record = adapter.records()[0];
     expect(record?.outcome).toBe('failed');
-    expect(record?.incurredCostMicros).toBeGreaterThanOrEqual(0);
-    expect(adapter.stats().modelFailures).toBe(1);
+    expect(record?.settlement).toBe('final');
+    expect(record?.incurredCostMicros).toBeGreaterThan(0);
+    expect(record?.heldCostMicros).toBeUndefined();
+    expect(adapter.stats().settled).toBe(1);
   });
 
   it('refuses ambiguous ledger wiring at construction', () => {
@@ -263,5 +302,158 @@ describe('failure paths remain auditable', () => {
         ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:probe' })
       })
     ).toThrow(MeteredModelError);
+  });
+});
+
+describe('LEDGER-5: transport exceptions hold funds/seats instead of booking FINAL', () => {
+  it('an ECONNRESET-shaped exception settles INTERIM and the late usage reconciles on the SAME callId', async () => {
+    const manager = createLedgerReservationManager({
+      enabled: true,
+      enforceHardBounds: true,
+      generalBudgetMicros: 1_000_000,
+      defaultRateCard: RATE_CARD
+    });
+    const { model } = fakeModel({ transportError: true });
+    const adapter = createMeteredModelAdapter(model, 'probe', {
+      ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:test' }),
+      idFactory: () => 'mcall_econnreset'
+    });
+    await expect(adapter.call(requestFor('probe'))).rejects.toThrow('read ECONNRESET');
+    const record = adapter.records()[0];
+    expect(record?.outcome).toBe('infrastructure_error');
+    expect(record?.settlement).toBe('interim');
+    expect(record?.reservationId).toBeDefined();
+    // Nothing was booked as settled spend; the conservative figure is HELD.
+    expect(record?.incurredCostMicros).toBeUndefined();
+    expect(record?.heldCostMicros).toBe(RATE_CARD.conservativeFallbackCostMicros);
+    expect(manager.getBudgetStatus().generalPool.settledMicros).toBe(0);
+    expect(manager.getBudgetStatus().generalPool.reservedMicros).toBeGreaterThan(0);
+
+    // The identity survives so the provider's late usage (or an external bill)
+    // can still land on the ORIGINAL callId — the held money gets its truth.
+    const merged = adapter.reconcileLateUsage({
+      originCallId: 'mcall_econnreset',
+      usage: createUsagePayload({ input: 1_000, output: 500, semantics: SEMANTICS })
+    });
+    expect(merged.callId).toBe('mcall_econnreset');
+    expect(merged.incurredCostMicros).toBeGreaterThan(0);
+    expect(adapter.lateUsageSettlements()).toHaveLength(1);
+    expect(manager.getBudgetStatus().generalPool.settledMicros).toBe(merged.incurredCostMicros);
+  });
+
+  it('holds the SEAT for an infrastructure_error and releases it for a remote-confirmed failed', () => {
+    // `requiresSeat` is a begin-call knob the adapter does not expose (it always
+    // passes false), so the seat half of the contract is pinned at the settlement
+    // level the adapter delegates to.
+    const infra = createLedgerReservationManager({
+      enabled: true,
+      enforceHardBounds: true,
+      defaultRateCard: RATE_CARD,
+      maxConcurrencySeats: 2
+    });
+    const infraSettlement = twoPhaseSettlementFor(infra, { consumer: 'metered-model-adapter:test' });
+    const infraCall = infraSettlement.beginCall({
+      consumer: 'metered-model-adapter:test',
+      callId: 'mcall_seat_infra',
+      phase: 'probe',
+      pool: 'general',
+      estimatedCostMicros: 10_000,
+      requiresSeat: true
+    });
+    expect(infraCall.granted).toBe(true);
+    const infraSettled = infraSettlement.settleCall({
+      callId: 'mcall_seat_infra',
+      reservationId: infraCall.reservationId as string,
+      outcome: 'infrastructure_error',
+      releaseSeat: true
+    });
+    // An explicit releaseSeat is DELAYED, never forced: the provider may still
+    // be generating, so the slot stays occupied (ADR-0004 §5.1).
+    expect(infraSettled.settlement).toBe('interim');
+    expect(infraSettled.result.seatReleased).toBe(false);
+    expect(infraSettled.result.seatRetainedPendingRemote).toBe(true);
+    expect(infra.occupiedSeatCount).toBe(1);
+
+    const failed = createLedgerReservationManager({
+      enabled: true,
+      enforceHardBounds: true,
+      defaultRateCard: RATE_CARD,
+      maxConcurrencySeats: 2
+    });
+    const failedSettlement = twoPhaseSettlementFor(failed, { consumer: 'metered-model-adapter:test' });
+    const failedCall = failedSettlement.beginCall({
+      consumer: 'metered-model-adapter:test',
+      callId: 'mcall_seat_failed',
+      phase: 'probe',
+      pool: 'general',
+      estimatedCostMicros: 10_000,
+      requiresSeat: true
+    });
+    expect(failedCall.granted).toBe(true);
+    const failedSettled = failedSettlement.settleCall({
+      callId: 'mcall_seat_failed',
+      reservationId: failedCall.reservationId as string,
+      outcome: 'failed',
+      releaseSeat: true
+    });
+    expect(failedSettled.settlement).toBe('final');
+    expect(failedSettled.result.seatReleased).toBe(true);
+    expect(failed.occupiedSeatCount).toBe(0);
+  });
+});
+
+describe('LEDGER-6: a failed settlement is recorded as settle_failed on EVERY path', () => {
+  it('the SUCCESS path records settle_failed and counts it in stats', async () => {
+    const manager = createLedgerReservationManager({ enabled: true, defaultRateCard: RATE_CARD });
+    const settlement = twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:test' });
+    // Poison the settlement AFTER the reservation is minted by beginCall but so
+    // that settleCall throws — the "money may already have moved" shape.
+    const poisonedSettle = settlement.settleCall.bind(settlement);
+    settlement.settleCall = (request: Parameters<typeof settlement.settleCall>[0]) => {
+      if (request.callId === 'mcall_poison_success') {
+        throw new Error('wal append failed (poisoned)');
+      }
+      return poisonedSettle(request);
+    };
+    const { model } = fakeModel();
+    const adapter = createMeteredModelAdapter(model, 'compose', {
+      ledgerSettlement: settlement,
+      idFactory: () => 'mcall_poison_success'
+    });
+    // The model call itself SUCCEEDS; only the settlement behind it fails.
+    const response = await adapter.call(requestFor('compose'));
+    expect(response.text).toBe('ok');
+    const record = adapter.records()[0];
+    expect(record?.outcome).toBe('succeeded');
+    expect(record?.reservationId).toBeDefined();
+    expect(record?.error).toBe('settle_failed');
+    expect(record?.provenance).toBe('unknown');
+    expect(record?.incurredCostMicros).toBeUndefined();
+    expect(record?.settlement).toBe('none');
+    const stats = adapter.stats();
+    expect(stats.settleFailures).toBe(1);
+    expect(stats.modelFailures).toBe(0);
+  });
+
+  it('the ERROR path keeps recording settle_failed (the mirrored marker)', async () => {
+    const manager = createLedgerReservationManager({ enabled: true, defaultRateCard: RATE_CARD });
+    const settlement = twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:test' });
+    const poisonedSettle = settlement.settleCall.bind(settlement);
+    settlement.settleCall = (request: Parameters<typeof settlement.settleCall>[0]) => {
+      if (request.callId === 'mcall_poison_error') {
+        throw new Error('wal append failed (poisoned)');
+      }
+      return poisonedSettle(request);
+    };
+    const { model } = fakeModel({ fail: true });
+    const adapter = createMeteredModelAdapter(model, 'reflect', {
+      ledgerSettlement: settlement,
+      idFactory: () => 'mcall_poison_error'
+    });
+    await expect(adapter.call(requestFor('reflect'))).rejects.toThrow('provider boom');
+    const record = adapter.records()[0];
+    expect(record?.error).toBe('settle_failed');
+    expect(adapter.stats().settleFailures).toBe(1);
+    expect(adapter.stats().modelFailures).toBe(0);
   });
 });

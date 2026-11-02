@@ -219,6 +219,35 @@ describe('runInIsolatedBranch', () => {
     ).resolves.toMatchObject({ status: 'succeeded' });
     expect(manager.activeBranchCount).toBe(0);
   });
+
+  it('admits only one same-tick call when the cap is 1 (MEM-5 check-then-await TOCTOU)', async () => {
+    const host = createInMemoryCordisHost();
+    const manager = createCordisSeamManager({
+      host,
+      maxConcurrentBranches: 1,
+      createBranchId: makeIdFactory('br'),
+      now: makeClock(1_000, 5)
+    });
+    let entered = 0;
+    // Both calls are fired in the same tick, so the second one must observe the
+    // first call's synchronous slot reservation when it runs the limit check.
+    const first = manager.runInIsolatedBranch(
+      makeRequest(makePatch(), async () => {
+        entered += 1;
+        return makeExecutionResult();
+      })
+    );
+    const second = manager.runInIsolatedBranch(
+      makeRequest(makePatch(), async () => {
+        entered += 1;
+        return makeExecutionResult();
+      })
+    );
+    await expect(second).rejects.toMatchObject({ code: 'branch_limit_exceeded' });
+    await expect(first).resolves.toMatchObject({ status: 'succeeded' });
+    expect(entered).toBe(1);
+    expect(manager.activeBranchCount).toBe(0);
+  });
 });
 
 describe('concurrent branch isolation', () => {

@@ -444,8 +444,11 @@ describe('JitActivePolicy diagnostics surface', () => {
       expect(Number.isFinite(entry.probability)).toBe(true);
       expect(entry.probability).toBeGreaterThanOrEqual(0);
     }
-    // Metadata stays JSON-serialisable: no class instances or functions.
-    expect(() => JSON.stringify(plan.metadata)).not.toThrow();
+    // Metadata stays JSON-serialisable: no class instances or functions. The
+    // round-tripped copy must equal the original (a plain stringify() succeeds
+    // for almost any object; equality after the round trip is what actually
+    // fails on functions, Dates, BigInts or cycles).
+    expect(JSON.parse(JSON.stringify(plan.metadata))).toEqual(plan.metadata);
     expect(jit.decisions).toHaveLength(1);
   });
 

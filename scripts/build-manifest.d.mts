@@ -1,5 +1,6 @@
 /**
- * Hand-written types for `build-manifest.mjs` (rev5 P0-5). See `git-objects.d.mts`.
+ * Hand-written types for `build-manifest.mjs` (rev5 P0-5; dependency digest
+ * added by schema 1.1.0, rev6 cross-audit BUILD-1). See `git-objects.d.mts`.
  */
 
 export interface SrcFileDigest {
@@ -10,6 +11,13 @@ export interface SrcFileDigest {
 
 export interface SrcTreeSummary {
   srcTreeSha256: string;
+  fileCount: number;
+  files: SrcFileDigest[];
+}
+
+/** Schema 1.1.0: `package.json` + `pnpm-lock.yaml`, the bytes the bundle inlines. */
+export interface DependencySummary {
+  dependencySha256: string;
   fileCount: number;
   files: SrcFileDigest[];
 }
@@ -26,12 +34,17 @@ export interface BuildStamp {
   srcTreeSha256: string;
   srcFileCount: number;
   srcFiles: SrcFileDigest[];
+  /** Schema 1.1.0: a dependency bump without a rebuild must not look fresh. */
+  dependencySha256: string;
+  dependencyFileCount: number;
+  dependencyFiles: SrcFileDigest[];
   artifact: BuildStampArtifact | null;
   commit: string | null;
   commitError: string | null;
   commitSource: string;
   algorithm: {
     fileSet: string;
+    dependencyFileSet: string;
     pathFormat: string;
     sorting: string;
     lineFormat: string;
@@ -59,6 +72,11 @@ export interface BuildStatus {
     recorded: string | null;
     currentFileCount: number;
   };
+  dependencySha256: {
+    current: string;
+    recorded: string | null;
+    currentFileCount: number;
+  };
   commit: {
     recorded: string | null;
     head: string | null;
@@ -72,6 +90,8 @@ export declare const BUILD_STAMP_PATH: string;
 export declare const BUILD_ARTIFACT_PATH: string;
 
 export declare function computeSrcTreeSha256(options?: { cwd?: string }): SrcTreeSummary;
+
+export declare function computeDependencySha256(options?: { cwd?: string }): DependencySummary;
 
 export declare function buildStamp(options?: { cwd?: string; artifactPath?: string }): BuildStamp;
 

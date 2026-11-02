@@ -10,7 +10,10 @@
  *   injected model adapter, the verdict is cached, and an unsupported or
  *   failing probe degrades to verbalized with a recorded diagnostic;
  * - policy_prior: log of the active-policy slot share, memory-confidence
- *   modulated and divided by the exploration temperature (section 3.1).
+ *   modulated and temperature-scaled as log(share^(1/T)) (section 3.1).
+ *   Audit JITRL-2: the temperature divides the LOGIT (log(share) / T), not
+ *   the pre-log share - dividing the share subtracts a constant from every
+ *   slot and is invisible to softmax/centerLogits.
  *
  * Everything is pure arithmetic over injected values. The only I/O is the
  * one-shot capability probe; probe failures degrade deterministically and
@@ -108,10 +111,19 @@ function normalizeSlotWeights(
  * Prior logit for one meta slot kind (plan section 3.1): the normalized
  * slot share, modulated by memory confidence exactly like
  * ActivePolicy.utilityOf (explore_domain boosted by confidence,
- * explore_invariant boosted by its absence), divided by the exploration
- * temperature, then logged. A zero share yields ZERO_SHARE_LOGIT.
+ * explore_invariant boosted by its absence), scaled by the exploration
+ * temperature (share^(1/T)) and logged. A zero share yields ZERO_SHARE_LOGIT.
  * Undefined memoryConfidence means 'no memory signal': the plain share is
  * used without modulation. Undefined or non-positive temperature means 1.
+ *
+ * Audit JITRL-2: this used to divide the SHARE by T, i.e. log(share) - log(T),
+ * which subtracts the SAME constant from every slot's logit. Softmax (and the
+ * `centerLogits` pre-shift inside adjustLogits) is invariant to a constant
+ * shift, so T changed neither the prior probabilities, nor the argmax, nor
+ * `klToPrior` whenever every slot share was positive - an inert
+ * "exploration temperature". log(share^(1/T)) = log(share) / T is the logit
+ * temperature the plan section 3.1 prior describes: T > 1 flattens the prior,
+ * T < 1 sharpens it, and T = 1 is the pre-fix default path bit for bit.
  */
 export function policyPriorLogit(
   slotWeights: Readonly<Record<BatchSlotKind, number>> | undefined,
@@ -140,8 +152,10 @@ export function policyPriorLogit(
     explorationTemperature > 0
       ? explorationTemperature
       : 1;
-  const effective = modulated / temperature;
-  return effective > 0 ? Math.log(effective) : ZERO_SHARE_LOGIT;
+  // log(share^(1/T)): the temperature scales the LOGIT, not the pre-log share.
+  // A zero share keeps the neutral floor (and a zero-share slot must not be
+  // "warmed" into a positive probability by 1/T).
+  return modulated > 0 ? Math.log(modulated) / temperature : ZERO_SHARE_LOGIT;
 }
 
 /** Per-decision context for a logit source; every field is optional. */
@@ -268,6 +282,11 @@ export interface AutoLogitSourceOptions {
   readonly logitSource: 'auto' | 'verbalized' | 'token';
   readonly model?: IModelAdapter;
   readonly capabilities?: LogprobCapabilities;
+  /**
+   * P3-B metering wiring for the capability probe (LEDGER-9); absent records
+   * the probe without cost. Forwarded verbatim to createTokenLogprobSource.
+   */
+  readonly metering?: MeteredModelOptions;
 }
 
 /**
@@ -295,7 +314,8 @@ export async function createAutoLogitSource(
     } else {
       inner = await createTokenLogprobSource({
         model: options.model,
-        capabilities: options.capabilities ?? { tokenLogprobs: 'unknown' }
+        capabilities: options.capabilities ?? { tokenLogprobs: 'unknown' },
+        ...(options.metering === undefined ? {} : { metering: options.metering })
       });
     }
   } else if (options.logitSource === 'auto') {
@@ -305,7 +325,8 @@ export async function createAutoLogitSource(
     } else {
       inner = await createTokenLogprobSource({
         model: options.model,
-        capabilities: options.capabilities ?? { tokenLogprobs: 'unknown' }
+        capabilities: options.capabilities ?? { tokenLogprobs: 'unknown' },
+        ...(options.metering === undefined ? {} : { metering: options.metering })
       });
     }
   } else {

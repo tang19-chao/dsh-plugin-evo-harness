@@ -424,6 +424,18 @@ function readPositiveInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : undefined;
 }
 
+/**
+ * Narrow a value to a positive finite number (fractional budgets are valid).
+ *
+ * VERIF-6: the adapter-level `probeTimeoutMs` rule accepts any finite
+ * non-negative number, so the per-probe metadata override must not be held to
+ * a stricter integer rule — a fractional budget used to fall back SILENTLY to
+ * the adapter default (0 = timer disabled), leaving the probe unbounded.
+ */
+function readPositiveFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
 /** Sum two optional usage records; either may be absent. */
 function addUsage(current: TokenUsage | undefined, next: TokenUsage | undefined): TokenUsage | undefined {
   if (next === undefined) {
@@ -531,22 +543,11 @@ export function createAgentLoopExecutor(
   const settlement: TwoPhaseSettlement | undefined =
     adapters.ledgerSettlement ?? ledgerAssembly?.settlement;
 
-  /** Per-probe max steps: context metadata wins, then the adapter default. */
-  const resolveMaxSteps = (context: IsolatedBranchContext): number =>
-    readPositiveInteger(context.metadata?.maxStepsPerProbe) ?? defaultMaxSteps;
-
-  /** Per-probe wall-clock budget: context metadata wins, then the adapter default. */
-  const resolveBudget = (context: IsolatedBranchContext): number =>
-    readPositiveInteger(context.metadata?.probeTimeoutMs) ?? defaultBudget;
-
   const runBranch: BranchExecutor = async (
     context: IsolatedBranchContext
   ): Promise<ProbeExecutionResult> => {
     const model = adapters.model;
     const tools = adapters.tools;
-    const maxSteps = resolveMaxSteps(context);
-    const budget = resolveBudget(context);
-    const guidance = extractToolGuidance(context.patch);
     const canLoop = model !== undefined && typeof model.planNext === 'function' && tools !== undefined;
     const mode: AgentExecutionMode = canLoop ? 'agent_loop' : 'single_call';
     const report = adapters.onDiagnostic;
@@ -568,6 +569,29 @@ export function createAgentLoopExecutor(
       collector.recordDiagnostic(message);
       report?.(message);
     };
+
+    // ---- per-probe budgets -------------------------------------------------
+    // VERIF-6: a metadata override that is present but unusable is reported
+    // EXPLICITLY instead of falling back silently — the silent fallback could
+    // leave a probe with NO wall-clock budget (the adapter default is 0 when
+    // none was configured) and no trace of the rejected override.
+    const metadataMaxSteps = context.metadata?.maxStepsPerProbe;
+    const maxSteps = readPositiveInteger(metadataMaxSteps) ?? defaultMaxSteps;
+    if (metadataMaxSteps !== undefined && readPositiveInteger(metadataMaxSteps) === undefined) {
+      diagnostic(
+        'metadata.maxStepsPerProbe override "' + String(metadataMaxSteps) +
+        '" is not a positive integer; the adapter default ' + String(defaultMaxSteps) + ' applies'
+      );
+    }
+    const metadataBudget = context.metadata?.probeTimeoutMs;
+    const budget = readPositiveFiniteNumber(metadataBudget) ?? defaultBudget;
+    if (metadataBudget !== undefined && readPositiveFiniteNumber(metadataBudget) === undefined) {
+      diagnostic(
+        'metadata.probeTimeoutMs override "' + String(metadataBudget) +
+        '" is not a positive finite number; the adapter default ' + String(defaultBudget) + 'ms applies' +
+        (defaultBudget > 0 ? '' : ' (the probe runs with NO wall-clock budget)')
+      );
+    }
 
     // ---- session/event collection -----------------------------------------
     const emit = (
@@ -617,10 +641,29 @@ export function createAgentLoopExecutor(
       if (settlement === undefined) {
         return;
       }
+      let identity: LedgerCallIdentity | undefined;
       try {
-        ledgerCallRefs.push(settlement.settleCall(request).identity);
+        identity = settlement.settleCall(request).identity;
       } catch (error) {
         diagnostic('ledger settlement failed for call "' + request.callId + '": ' + errorMessageOf(error));
+      } finally {
+        // VERIF-5: the callId -> reservationId identity must survive a failed
+        // settlement. metadata.ledgerCalls is the sanctioned reconciliation
+        // surface; skipping the push would strand an open reservation with no
+        // callId to reconcile (or release) it by — the exact leak the two-phase
+        // lifecycle must not create. The ledger's own identity (beginCall wrote
+        // the durable mapping) is authoritative; if even that cannot be
+        // recovered the miss is reported, never silent.
+        if (identity === undefined) {
+          identity = settlement.identities().find((entry) => entry.callId === request.callId);
+        }
+        if (identity !== undefined) {
+          ledgerCallRefs.push(identity);
+        } else {
+          diagnostic(
+            'ledger identity for call "' + request.callId + '" could not be registered after a failed settlement'
+          );
+        }
       }
     };
 
@@ -704,14 +747,6 @@ export function createAgentLoopExecutor(
       return settle('failed', { name: 'EvoHarnessAgentLoopError', message });
     }
 
-    const messages: readonly ModelMessage[] = (() => {
-      const built = (adapters.buildMessages ?? defaultAgentProbeMessages)(context);
-      const systemPrompt = adapters.systemPrompt?.(context);
-      return systemPrompt === undefined
-        ? built
-        : [{ role: 'system' as const, content: systemPrompt }, ...built];
-    })();
-
     // ---- cooperative + hard cancellation ---------------------------------
     let timedOut = false;
     let cancelled = false;
@@ -780,6 +815,21 @@ export function createAgentLoopExecutor(
     const completeFn = typeof model.complete === 'function' ? model.complete.bind(model) : undefined;
 
     try {
+      // VERIF-4: host-supplied prompt assembly runs INSIDE the try. A throwing
+      // `extractToolGuidance`/`buildMessages`/`systemPrompt` must settle a
+      // failed trajectory — the catch below guarantees it — never reject
+      // runBranch: the seam manager must never receive a rejection, and a bare
+      // reject would finalize a trajectory with none of this executor's steps
+      // or failure signals.
+      const guidance = extractToolGuidance(context.patch);
+      const messages: readonly ModelMessage[] = (() => {
+        const built = (adapters.buildMessages ?? defaultAgentProbeMessages)(context);
+        const systemPrompt = adapters.systemPrompt?.(context);
+        return systemPrompt === undefined
+          ? built
+          : [{ role: 'system' as const, content: systemPrompt }, ...built];
+      })();
+
       // -------------------------------------------------------------------
       // single_call: one model call, one result step
       // -------------------------------------------------------------------

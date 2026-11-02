@@ -128,7 +128,10 @@ export function snapshotJsonValue(value: unknown, depth = 0): unknown {
   }
   const copy: Record<string, unknown> = {};
   for (const key of keys.slice(0, MAX_JSON_ITEMS)) {
-    const item = snapshotJsonValue(record[key], depth + 1);
+    // The property read itself is guarded: a live host object can carry an
+    // accessor that throws, and the docstring above promises the accessor is
+    // DROPPED, never that the snapshot throws.
+    const item = snapshotJsonValue(safeGet(record, key), depth + 1);
     if (item !== undefined) {
       copy[key] = item;
     }

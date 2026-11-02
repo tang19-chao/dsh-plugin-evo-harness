@@ -1,5 +1,8 @@
 # ADR 0004：C2b 可信质量消费与 Dreamer 独立留出验证契约（含双轨分别检索、生产保守门复用与 Holdout 四维隔离）
 
+> **编号消歧（2026-11-01 审计 DOCS-5）**：本文件与 `docs/adr/0004-c3-metering-cancellation-recovery-and-limits-contract.md` 共用编号 0004。
+> 裸引用「ADR 0004 §x」默认指 **0004-c2b**（本文件，C2b 质量消费与 Dreamer 留出）；涉及计量/取消/限额时一律写 **0004-c3**。
+
 | 项 | 值 |
 | --- | --- |
 | **状态** | **proposed / draft**（提议 / 草案；明确作为本轮及后续 PR-2 / PR-4B / PR-5 实现、独立验证与独立评审共同遵守的设计契约；**明确声明：本草案不代表已接受或已在线启用能力**） |
@@ -189,6 +192,8 @@ export function isLearningEligibleRecord(
 | **留出集分组数** | 留出集独立 `groupKey` 数 $\ge G_{hold}^{min}$（建议值 1） | `insufficient-holdout-groups` | 判定为证据不足，禁止发布 |
 | **分组时序可容许性** | 存在整组切分且 $\max(\mathcal{T}_{sel}) \le \min(\mathcal{T}_{hold})$ | `insufficient-temporal-isolation` | 无可行切分则不生成/不发布，不得改用尾部近似切分 |
 | **泛化超体积增量** | $HV_{hold}(C^*) > HV_{hold}(Baseline) + \epsilon_{hold}$ | 未显著跑赢 Baseline | `validatedOnHoldout: false`，G3 判定为 `held-out-underperformed` 拒绝 |
+
+> 实现注记（2026-11-01）：选择集样本量的硬性拒绝下限为 0（空选择集，verdict `insufficient-selection-trees`）；建议值 2 以 advisory 常量 `RECOMMENDED_MIN_SELECTION_TREES` 实现，经 `split.diagnostics.selectionMeetsRecommendedMinimum` 上报而不强制——硬性 2 下限会使已授权的阳性对照（1 选择集 + 1 留出集）无法构造（见 `src/dream-rsi/offline-dreamer.ts` 及 pr4b-holdout 测试）。
 
 ### 4.5 Dreamer 发布门与 idle 回退彻底收口
 1. **三道闸全闭（G1/G2/G3）**：

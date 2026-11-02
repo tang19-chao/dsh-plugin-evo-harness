@@ -11,8 +11,26 @@
  * - Time-freezing principle: rate card snapshotted at reservation time (ADR-0004 §8.1).
  * - Real cancellation & late usage reconciliation (ADR-0004 §5).
  * - Write-Ahead Log (WAL) and crash recovery with conservation check (ADR-0004 §6).
+ *
+ * SINGLE-WRITER ASSUMPTION (LEDGER-11)
+ *   Every admission decision (pool counters, seats, idempotency cache) lives in
+ *   THIS instance's memory, while the WAL/snapshot/call index are shared files
+ *   in `storageDir`. The ledger therefore assumes ONE writer per storageDir:
+ *   two live writers would each grant reservations against their own counters
+ *   and the combined spend could exceed the budget. When a storageDir is
+ *   configured, the constructor takes `ledger.writer.lock` in it and refuses a
+ *   second LIVE writer (a different live pid on this host, or any other host) —
+ *   a crashed writer's lock is taken over, and re-opening inside the SAME
+ *   process (the sanctioned in-process restart/recovery flow) re-takes it. The
+ *   lock is best-effort (it is never fsynced and PID reuse can fool the
+ *   liveness probe); it is a tripwire, not a correctness gate — the WAL remains
+ *   the authority. To recover on a different host, remove the stale lock file
+ *   explicitly.
  */
 
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { aggregatePrecision, calculateUsageCost } from './pricing.js';
 import { createUsageLedgerEvent } from './ledger-event.js';
 import { summarizeUsageAccounting, type UsageAccountingReport } from './usage-report.js';
@@ -66,13 +84,129 @@ export class LedgerError extends Error {
       | 'LEDGER_BALANCE_MISMATCH'
       | 'CALL_NOT_FOUND'
       | 'CANNOT_RECONCILE'
+      // LEDGER-11: another live writer already owns this storageDir.
+      | 'STORAGE_DIR_ALREADY_OPEN'
   ) {
     super(`[LedgerError:${code}] ${message}`);
     this.name = 'LedgerError';
   }
 }
 
+/**
+ * The conservative floor booked when NO rate card is reachable (R2-3/LEDGER-3
+ * family): unknown usage must never silently book 0 (ADR-0003 §7.3.5). settle()
+ * and reconcileLateUsage() fall back to this when they have neither a frozen
+ * card nor a request card, and `bookNewAttempt` ring-fences it so a no-card new
+ * attempt settles at the reserved upper bound instead of 0.
+ */
+export const CONSERVATIVE_FALLBACK_FLOOR_MICROS = 10_000;
+
 let reservationSequence = 0;
+
+/**
+ * The file that records which writer owns a durable storageDir (LEDGER-11).
+ * Lives BESIDE the WAL/snapshot; nothing else in the ledger reads it.
+ */
+const WRITER_LOCK_FILE = 'ledger.writer.lock';
+
+/** What the writer lock records: enough to identify the owning process and host. */
+interface WriterLockContents {
+  readonly pid: number;
+  readonly hostname: string;
+  readonly takenAt: number;
+}
+
+function currentHostname(): string {
+  try {
+    return os.hostname();
+  } catch {
+    return 'unknown-host';
+  }
+}
+
+/**
+ * Best-effort liveness probe for a recorded writer pid.
+ *
+ * `process.kill(pid, 0)` throws ESRCH for a dead pid; EPERM means the process
+ * exists but is not signalable by us (another user's process) — alive. PID
+ * reuse can fool this probe; that is accepted (the lock is a tripwire, see the
+ * module header).
+ */
+function writerProcessIsAlive(pid: number): boolean {
+  if (pid === process.pid) {
+    return true;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | undefined)?.code === 'EPERM';
+  }
+}
+
+/**
+ * Take the storageDir writer lock, refusing a second LIVE writer (LEDGER-11).
+ *
+ *   - lock by a different live pid on THIS host → refused (the audit's
+ *     double-open: two writers each granting the full budget);
+ *   - lock by ANY other host → refused (liveness cannot be checked remotely;
+ *     fail closed — remove the stale lock file explicitly to recover);
+ *   - lock by THIS process → re-taken (the sanctioned in-process restart /
+ *     recovery flow: a fresh manager over the same dir after recoverFromWal);
+ *   - lock by a DEAD pid (crash takeover) or unreadable/absent lock → taken.
+ *
+ * The lock is written without fsync on purpose: losing it to a power cut opens
+ * no accounting hole (the next writer takes over a missing lock), while a
+ * crash leaves the stale pid behind, which the liveness probe clears.
+ */
+function acquireWriterLock(storageDir: string): void {
+  // Same compliance guard as the WAL (`LedgerWalWriter`): the lock is a file
+  // like any other and must never be written into team collaboration internals.
+  // Checked BEFORE the lock write because this runs first in the constructor.
+  if (storageDir.includes('.agent-teams')) {
+    throw new Error(
+      `Security violation: WAL storageDir cannot be inside .agent-teams ("${storageDir}")`
+    );
+  }
+  const lockPath = path.join(storageDir, WRITER_LOCK_FILE);
+  let existing: WriterLockContents | undefined;
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      typeof (parsed as WriterLockContents).pid === 'number' &&
+      typeof (parsed as WriterLockContents).hostname === 'string'
+    ) {
+      existing = parsed as WriterLockContents;
+    }
+  } catch {
+    existing = undefined;
+  }
+  if (existing !== undefined) {
+    const foreignHost = existing.hostname !== currentHostname();
+    const foreignLiveProcess =
+      existing.pid !== process.pid && writerProcessIsAlive(existing.pid);
+    if (foreignHost || foreignLiveProcess) {
+      // Same-host dead writers AND this process's own lock fall through to the
+      // takeover below; everything else still holding the lock is foreign.
+      throw new LedgerError(
+        `storageDir "${storageDir}" is already open by writer pid=${existing.pid} on host "${existing.hostname}". ` +
+          'The ledger enforces a SINGLE writer per storageDir (two live writers would each grant the full budget ' +
+          'against their own counters). If that writer is provably gone (crashed host/process), remove ' +
+          `${lockPath} explicitly and reopen.`,
+        'STORAGE_DIR_ALREADY_OPEN'
+      );
+    }
+  }
+  fs.mkdirSync(storageDir, { recursive: true });
+  const contents: WriterLockContents = {
+    pid: process.pid,
+    hostname: currentHostname(),
+    takenAt: Date.now()
+  };
+  fs.writeFileSync(lockPath, JSON.stringify(contents, null, 2) + '\n', 'utf8');
+}
 
 /**
  * Outcomes that prove the REMOTE side has stopped generating (ADR-0004 §5.2).
@@ -215,6 +349,11 @@ export class LedgerReservationManager {
   private watermarks?: WatermarkConfig;
 
   constructor(config: LedgerManagerOptions) {
+    // LEDGER-11: refuse a second LIVE writer on a shared storageDir before any
+    // state is built (see SINGLE-WRITER ASSUMPTION in the module header).
+    if (config.storageDir !== undefined) {
+      acquireWriterLock(path.resolve(config.storageDir));
+    }
     this.generalTotalMicros = Math.max(0, config.generalBudgetMicros);
     this.verificationTotalMicros = Math.max(0, config.verificationReserveMicros);
     this.maxSeats = Math.max(0, config.maxConcurrencySeats);
@@ -574,7 +713,6 @@ export class LedgerReservationManager {
           rejectionReason: 'insufficient_budget'
         };
       }
-      this.generalReservedMicros += requiredMicros;
     } else if (pool === 'verification') {
       if (this.verificationRemainingMicros < requiredMicros) {
         return {
@@ -586,13 +724,9 @@ export class LedgerReservationManager {
           rejectionReason: 'insufficient_verification_reserve'
         };
       }
-      this.verificationReservedMicros += requiredMicros;
     }
 
     const seatAcquired = needsSeat && !observe;
-    if (seatAcquired) {
-      this.seatOwners.add(callId);
-    }
 
     reservationSequence += 1;
     const reservationId = `res_${callId}_${Date.now()}_${reservationSequence}`;
@@ -616,9 +750,11 @@ export class LedgerReservationManager {
       state: 'active'
     };
 
-    this.activeReservations.set(reservationId, record);
-    this.callToReservation.set(callId, reservationId);
-
+    // LEDGER-8 (append-then-apply): the WAL event gates the state change
+    // (ADR-0004 §6.1). The pool counters, the seat ownership and the reservation
+    // maps are only touched AFTER the append succeeded, so a failed append
+    // leaves NO unlogged money movement and no orphaned live reservation — the
+    // caller sees the error and a retry simply reserves again.
     this.walWriter.append('EVENT_RESERVED', {
       reservationId,
       callId,
@@ -633,6 +769,19 @@ export class LedgerReservationManager {
       // silently reprice a recovered reservation against today's default card.
       ...(effectiveRateCard === undefined ? {} : { rateCard: effectiveRateCard })
     });
+
+    if (!observe) {
+      if (pool === 'general') {
+        this.generalReservedMicros += requiredMicros;
+      } else if (pool === 'verification') {
+        this.verificationReservedMicros += requiredMicros;
+      }
+    }
+    if (seatAcquired) {
+      this.seatOwners.add(callId);
+    }
+    this.activeReservations.set(reservationId, record);
+    this.callToReservation.set(callId, reservationId);
 
     if (observe) {
       this.reserveGranted += 1;
@@ -761,7 +910,9 @@ export class LedgerReservationManager {
 
     if (request.actualCostMicros !== undefined) {
       const rawMicros = Math.max(0, request.actualCostMicros);
-      const fallbackFloor = effectiveRateCard ? Math.max(1, effectiveRateCard.conservativeFallbackCostMicros) : 10_000;
+      const fallbackFloor = effectiveRateCard
+        ? Math.max(1, effectiveRateCard.conservativeFallbackCostMicros)
+        : CONSERVATIVE_FALLBACK_FLOOR_MICROS;
 
       if (!usage) {
         // actualCostMicros provided without usage payload => cannot claim estimated; must be unknown and conservative
@@ -859,12 +1010,19 @@ export class LedgerReservationManager {
         auditNote: 'Usage payload omitted; applied conservative rate card ceiling'
       };
     } else {
-      // Fallback: use reserved amount
+      // Fallback: use reserved amount. R2-3: REAL usage with no reachable card
+      // must never silently book 0 (ADR-0003 §7.3.5) — when the reservation
+      // ring-fenced nothing (observe mode, or a zero estimate), land on the
+      // same conservative floor settle() applies elsewhere.
+      const reservedBound =
+        usage !== undefined
+          ? Math.max(reservation.reservedCostMicros, CONSERVATIVE_FALLBACK_FLOOR_MICROS)
+          : reservation.reservedCostMicros;
       costCalc = {
-        totalCostMicros: reservation.reservedCostMicros,
+        totalCostMicros: reservedBound,
         breakdown: {
           netInputTokens: 0,
-          inputCostMicros: reservation.reservedCostMicros,
+          inputCostMicros: reservedBound,
           cacheReadTokens: 0,
           cacheReadCostMicros: 0,
           cacheWriteTokens: 0,
@@ -876,7 +1034,10 @@ export class LedgerReservationManager {
         },
         provenance: 'unknown',
         conservative: true,
-        auditNote: 'No rate card or usage provided; settled at reserved upper bound'
+        auditNote:
+          usage !== undefined
+            ? 'Usage arrived with no reachable rate card; settled at the conservative fallback floor'
+            : 'No rate card or usage provided; settled at reserved upper bound'
       };
     }
 
@@ -886,20 +1047,19 @@ export class LedgerReservationManager {
     // Handle Interim vs Final Settlement
     const isInterim = request.interim === true;
 
+    // LEDGER-8 (append-then-apply): every decision below is first computed as a
+    // PURE value so the WAL event can be appended BEFORE any state changes. A
+    // failed append (ENOSPC/EIO) then leaves nothing to roll back: the caller
+    // sees the error with the pools, seats, reservation and idempotency cache
+    // untouched, and a retry re-computes the same settlement and re-attempts the
+    // append — the money movement is never unlogged (ADR-0004 §6.1: the log
+    // record gates the state change).
     let amountRefundedMicros = 0;
     if (!isInterim) {
       amountRefundedMicros = Math.max(0, reservedCostMicros - incurredCostMicros);
-      // Update Budget Pool
-      if (reservation.pool === 'general') {
-        this.generalReservedMicros = Math.max(0, this.generalReservedMicros - reservedCostMicros);
-        this.generalSettledMicros += incurredCostMicros;
-      } else {
-        this.verificationReservedMicros = Math.max(0, this.verificationReservedMicros - reservedCostMicros);
-        this.verificationSettledMicros += incurredCostMicros;
-      }
     }
 
-    // Seat Management: seatReleased != amountRefunded
+    // Seat Management: seatReleased != Amount refund
     //
     // ADR-0004 §5.1 / B-4 (t7 repair): a seat may only be returned once the REMOTE
     // termination is confirmable. `Promise.race` deciding that we stop waiting is
@@ -914,23 +1074,15 @@ export class LedgerReservationManager {
     const remoteConfirmed = isRemoteTerminationConfirmed(outcome);
     const seatRetainedForRemote = reservation.seatAcquired && shouldReleaseSeat && !remoteConfirmed;
     const seatRetainedForCaller = reservation.seatAcquired && !shouldReleaseSeat;
+    // Pure release decision: `releaseSeatOwnership` would return true exactly
+    // when one of the three ownership handles still holds this callId.
     const seatReleased =
-      reservation.seatAcquired && shouldReleaseSeat && remoteConfirmed
-        ? this.releaseSeatOwnership(callId)
-        : false;
-    if (seatRetainedForRemote) {
-      // Keep the OWNERSHIP SET unchanged (the call still owns the slot) and
-      // record why. The handle is metadata; releasing just deletes the callId
-      // from the set and this map, so a stale call can never free someone else.
-      this.seatsRetainedPendingRemote.set(callId, reservationId);
-      this.pushAlert(
-        'seat-retained-pending-remote',
-        `call "${callId}" stopped waiting locally but remote termination is unconfirmed; seat retained`,
-        { pool: reservation.pool, callId }
-      );
-    } else if (seatRetainedForCaller) {
-      this.seatsRetainedByCaller.add(callId);
-    }
+      reservation.seatAcquired &&
+      shouldReleaseSeat &&
+      remoteConfirmed &&
+      (this.seatOwners.has(callId) ||
+        this.seatsRetainedPendingRemote.has(callId) ||
+        this.seatsRetainedByCaller.has(callId));
 
     // Record Event
     const effectiveUsage: ProviderUsagePayload = usage ?? {
@@ -949,18 +1101,6 @@ export class LedgerReservationManager {
       sessionId: request.sessionId ?? reservation.sessionId
     });
 
-    this.ledgerEvents.push(ledgerEvent);
-
-    if (isInterim) {
-      reservation.state = 'interim_settled';
-      reservation.incurredCostMicros = incurredCostMicros;
-    } else {
-      reservation.state = 'settled';
-      reservation.incurredCostMicros = incurredCostMicros;
-      this.activeReservations.delete(reservationId);
-      this.callToReservation.delete(callId);
-    }
-
     const result: SettleResult = {
       settled: true,
       callId,
@@ -978,9 +1118,6 @@ export class LedgerReservationManager {
       state: isInterim ? 'interim_settled' : 'settled'
     };
 
-    // Store for idempotent replay
-    this.settledCalls.set(callId, result);
-
     this.walWriter.append('EVENT_SETTLED', {
       callId,
       reservationId,
@@ -994,6 +1131,50 @@ export class LedgerReservationManager {
       ...(seatRetainedForRemote ? { seatRetainedPendingRemote: true } : {}),
       ...(seatRetainedForCaller ? { seatRetainedByCaller: true } : {})
     });
+
+    // ---- apply (only after the WAL accepted the event) ----
+    if (!isInterim) {
+      // Update Budget Pool
+      if (reservation.pool === 'general') {
+        this.generalReservedMicros = Math.max(0, this.generalReservedMicros - reservedCostMicros);
+        this.generalSettledMicros += incurredCostMicros;
+      } else {
+        this.verificationReservedMicros = Math.max(0, this.verificationReservedMicros - reservedCostMicros);
+        this.verificationSettledMicros += incurredCostMicros;
+      }
+    }
+
+    if (seatReleased) {
+      this.releaseSeatOwnership(callId);
+    }
+    if (seatRetainedForRemote) {
+      // Keep the OWNERSHIP SET unchanged (the call still owns the slot) and
+      // record why. The handle is metadata; releasing just deletes the callId
+      // from the set and this map, so a stale call can never free someone else.
+      this.seatsRetainedPendingRemote.set(callId, reservationId);
+      this.pushAlert(
+        'seat-retained-pending-remote',
+        `call "${callId}" stopped waiting locally but remote termination is unconfirmed; seat retained`,
+        { pool: reservation.pool, callId }
+      );
+    } else if (seatRetainedForCaller) {
+      this.seatsRetainedByCaller.add(callId);
+    }
+
+    this.ledgerEvents.push(ledgerEvent);
+
+    if (isInterim) {
+      reservation.state = 'interim_settled';
+      reservation.incurredCostMicros = incurredCostMicros;
+    } else {
+      reservation.state = 'settled';
+      reservation.incurredCostMicros = incurredCostMicros;
+      this.activeReservations.delete(reservationId);
+      this.callToReservation.delete(callId);
+    }
+
+    // Store for idempotent replay
+    this.settledCalls.set(callId, result);
 
     // PR-3B §7.4: emit watermark / freeze / overdraft alerts after the pools move.
     this.emitPoolAlerts(reservation.pool, callId);
@@ -1086,7 +1267,9 @@ export class LedgerReservationManager {
 
     if (request.actualCostMicros !== undefined) {
       const rawMicros = Math.max(0, request.actualCostMicros);
-      const fallbackFloor = effectiveRateCard ? Math.max(1, effectiveRateCard.conservativeFallbackCostMicros) : 10_000;
+      const fallbackFloor = effectiveRateCard
+        ? Math.max(1, effectiveRateCard.conservativeFallbackCostMicros)
+        : CONSERVATIVE_FALLBACK_FLOOR_MICROS;
       if (!usage) {
         // No usage payload => this is NOT a measured figure. Apply the same
         // conservative floor as settle(), so reconcile({actualCostMicros:0})
@@ -1161,41 +1344,14 @@ export class LedgerReservationManager {
     let amountRefundedMicros = 0;
     let delta = 0;
 
+    // Pure delta/refund computation — no state is touched yet (LEDGER-8).
     if (wasInterim) {
       delta = newIncurredCost - reservedCost;
-      if (pool === 'general') {
-        this.generalReservedMicros = Math.max(0, this.generalReservedMicros - reservedCost);
-        this.generalSettledMicros += newIncurredCost;
-      } else {
-        this.verificationReservedMicros = Math.max(0, this.verificationReservedMicros - reservedCost);
-        this.verificationSettledMicros += newIncurredCost;
-      }
       amountRefundedMicros = Math.max(0, -delta);
-      if (reservation) {
-        reservation.state = 'settled';
-        reservation.incurredCostMicros = newIncurredCost;
-        this.activeReservations.delete(reservationId);
-        this.callToReservation.delete(callId);
-      }
     } else {
       // Adjusting an already-settled record with later telemetry.
       delta = newIncurredCost - previousIncurred;
-      if (delta !== 0) {
-        if (pool === 'general') {
-          this.generalSettledMicros += delta;
-        } else {
-          this.verificationSettledMicros += delta;
-        }
-      }
       amountRefundedMicros = existing?.amountRefundedMicros ?? 0;
-    }
-
-    if (delta > 0) {
-      const overdraft =
-        pool === 'general' ? this.derivedGeneralOverdraftMicros : this.derivedVerificationOverdraftMicros;
-      if (overdraft > 0) {
-        this.overdraftVariances.push({ callId, pool, overdraftMicros: overdraft, observedAt: Date.now() });
-      }
     }
 
     const effectiveUsage: ProviderUsagePayload = usage ?? existing?.ledgerEvent?.usage ?? {
@@ -1214,8 +1370,6 @@ export class LedgerReservationManager {
       sessionId: request.sessionId ?? reservation?.sessionId ?? existing?.ledgerEvent?.sessionId
     });
 
-    this.ledgerEvents.push(reconciledEvent);
-
     // ADR-0004 §5.1/§5.3 (t7 repair): arriving late usage IS the remote
     // termination becoming confirmable, so the seat retained at interim
     // settlement is returned HERE. The previous implementation hardcoded
@@ -1223,14 +1377,13 @@ export class LedgerReservationManager {
     // the report and leaked the seat forever (the record is deleted right below).
     // Late usage proves the remote call ended, so the single ownership primitive
     // releases exactly once and clears every metadata handle atomically.
-    const seatReleased = this.releaseSeatOwnership(callId);
-    if (seatReleased) {
-      this.walWriter.append('EVENT_SEAT_RELEASED', {
-        callId,
-        reservationId,
-        reason: 'late-usage-confirms-remote'
-      });
-    }
+    //
+    // Pure release decision (LEDGER-8): `releaseSeatOwnership` would return true
+    // exactly when one of the three ownership handles still holds this callId.
+    const seatReleased =
+      this.seatOwners.has(callId) ||
+      this.seatsRetainedPendingRemote.has(callId) ||
+      this.seatsRetainedByCaller.has(callId);
 
     const reconciledResult: SettleResult = {
       settled: true,
@@ -1247,8 +1400,17 @@ export class LedgerReservationManager {
       state: 'settled'
     };
 
-    this.settledCalls.set(callId, reconciledResult);
-
+    // LEDGER-8 (append-then-apply): both WAL events are appended BEFORE any
+    // state changes, so a failed append leaves the pools, the reservation, the
+    // seat ownership and the idempotency cache untouched and a retry re-computes
+    // the same reconciliation and re-attempts the appends.
+    if (seatReleased) {
+      this.walWriter.append('EVENT_SEAT_RELEASED', {
+        callId,
+        reservationId,
+        reason: 'late-usage-confirms-remote'
+      });
+    }
     this.walWriter.append('EVENT_RECONCILED', {
       callId,
       reservationId,
@@ -1262,6 +1424,41 @@ export class LedgerReservationManager {
       qualityEvidence: reconciledEvent.qualityEvidence,
       seatReleased
     });
+
+    // ---- apply (only after the WAL accepted the events) ----
+    if (wasInterim) {
+      if (pool === 'general') {
+        this.generalReservedMicros = Math.max(0, this.generalReservedMicros - reservedCost);
+        this.generalSettledMicros += newIncurredCost;
+      } else {
+        this.verificationReservedMicros = Math.max(0, this.verificationReservedMicros - reservedCost);
+        this.verificationSettledMicros += newIncurredCost;
+      }
+      if (reservation) {
+        reservation.state = 'settled';
+        reservation.incurredCostMicros = newIncurredCost;
+        this.activeReservations.delete(reservationId);
+        this.callToReservation.delete(callId);
+      }
+    } else if (delta !== 0) {
+      if (pool === 'general') {
+        this.generalSettledMicros += delta;
+      } else {
+        this.verificationSettledMicros += delta;
+      }
+    }
+
+    if (delta > 0) {
+      const overdraft =
+        pool === 'general' ? this.derivedGeneralOverdraftMicros : this.derivedVerificationOverdraftMicros;
+      if (overdraft > 0) {
+        this.overdraftVariances.push({ callId, pool, overdraftMicros: overdraft, observedAt: Date.now() });
+      }
+    }
+
+    this.ledgerEvents.push(reconciledEvent);
+    this.releaseSeatOwnership(callId);
+    this.settledCalls.set(callId, reconciledResult);
 
     // Same watermark/freeze/overdraft visibility as settle(): a reconciliation
     // that pushes a pool over budget must not be quieter than a normal settle.

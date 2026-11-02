@@ -11,7 +11,10 @@
  *    the behavioral contrast table. Branch/node/patch identities are removed
  *    and every known identifier is redacted from free text.
  * 2. The judge's ranking can only blend a bounded share (default 15%) into the
- *    adoption ratio; the deterministic evidence score carries the rest.
+ *    adoption ratio; the deterministic evidence score carries the rest. The
+ *    pair is NORMALIZED at construction (CORE-7), so 0.15 is an invariant of
+ *    the blend, not merely its default: a drifted pair is renormalized and the
+ *    renormalization is recorded in the result rationale.
  * 3. A candidate whose trajectory did not succeed can never be selected; when
  *    nothing succeeded the result reports selectedPatch/composedPatch null.
  * 4. Every adoption ratio is clamped to [0, 1].
@@ -538,6 +541,99 @@ function judgeScoreOf(rank: number | undefined, total: number): number | undefin
   return clamp01(1 - (rank - 1) / (total - 1));
 }
 
+/**
+ * Dimensions a contrast DELTA proves the candidate improved on (CORE-2).
+ *
+ * `delta` is always `candidate - reference`, so its sign is dimension-specific:
+ * `task_completion` and `deliverable_quality` are higher-is-better, while
+ * `steps`, `tool_errors`, `cost` and `robustness` count the candidate's
+ * consumption, so a POSITIVE delta there means the winner did worse. Filtering
+ * on `delta > 0` alone therefore named exactly the regressed dimensions as
+ * "wins" - and that sentence is committed verbatim as the lesson's
+ * `executionPatch.summary` (reflector.ts `executionSummary`).
+ */
+const HIGHER_IS_BETTER: ReadonlySet<ContrastDimension> = new Set<ContrastDimension>([
+  'task_completion',
+  'deliverable_quality'
+]);
+
+function improvedContrasts(contrasts: readonly BehavioralContrast[]): BehavioralContrast[] {
+  return contrasts.filter((contrast) => {
+    const delta = contrast.delta;
+    if (delta === undefined || delta === 0) {
+      return false;
+    }
+    return HIGHER_IS_BETTER.has(contrast.dimension) ? delta > 0 : delta < 0;
+  });
+}
+
+/** Effective adoption blend plus any normalization note (CORE-7). */
+interface EffectiveAdoptionBlend {
+  readonly evidence: number;
+  readonly judge: number;
+  /** Present only when the supplied pair had to be repaired/renormalized. */
+  readonly note?: string;
+}
+
+/**
+ * Repair the evidence/judge adoption pair so the blend is always a convex
+ * combination, mirroring `normalizeSurrogateWeights` in surrogate-scorer.ts:
+ * negative and non-finite entries become 0, an all-zero pair falls back to the
+ * frozen defaults, and a pair that does not sum to 1 is renormalized. Without
+ * this, `{ evidenceWeight: 0.9, judgeWeight: 0.9 }` reached
+ * `0.85 * evidence + 0.9 * judge` pre-clamp and the judge could dominate —
+ * making the header's "bounded 15%" only a default rather than an invariant.
+ */
+function normalizeAdoptionBlend(
+  evidence: number | undefined,
+  judge: number | undefined
+): EffectiveAdoptionBlend {
+  const fallback: EffectiveAdoptionBlend = {
+    evidence: DEFAULT_ADOPTION_BLEND.evidence,
+    judge: DEFAULT_ADOPTION_BLEND.judge
+  };
+  if (evidence === undefined && judge === undefined) {
+    return fallback;
+  }
+  // A single absent weight means "use its default"; it is not coerced to 0.
+  const rawEvidence = evidence ?? DEFAULT_ADOPTION_BLEND.evidence;
+  const rawJudge = judge ?? DEFAULT_ADOPTION_BLEND.judge;
+  const sanitizedEvidence = Number.isFinite(rawEvidence) && rawEvidence > 0 ? rawEvidence : 0;
+  const sanitizedJudge = Number.isFinite(rawJudge) && rawJudge > 0 ? rawJudge : 0;
+  const sum = sanitizedEvidence + sanitizedJudge;
+  if (sum <= 0) {
+    return {
+      ...fallback,
+      note:
+        'adoption weights were zero or invalid (evidence=' +
+        String(rawEvidence) +
+        ', judge=' +
+        String(rawJudge) +
+        '); using defaults'
+    };
+  }
+  if (
+    Math.abs(sanitizedEvidence - rawEvidence) > 1e-9 ||
+    Math.abs(sanitizedJudge - rawJudge) > 1e-9
+  ) {
+    return {
+      evidence: sanitizedEvidence / sum,
+      judge: sanitizedJudge / sum,
+      note:
+        'negative or non-finite adoption weights coerced to 0 and normalized by ' +
+        sum.toFixed(6)
+    };
+  }
+  if (Math.abs(sum - 1) <= 1e-9) {
+    return { evidence: sanitizedEvidence, judge: sanitizedJudge };
+  }
+  return {
+    evidence: sanitizedEvidence / sum,
+    judge: sanitizedJudge / sum,
+    note: 'adoption weights did not sum to 1; normalized by ' + sum.toFixed(6)
+  };
+}
+
 function isBetter(left: CandidateEvaluation, right: CandidateEvaluation): boolean {
   if (left.adoptionRatio !== right.adoptionRatio) {
     return left.adoptionRatio > right.adoptionRatio;
@@ -565,8 +661,9 @@ function mergeEdits(base: EightSurfaceEdits | undefined, overlay: EightSurfaceEd
 export function createAnonymousComposer(options: HarnessComposerOptions): IHarnessComposer {
   const now = options.now ?? systemClock;
   const newId = options.newId ?? createDeterministicIdFactory('compose');
-  const evidenceWeight = options.evidenceWeight ?? DEFAULT_ADOPTION_BLEND.evidence;
-  const judgeWeight = options.judgeWeight ?? DEFAULT_ADOPTION_BLEND.judge;
+  // CORE-7: normalize once, at construction, so every call blends with the same
+  // convex pair and a drifted pair is reported instead of silently used.
+  const blend = normalizeAdoptionBlend(options.evidenceWeight, options.judgeWeight);
   const deliverableChars = options.deliverableChars ?? 1200;
   const model = createMeteredModelAdapter(options.model, 'compose', options.metering);
 
@@ -629,18 +726,38 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
         const verdict = readJudgeVerdict(response.text, aliases);
         if (verdict === undefined) {
           judgeUnavailableReason = 'judge returned an unparseable verdict';
-        } else {
-          const ranked = [...verdict.ranking, ...aliases.filter((alias) => !verdict.ranking.includes(alias))];
+        } else if (verdict.ranking.length === 0) {
+          // CORE-3: a parseable verdict without a usable `ranking` (e.g.
+          // `{"assessments": [...]}` or `{"ranking": "A > B"}`, which
+          // readStringList rejects) is NOT a decision. Previously the empty
+          // ranking fell through to `ranked = aliases`, whose order is
+          // branchId\0nodeId — so the lexicographically-first identity earned
+          // judgeScoreOf(1) = 1.0 and the full judge share, a score manufactured
+          // from identity order. It is treated exactly like an unparseable
+          // verdict: judgeUnavailableReason -> evidence-only ratios.
+          judgeUnavailableReason = 'judge returned no usable ranking';
           for (const evaluation of evaluations) {
-            const rank = ranked.indexOf(evaluation.alias);
+            evaluation.judgeRationale = verdict.rationales[evaluation.alias];
+            evaluation.judgeRejectedReason = verdict.rejectedReasons[evaluation.alias];
+          }
+        } else {
+          // CORE-3: blend ONLY the aliases the judge actually ranked. An alias
+          // the judge left out keeps its evidence-only ratio instead of being
+          // assigned a trailing rank by position, so an incomplete ranking
+          // cannot hand a bonus (or a penalty) to whoever sorted first.
+          for (const evaluation of evaluations) {
+            const rank = verdict.ranking.indexOf(evaluation.alias);
             evaluation.judgeRank = rank >= 0 ? rank + 1 : undefined;
             evaluation.judgeRationale = verdict.rationales[evaluation.alias];
             evaluation.judgeRejectedReason = verdict.rejectedReasons[evaluation.alias];
+            // The rank scale stays the full candidate set (the judge saw every
+            // alias), so a partial ranking cannot condense the scores of the
+            // candidates it did rank.
             const judgeScore = judgeScoreOf(evaluation.judgeRank, evaluations.length);
             evaluation.adoptionRatio = clamp01(
               judgeScore === undefined
                 ? evaluation.evidenceScore
-                : evidenceWeight * evaluation.evidenceScore + judgeWeight * judgeScore
+                : blend.evidence * evaluation.evidenceScore + blend.judge * judgeScore
             );
           }
         }
@@ -818,8 +935,7 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
                 ? ' over reference patch ' + referenceBase.patch.id + ' (' + referenceBase.patch.label + ')'
                 : '') +
           '; dimension wins: ' +
-          selected.contrasts
-            .filter((contrast) => (contrast.delta ?? 0) > 0)
+          improvedContrasts(selected.contrasts)
             .map((contrast) => contrast.dimension)
             .join(', ');
         composedPatch = {
@@ -841,7 +957,12 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
             composedFromNodeId: selected.candidate.nodeId,
             evidenceScore: selected.evidenceScore,
             adoptionRatio: selected.adoptionRatio,
-            contrastDimensions: selected.contrasts.map((contrast) => contrast.dimension),
+            // CORE-2: the SAME direction-aware set the rationale names, so the
+            // committed metadata and the committed summary sentence cannot
+            // disagree about which dimensions the winner actually won.
+            contrastDimensions: improvedContrasts(selected.contrasts).map(
+              (contrast) => contrast.dimension
+            ),
             basePatchId: immediateParent?.patch.id ?? referenceBase?.patch.id,
             baseResolution,
             lineageIds,
@@ -879,6 +1000,11 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
         rationaleParts.push('judge unavailable -> evidence-only adoption ratios (' + judgeUnavailableReason + ')');
       } else if (selected?.judgeRank !== undefined) {
         rationaleParts.push('judge rank of the winner: ' + selected.judgeRank);
+      }
+      // CORE-7: a repaired weight pair is never silent - the audit trail names
+      // the renormalization, exactly like the surrogate scorer's diagnostic.
+      if (blend.note !== undefined) {
+        rationaleParts.push('adoption blend repaired: ' + blend.note);
       }
       if (adoptionKeyConflicts.length > 0) {
         rationaleParts.push('adoption key collisions kept the first writer: ' + adoptionKeyConflicts.join(', '));

@@ -207,8 +207,8 @@ describe.each(BACKENDS)('$label', (backend) => {
       sessionId: 'sess-roundtrip'
     });
 
-    const positiveCommit = await memory.commit(positive, { scope, enforceGovernance: true });
-    const negativeCommit = await memory.commit(negative, { scope, enforceGovernance: true });
+    const positiveCommit = await memory.commit(positive, { scope });
+    const negativeCommit = await memory.commit(negative, { scope });
     expect(positiveCommit.accepted).toBe(true);
     expect(negativeCommit.accepted).toBe(true);
 
@@ -240,8 +240,7 @@ describe('governance gate', () => {
 
     const invalid = makeLesson({ id: 'lesson_invalid', whenNotToApply: [] });
     const outcome = await memory.commit(invalid, {
-      scope: { kind: 'session', sessionId: 'sess-gov' },
-      enforceGovernance: true
+      scope: { kind: 'session', sessionId: 'sess-gov' }
     });
 
     expect(outcome.accepted).toBe(false);

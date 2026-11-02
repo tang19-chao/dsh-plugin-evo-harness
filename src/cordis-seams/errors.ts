@@ -16,6 +16,7 @@ export const CORDIS_SEAM_ERROR_CODES = [
   'surface_mount_failed',
   'branch_setup_failed',
   'branch_limit_exceeded',
+  'branch_id_conflict',
   'branch_timeout',
   'branch_aborted',
   'permanent_patch_conflict',

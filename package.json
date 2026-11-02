@@ -51,7 +51,10 @@
     "eval:jitrl": "node scripts/eval-jitrl.mjs",
     "eval:build": "node scripts/eval/build-eval.mjs",
     "eval:jitrl:baseline": "node scripts/eval-jitrl.mjs --baseline docs/reports/p6-eval-baseline.md",
-    "verify": "pnpm run typecheck && pnpm run test"
+    "verify": "pnpm run typecheck && pnpm run test",
+    "check:metering": "node scripts/eval/metering-coverage.mjs",
+    "check:orphans": "node scripts/eval/check-orphan-exports.mjs",
+    "check:import-coverage": "node scripts/eval/check-test-import-coverage.mjs"
   },
   "devDependencies": {
     "@types/node": "22.20.5",

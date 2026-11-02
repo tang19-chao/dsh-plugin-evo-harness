@@ -50,7 +50,13 @@ export * from './policy.store';
 export interface PersistenceRuntimeOptions {
   /** DSH profile whose data directory is used; DSH_PROFILE is the fallback. */
   readonly profile?: string;
-  /** Explicit final data directory (wins over profile/rootDir). */
+  /**
+   * Explicit final data directory (wins over profile/rootDir). Single-host
+   * assumption: a resolved directory must be used by at most one host process
+   * at a time — writers serialize within a process only, so two hosts sharing
+   * a directory lose updates last-writer-wins and can tear JSONL records
+   * (DREAM-9).
+   */
   readonly dataDir?: string;
   /** Persistence root that contains 'profiles/<name>'. */
   readonly rootDir?: string;
@@ -112,13 +118,17 @@ export async function createPersistenceRuntime(
     ...(options.maxHistory === undefined ? {} : { maxHistory: options.maxHistory })
   });
 
-  const diagnostics: readonly string[] = [...treePool.diagnostics, ...policyStore.diagnostics];
   return {
     dataDir,
     treePoolStore,
     treePool,
     policyStore,
-    diagnostics,
+    // Live view over both store sinks: diagnostics noted after creation (tree id
+    // collision rejections, swallowed write failures) stay reachable through this
+    // handle instead of only in the on-disk diagnostics file.
+    get diagnostics(): readonly string[] {
+      return [...treePool.diagnostics, ...policyStore.diagnostics];
+    },
     wrapPolicy: (base: ActivePolicy, policyOptions: PersistentActivePolicyOptions = {}) =>
       new PersistentActivePolicy(policyStore, base, policyOptions),
     async flush(): Promise<void> {

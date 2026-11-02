@@ -31,6 +31,13 @@
  * - request proves no branchId (host call): `outOfScope` — a probe policy can
  *   never deny the host's own tools (that would be the opposite leak).
  * - registry disposed: a branch request is denied (`registry-disposed`).
+ *
+ * TTL semantics (MEM-7): the policy lifetime is SLIDING — every decision for
+ * the branch renews its expiry, so a branch that is still dispatching never
+ * loses its allowlist mid-run (an expired configured policy would otherwise
+ * silently convert to the fail-open `no-policy` default). A policy that sees
+ * no decisions for its TTL still expires and is swept: the lifetime remains a
+ * leak guard for branches whose cleanup never ran.
  */
 
 /** One installed branch policy. Immutable. */
@@ -43,6 +50,8 @@ export interface ToolFacePolicy {
   readonly label?: string;
   readonly installedAt: number;
   readonly expiresAt?: number;
+  /** Effective TTL used for the sliding renewal on each decision. */
+  readonly ttlMs?: number;
 }
 
 /** An explicit denial evaluated before the allowlist. */
@@ -275,7 +284,8 @@ export function createToolFaceRegistry(options: ToolFaceRegistryOptions = {}): T
         denies: Object.freeze(denies.map((denial) => Object.freeze({ ...denial }))),
         ...(spec.label === undefined ? {} : { label: spec.label }),
         installedAt: currentTime,
-        ...(ttl > 0 ? { expiresAt: currentTime + ttl } : {})
+        ...(ttl > 0 ? { expiresAt: currentTime + ttl } : {}),
+        ...(ttl > 0 ? { ttlMs: ttl } : {})
       });
       policies.set(branchId, policy);
       order.push(branchId);
@@ -332,10 +342,18 @@ export function createToolFaceRegistry(options: ToolFaceRegistryOptions = {}): T
         counters.outOfScope += 1;
         return { allowed: true, code: 'out-of-scope', toolName };
       }
-      const policy = policyForInternal(branchId);
-      if (policy === undefined) {
+      const found = policyForInternal(branchId);
+      if (found === undefined) {
         counters.noPolicy += 1;
         return { allowed: true, code: 'no-policy', toolName, branchId };
+      }
+      // MEM-7: renew-on-use. The expiry is sliding from the LAST decision, so
+      // an active branch never lapses into the fail-open no-policy default
+      // mid-run; an idle policy still expires after its TTL and is swept.
+      let policy = found;
+      if (typeof found.ttlMs === 'number' && found.ttlMs > 0) {
+        policy = Object.freeze({ ...found, expiresAt: now() + found.ttlMs });
+        policies.set(branchId, policy);
       }
       const explicit = policy.denies.find((denial) => denial.toolName === toolName);
       if (explicit !== undefined) {

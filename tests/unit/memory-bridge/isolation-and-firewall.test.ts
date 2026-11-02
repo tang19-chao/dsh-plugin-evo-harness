@@ -6,8 +6,10 @@
 
 import { describe, expect, it } from 'vitest';
 
+import type { CanonicalLesson } from '../../../src/types/contracts';
 import { createMemoryBridge } from '../../../src/memory-bridge/bridge';
 import { applyPostRecallFirewall, clauseMatchesContext, tokenizeContext } from '../../../src/memory-bridge/governance-polyfill';
+import { collectLessonRecords, serializeLesson } from '../../../src/memory-bridge/lesson-codec';
 import { deriveNamespace, visibleNamespaces } from '../../../src/memory-bridge/namespace';
 import { graphEntityServer, vectorFactServer } from './mocks/mock-mcp';
 import {
@@ -246,5 +248,95 @@ describe('negative firewall', () => {
     expect(outcome.lessons).toEqual([]);
     expect(outcome.suppressedLessons).toHaveLength(1);
     expect(outcome.confidence).toBe(0);
+  });
+});
+
+describe('unverified-origin firewall (P1-6 / MEM-1)', () => {
+  /** A complete lesson authored by a DIFFERENT deployment's session. */
+  function foreignLesson(overrides: Partial<CanonicalLesson> = {}): CanonicalLesson {
+    return validLesson({ id: 'L-foreign', sessionId: 's-other', branchId: 'b-other', ...overrides });
+  }
+
+  function firewall(records: Parameters<typeof applyPostRecallFirewall>[0]['records'], scope = branchScope()) {
+    return applyPostRecallFirewall({
+      records,
+      query: { scope, text: 'unrelated refactor' },
+      scope,
+      config: memoryConfig(),
+      minConfidence: 0
+    });
+  }
+
+  it('marks hint-attributed untagged payloads as unverified origin and keeps tagged ones verified', () => {
+    const hint = { namespaceHint: BRANCH_A_NS, defaultNamespace: BRANCH_A_NS };
+    const untagged = collectLessonRecords(serializeLesson(foreignLesson()), hint);
+    expect(untagged).toHaveLength(1);
+    expect(untagged[0]?.namespace).toBe(BRANCH_A_NS);
+    expect(untagged[0]?.unverifiedOrigin).toBe(true);
+
+    const tagged = collectLessonRecords(serializeLesson(validLesson(), { namespace: BRANCH_A_NS }), hint);
+    expect(tagged).toHaveLength(1);
+    expect(tagged[0]?.namespace).toBe(BRANCH_A_NS);
+    expect(tagged[0]?.unverifiedOrigin).toBeUndefined();
+  });
+
+  it('suppresses an untagged foreign lesson that hint attribution filed into this branch namespace', () => {
+    const [record] = collectLessonRecords(serializeLesson(foreignLesson()), {
+      namespaceHint: BRANCH_A_NS,
+      defaultNamespace: BRANCH_A_NS
+    });
+    const outcome = firewall(record === undefined ? [] : [record]);
+    expect(outcome.lessons).toEqual([]);
+    expect(outcome.suppressedLessons).toHaveLength(1);
+    expect(outcome.suppressedLessons[0]?.lessonId).toBe('L-foreign');
+    expect(outcome.suppressedLessons[0]?.reason).toBe('scope_mismatch');
+    expect(outcome.suppressedLessons[0]?.detail).toContain('unverified-origin');
+  });
+
+  it('still requires the lesson sessionId when a payload does declare this branch namespace', () => {
+    // Tagged with the requested branch namespace, but the lesson's own scope
+    // metadata belongs to another session: the namespace match alone must not
+    // make it visible.
+    const outcome = firewall([{ lesson: foreignLesson(), namespace: BRANCH_A_NS }]);
+    expect(outcome.lessons).toEqual([]);
+    expect(outcome.suppressedLessons[0]?.detail).toContain('s-other');
+  });
+
+  it('keeps a legitimately written branch lesson visible (no false suppression)', () => {
+    const outcome = firewall([{ lesson: validLesson(), namespace: BRANCH_A_NS }]);
+    expect(outcome.positiveLessons.map((lesson) => lesson.id)).toEqual(['L-1']);
+    expect(outcome.suppressedLessons).toEqual([]);
+  });
+
+  it('no longer surfaces a non-global lesson merely parked under the global namespace', () => {
+    const outcome = firewall([{ lesson: foreignLesson(), namespace: GLOBAL_NS }]);
+    expect(outcome.lessons).toEqual([]);
+    expect(outcome.suppressedLessons[0]?.detail).toContain('not a globally visible lesson');
+  });
+
+  it('still surfaces a session-mismatched lesson through a same-session namespace match', () => {
+    const outcome = firewall([{ lesson: foreignLesson(), namespace: 'harness2:session:s-1' }]);
+    expect(outcome.lessons).toEqual([]);
+    expect(outcome.suppressedLessons[0]?.detail).toContain('s-other');
+  });
+
+  it('suppresses the same untagged foreign lesson end-to-end on a namespace-blind backend', async () => {
+    const server = graphEntityServer({
+      serverId: 'official_kg',
+      seed: [
+        // The text carries no namespace anywhere (the untagged-foreign shape);
+        // only the mock's bookkeeping knows a namespace.
+        { lesson: foreignLesson(), namespace: BRANCH_A_NS, text: serializeLesson(foreignLesson()) }
+      ]
+    });
+    const bridge = createMemoryBridge({ config: memoryConfig(), clients: [server.client], now: () => FIXED_NOW });
+    // Control: a write from THIS bridge (always tagged) stays visible beside it.
+    await bridge.commit(validLesson({ id: 'L-own' }), { scope: branchScope() });
+
+    const recall = await bridge.recall({ scope: branchScope(), text: 'unrelated task' });
+    expect(recall.positiveLessons.map((lesson) => lesson.id)).toEqual(['L-own']);
+    const suppressed = recall.suppressedLessons.find((entry) => entry.lessonId === 'L-foreign');
+    expect(suppressed?.reason).toBe('scope_mismatch');
+    expect(suppressed?.detail).toContain('unverified-origin');
   });
 });

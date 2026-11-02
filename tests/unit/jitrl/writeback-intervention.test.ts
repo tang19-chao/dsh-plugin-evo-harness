@@ -909,3 +909,108 @@ describe('t27 wiring pin: the REAL orchestrator query carries the eligibility fi
     ).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// CORE-4: the gate's history read must share the L2 eligibility rule, including
+// the EXACT current rewardVersion. A record the store would never return to the
+// L2 decision (stale/foreign rewardVersion) must not vote in G-A/G-B either -
+// otherwise the gate admits a route on evidence the decision it gates can never
+// see, contradicting the "visible to L2 === counted by the gate" contract.
+//
+// THE TWO DIRECTIONS (both required, or the test is vacuous)
+//   A. stale rewardVersion  -> the seeded records are INVISIBLE to the gate
+//      history (support 0). Red against the old filter, which counted them.
+//   B. current rewardVersion -> the SAME-shaped records ARE counted (support
+//      grows), proving the exclusion is the rewardVersion rule's doing.
+// ---------------------------------------------------------------------------
+describe('CORE-4: the gate history read shares the L2 rewardVersion rule', () => {
+  /** Seed shape: eligible, current schema, but a STALE reward contract id. */
+  function seededHistoryRecord(now: number, actionKey: string, index: number, rewardVersion: string): ExperienceRecord {
+    return {
+      id: 'seed-rv-' + String(index),
+      level: 'meta',
+      state: { level: 'meta', bucket: 'task|simple', tokens: ['alpha'], summary: 'seed' } as never,
+      actionKey,
+      guidance: 'memory',
+      policyId: 'seed-policy',
+      sessionId: 'session-wb',
+      reward: 0.5,
+      return: 0.5,
+      learningEligible: true,
+      learningTarget: 0.5,
+      rewardVersion,
+      experienceSchemaVersion: EXPERIENCE_SCHEMA_VERSION,
+      // Below every harness clock (makeClock starts at 1_700_000_000_000), so
+      // the causal cutoff never hides the seed from the gate's history read.
+      createdAt: 1_699_999_999_000,
+      rewardSources: {},
+      redacted: false
+    } as unknown as ExperienceRecord;
+  }
+
+  interface GateVerdict {
+    readonly actionKey: string;
+    readonly admitted: boolean;
+    readonly refusal?: string;
+    readonly support: number;
+  }
+
+  function gateVerdictsOf(harness: Harness): readonly GateVerdict[] {
+    const gate = recordStageDetail(harness.events)?.['writebackGate'] as { verdicts?: readonly GateVerdict[] } | undefined;
+    return gate?.verdicts ?? [];
+  }
+
+  it('stale-rewardVersion records are invisible to the gate history (support stays 0)', async () => {
+    // Run 1 only DISCOVERS the actionKeys the recorder produces; its records
+    // never enter run 2's store.
+    const discovery = makeHarness({ writebackGate: false });
+    await runOnce(discovery);
+    const actionKeys = [...new Set(onlineRecords(discovery.store).map((record) => record.actionKey))];
+    expect(actionKeys.length, 'the fixture must produce actionKeys to seed').toBeGreaterThan(0);
+
+    const harness = makeHarness({ writebackGate: true });
+    await harness.store.append(
+      actionKeys.flatMap((actionKey, index) => [
+        seededHistoryRecord(Date.now(), actionKey, index, 'r3/unified-signals-v1'),
+        seededHistoryRecord(Date.now(), actionKey, index + 100, 'r3/unified-signals-v1')
+      ])
+    );
+    await runOnce(harness);
+
+    const verdicts = gateVerdictsOf(harness);
+    const matching = verdicts.filter((verdict) => actionKeys.includes(verdict.actionKey));
+    expect(
+      matching.length,
+      'run 2 must judge the same actionKeys the stale seeds were written for'
+    ).toBeGreaterThan(0);
+    for (const verdict of matching) {
+      expect(
+        verdict.support,
+        `stale-rewardVersion history must not count as support for ${verdict.actionKey}`
+      ).toBe(0);
+    }
+  });
+
+  it('the SAME-shaped records with the CURRENT rewardVersion ARE counted (non-vacuity)', async () => {
+    const discovery = makeHarness({ writebackGate: false });
+    await runOnce(discovery);
+    const actionKeys = [...new Set(onlineRecords(discovery.store).map((record) => record.actionKey))];
+
+    const harness = makeHarness({ writebackGate: true });
+    await harness.store.append(
+      actionKeys.flatMap((actionKey, index) => [
+        seededHistoryRecord(Date.now(), actionKey, index, CURRENT_REWARD_VERSION),
+        seededHistoryRecord(Date.now(), actionKey, index + 100, CURRENT_REWARD_VERSION)
+      ])
+    );
+    await runOnce(harness);
+
+    const verdicts = gateVerdictsOf(harness);
+    const matching = verdicts.filter((verdict) => actionKeys.includes(verdict.actionKey));
+    expect(matching.length).toBeGreaterThan(0);
+    expect(
+      matching.some((verdict) => verdict.support > 0),
+      'current-rewardVersion history must still count - the exclusion is the version rule, not the shape'
+    ).toBe(true);
+  });
+});

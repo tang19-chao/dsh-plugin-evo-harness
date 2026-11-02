@@ -815,3 +815,27 @@ describe('ScopeRegistry integration and invariant isolation', () => {
     expect(records[0]?.branchId).toBe('br-d1');
   });
 });
+
+describe('JINFRA-12: bounded collector diagnostics', () => {
+  it('keeps only the newest 100 diagnostic lines', async () => {
+    const { store } = memoryStore();
+    const collector = createHostToolExperienceCollector({
+      config: baseConfig,
+      store,
+      scopeRegistry: createScopeRegistry()
+    });
+
+    // Identity-free observations each emit one counted, payload-free
+    // `scope_unknown_skipped: N (...)` line; 130 of them overflow the ring.
+    for (let index = 0; index < 130; index += 1) {
+      await collector.observeToolCall({ toolName: 'host_local_bash', isError: false });
+    }
+    expect(collector.scopeUnknownSkipped()).toBe(130);
+
+    const diagnostics = collector.diagnostics();
+    expect(diagnostics).toHaveLength(100);
+    // The counter in the message proves which lines survived: 31..130.
+    expect(diagnostics[0]).toContain('scope_unknown_skipped: 31 ');
+    expect(diagnostics[99]).toContain('scope_unknown_skipped: 130 ');
+  });
+});

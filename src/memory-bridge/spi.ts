@@ -343,6 +343,13 @@ export interface DriverLessonRecord {
   readonly lesson: CanonicalLesson;
   readonly namespace: string;
   readonly backendRef?: string;
+  /**
+   * True when the namespace was attributed only from the requested scope
+   * (hint/default fallback) and the payload itself carried none: the origin is
+   * unverified, so the firewall restricts such records to globally visible
+   * lessons instead of trusting the attribution (P1-6 / MEM-1).
+   */
+  readonly unverifiedOrigin?: boolean;
 }
 
 export interface MemoryDriverRecallInput {

@@ -216,6 +216,42 @@ describe('P4-B invariant key-level immutability (time-ordered)', () => {
     h2.dispose();
     expect(registry.size()).toBe(0);
   });
+
+  it('a live lease re-reads its scope, so an invariant upgrade seals it immediately', () => {
+    // JINFRA-5: a lease must never keep reporting the pre-upgrade scope
+    // snapshot. Attach to a DOMAIN scope (advice-permitting), then upgrade the
+    // SAME key to invariant: the lease stays active (the scope's lifetime is
+    // unchanged) but its advice-permitting surface is gone the instant the
+    // upgrade lands - the advice-channel sealing ADR 0006/P4-B is about.
+    const { registry } = freshRegistry();
+    const lease = registry.acquireLease({ sessionId: SESSION, branchId: 'br-lease-upg' });
+    expect(lease.isActive).toBe(true);
+    expect(lease.scope.allowAdvice).toBe(true);
+
+    registry.register({
+      sessionId: SESSION,
+      branchId: 'br-lease-upg',
+      role: 'invariant',
+      guidance: 'guidance_free',
+      allowAdvice: false
+    });
+
+    expect(lease.isActive).toBe(true);
+    expect(lease.scope.allowAdvice).toBe(false);
+    expect(lease.scope.isInvariant).toBe(true);
+    expect(lease.scope.role).toBe('invariant');
+  });
+
+  it('a terminated lease still reports the scope it was bound to (fallback, no crash)', () => {
+    // The live read falls back to the captured scope once the key no longer
+    // resolves (released/expired/invalidated), so a terminated lease keeps its
+    // historical shape without reaching into the registry.
+    const { registry } = freshRegistry();
+    const lease = registry.acquireLease({ sessionId: SESSION, branchId: 'br-lease-gone' });
+    lease.release();
+    expect(lease.isActive).toBe(false);
+    expect(lease.scope.scopeKey).toBe('sess-p4b::br-lease-gone');
+  });
 });
 
 describe('P4-B sessionId lease: refused unless single occupancy is PROVEN', () => {

@@ -74,6 +74,34 @@ describe('ADR 0006 D-P4-2: classifyScopeIdentity is the exhaustive identity read
     expect(reading.status).toBe('session-only');
     expect(reading.hasBranchProof).toBe(false);
   });
+
+  it('reads a branch-object carrier\'s id as a BRANCH, not a session ({ branch: { id } })', () => {
+    // ADR 0006 D-P4-2: the carrier's vocabulary decides where an `id` belongs.
+    // A `branch` object is a branch carrier, so its id is a branchId. The old
+    // reading produced `session-only` with sessionId 'br-1' (and, paired with
+    // an explicit branchId, the compound 'br-1::br-1' that is never
+    // registered) - a misreported vocabulary even though resolution stayed
+    // fail-closed.
+    const reading = classifyScopeIdentity({ branch: { id: 'br-1' } });
+    expect(reading.status).toBe('branch-only');
+    expect(reading.branchId).toBe('br-1');
+    expect(reading.sessionCount).toBe(0);
+    expect(reading.hasBranchProof).toBe(true);
+  });
+
+  it('does not conflate a branch-object id with an explicit sessionId of the same value', () => {
+    const reading = classifyScopeIdentity({ branch: { id: 'br-1' }, branchId: 'br-1' });
+    expect(reading.status).toBe('branch-only');
+    expect(reading.branchId).toBe('br-1');
+    expect(reading.sessionCount).toBe(0);
+  });
+
+  it('keeps an explicit sessionId inside a branch object a SESSION id', () => {
+    const reading = classifyScopeIdentity({ branch: { id: 'br-1', sessionId: 'sess-1' } });
+    expect(reading.status).toBe('branch-and-session');
+    expect(reading.branchId).toBe('br-1');
+    expect(reading.sessionId).toBe('sess-1');
+  });
 });
 
 describe('ADR 0006 D-P4-1: a sessionId never stands in for a branch identity', () => {
@@ -187,6 +215,45 @@ describe('ADR 0006 D-P4-3: trusted host scope', () => {
     handle.dispose();
     expect(registry.resolveHostScope({ agent: { id: 'sess-host' } })).toBe('unknown');
     expect(registry.activeHostScopes()).toEqual([]);
+  });
+
+  it('refuses a host dispatch whose only identity is a branch-object carrier', () => {
+    // Under the correct vocabulary `{ branch: { id } }` is branch-attributed,
+    // and a host scope never covers a dispatch that names a branch
+    // (ADR 0006 D-P4-3). The old extractor read that id as the host SESSION
+    // and resolved it.
+    const registry = freshRegistry();
+    registry.registerHostScope({ sessionId: 'sess-host', grantedBy: 'g' });
+    expect(registry.resolveHostScope({ branch: { id: 'sess-host' } })).toBe('unknown');
+    expect(registry.stats().hostScopeResolves.rejected).toBe(1);
+  });
+
+  it('re-registration is versioned: a stale handle cannot delete the newer registration', () => {
+    // Two host mounts on one session are reachable (one per mount with
+    // mountScope 'host'); handle #1 must never be able to delete registration
+    // #2 - the same late-dispose safety the branch path got via its version
+    // check, now on the host path too.
+    const registry = freshRegistry();
+    const first = registry.registerHostScope({ sessionId: 'sess-host', grantedBy: 'grant-1' });
+    const second = registry.registerHostScope({ sessionId: 'sess-host', grantedBy: 'grant-2' });
+
+    expect(registry.activeHostScopes()).toHaveLength(1);
+    expect(registry.activeHostScopes()[0]?.grantedBy).toBe('grant-2');
+
+    first.dispose();
+    const stats = registry.stats();
+    expect(stats.hostScopeStaleDisposeNoop).toBe(1);
+    expect(stats.hostScopeRegistrations).toBe(2);
+    // The trust record for the live, explicitly granted identity survives.
+    expect(registry.activeHostScopes()).toHaveLength(1);
+    expect(registry.resolveHostScope({ agent: { id: 'sess-host' } })).not.toBe('unknown');
+
+    // The CURRENT owner still releases the key, exactly once.
+    second.dispose();
+    expect(registry.activeHostScopes()).toHaveLength(0);
+    expect(registry.resolveHostScope({ agent: { id: 'sess-host' } })).toBe('unknown');
+    second.dispose();
+    expect(registry.stats().hostScopeStaleDisposeNoop).toBe(1);
   });
 
   it('expires a host scope after its TTL', () => {

@@ -172,6 +172,13 @@ export function emptyWritebackGateSummary(enabled: boolean): WritebackGateSummar
 /** One history entry, derived from the snapshot the L2 decision would see. */
 export interface WritebackHistoryEntry {
   readonly actionKey: string;
+  /**
+   * The verdict the record's verification carried. G-A's "prior failure" is a
+   * record whose verification left `status === 'failed'` (preregistration §5):
+   * a `partial` verdict is neither a pass nor a failure, so it reads as
+   * `unknown`, and only an explicit `failed` satisfies G-A.
+   */
+  readonly status: 'passed' | 'failed' | 'unknown';
   readonly verified: boolean;
   readonly counterexample: boolean;
 }
@@ -196,6 +203,10 @@ export function writebackHistoryEntryOf(
   const verified = signals.trustedSource && signals.verificationStatus === 'passed';
   return {
     actionKey,
+    status:
+      signals.verificationStatus === 'passed' || signals.verificationStatus === 'failed'
+        ? signals.verificationStatus
+        : 'unknown',
     verified,
     counterexample: signals.verifierRewardMismatch || signals.forceAuditOnly
   };
@@ -255,9 +266,11 @@ export type WritebackGateRules = typeof WRITEBACK_CONVERGENCE_RULES;
  * Order of evaluation matters and is part of the frozen contract:
  *   1. record-ineligible (the record already declares itself audit-only);
  *   2. no-verdict (nothing to reason about);
- *   3. G-A  fail->pass  (the cheapest, most specific evidence);
- *   4. G-B  convergence (support / verified-rate / counterexamples);
- *   5. first refusal reason wins, so the report can name why, not just "no".
+ *   3. current-run counterexample (verifier/reward mismatch or the host's own
+ *      audit-only veto - the same poisoning shapes that veto G-B from history);
+ *   4. G-A  fail->pass  (the cheapest, most specific evidence);
+ *   5. G-B  convergence (support / verified-rate / counterexamples);
+ *   6. first refusal reason wins, so the report can name why, not just "no".
  */
 export function judgeWriteback(
   signals: WritebackGateTrajectoryView,
@@ -270,8 +283,12 @@ export function judgeWriteback(
   const counterexamples = bucket.reduce((sum, entry) => sum + (entry.counterexample ? 1 : 0), 0);
   const verifiedRate = support === 0 ? 0 : verifiedCount / support;
   const trustedReceipt = signals.trustedSource === true;
+  // G-A's "prior failure" is an entry whose verification explicitly FAILED -
+  // not merely one that is not a verified pass. `unknown` (no verdict at all,
+  // or a `partial`) and an untrusted `passed` do not repair anything and must
+  // not satisfy the route (preregistration §5; audit JITRL-1).
   const priorFailure = bucket.some(
-    (entry) => entry.actionKey === signals.actionKey && !entry.verified && !entry.counterexample
+    (entry) => entry.actionKey === signals.actionKey && entry.status === 'failed' && !entry.counterexample
   );
 
   const base = { support, verifiedRate, counterexamples, trustedReceipt, priorFailure } as const;
@@ -285,6 +302,19 @@ export function judgeWriteback(
   // 2. No verdict at all: there is no evidence to reason about.
   if (signals.verificationStatus === 'unknown') {
     return { admitted: false, refusal: 'rejected-no-verdict', ...base };
+  }
+
+  // 3. A CURRENT-RUN counterexample vetoes every route, exactly as its history
+  //    counterparts veto G-B (preregistration §5: any record with
+  //    `verifierRewardMismatch === true` or `forceAuditOnly === true` counts as
+  //    a counterexample, and one is enough). Audit JITRL-6: both channels were
+  //    declared on the view but never read. Production cannot reach this line
+  //    with a mismatch today (the reward contract clamps a failed verification
+  //    to reward 0, and `forceAuditOnly` already forces
+  //    `recordLearningEligible: false` at step 1), so this is the declared
+  //    surface made real - defence in depth, not a new production refusal.
+  if (signals.verifierRewardMismatch || signals.forceAuditOnly) {
+    return { admitted: false, refusal: 'rejected-verifier-mismatch', ...base };
   }
 
   // 3. G-A: a trusted pass that repairs a recorded failure of the same action.
@@ -354,17 +384,19 @@ export function accumulateWritebackSummary(
  * CONTRACT: this never raises a reward and never mints a positive target. An
  * admitted record is returned UNCHANGED (the gate is not a scorer). A refused
  * record keeps its scored `reward` for audit, but is forced to a zero learning
- * target and explicit ineligibility, so the L2 filter drops it and no consumer
- * can read a gain from it.
+ * target and explicit ineligibility - the frozen refused-record encoding of
+ * preregistration §5 - so the L2 filter drops it and no consumer, including
+ * the documented ablation arm that reads `learningTarget`, can read a gain
+ * from it (audit JITRL-3: the pre-fix body never zeroed the target).
  */
 export function applyWritebackVerdict<T extends Pick<ExperienceRecord, 'reward' | 'learningEligible'>>(
   record: T,
   verdict: WritebackGateVerdict
-): T & Pick<ExperienceRecord, 'learningEligible'> {
+): T & Pick<ExperienceRecord, 'learningEligible' | 'learningTarget'> {
   if (verdict.admitted) {
     return { ...record, learningEligible: record.learningEligible };
   }
-  return { ...record, learningEligible: false };
+  return { ...record, learningEligible: false, learningTarget: 0 };
 }
 
 /** Reason-code helper: a stable numeric code for ledger marks (0 = admitted). */

@@ -596,7 +596,6 @@ export interface MemoryRecallResult {
 /** Options for a governed memory commit. */
 export interface MemoryCommitOptions {
   readonly scope: MemoryScope;
-  readonly enforceGovernance?: boolean;
   readonly dryRun?: boolean;
   readonly metadata?: ContractMetadata;
 }

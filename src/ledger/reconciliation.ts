@@ -36,7 +36,7 @@ export const DEFAULT_RECONCILIATION_TOLERANCE_MICROS = 500;
 
 /** One line of the provider's external bill. */
 export interface ExternalBillLine {
-  /** The provider-side identifier. Matched to `callId` when the bill exposes it. */
+  /** The provider-side identifier. Matched to `callId` or a recorded `providerCallId`. */
   readonly providerCallId?: string;
   /** Our call id, when the bill can be joined directly. */
   readonly callId?: string;
@@ -49,6 +49,13 @@ export interface ExternalBillLine {
 /** Our own settled figure for one call. */
 export interface InternalLedgerLine {
   readonly callId: string;
+  /**
+   * The provider-side id the call index persisted when late usage arrived
+   * (LEDGER-12, `LedgerCallIdentity.providerCallId`). A bill exposing only
+   * provider ids can then be matched — without it, such a bill is 100%
+   * unresolved no matter how accurate the ledger is.
+   */
+  readonly providerCallId?: string;
   readonly incurredCostMicros: number;
   readonly pool?: 'general' | 'verification';
 }
@@ -116,16 +123,17 @@ export interface ManualResolution {
   readonly resolvedAt: number;
 }
 
-function matchKey(line: { callId?: string; providerCallId?: string }): string | undefined {
-  return line.callId ?? line.providerCallId;
-}
-
 /**
  * Reconcile our settled ledger against an external bill.
  *
- * Matching is by `callId` (preferred) or `providerCallId`. A bill line that
- * matches nothing is reported as `unknownToLedger` rather than dropped: it is the
- * signature of double-billing or a mis-joined export.
+ * Matching is dual-key (LEDGER-12): a bill line joins an internal line by our
+ * `callId` (preferred — the strongest join) or, failing that, by the
+ * `providerCallId` the call index persisted when late usage arrived. The two
+ * identifiers live in SEPARATE namespaces: our callIds and the provider's ids
+ * are different vocabularies, so a line is indexed and matched under each key
+ * it actually carries. A bill line that matches nothing is reported as
+ * `unknownToLedger` rather than dropped: it is the signature of double-billing
+ * or a mis-joined export.
  */
 export function reconcileWithExternalBill(params: {
   readonly internal: readonly InternalLedgerLine[];
@@ -137,27 +145,42 @@ export function reconcileWithExternalBill(params: {
       ? DEFAULT_RECONCILIATION_TOLERANCE_MICROS
       : Math.max(0, Math.floor(params.toleranceMicros));
 
-  const billByKey = new Map<string, ExternalBillLine>();
+  const billByCallId = new Map<string, ExternalBillLine>();
+  const billByProviderId = new Map<string, ExternalBillLine>();
+  const billLines: ExternalBillLine[] = [];
   const duplicateBillKeys: string[] = [];
   const seenBillKeys = new Set<string>();
   for (const line of params.external) {
-    const key = matchKey(line);
-    if (key === undefined) {
+    if (line.callId === undefined && line.providerCallId === undefined) {
       continue;
     }
-    if (seenBillKeys.has(key)) {
+    const callKey = line.callId === undefined ? undefined : 'callId:' + line.callId;
+    const providerKey = line.providerCallId === undefined ? undefined : 'provider:' + line.providerCallId;
+    if (callKey !== undefined && seenBillKeys.has(callKey)) {
       // First occurrence wins; a duplicate key is itself a defect worth
       // surfacing, and silently summing it would inflate the comparison.
-      duplicateBillKeys.push(key);
+      duplicateBillKeys.push(line.callId as string);
       continue;
     }
-    seenBillKeys.add(key);
-    billByKey.set(key, line);
+    if (providerKey !== undefined && seenBillKeys.has(providerKey)) {
+      duplicateBillKeys.push(line.providerCallId as string);
+      continue;
+    }
+    if (callKey !== undefined) {
+      seenBillKeys.add(callKey);
+      billByCallId.set(line.callId as string, line);
+    }
+    if (providerKey !== undefined) {
+      seenBillKeys.add(providerKey);
+      billByProviderId.set(line.providerCallId as string, line);
+    }
+    billLines.push(line);
   }
 
-  const internalKeys = new Set<string>();
   const verdicts: ReconciliationVerdict[] = [];
   const missingFromBill: string[] = [];
+  /** Bill lines that ARE some internal line's match target (dual-key join). */
+  const matchedBillLines = new Set<ExternalBillLine>();
   let exact = 0;
   let withinTolerance = 0;
   let disputed = 0;
@@ -165,8 +188,14 @@ export function reconcileWithExternalBill(params: {
   let netDifferenceMicros = 0;
 
   for (const entry of params.internal) {
-    internalKeys.add(entry.callId);
-    const billLine = billByKey.get(entry.callId);
+    // Dual-key join (LEDGER-12): our callId wins when the bill exposes it;
+    // otherwise the provider-side id recorded on the identity decides.
+    const billLine =
+      billByCallId.get(entry.callId) ??
+      (entry.providerCallId === undefined ? undefined : billByProviderId.get(entry.providerCallId));
+    if (billLine !== undefined) {
+      matchedBillLines.add(billLine);
+    }
 
     if (billLine === undefined) {
       unresolved += 1;
@@ -230,8 +259,11 @@ export function reconcileWithExternalBill(params: {
   }
 
   const unknownToLedger: ExternalBillLine[] = [];
-  for (const [key, line] of billByKey) {
-    if (!internalKeys.has(key)) {
+  for (const line of billLines) {
+    // Unknown to the ledger = nobody's match target. Matching BY key alone is
+    // not enough: a duplicate bill line carrying a claimed providerCallId would
+    // otherwise vanish instead of surfacing as a double-billing signature.
+    if (!matchedBillLines.has(line)) {
       unknownToLedger.push(line);
     }
   }

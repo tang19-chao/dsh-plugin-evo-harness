@@ -111,6 +111,11 @@ export function createHostOwnedVerificationRunner(
   }
 
   const registry = new Map<string, RegisteredReceipt>();
+  // VERIF-8: keys whose verification ran past the attach-side deadline. Their
+  // late receipts are discarded (never registered) and the key stays closed for
+  // this runner instance - a runner-timeout decision is irreversible, not a
+  // state a later re-verification can silently reverse.
+  const abandoned = new Set<string>();
   const trustedProducers: ReadonlySet<string> = new Set<string>([verifierId]);
 
   const refuse = (
@@ -138,6 +143,15 @@ export function createHostOwnedVerificationRunner(
     }
     const digest = artifactDigestOf(artifact);
     const key = registryKey(runId, trajectoryId, request.role);
+    // VERIF-8: a key whose deadline already fired stays abandoned - the attach
+    // side has already answered `runner-timeout`, and no late or retried work
+    // may produce a receipt for it now.
+    if (abandoned.has(key)) {
+      return refuse(
+        'runner-timeout',
+        'an earlier verification of this trajectory exceeded its deadline and was abandoned; the decision is irreversible for this runner'
+      );
+    }
     const existing = registry.get(key);
     if (existing !== undefined) {
       if (existing.digest !== digest) {
@@ -168,6 +182,17 @@ export function createHostOwnedVerificationRunner(
       results.push({ id: check.id, passed });
     }
     const status: 'passed' | 'failed' = results.every((entry) => entry.passed) ? 'passed' : 'failed';
+    // VERIF-8: the attach side raced this request against a deadline that has
+    // since fired (the caller already received `runner-timeout`). The late
+    // receipt is discarded: no registration, so the timeout decision cannot be
+    // reversed by a later re-verification finding this receipt in the registry.
+    if (request.deadlineAt !== undefined && Date.now() >= request.deadlineAt) {
+      abandoned.add(key);
+      return refuse(
+        'runner-timeout',
+        'the host runner exceeded its verification deadline; the late result is discarded and never registered'
+      );
+    }
     const receipt: HostVerificationReceipt = {
       status,
       verifierId,

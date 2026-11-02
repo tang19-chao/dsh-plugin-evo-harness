@@ -341,6 +341,8 @@ export interface ScopeRegistryCounters {
   readonly hostScopeRegistrations: number;
   /** registerHostScope calls rejected for a missing sessionId/grantedBy. */
   readonly hostScopeRejections: number;
+  /** Host-scope handles disposed after their registration was replaced (counted no-op). */
+  readonly hostScopeStaleDisposeNoop: number;
   readonly evictions: number;
   readonly expiredPruned: number;
   readonly resolves: ScopeResolveCounters;
@@ -481,15 +483,19 @@ export function extractScopeIdentity(...payloads: readonly unknown[]): {
     }
   };
 
-  const visit = (value: unknown, depth: number, readId: boolean): void => {
+  const visit = (value: unknown, depth: number, readId: false | 'session' | 'branch'): void => {
     const record = asRecord(value);
     if (record === undefined || depth > 4) {
       return;
     }
-    if (readId) {
+    if (readId !== false) {
       const id = record['id'];
       if (typeof id === 'string' && id.trim().length > 0) {
-        sessionIds.add(id.trim());
+        // The carrier's own vocabulary decides where its `id` belongs: an
+        // agent/session carrier names a SESSION, a branch carrier names a
+        // BRANCH (ADR 0006 D-P4-2). Reading a branch object's id into
+        // sessionIds misreported the identity of `{ branch: { id } }` shapes.
+        (readId === 'session' ? sessionIds : branchIds).add(id.trim());
       }
     }
     addStr(branchIds, record['branchId']);
@@ -501,7 +507,11 @@ export function extractScopeIdentity(...payloads: readonly unknown[]): {
     for (const key of CARRIER_KEYS) {
       const child = record[key];
       if (child !== undefined) {
-        visit(child, depth + 1, key === 'agent' || key === 'session' || key === 'branch');
+        visit(
+          child,
+          depth + 1,
+          key === 'agent' || key === 'session' ? 'session' : key === 'branch' ? 'branch' : false
+        );
       }
     }
   };
@@ -591,6 +601,7 @@ export function createScopeRegistry(options: ScopeRegistryOptions = {}): ScopeRe
     staleDisposeNoop: 0,
     hostScopeRegistrations: 0,
     hostScopeRejections: 0,
+    hostScopeStaleDisposeNoop: 0,
     evictions: 0,
     expiredPruned: 0,
     resolves: { total: 0, proven: 0, branchOnlyMatches: 0, unknown: 0, sessionOnlyRejected: 0, ambiguousRejected: 0, unattributedRejected: 0, unregisteredRejected: 0, expiredRejected: 0 },
@@ -615,6 +626,15 @@ export function createScopeRegistry(options: ScopeRegistryOptions = {}): ScopeRe
   // Map from hostScopeKey (sessionId) to the registered host scope.
   const hostScopes = new Map<string, RegisteredHostScope>();
   const hostScopeOrder: string[] = [];
+  // Versioned like the branch registrations: each handle owns the version it
+  // created, so a late dispose can never delete a newer registration.
+  const hostScopeVersions = new Map<string, number>();
+  let nextHostScopeVersion = 0;
+  const bumpHostScopeVersion = (hostScopeKey: string): number => {
+    nextHostScopeVersion += 1;
+    hostScopeVersions.set(hostScopeKey, nextHostScopeVersion);
+    return nextHostScopeVersion;
+  };
 
   const removeHostScopeInternal = (hostScopeKey: string): boolean => {
     const existing = hostScopes.get(hostScopeKey);
@@ -896,7 +916,14 @@ export function createScopeRegistry(options: ScopeRegistryOptions = {}): ScopeRe
   const makeLeaseHandle = (record: LeaseRecord, scope: RegisteredScope): BranchLease => ({
     leaseId: record.leaseId,
     kind: record.kind,
-    scope,
+    // The scope is read LIVE from the registry: a re-registration of the key
+    // (for example a domain -> invariant upgrade) must be visible to every
+    // live lease holder immediately, never frozen at acquire time. The
+    // captured scope is only the fallback for a key that no longer resolves
+    // (the lease has been or is being invalidated).
+    get scope(): RegisteredScope {
+      return scopesByCompound.get(record.scopeKey) ?? scope;
+    },
     acquiredAt: record.acquiredAt,
     get expiresAt(): number | undefined {
       return record.expiresAt;
@@ -1408,14 +1435,25 @@ export function createScopeRegistry(options: ScopeRegistryOptions = {}): ScopeRe
         ...(spec.metadata ? { metadata: Object.freeze({ ...spec.metadata }) } : {})
       });
       hostScopes.set(hostScopeKey, scope);
-      hostScopeOrder.push(hostScopeKey);
+      if (!hostScopeOrder.includes(hostScopeKey)) {
+        hostScopeOrder.push(hostScopeKey);
+      }
       counters.hostScopeRegistrations += 1;
+      // Version check (same rule as the branch registrations): the handle may
+      // only release the registration it owns. A late dispose of a replaced
+      // registration is a counted no-op and can never delete the newer one.
+      const version = bumpHostScopeVersion(hostScopeKey);
       let handleDisposed = false;
       return {
         scope,
         dispose(): void {
           if (!handleDisposed && !disposed) {
             handleDisposed = true;
+            if (hostScopeVersions.get(hostScopeKey) !== version || hostScopes.get(hostScopeKey) !== scope) {
+              counters.hostScopeStaleDisposeNoop += 1;
+              note('host_scope_stale_dispose: the handle no longer owns ' + hostScopeKey);
+              return;
+            }
             removeHostScopeInternal(hostScopeKey);
           }
         }
@@ -1487,6 +1525,7 @@ export function createScopeRegistry(options: ScopeRegistryOptions = {}): ScopeRe
         staleDisposeNoop: counters.staleDisposeNoop,
         hostScopeRegistrations: counters.hostScopeRegistrations,
         hostScopeRejections: counters.hostScopeRejections,
+        hostScopeStaleDisposeNoop: counters.hostScopeStaleDisposeNoop,
         evictions: counters.evictions,
         expiredPruned: counters.expiredPruned,
         resolves: Object.freeze({ ...counters.resolves }),
@@ -1563,6 +1602,7 @@ export function createScopeRegistry(options: ScopeRegistryOptions = {}): ScopeRe
       keyLeaseByKey.clear();
       hostScopes.clear();
       hostScopeOrder.length = 0;
+      hostScopeVersions.clear();
     },
 
     dispose(): void {
@@ -1581,6 +1621,7 @@ export function createScopeRegistry(options: ScopeRegistryOptions = {}): ScopeRe
       keyLeaseByKey.clear();
       hostScopes.clear();
       hostScopeOrder.length = 0;
+      hostScopeVersions.clear();
     }
   };
 }

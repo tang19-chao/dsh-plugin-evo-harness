@@ -94,7 +94,10 @@ describe('plugin entrypoint', () => {
   it('registers /evo and the verified DSH triggers on a capable host context', async () => {
     const { ctx, commands, events, info } = createFakeContext();
     const plugin = apply(ctx, {
-      config: e2eConfig(),
+      // INT-5 made `logging.level` live configuration and the e2e base config is
+      // `level: 'silent'`; state `info` so this entrypoint test still observes
+      // the mount line it asserts on below.
+      config: e2eConfig({ config: { logging: { level: 'info' } } }),
       model: createScriptedModel(),
       clients: [mem0LikeServer().client],
       runBranch: createScriptedRunner(makeClock()),

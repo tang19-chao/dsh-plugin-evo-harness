@@ -280,9 +280,12 @@ describe('idle dream', () => {
       onDiagnostic: (message) => diagnostics.push(message)
     });
     expect(registration.events).toContain('agent/status');
-    // a throwing maintenance call must not propagate out of the listener
-    expect(() => listeners.get('agent/status')?.({ status: 'idle' })).not.toThrow();
-    expect(maintenance).toHaveBeenCalled();
+    // a throwing maintenance call must not propagate out of the listener: the
+    // direct dispatch below fails this test if it does, and the skip is visible
+    // downstream (maintenance attempted once, diagnostic recorded) instead of
+    // being swallowed silently.
+    listeners.get('agent/status')?.({ status: 'idle' });
+    expect(maintenance).toHaveBeenCalledTimes(1);
     expect(diagnostics.join(' ')).toContain('idle dream skipped');
   });
 });

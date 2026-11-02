@@ -45,11 +45,14 @@
  *   1. Usage is carried VERBATIM: a field the host reported is passed through
  *      unchanged; a field it did not report stays absent (never zero). The
  *      guard counts only measured values — it never invents tokens.
- *   2. The counting rule (`canaryUsageTokenCount`) sums every REPORTED field.
- *      When counting semantics declare inclusion (inputIncludesCacheRead /
- *      outputIncludesReasoning) the sum double-counts — for a KILL SWITCH that
- *      over-count is the safe direction (it aborts earlier). Accounting and
- *      reports keep the raw usage; only the abort decision uses the gross sum.
+ *   2. Two counting rules, by decision: the KILL SWITCH (`canaryUsageTokenCount`)
+ *      sums every REPORTED field — when counting semantics declare inclusion
+ *      (inputIncludesCacheRead / outputIncludesReasoning) the sum double-counts,
+ *      and for an abort switch over-counting aborts EARLIER, the safe direction.
+ *      The token REPORTS (`canaryUsageNetTokenCount`, consumed by the
+ *      controller's tokenBudget block) use the per-call NET sum — each logical
+ *      token counted once — so the report no longer overstates spend. Raw usage
+ *      is recorded verbatim either way.
  *   3. No secrets: the client identity holds the masked account id only. The
  *      raw account id never enters a client object, a log, or a report.
  *   4. No memory write, no guarded-active, no publish, no fs/network of its
@@ -127,7 +130,7 @@ export function verifyHostClientIdentity(
 }
 
 // ---------------------------------------------------------------------------
-// Token accounting (the ONE counting rule for the canary kill switch)
+// Token accounting (gross = the kill switch's rule; net = the report's rule)
 // ---------------------------------------------------------------------------
 
 /** Structural view of a raw usage record (compatible with the controller's RawCanaryUsage). */
@@ -164,6 +167,52 @@ export function canaryUsageTokenCount(usage: CanaryUsageLike | undefined): numbe
     usage.reasoningTokens
   ]) {
     if (value === undefined) continue;
+    reportedAny = true;
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+      total += value;
+    }
+  }
+  return reportedAny ? total : undefined;
+}
+
+/**
+ * NET measured token count for ACCOUNTING/REPORTS (VERIF-10): each logical
+ * token counted ONCE per call.
+ *
+ * The subtraction depends on the DECLARED counting semantics, never on a guess:
+ * when the provider declares `inputIncludesCacheRead`, cacheRead is already
+ * inside input and is not added again; when it declares
+ * `outputIncludesReasoning`, reasoning is already inside output. An UNDECLARED
+ * dimension is treated as independent (added), which is the conservative
+ * direction for a report — it can never understate spend. cacheWrite is always
+ * its own field. The KILL SWITCH keeps the gross `canaryUsageTokenCount`
+ * (over-counting aborts earlier — the safe direction); the tokenBudget report
+ * consumes THIS figure so it stops overstating spend under the declared
+ * inclusion semantics DSH reports by default.
+ *
+ * Absent-field rules match the gross counter: only REPORTED values count
+ * (nothing invented), a present-but-invalid number contributes 0, and no
+ * reported logical field at all yields `undefined`.
+ */
+export function canaryUsageNetTokenCount(
+  usage: CanaryUsageLike | undefined,
+  semantics: { readonly inputIncludesCacheRead?: boolean; readonly outputIncludesReasoning?: boolean } = {}
+): number | undefined {
+  if (usage === undefined) {
+    return undefined;
+  }
+  const fields: readonly (readonly [number | undefined, boolean])[] = [
+    [usage.inputTokens, true],
+    [usage.outputTokens, true],
+    [usage.cacheWriteTokens, true],
+    [usage.cacheReadTokens, semantics.inputIncludesCacheRead !== true],
+    [usage.reasoningTokens, semantics.outputIncludesReasoning !== true]
+  ];
+  let total = 0;
+  let reportedAny = false;
+  for (const [value, counted] of fields) {
+    if (value === undefined) continue;
+    if (!counted) continue;
     reportedAny = true;
     if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
       total += value;

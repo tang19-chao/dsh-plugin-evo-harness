@@ -8,6 +8,11 @@
 import { describe, expect, it } from 'vitest';
 import { HARNESS_COMPONENT_KEYS } from '../../../src/types/contracts';
 import {
+  DEFAULT_JIT_KS,
+  DEFAULT_JIT_SIMILARITY_THRESHOLDS,
+  resolveJitPerturbationGrid
+} from '../../../src/dream-rsi';
+import {
   DEFAULT_EVO_HARNESS_CONFIG,
   createDefaultConfig,
   parseEvoHarnessConfig,
@@ -326,6 +331,11 @@ describe('jitrl.dream (Phase 4 dual-loop settings)', () => {
       candidateJitBetas: [0.5, 1, 2],
       candidateJitLambdas: [0.02, 0.05, 0.1]
     });
+    // INT-3: the k/threshold sweep axes are OPTIONAL leaves with NO default
+    // entry, so the frozen default object (and the documented leaf set) is
+    // unchanged; the dreamer keeps its built-in grids when they are absent.
+    expect(dream.candidateJitKs).toBeUndefined();
+    expect(dream.candidateJitSimilarityThresholds).toBeUndefined();
     expect(DEFAULT_EVO_HARNESS_CONFIG.jitrl.dream.driftRho).toBe(0.7);
     expect(DEFAULT_EVO_HARNESS_CONFIG.jitrl.dream.hyperparamPerturbation).toBe(true);
   });
@@ -356,6 +366,64 @@ describe('jitrl.dream (Phase 4 dual-loop settings)', () => {
       candidateJitBetas: [1, 4],
       candidateJitLambdas: [0.1]
     });
+  });
+
+  it('accepts the k and similarity-threshold axes the dreamer actually sweeps (INT-3)', () => {
+    // Pre-fix `collectUnknownKeys(raw.jitrl.dream, JITRL_DREAM_KEYS, ...)` rejected
+    // both of these with unknown_key, even though `resolveJitPerturbationGrid`
+    // reads them from `config.jitrl.dream` - so the two sweep axes were
+    // unreachable from configuration and pinned to the built-in defaults.
+    const result = validateEvoHarnessConfig({
+      jitrl: {
+        dream: {
+          candidateJitKs: [4, 8, 16],
+          candidateJitSimilarityThresholds: [0.25, 0.4]
+        }
+      }
+    });
+    expect(result.issues).toEqual([]);
+    expect(result.ok).toBe(true);
+    expect(result.config?.jitrl.dream.candidateJitKs).toEqual([4, 8, 16]);
+    expect(result.config?.jitrl.dream.candidateJitSimilarityThresholds).toEqual([0.25, 0.4]);
+  });
+
+  it('the configured k/threshold axes really reach the dreamer grid (INT-3 end to end)', () => {
+    const config = parseEvoHarnessConfig({
+      jitrl: {
+        dream: { candidateJitKs: [4, 8], candidateJitSimilarityThresholds: [0.25] }
+      }
+    });
+    const grid = resolveJitPerturbationGrid(config.jitrl.dream);
+    expect(grid.ks).toEqual([4, 8]);
+    expect(grid.similarityThresholds).toEqual([0.25]);
+    // Absent leaves keep the built-in grids (the documented default path).
+    const untouched = resolveJitPerturbationGrid(parseEvoHarnessConfig({}).jitrl.dream);
+    expect(untouched.ks).toEqual([...DEFAULT_JIT_KS]);
+    expect(untouched.similarityThresholds).toEqual([...DEFAULT_JIT_SIMILARITY_THRESHOLDS]);
+  });
+
+  it('keeps the k axis a positive integer and the threshold axis inside [0, 1]', () => {
+    // The retriever drops an illegal grid point silently, so the schema refuses
+    // it up front instead of accepting a no-op axis.
+    const fractionalK = validateEvoHarnessConfig({
+      jitrl: { dream: { candidateJitKs: [2.5] } }
+    });
+    expect(fractionalK.issues).toContainEqual(
+      expect.objectContaining({ path: 'jitrl.dream.candidateJitKs[0]', code: 'invalid_type' })
+    );
+    const zeroK = validateEvoHarnessConfig({ jitrl: { dream: { candidateJitKs: [0] } } });
+    expect(zeroK.issues).toContainEqual(
+      expect.objectContaining({ path: 'jitrl.dream.candidateJitKs[0]', code: 'out_of_range' })
+    );
+    const badThreshold = validateEvoHarnessConfig({
+      jitrl: { dream: { candidateJitSimilarityThresholds: [1.5] } }
+    });
+    expect(badThreshold.issues).toContainEqual(
+      expect.objectContaining({
+        path: 'jitrl.dream.candidateJitSimilarityThresholds[0]',
+        code: 'out_of_range'
+      })
+    );
   });
 
   it('rejects unknown keys inside jitrl.dream with unknown_key', () => {

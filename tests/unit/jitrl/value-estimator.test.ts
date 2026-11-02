@@ -144,6 +144,30 @@ describe('selectNeighbors', () => {
     ]);
     expect(selected.map((entry) => entry.record.id)).toEqual(['ok']);
   });
+
+  it('gates on the CONTRACT target (observedReturn), not the legacy `return`', () => {
+    // JITRL-7: the admission check used `Number.isFinite(record.return)` while
+    // estimateStateValue consumes `readLearningTarget` (observedReturn first).
+    // A record with a finite observedReturn and a non-finite legacy `return` is
+    // therefore excluded from the neighbourhood even though its contract
+    // target is perfectly usable - and conversely a record could pass on
+    // `return` while contributing a DIFFERENT observedReturn value.
+    const withObservedReturnOnly = {
+      ...scored({ id: 'observed-only', actionKey: 'a1', value: 1 }),
+      record: {
+        ...scored({ id: 'observed-only', actionKey: 'a1', value: 1 }).record,
+        return: Number.NaN,
+        observedReturn: 2
+      } as ScoredExperience['record']
+    };
+    const unusable = scored({ id: 'no-target', actionKey: 'a2', value: Number.NaN });
+
+    const selected = selectNeighbors(STATE, [withObservedReturnOnly, unusable]);
+    expect(selected.map((entry) => entry.record.id)).toEqual(['observed-only']);
+    // The survivor contributes its CONTRACT target, which is what the
+    // estimator averages - so admission and consumption now agree.
+    expect(estimateStateValue(selected)).toBe(2);
+  });
 });
 
 describe('estimateStateValue', () => {

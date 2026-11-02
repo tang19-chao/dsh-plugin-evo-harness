@@ -5,16 +5,27 @@
  * timeline (stg op='timeline'), and writes the CCG six-element text straight into
  * cg(op='write') so 灵枢's own gates adjudicate the write
  * (ARCHITECTURE.md 4.2 row 5).
+ *
+ * MEM-4: the write text carries the machine-readable frontmatter envelope in
+ * front of the rendered six-element body (the envelope path is verified
+ * lossless, the rendered-only roundtrip is not), so recall recovers fractional
+ * metricsDelta values, multi-line evidence and multi-line cues instead of
+ * trusting the lossy rendered parse alone.
  */
 
 import type { CanonicalLesson, MemoryBackendCapabilities } from '../../types/contracts';
-import { renderLessonMarkdown } from '../lesson-codec';
+import { serializeLesson } from '../lesson-codec';
 import { scopeInlineTag } from '../namespace';
-import { detectBackendRejection, recordsFromPayload, resolveFields } from './shared';
+import {
+  dedupeRecordsById,
+  detectBackendRejection,
+  recallNamespaceScoped,
+  recordsFromPayload,
+  resolveFields
+} from './shared';
 import type {
   IMemoryDriver,
   JsonObject,
-  JsonValue,
   MemoryDriverContext,
   MemoryDriverPruneInput,
   MemoryDriverPruneOutput,
@@ -34,7 +45,9 @@ export const LINGSHU_MDCG_TOOLS = {
 
 /** The exact六要素 text handed to cg(op='write'), scope-tagged for isolation. */
 export function renderLingshuWriteText(lesson: CanonicalLesson, namespace: string): string {
-  return scopeInlineTag(namespace) + '\n' + renderLessonMarkdown(lesson);
+  // MEM-4: frontmatter envelope first (lossless on recall), rendered CCG body
+  // after it so the white-box gate still adjudicates the six elements.
+  return scopeInlineTag(namespace) + '\n' + serializeLesson(lesson, { namespace });
 }
 
 export function createLingshuMdcgDriver(binding: MemoryDriverToolBinding): IMemoryDriver {
@@ -57,35 +70,71 @@ export function createLingshuMdcgDriver(binding: MemoryDriverToolBinding): IMemo
     ): Promise<MemoryDriverRecallOutput> {
       const fields = resolveFields(context, binding.recall);
       const diagnostics: string[] = [];
-      const scopeArg: JsonValue = input.namespaces.length > 1 ? [...input.namespaces] : input.namespace;
-      const args: JsonObject = {};
-      if (binding.recall === 'cg') {
-        args.op = 'route';
-        args.query = input.fingerprint;
-        args[fields.limit] = input.limit;
-        args[fields.namespace] = scopeArg;
-      } else if (binding.recall === 'stg') {
-        args.op = 'timeline';
-        args[fields.limit] = input.limit;
-        args[fields.namespace] = scopeArg;
-      } else {
-        args[fields.query] = input.fingerprint;
-        args[fields.limit] = input.limit;
-        args[fields.namespace] = scopeArg;
-      }
-      const result = await context.call(binding.recall, args);
-      diagnostics.push('lingshu recall via ' + binding.recall + " op=" + describeOp(binding.recall, args));
-      const records = recordsFromPayload(parseToolPayload(result), {
-        namespace: input.namespace,
-        limit: input.limit
+      // MEM-3: one scalar-namespace call per visible namespace unless the tool
+      // declares the filter field as an array.
+      const primaryArgs: JsonObject[] = [];
+      const results = await recallNamespaceScoped(context, binding.recall, fields.namespace, input.namespaces, (
+        namespaceFilterValue
+      ) => {
+        const args: JsonObject = {};
+        if (binding.recall === 'cg') {
+          args.op = 'route';
+          args.query = input.fingerprint;
+          args[fields.limit] = input.limit;
+          args[fields.namespace] = namespaceFilterValue;
+        } else if (binding.recall === 'stg') {
+          args.op = 'timeline';
+          args[fields.limit] = input.limit;
+          args[fields.namespace] = namespaceFilterValue;
+        } else {
+          args[fields.query] = input.fingerprint;
+          args[fields.limit] = input.limit;
+          args[fields.namespace] = namespaceFilterValue;
+        }
+        primaryArgs.push(args);
+        return args;
       });
-      if (context.hasTool('stg') && binding.recall !== 'stg') {
-        try {
-          const timeline = await context.call('stg', { op: 'timeline', limit: input.limit });
-          const extra = recordsFromPayload(parseToolPayload(timeline), {
+      const records: ReturnType<typeof recordsFromPayload> = [];
+      diagnostics.push(
+        'lingshu recall via ' + binding.recall + ' op=' + describeOp(binding.recall, primaryArgs[0] ?? {})
+      );
+      for (const result of results) {
+        records.push(
+          ...recordsFromPayload(parseToolPayload(result), {
             namespace: input.namespace,
             limit: input.limit
+          })
+        );
+      }
+      if (context.hasTool('stg') && binding.recall !== 'stg') {
+        try {
+          // MEM-2: the supplemental timeline is scoped exactly like the primary
+          // recall — an unscoped stg query pulls cross-namespace records into
+          // the set, where hint attribution alone would file them here.
+          const timelineFields = resolveFields(context, 'stg');
+          const timelineResults = await recallNamespaceScoped(context, 'stg', timelineFields.namespace, input.namespaces, (
+            namespaceFilterValue
+          ) => {
+            const args: JsonObject = { op: 'timeline' };
+            args[timelineFields.limit] = input.limit;
+            args[timelineFields.namespace] = namespaceFilterValue;
+            return args;
           });
+          const visible = new Set(input.namespaces);
+          const extra: ReturnType<typeof recordsFromPayload> = [];
+          for (const timeline of timelineResults) {
+            for (const record of recordsFromPayload(parseToolPayload(timeline), {
+              namespace: input.namespace,
+              limit: input.limit
+            })) {
+              // Records the payload tags with a namespace outside this scope
+              // never belong to the recall set, regardless of backend leniency.
+              if (!visible.has(record.namespace)) {
+                continue;
+              }
+              extra.push(record);
+            }
+          }
           diagnostics.push('lingshu stg timeline added ' + extra.length + ' record(s)');
           for (const record of extra) {
             if (!records.some((existing) => existing.lesson.id === record.lesson.id)) {
@@ -96,7 +145,7 @@ export function createLingshuMdcgDriver(binding: MemoryDriverToolBinding): IMemo
           diagnostics.push('lingshu timeline lookup degraded: ' + errorMessage(error));
         }
       }
-      return { records: records.slice(0, input.limit), diagnostics };
+      return { records: dedupeRecordsById(records).slice(0, input.limit), diagnostics };
     },
     async commit(
       context: MemoryDriverContext,

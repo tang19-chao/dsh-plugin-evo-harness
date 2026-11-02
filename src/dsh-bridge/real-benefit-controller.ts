@@ -119,9 +119,10 @@ import {
   isTrustedVerification,
   type TrustedVerification
 } from '../jitrl/step-evaluator';
-import { scoreUnderRewardContract } from '../jitrl/reward-contract';
+import { REWARD_CONTRACT, scoreUnderRewardContract } from '../jitrl/reward-contract';
 import { observeCacheUsage, type CacheReadSample } from './cache-observation';
 import {
+  canaryUsageNetTokenCount,
   canaryUsageTokenCount,
   maskAccountId,
   verifyHostClientIdentity,
@@ -885,6 +886,12 @@ export interface RealBenefitCanaryResult {
    */
   readonly tokenBudget: {
     readonly caps: RealBenefitTokenCaps;
+    /**
+     * VERIF-10: the per-call NET measured tokens (each logical token counted
+     * once — cacheRead/reasoning are not re-added when the provider declared
+     * them inside input/output). The abort caps keep the per-call GROSS figure
+     * on each record (`measuredTokens`); these three report fields do not.
+     */
     readonly measuredTotalTokens: number;
     readonly measuredBaselineTokens: number;
     readonly measuredTreatmentTokens: number;
@@ -1717,6 +1724,12 @@ function assembleResult(input: {
   readonly postHocPerCallChecks: number;
   /** t4-fix: absolute-total pre-check executions before arm reservations. */
   readonly absoluteTotalPrechecks: number;
+  /**
+   * VERIF-10: the DECLARED counting semantics, so the net report figure knows
+   * which reported fields are already included in another field. Omitted means
+   * every field is counted independently (conservative — never understates).
+   */
+  readonly countingSemantics?: RealBenefitCanaryInput['countingSemantics'];
 }): RealBenefitCanaryResult {
   const baseline = input.calls.find((call) => call.arm === 'baseline');
   const treatment = input.calls.find((call) => call.arm === 'treatment');
@@ -1735,8 +1748,14 @@ function assembleResult(input: {
   }
   const remaining = Math.max(0, input.generalBudgetMicros - settledMicros - heldMicros);
   const metering = input.assembly === undefined ? undefined : input.assembly.meteringStatus();
-  // T4: token accounting over MEASURED usage only. A call whose host reported
-  // no usage contributes nothing to the counters and marks allUsageMeasured
+  // T4: token accounting over MEASURED usage only, on the per-call NET basis
+  // (VERIF-10): each logical token counted once — under the declared inclusion
+  // semantics cacheRead is already inside input and reasoning inside output, so
+  // the gross per-call sum double-counted them and the report overstated spend.
+  // The KILL-SWITCH caps keep the gross `measuredTokens` (over-counting aborts
+  // earlier — the safe direction); this report block uses the net figure
+  // recomputed from the verbatim `usageRaw`. A call whose host reported no
+  // usage contributes nothing to the counters and marks allUsageMeasured
   // false — the caps stay honest instead of pretending unmeasured spend away.
   let measuredTotalTokens = 0;
   let measuredBaselineTokens = 0;
@@ -1744,13 +1763,14 @@ function assembleResult(input: {
   let allUsageMeasured = true;
   for (const call of input.calls) {
     if (call.outcome === 'not-called') continue;
-    if (call.measuredTokens === undefined) {
+    const netTokens = canaryUsageNetTokenCount(call.usageRaw, input.countingSemantics);
+    if (netTokens === undefined) {
       allUsageMeasured = false;
       continue;
     }
-    measuredTotalTokens += call.measuredTokens;
-    if (call.arm === 'baseline') measuredBaselineTokens += call.measuredTokens;
-    else measuredTreatmentTokens += call.measuredTokens;
+    measuredTotalTokens += netTokens;
+    if (call.arm === 'baseline') measuredBaselineTokens += netTokens;
+    else measuredTreatmentTokens += netTokens;
   }
   const tokenBudgetReport = {
     caps: { ...input.binding.tokenBudget },
@@ -1769,8 +1789,11 @@ function assembleResult(input: {
     abortTrigger: input.abortTrigger,
     calls: [...input.calls],
     reward: {
-      contractVersion: 'r4/verifier-first-v1',
-      aggregation: 'trajectory-signals-v1',
+      // INT-6: the single source (src/jitrl/reward-contract.ts) instead of two
+      // hand-copied literals, so a contract bump can never leave this evidence
+      // chain stamping the previous generation.
+      contractVersion: REWARD_CONTRACT.version,
+      aggregation: REWARD_CONTRACT.aggregation,
       baseline: baseline?.reward,
       treatment: treatment?.reward,
       delta: bothScored ? (treatment?.reward ?? 0) - (baseline?.reward ?? 0) : undefined,
@@ -1853,7 +1876,8 @@ export async function evaluateRealBenefitCanary(input: RealBenefitCanaryInput): 
       verificationBasis: 'absent',
       hostClientVerified: false,
       postHocPerCallChecks: 0,
-      absoluteTotalPrechecks: 0
+      absoluteTotalPrechecks: 0,
+      countingSemantics: input.countingSemantics
     });
   }
 
@@ -1877,7 +1901,8 @@ export async function evaluateRealBenefitCanary(input: RealBenefitCanaryInput): 
       verificationBasis: 'absent',
       hostClientVerified: false,
       postHocPerCallChecks: 0,
-      absoluteTotalPrechecks: 0
+      absoluteTotalPrechecks: 0,
+      countingSemantics: input.countingSemantics
     });
   }
   const identityProblems = verifyHostClientIdentity(
@@ -1900,7 +1925,8 @@ export async function evaluateRealBenefitCanary(input: RealBenefitCanaryInput): 
       verificationBasis: 'absent',
       hostClientVerified: false,
       postHocPerCallChecks: 0,
-      absoluteTotalPrechecks: 0
+      absoluteTotalPrechecks: 0,
+      countingSemantics: input.countingSemantics
     });
   }
   hostClientVerified = true;
@@ -1921,7 +1947,8 @@ export async function evaluateRealBenefitCanary(input: RealBenefitCanaryInput): 
       verificationBasis: 'absent',
       hostClientVerified,
       postHocPerCallChecks: 0,
-      absoluteTotalPrechecks: 0
+      absoluteTotalPrechecks: 0,
+      countingSemantics: input.countingSemantics
     });
   }
 
@@ -1956,7 +1983,8 @@ export async function evaluateRealBenefitCanary(input: RealBenefitCanaryInput): 
       verificationBasis: 'absent',
       hostClientVerified,
       postHocPerCallChecks: 0,
-      absoluteTotalPrechecks: 0
+      absoluteTotalPrechecks: 0,
+      countingSemantics: input.countingSemantics
     });
   }
   const settlement = assembly.settlement;
@@ -2014,7 +2042,8 @@ export async function evaluateRealBenefitCanary(input: RealBenefitCanaryInput): 
       verificationBasis: 'absent',
       hostClientVerified,
       postHocPerCallChecks: baseline.record.outcome === 'not-called' ? 0 : 1,
-      absoluteTotalPrechecks
+      absoluteTotalPrechecks,
+      countingSemantics: input.countingSemantics
     });
   }
   // Between-arms token gate: the baseline's measured gross already counts
@@ -2052,7 +2081,8 @@ export async function evaluateRealBenefitCanary(input: RealBenefitCanaryInput): 
       verificationBasis: 'absent',
       hostClientVerified,
       postHocPerCallChecks: baseline.record.outcome === 'not-called' ? 0 : 1,
-      absoluteTotalPrechecks
+      absoluteTotalPrechecks,
+      countingSemantics: input.countingSemantics
     });
   }
   const treatment = await runArm(input, settlement, toolFace, authorization, 'treatment', 2);
@@ -2084,7 +2114,8 @@ export async function evaluateRealBenefitCanary(input: RealBenefitCanaryInput): 
       postHocPerCallChecks:
         (baseline.record.outcome === 'not-called' ? 0 : 1) +
         (treatment.record.outcome === 'not-called' ? 0 : 1),
-      absoluteTotalPrechecks
+      absoluteTotalPrechecks,
+      countingSemantics: input.countingSemantics
     });
   }
   // Post-run total gate: the task/total caps are judged on the accumulated
@@ -2113,7 +2144,8 @@ export async function evaluateRealBenefitCanary(input: RealBenefitCanaryInput): 
       postHocPerCallChecks:
         (baseline.record.outcome === 'not-called' ? 0 : 1) +
         (treatment.record.outcome === 'not-called' ? 0 : 1),
-      absoluteTotalPrechecks
+      absoluteTotalPrechecks,
+      countingSemantics: input.countingSemantics
     });
   }
   void anyUsageUnmeasured;
@@ -2153,7 +2185,8 @@ export async function evaluateRealBenefitCanary(input: RealBenefitCanaryInput): 
     postHocPerCallChecks:
       (baseline.record.outcome === 'not-called' ? 0 : 1) +
       (treatment.record.outcome === 'not-called' ? 0 : 1),
-    absoluteTotalPrechecks
+    absoluteTotalPrechecks,
+    countingSemantics: input.countingSemantics
   });
 }
 

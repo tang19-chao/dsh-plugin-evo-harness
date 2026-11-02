@@ -6,7 +6,9 @@
  *
  * Durability rules enforced here:
  *  - every structured write goes to a sibling temp file, is fsynced, then renamed
- *    over its target, so a crash can never expose a half-written snapshot;
+ *    over its target, so a crash can never expose a half-written snapshot; after
+ *    the rename the parent directory is fsynced on a best-effort basis (POSIX
+ *    only, no Node API for it on Windows) so the rename itself is durable too;
  *  - a truncated JSON document, or a JSONL tail written without its terminating
  *    newline, is detected on load; the damaged file is quarantined as
  *    '<name>.corrupt' (never silently deleted) and the healthy prefix is rewritten
@@ -16,6 +18,13 @@
  *    state instead of refusing to start).
  *
  * The module owns no domain state: it only resolves paths and moves bytes.
+ *
+ * Single-host assumption (DREAM-9): a profile data directory is safe for ONE
+ * host process at a time. Writers serialize within a process only — counters
+ * are in-memory read-modify-write snapshots and JSONL appends can interleave
+ * across processes — so two hosts sharing a resolved directory (same
+ * profile/dataDir/rootDir) lose updates last-writer-wins and can tear JSONL
+ * records. Sharing a data root is fine; sharing a profile directory is not.
  */
 
 import { promises as fs } from 'node:fs';
@@ -90,6 +99,15 @@ function readEnv(
 }
 
 /**
+ * Windows reserved device names (SEC-6). They survive the character allowlist
+ * below unchanged, and `profiles/CON` then resolves to the console device
+ * instead of a directory. The filesystem matches the name before the FIRST dot
+ * ('CON.txt' opens the console too) and case-insensitively, so the check is
+ * applied to the dot-stripped base name.
+ */
+const RESERVED_DEVICE_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+
+/**
  * Reduce an arbitrary profile name to a single safe path segment. Path
  * separators, traversal sequences and control characters cannot survive, so a
  * hostile profile can never escape the configured data root.
@@ -106,7 +124,12 @@ export function sanitizeProfileName(profile: string | undefined): string {
   if (normalized.length === 0 || normalized === '.' || normalized === '..') {
     return DEFAULT_PROFILE_NAME;
   }
-  return normalized.slice(0, 64);
+  const truncated = normalized.slice(0, 64);
+  // SEC-6: prefix a reserved device name instead of collapsing it to
+  // DEFAULT_PROFILE_NAME, so two distinct profiles never share one directory.
+  const dot = truncated.indexOf('.');
+  const baseName = dot === -1 ? truncated : truncated.slice(0, dot);
+  return RESERVED_DEVICE_NAME.test(baseName) ? '_' + truncated : truncated;
 }
 
 /**
@@ -144,10 +167,73 @@ export async function pathExists(target: string): Promise<boolean> {
 }
 
 /**
+ * Bounded rename retry for Windows sharing violations (DREAM-2): MoveFileExW
+ * fails with EPERM/EACCES while another handle holds the target without
+ * FILE_SHARE_DELETE (antivirus/indexer scans, concurrent readers). The
+ * violation is transient — the same write succeeds once the handle closes — so
+ * exactly these two codes are retried with a short linear backoff; every other
+ * error, and an exhausted retry budget, rethrows to the caller.
+ */
+export const WRITE_FILE_ATOMIC_RENAME_RETRIES = 5;
+
+const RENAME_RETRY_BASE_DELAY_MS = 10;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function renameWithRetry(temp: string, filePath: string): Promise<void> {
+  let attempt = 0;
+  for (;;) {
+    try {
+      await fs.rename(temp, filePath);
+      return;
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      attempt += 1;
+      if ((code !== 'EPERM' && code !== 'EACCES') || attempt > WRITE_FILE_ATOMIC_RENAME_RETRIES) {
+        throw error;
+      }
+      await delay(RENAME_RETRY_BASE_DELAY_MS * attempt);
+    }
+  }
+}
+
+/**
+ * Best-effort fsync of the parent directory after a successful rename: without
+ * it the rename itself is not durable on POSIX (a power loss can revert the
+ * target while the renamed-away temp is gone). Windows exposes no directory
+ * fsync through Node, so it is skipped there. Failures are swallowed — the file
+ * content is already durable; this only closes the rename-durability gap
+ * (DREAM-10).
+ */
+async function fsyncDirectoryBestEffort(dir: string): Promise<void> {
+  if (process.platform === 'win32') {
+    return;
+  }
+  try {
+    const handle = await fs.open(dir, 'r');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    // Best effort by contract; never fail the write over it.
+  }
+}
+
+/**
  * Atomically replace a file: write a random sibling temp file, fsync it, then
  * rename it over the target. rename(2) is atomic on POSIX; on Windows Node maps
  * it to MoveFileExW with MOVEFILE_REPLACE_EXISTING, which also replaces an
- * existing target. A failure removes the temp file so no debris is left behind.
+ * existing target — except while another handle holds the target, where the
+ * rename fails with EPERM/EACCES and is retried (see renameWithRetry). After a
+ * successful rename the parent directory is fsynced best-effort (POSIX only,
+ * see fsyncDirectoryBestEffort). A failure removes the temp file so no debris
+ * is left behind.
  */
 export async function writeFileAtomic(
   filePath: string,
@@ -168,7 +254,8 @@ export async function writeFileAtomic(
     } finally {
       await handle.close();
     }
-    await fs.rename(temp, filePath);
+    await renameWithRetry(temp, filePath);
+    await fsyncDirectoryBestEffort(dir);
     committed = true;
   } finally {
     if (!committed) {
@@ -240,7 +327,15 @@ export async function quarantineFile(
   return target;
 }
 
-/** Remove stale '<name>.tmp-*' leftovers of an interrupted atomic write. */
+/**
+ * The exact basename shape writeFileAtomic mints: '<target>.tmp-<pid>-<12 hex>'.
+ * The sweep matches only this anchored shape, so an operator- or host-placed
+ * file that merely contains the '.tmp-' marker somewhere in its name is never
+ * deleted (DREAM-8).
+ */
+const TEMP_FILE_NAME_PATTERN = /\.tmp-[0-9]+-[0-9a-f]{12}$/;
+
+/** Remove stale temp leftovers of an interrupted atomic write ('<name>.tmp-<pid>-<hex>'). */
 export async function sweepTempFiles(dir: string): Promise<readonly string[]> {
   let entries: readonly string[];
   try {
@@ -253,7 +348,7 @@ export async function sweepTempFiles(dir: string): Promise<readonly string[]> {
   }
   const removed: string[] = [];
   for (const entry of entries) {
-    if (!entry.includes(TEMP_FILE_MARKER)) {
+    if (!TEMP_FILE_NAME_PATTERN.test(entry)) {
       continue;
     }
     try {

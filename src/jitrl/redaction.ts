@@ -49,8 +49,12 @@ export const SECRET_PATTERNS: readonly SecretPattern[] = [
   // disclosure). For the bare-whitespace separator ("password hunter2") the
   // value must look value-shaped - quoted, at least 12 chars, or containing
   // a digit or symbol - so ordinary nouns ("token refresh bug") are no
-  // longer swallowed. Quoted values are always consumed whole.
-  { name: 'keyword_secret', pattern: /(?:api[_-]?key|apikey|access[_-]?key|token|secret|password|passwd|pwd|authorization|credentials?|private[_-]?key)\s*(?:[=:]\s*(?:"[^"]*"|[^\s"';,]+)|\bis\b\s+(?:"[^"]*"|[^\s"';,]+)|\s+(?:"[^"]*"|(?=[^\s"';,]{12,}|[^\s"';,]*\d|[^\s"';,]*[^\s0-9A-Za-z"';,])[^\s"';,]+))/i },
+  // longer swallowed. Quoted values are always consumed whole. When the
+  // consumed value is the auth scheme word bearer/basic/digest, the match
+  // extends over the following credential token, so "Authorization: Bearer
+  // <jwt>" folds into one placeholder instead of stranding the credential
+  // after the anchor (JINFRA-1/P0-2).
+  { name: 'keyword_secret', pattern: /(?:api[_-]?key|apikey|access[_-]?key|token|secret|password|passwd|pwd|authorization|credentials?|private[_-]?key)\s*(?:[=:]\s*(?:"[^"]*"|(?:bearer|basic|digest)(?=$|[\s"';,])(?:\s+(?:"[^"]*"|[^\s"';,]+))?|[^\s"';,]+)|\bis\b\s+(?:"[^"]*"|(?:bearer|basic|digest)(?=$|[\s"';,])(?:\s+(?:"[^"]*"|[^\s"';,]+))?|[^\s"';,]+)|\s+(?:"[^"]*"|(?=[^\s"';,]{12,}|[^\s"';,]*\d|[^\s"';,]*[^\s0-9A-Za-z"';,])[^\s"';,]+))/i },
   // Long high-entropy blobs: hex digests and base64url-ish bodies. Two
   // anti-over-redaction guards (P3-FIX3/B3): a run that starts right after
   // a scheme/path/userinfo/hyphen separator (: / \ @ . -) is a structured

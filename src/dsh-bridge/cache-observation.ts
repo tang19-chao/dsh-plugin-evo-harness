@@ -429,20 +429,32 @@ export type CacheOptimizationGate =
       readonly recommendation: string;
     };
 
-/** Exact two-sided sign test over the discordant pairs. */
+/**
+ * Exact two-sided sign test over the discordant pairs.
+ *
+ * Computed in exact BigInt arithmetic: the old float accumulation overflowed
+ * once `2 * tail` or the `2^discordant` denominator left the double range (the
+ * NaN regime starts at 1024 discordant pairs on a balanced split), and
+ * `NaN > alpha` is false, so a near-balanced large split silently opened the
+ * gate. The result is the exact rational p-value rounded into a double, so it
+ * is always finite and the small-n values are bit-identical to the old path.
+ */
 function exactSignTestP(reduced: number, increased: number): number {
   const discordant = reduced + increased;
   if (discordant === 0) {
     return 1;
   }
   const k = Math.min(reduced, increased);
-  let tail = 0;
-  let combination = 1;
-  for (let i = 0; i <= k; i += 1) {
+  let tail = 1n;
+  let combination = 1n;
+  for (let i = 1; i <= k; i += 1) {
+    // C(n, i) = C(n, i-1) * (n - i + 1) / i; the division is exact.
+    combination = (combination * BigInt(discordant - i + 1)) / BigInt(i);
     tail += combination;
-    combination = (combination * (discordant - i)) / (i + 1);
   }
-  return Math.min(1, (2 * tail) / Math.pow(2, discordant));
+  // p = 2 * tail / 2^discordant, scaled by 2^53 so the quotient fits a double.
+  const scaled = Number(((2n * tail) << 53n) / (1n << BigInt(discordant)));
+  return Math.min(1, scaled / Number(1n << 53n));
 }
 
 /**
@@ -453,7 +465,11 @@ function exactSignTestP(reduced: number, increased: number): number {
  *   1. the pairs are `measured` (an estimated or unknown pair cannot open it -
  *      this is the negative control, exercised in both directions in the tests);
  *   2. at least one pair is complete and shows a real reduction (not a tie);
- *   3. the exact two-sided sign test is significant at alpha = 0.05.
+ *   3. the exact two-sided sign test is significant at alpha = 0.05;
+ *   4. the significant direction is a reduction: the majority of discordant
+ *      pairs reduced AND the mean reduction is positive (VERIF-1 - the
+ *      two-sided test is direction-agnostic, so a lopsided split in the WRONG
+ *      direction must never open the gate).
  *
  * Otherwise it says WHY it is closed. It never returns a fabricated effect, and
  * `applicable` deliberately recommends an A/B rather than the optimisation.
@@ -515,6 +531,22 @@ export function cacheOptimizationGate(
     return {
       status: 'measured-no-significant-reduction',
       reason: 'measured, but the sign test is not significant (p=' + p.toFixed(6) + ' > alpha=' + String(alpha) + ')',
+      meanReduction
+    };
+  }
+
+  // Rule 4: direction (VERIF-1). The two-sided sign test only says the split is
+  // lopsided - 1 reduced / 47 increased is significant in the WRONG direction,
+  // and a majority-reduced split can still carry a negative mean. `applicable`
+  // therefore also requires the measured effect to point the optimisation's
+  // way: most discordant pairs reduced and a positive mean reduction.
+  if (reduced <= increased || meanReduction <= 0) {
+    return {
+      status: 'measured-no-significant-reduction',
+      reason:
+        'measured, but the significant direction is not a reduction (' + String(reduced) + ' reduced vs ' +
+        String(increased) + ' increased, meanReduction=' + String(meanReduction) +
+        '); the optimisation requires the measured effect to point the reduction way',
       meanReduction
     };
   }

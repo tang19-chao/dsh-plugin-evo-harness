@@ -46,7 +46,7 @@ import {
   sweepTempFiles,
   writeFileAtomic
 } from './data-dir';
-import { createDiscoveryTreePool } from '../dream-rsi/discovery-tree';
+import { createDiscoveryTreePool, isDiscoveryTreeGraphValid } from '../dream-rsi/discovery-tree';
 
 /** JSONL file name inside the profile data directory. */
 export const TREE_POOL_LOG_FILE = 'tree-pool.jsonl';
@@ -127,7 +127,10 @@ function isDiscoveryTreeStats(value: unknown): value is DiscoveryTreeStats {
 
 /**
  * Structural validation of one persisted tree snapshot. The root node must be
- * present, otherwise restoring the tree would be impossible.
+ * present, otherwise restoring the tree would be impossible, and the parent
+ * graph must be resolvable and acyclic — the pool feeds the offline replay,
+ * whose prefix views walk parent links, so a cyclic snapshot would hang a later
+ * ancestorsOf/causalPrefix call (DREAM-3).
  */
 export function isDiscoveryTreeSnapshot(value: unknown): value is DiscoveryTreeSnapshot {
   if (!isRecord(value)) {
@@ -158,7 +161,9 @@ export function isDiscoveryTreeSnapshot(value: unknown): value is DiscoveryTreeS
       return false;
     }
   }
-  return true;
+  // Every node passed isDiscoveryNode above, so the graph validator can trust
+  // the node shape from here on.
+  return isDiscoveryTreeGraphValid({ nodes: nodes as DiscoveryTreeSnapshot['nodes'] });
 }
 
 /** One record of the tree-pool JSONL event log. */
@@ -228,6 +233,21 @@ function errorMessage(error: unknown): string {
 /** Cheap structural equality for two tree snapshots. */
 function sameTreeSnapshot(left: DiscoveryTreeSnapshot, right: DiscoveryTreeSnapshot): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/**
+ * True when the incoming snapshot is strictly newer than the stored one:
+ * createdAt decides, updatedAt only breaks ties within the same creation stamp
+ * so a legitimate same-tick refresh still lands while a stale snapshot cannot.
+ */
+function isSnapshotNewerThan(
+  incoming: DiscoveryTreeSnapshot,
+  stored: DiscoveryTreeSnapshot
+): boolean {
+  if (incoming.createdAt !== stored.createdAt) {
+    return incoming.createdAt > stored.createdAt;
+  }
+  return incoming.updatedAt > stored.updatedAt;
 }
 
 /**
@@ -474,9 +494,23 @@ export class PersistentTreePool implements IDiscoveryTreePool {
   add(tree: DiscoveryTreeSnapshot): void {
     const existing = this.base.get(tree.id);
     if (existing !== undefined && !sameTreeSnapshot(existing, tree)) {
-      // The IDiscoveryTreePool contract is upsert-by-id, so the new snapshot wins.
-      // A restarted host whose id factory restarts at 1 would otherwise silently
-      // destroy a persisted tree; report it instead of hiding the overwrite.
+      if (!isSnapshotNewerThan(tree, existing)) {
+        // A snapshot that is not newer than the persisted one is rejected instead
+        // of winning the upsert: a restarted host whose id factory restarts at 1
+        // would otherwise silently destroy the persisted tree with stale state.
+        this.store.noteDiagnostic(
+          'persistence: tree id collision for ' +
+            tree.id +
+            '; rejected an add that is not newer than the persisted tree (createdAt ' +
+            tree.createdAt +
+            ' vs ' +
+            existing.createdAt +
+            ')'
+        );
+        return;
+      }
+      // The IDiscoveryTreePool contract is upsert-by-id, so a strictly newer
+      // snapshot wins; report the overwrite instead of hiding it.
       this.store.noteDiagnostic(
         'persistence: tree id collision for ' +
           tree.id +
