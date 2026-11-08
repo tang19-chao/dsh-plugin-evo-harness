@@ -49,6 +49,7 @@ import {
   createDeterministicIdFactory,
   isRecord,
   nonEmptyString,
+  normalizePathForFingerprint,
   oneLine,
   readStringList,
   surfaceEditSummary,
@@ -57,6 +58,10 @@ import {
   truncate,
   extractJsonValue
 } from './shared';
+// Harness2 #37 content-layer port: every free-text dossier field handed to the
+// model passes the shared secret redaction before it leaves the process
+// boundary (same discipline as src/mcp/server.ts redactForBoundary).
+import { redactSecrets } from '../jitrl/redaction';
 
 /** Injectable dependencies of the evidence reflector. */
 export interface HarnessReflectorOptions {
@@ -143,16 +148,110 @@ function isEightSurfacePatch(value: unknown): value is EightSurfacePatch {
   );
 }
 
+interface ReflectionTripwireHit {
+  readonly field: string;
+}
+
+/**
+ * Upstream #163's grader-verdict tripwire, adapted to this repository's
+ * in-memory reflection boundary (the upstream PR scans the reflection tree
+ * before it can be rolled or stored; here the same scan runs on the model
+ * headers, the patch/trajectory evidence and the assembled lesson). The
+ * upstream marker list is kept verbatim apart from dropping the JSON quote
+ * characters: parsed object fields no longer carry them, and the scan must
+ * stay fail-closed. The marker names are deliberately not copied into
+ * diagnostics or lessons: this is a leak guard, not a sanitizer.
+ */
+const GRADER_VERDICT_MARKERS: readonly string[] = [
+  'deterministic_eval_summary',
+  'deterministic_eval_result',
+  'judge_scope_and_deterministic_status',
+  'judge findings on the rendered result',
+  'passed_count',
+  'pass_rate',
+  'test_pass_rate'
+];
+
+/**
+ * Answer-key / golden-output path shapes, checked ONLY on path-bearing fields
+ * (`path`, `producedFiles`) after POSIX normalization, so `dir\answer_key.json`
+ * and `dir/answer_key.json` are caught identically on every platform. Prose is
+ * never path-matched: a lesson that merely mentions an answer key in its body
+ * is a content matter for the marker scan, not this structural one.
+ */
+const ANSWER_KEY_DIR_PATTERN = /(?:^|[/\\])(?:answer[-_ ]?keys?|gold(?:en)?(?:[-_ ]?(?:answers?|outputs?))?|expected[-_ ]?outputs?|grader[-_ ]?verdicts?)(?:[/\\]|$)/i;
+const ANSWER_KEY_FILE_PATTERN = /(?:^|[/\\])(?:answer[-_ ]?key|gold(?:en)?(?:[-_ ]?(?:answer|output))?|expected[-_ ]?output|grader[-_ ]?verdict)\.[a-z0-9]+$/i;
+
+function answerKeyPathHit(value: unknown): boolean {
+  if (typeof value === 'string') {
+    const normalized = normalizePathForFingerprint(value);
+    return ANSWER_KEY_DIR_PATTERN.test(normalized) || ANSWER_KEY_FILE_PATTERN.test(normalized);
+  }
+  if (Array.isArray(value)) {
+    return value.some(answerKeyPathHit);
+  }
+  return false;
+}
+
+function reflectionTripwireHit(value: unknown, field: string): ReflectionTripwireHit | undefined {
+  if (typeof value === 'string') {
+    const marker = GRADER_VERDICT_MARKERS.find((candidate) => value.toLowerCase().includes(candidate));
+    return marker === undefined ? undefined : { field };
+  }
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const hit = reflectionTripwireHit(value[index], field + '[' + index + ']');
+      if (hit !== undefined) {
+        return hit;
+      }
+    }
+    return undefined;
+  }
+  if (isRecord(value)) {
+    for (const [key, item] of Object.entries(value)) {
+      // Structural answer-key check applies only to path-bearing fields.
+      if ((key === 'path' || key === 'producedFiles') && answerKeyPathHit(item)) {
+        return { field: field + '.' + key };
+      }
+      const hit = reflectionTripwireHit(item, field + '.' + key);
+      if (hit !== undefined) {
+        return hit;
+      }
+    }
+  }
+  return undefined;
+}
+
+interface CollectedPatches {
+  readonly patches: ReadonlyMap<string, EightSurfacePatch>;
+  /** Patch bodies the tripwire refused; candidates mounted on them are skipped. */
+  readonly rejectedPatchIds: ReadonlySet<string>;
+}
+
 function collectPatches(
   request: ReflectionRequest,
   diagnostics: string[]
-): ReadonlyMap<string, EightSurfacePatch> {
+): CollectedPatches {
   const patches = new Map<string, EightSurfacePatch>();
+  const rejectedPatchIds = new Set<string>();
+  const add = (patch: EightSurfacePatch): void => {
+    // The whole patch record is screened: label and rationale cross into the
+    // lesson header prompt and the lesson body, not only the edit payloads.
+    const hit = reflectionTripwireHit(patch, 'patch ' + patch.id);
+    if (hit !== undefined) {
+      rejectedPatchIds.add(patch.id);
+      diagnostics.push(
+        'reflection tripwire rejected patch ' + patch.id + ' (' + hit.field + '); patch skipped instead of poisoning the lesson evidence'
+      );
+      return;
+    }
+    patches.set(patch.id, patch);
+  };
   if (request.composition.selectedPatch !== null) {
-    patches.set(request.composition.selectedPatch.id, request.composition.selectedPatch);
+    add(request.composition.selectedPatch);
   }
   if (request.composition.composedPatch !== null) {
-    patches.set(request.composition.composedPatch.id, request.composition.composedPatch);
+    add(request.composition.composedPatch);
   }
   const raw: unknown = request.metadata?.candidatePatches;
   const list: unknown[] = Array.isArray(raw) ? raw : isRecord(raw) ? Object.values(raw) : [];
@@ -163,10 +262,10 @@ function collectPatches(
   }
   for (const item of list) {
     if (isEightSurfacePatch(item)) {
-      patches.set(item.id, item);
+      add(item);
     }
   }
-  return patches;
+  return { patches, rejectedPatchIds };
 }
 
 function describeReference(reference: ProbeTrajectory | undefined): string {
@@ -384,6 +483,24 @@ function isSelectedWinner(request: ReflectionRequest, trajectory: ProbeTrajector
   );
 }
 
+/**
+ * The free-text/structured evidence of one probe that can reach a lesson or
+ * the header prompt. Both the skip decision (buildDossier) and the audit
+ * diagnostic in reflect() scan EXACTLY this projection, so the two can never
+ * disagree about why a candidate was dropped.
+ */
+function trajectoryEvidence(trajectory: ProbeTrajectory): Record<string, unknown> {
+  return {
+    surfaceKeys: trajectory.surfaceKeys,
+    steps: trajectory.steps,
+    toolErrors: trajectory.toolErrors,
+    deliverable: trajectory.deliverable,
+    failureSignals: trajectory.failureSignals,
+    error: trajectory.error,
+    metadata: trajectory.metadata
+  };
+}
+
 function buildDossier(
   request: ReflectionRequest,
   trajectory: ProbeTrajectory,
@@ -403,6 +520,12 @@ function buildDossier(
   const fromTrajectory = surfaceKeysInOrder(trajectory.surfaceKeys);
   const surfaces = fromTrajectory.length > 0 ? fromTrajectory : patch !== undefined ? surfaceKeysInOrder(Object.keys(patch.edits)) : [];
   if (surfaces.length === 0) {
+    return undefined;
+  }
+  // The trajectory itself is untrusted model/tool output too. A poisoned probe
+  // must not be kept alive merely because its surfaceKeys came from the probe.
+  const trajectoryHit = reflectionTripwireHit(trajectoryEvidence(trajectory), 'trajectory ' + trajectory.id);
+  if (trajectoryHit !== undefined) {
     return undefined;
   }
   const assessment = request.composition.assessments.find(
@@ -443,6 +566,11 @@ function buildHeaderMessages(
   dossiers: readonly CandidateDossier[],
   reference: ProbeTrajectory | undefined
 ): readonly ModelMessage[] {
+  // Harness2 #37 content layer: the dossier is model input, so every free-text
+  // field is secret-redacted here — the single seam where trajectory evidence
+  // becomes a prompt. Deterministic lesson fields keep their original text;
+  // only what crosses the model boundary is redacted.
+  const secretFree = (text: string): string => redactSecrets(text);
   const system: string[] = [];
   system.push('You are the Harness² evidence reflector for a DeepSeek Harness (Cordis) agent.');
   system.push(
@@ -457,9 +585,9 @@ function buildHeaderMessages(
   );
   const user: string[] = [];
   user.push('## Task');
-  user.push('prompt: ' + truncate(oneLine(request.task.prompt), 800));
+  user.push('prompt: ' + secretFree(truncate(oneLine(request.task.prompt), 800)));
   if (request.task.taskSignature !== undefined) {
-    user.push('taskSignature: ' + request.task.taskSignature);
+    user.push('taskSignature: ' + secretFree(request.task.taskSignature));
   }
   user.push('scope: ' + request.scope.kind);
   if (reference !== undefined) {
@@ -473,8 +601,8 @@ function buildHeaderMessages(
     user.push('polarity: ' + dossier.polarity);
     user.push('status: ' + dossier.trajectory.status);
     user.push('surfaces: ' + dossier.surfaces.join(', '));
-    user.push('referenceFailure: ' + dossier.referenceFailure);
-    user.push('candidateOutcome: ' + dossier.candidateOutcome);
+    user.push('referenceFailure: ' + secretFree(dossier.referenceFailure));
+    user.push('candidateOutcome: ' + secretFree(dossier.candidateOutcome));
     user.push(
       'metricsDelta: stepsDiff=' +
         dossier.metricsDelta.stepsDiff +
@@ -491,12 +619,19 @@ function buildHeaderMessages(
             String(contrast.referenceValue) +
             ' candidate=' +
             String(contrast.candidateValue) +
-            (contrast.delta === undefined ? '' : ' delta=' + contrast.delta)
+            (contrast.delta === undefined ? '' : ' delta=' + contrast.delta) +
+            (contrast.evidence.length === 0
+              ? ''
+              : ' | ' + secretFree(contrast.evidence.join('; ')))
         );
       }
     }
-    user.push('requiredWhenToApply: ' + dossier.cues.join(' | '));
-    user.push('requiredWhenNotToApply: ' + dossier.clauses.join(' | '));
+    user.push(
+      'requiredWhenToApply: ' + secretFree(dossier.cues.join(' | '))
+    );
+    user.push(
+      'requiredWhenNotToApply: ' + secretFree(dossier.clauses.join(' | '))
+    );
   }
   user.push('');
   user.push('## Output');
@@ -507,18 +642,30 @@ function buildHeaderMessages(
   ];
 }
 
-function readAssistedHeaders(text: string): ReadonlyMap<string, AssistedHeader> {
+function readAssistedHeaders(
+  text: string,
+  dossiers: readonly CandidateDossier[],
+  diagnostics: string[]
+): ReadonlyMap<string, AssistedHeader> {
   const headers = new Map<string, AssistedHeader>();
   const parsed = extractJsonValue(text);
   if (!isRecord(parsed) || !Array.isArray(parsed.lessons)) {
     return headers;
   }
+  const knownIds = new Set(dossiers.map((dossier) => dossier.trajectory.id));
   for (const item of parsed.lessons) {
     if (!isRecord(item)) {
       continue;
     }
     const candidateId = nonEmptyString(item.candidateId);
-    if (candidateId === undefined) {
+    if (candidateId === undefined || !knownIds.has(candidateId)) {
+      continue;
+    }
+    const hit = reflectionTripwireHit(item, 'model header ' + candidateId);
+    if (hit !== undefined) {
+      diagnostics.push(
+        'reflection tripwire rejected model header for ' + candidateId + ' (' + hit.field + '); deterministic header used for this lesson'
+      );
       continue;
     }
     headers.set(candidateId, {
@@ -574,6 +721,21 @@ export function createEvidenceReflector(options: HarnessReflectorOptions): IHarn
   return {
     async reflect(request: ReflectionRequest): Promise<ReflectionResult> {
       const diagnostics: string[] = [];
+      // Upstream #163 degradation seam: a tripwire firing on the reflection
+      // INPUT must never crash the run, and must never be laundered into a
+      // success. The task prompt is echoed into lesson cues and the header
+      // prompt, so poisoned task material degrades the WHOLE reflection to an
+      // honest empty result with a diagnostic naming the field.
+      const inputHit = reflectionTripwireHit(
+        { prompt: request.task.prompt, taskSignature: request.task.taskSignature },
+        'task input'
+      );
+      if (inputHit !== undefined) {
+        diagnostics.push(
+          'reflection tripwire rejected reflection input (' + inputHit.field + '); no lessons emitted and the run continues'
+        );
+        return { lessons: [], positiveCount: 0, negativeCount: 0, diagnostics };
+      }
       const all = dedupeTrajectories(request.trajectories);
       const reference =
         request.referenceTrajectory ?? all.find((trajectory) => trajectory.role === 'reference');
@@ -592,16 +754,31 @@ export function createEvidenceReflector(options: HarnessReflectorOptions): IHarn
         return { lessons: [], positiveCount: 0, negativeCount: 0, diagnostics };
       }
 
-      const patches = collectPatches(request, diagnostics);
+      const { patches, rejectedPatchIds } = collectPatches(request, diagnostics);
       const dossiers: CandidateDossier[] = [];
       for (const candidate of candidates) {
+        // A candidate mounted on a refused patch body has an uninspectable
+        // intervention: emit neither lesson nor a silent fallback for it.
+        if (rejectedPatchIds.has(candidate.patchId)) {
+          diagnostics.push(
+            'reflection tripwire rejected candidate ' + candidate.id + ' patch ' + candidate.patchId + '; no lesson emitted'
+          );
+          continue;
+        }
         const dossier = buildDossier(request, candidate, reference, patches, maxClauses);
         if (dossier === undefined) {
-          diagnostics.push(
-            'candidate ' +
-              candidate.id +
-              ' has no recorded surface keys and no patch body; skipped instead of emitting an unverifiable lesson'
-          );
+          const tripwire = reflectionTripwireHit(trajectoryEvidence(candidate), 'trajectory ' + candidate.id);
+          if (tripwire !== undefined) {
+            diagnostics.push(
+              'reflection tripwire rejected candidate ' + candidate.id + ' (' + tripwire.field + '); no lesson emitted'
+            );
+          } else {
+            diagnostics.push(
+              'candidate ' +
+                candidate.id +
+                ' has no recorded surface keys and no patch body; skipped instead of emitting an unverifiable lesson'
+            );
+          }
           continue;
         }
         if (dossier.node === undefined && candidate.nodeId !== undefined) {
@@ -610,7 +787,11 @@ export function createEvidenceReflector(options: HarnessReflectorOptions): IHarn
         dossiers.push(dossier);
       }
       if (dossiers.length === 0) {
-        diagnostics.push('no candidate produced enough evidence for a canonical lesson');
+        diagnostics.push(
+          diagnostics.some((entry) => entry.startsWith('reflection tripwire'))
+            ? 'every candidate was rejected by the reflection tripwire; no lessons emitted'
+            : 'no candidate produced enough evidence for a canonical lesson'
+        );
         return { lessons: [], positiveCount: 0, negativeCount: 0, diagnostics };
       }
 
@@ -625,7 +806,7 @@ export function createEvidenceReflector(options: HarnessReflectorOptions): IHarn
           metadata: { sessionId: request.sessionId, dossierCount: dossiers.length, scope: request.scope.kind }
         };
         const response = await model.call(modelRequest);
-        headers = readAssistedHeaders(response.text);
+        headers = readAssistedHeaders(response.text, dossiers, diagnostics);
         if (headers.size === 0) {
           diagnostics.push('model header refinement returned no usable lesson headers; deterministic headers were used');
         }
@@ -664,7 +845,7 @@ export function createEvidenceReflector(options: HarnessReflectorOptions): IHarn
           contrastDimensions: dossier.contrasts.map((contrast) => contrast.dimension),
           headerSource: assisted?.title !== undefined ? 'model' : 'deterministic'
         };
-        lessons.push({
+        const lesson: CanonicalLesson = {
           id: newId('lesson'),
           title: truncate(title, 160),
           whenToApply,
@@ -683,7 +864,18 @@ export function createEvidenceReflector(options: HarnessReflectorOptions): IHarn
           taskSignature: request.task.taskSignature,
           sourceTreeId: request.tree.id,
           metadata
-        });
+        };
+        // Last boundary before the memory bridge: model refinements are already
+        // screened above, but deterministic fields and future additions remain
+        // fail-closed here. Degrade this lesson only; never throw away the run.
+        const finalHit = reflectionTripwireHit(lesson, 'lesson ' + lesson.id);
+        if (finalHit !== undefined) {
+          diagnostics.push(
+            'reflection tripwire rejected completed lesson ' + lesson.id + ' (' + finalHit.field + '); no lesson emitted'
+          );
+          continue;
+        }
+        lessons.push(lesson);
       }
 
       const deduped: CanonicalLesson[] = [];

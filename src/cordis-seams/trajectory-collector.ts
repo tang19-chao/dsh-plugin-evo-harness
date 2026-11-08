@@ -26,6 +26,15 @@ import {
   type TrajectoryStatus,
   type TrajectoryStep
 } from '../types/contracts';
+import {
+  isMissingTrajectorySentinel,
+  mergeEvidenceIntegrityMarks,
+  quarantineTrajectory,
+  readCarriedEvidenceIntegrityMark,
+  scanPatchEvidenceIntegrity,
+  scanTrajectoryEvidenceIntegrity,
+  type EvidenceIntegrityPolicy
+} from '../verification/evidence-integrity';
 
 /** Step input accepted by the collector; index/at are assigned by the collector. */
 export type TrajectoryStepInput = Omit<TrajectoryStep, 'index' | 'at'> & { readonly at?: number };
@@ -44,6 +53,22 @@ export interface TrajectoryCollectorInit {
   readonly referenceTrajectoryId?: string;
   readonly memoryRecallIds?: readonly string[];
   readonly now?: () => number;
+  /**
+   * rev8 #118/#175: the HOST-owned evidence-integrity policy (answer-key
+   * criteria, visible text, forbidden path segments). Never derived from
+   * `result.metadata` — a branch cannot declare its own evidence clean (the
+   * same trust boundary as C2a). Absent => the host-owned scan is skipped
+   * entirely and finalize behaves byte-identically to the pre-rev8 shape
+   * (sentinel rejection on the deliverable still applies: it is unconditional).
+   *
+   * rev8 W2-propagation: the ONLY thing read from a result's metadata is the
+   * inner collector's mark at `metadata.trajectory.evidenceIntegrity`, and it is
+   * accepted only as a DENIAL (`contaminated === true`, exact version, well-
+   * formed findings). A "clean" claim is never read, so it cannot suppress this
+   * collector's own scan; the mark can only withhold its own evidence. Absent
+   * policy + absent mark => byte-identical output.
+   */
+  readonly evidenceIntegrity?: EvidenceIntegrityPolicy;
 }
 
 /** Terminal input for finalize(). */
@@ -203,6 +228,14 @@ export class TrajectoryCollector {
   private readonly toolErrors: ToolErrorRecord[] = [];
   private readonly signals: FailureSignal[] = [];
   private readonly diagnostics: string[] = [];
+  /**
+   * rev8 #67: the TWO artifact channels fail independently. A trajectory
+   * render/read failure and a deliverable render/read failure are recorded
+   * here — never merged into `this.error` (which is the RUN's terminal error)
+   * and never allowed to overwrite each other.
+   */
+  private readonly trajectoryFaults: TrajectoryError[] = [];
+  private readonly deliverableFaults: TrajectoryError[] = [];
   private error: TrajectoryError | undefined;
   private surfaceKeys: readonly HarnessComponentKey[];
   private trajectory: ProbeTrajectory | undefined;
@@ -267,38 +300,134 @@ export class TrajectoryCollector {
     return normalized;
   }
 
-  /** Build the immutable ProbeTrajectory. Idempotent: repeated calls return it. */
+  /**
+   * rev8 #67: record a failure of the TRAJECTORY channel (the step/event
+   * render). It is kept beside the run error, never in place of it, so a
+   * successful deliverable read can neither overwrite it nor be overwritten
+   * by it.
+   */
+  recordTrajectoryFault(error: unknown): TrajectoryError {
+    const normalized = toTrajectoryError(error);
+    this.trajectoryFaults.push(normalized);
+    return normalized;
+  }
+
+  /**
+   * rev8 #67: record a failure of the DELIVERABLE channel. Upstream #67's
+   * exact shape: the trajectory stays intact, the produced artifact is
+   * reported as unavailable, and neither write clobbers the other.
+   */
+  recordDeliverableFault(error: unknown): TrajectoryError {
+    const normalized = toTrajectoryError(error);
+    this.deliverableFaults.push(normalized);
+    return normalized;
+  }
+
+  /**
+   * Build the immutable ProbeTrajectory. Idempotent: repeated calls return it.
+   *
+   * rev8 additions (all additive; with no integrity policy and no faults the
+   * output is byte-identical to the pre-rev8 shape):
+   *   #67  every `result.*` channel is read independently — a getter that
+   *        throws on one channel records a fault and yields `undefined`, it
+   *        can never erase the channels that already read; a recorded terminal
+   *        error demotes a `succeeded` status (a later success cannot swallow a
+   *        recorded failure); channel faults become failure signals, never the
+   *        run error.
+   *   #72  a missing/unparseable-trajectory sentinel deliverable is rejected:
+   *        it is dropped, a failure signal fires, the already-collected steps
+   *        stay intact.
+   *   #118/#175  with a host-supplied integrity policy the merged content and
+   *        the patch paths are scanned; a contaminated trajectory is replaced
+   *        by the neutral quarantine record.
+   *   W2-propagation  a DENY-ONLY contamination mark carried by the result
+   *        (`metadata.trajectory.evidenceIntegrity`, written by this repo's
+   *        agent-loop bridge) is merged with the host's own re-scan, so the
+   *        outer trajectory keeps the fact the inner collector already acted
+   *        on. A "clean"/malformed/foreign claim reads as absent.
+   */
   finalize(input: FinalizeTrajectoryInput = {}): ProbeTrajectory {
     if (this.trajectory !== undefined) {
       return this.trajectory;
     }
     const result = input.result;
     const endedAt = input.endedAt ?? this.now();
+
+    // #67: read each executor-result channel behind its own guard.
+    const getterFaults: TrajectoryError[] = [];
+    const readChannel = <T>(read: () => T): T | undefined => {
+      try {
+        return read();
+      } catch (caught) {
+        getterFaults.push(toTrajectoryError(caught));
+        return undefined;
+      }
+    };
+    const resultStatus = readChannel(() => result?.status);
+    const resultError = readChannel(() => result?.error);
+    const resultSteps = readChannel(() => result?.steps);
+    const resultToolErrors = readChannel(() => result?.toolErrors);
+    const resultDeliverable = readChannel(() => result?.deliverable);
+    const resultUsage = readChannel(() => result?.usage);
+    const resultSignals = readChannel(() => result?.failureSignals);
+    // rev8 W2-propagation: the inner collector's DENY-ONLY mark, read from the
+    // one documented bridge channel. A "clean"/malformed/foreign claim reads as
+    // absent; the host-owned scan below always runs regardless.
+    const resultMetadata = readChannel(() => result?.metadata);
+
     const error =
-      result !== undefined && result.error !== undefined
-        ? result.error
+      resultError !== undefined
+        ? resultError
         : this.error ?? (input.error === undefined ? undefined : toTrajectoryError(input.error));
+    const declaredStatus: TrajectoryStatus =
+      input.status ??
+      (result === undefined ? undefined : resultStatus) ??
+      (error === undefined ? 'succeeded' : 'failed');
+    // #67: a recorded terminal error cannot be swallowed by a later success.
     const status: TrajectoryStatus =
-      input.status ?? (result === undefined ? undefined : result.status) ?? (error === undefined ? 'succeeded' : 'failed');
+      declaredStatus === 'succeeded' && error !== undefined ? 'failed' : declaredStatus;
     // MEM-12: one merge policy for all three observed-event channels — the
     // union of collector-recorded and executor-returned entries, in that order,
     // with steps reindexed afterwards. Steps used to be REPLACED while tool
     // errors and signals were CONCATENATED, so metrics could describe two
     // different event sets and every collector-recorded step silently vanished
     // once an executor returned its own steps.
-    const steps = reindexSteps([
-      ...this.steps,
-      ...(result !== undefined && result.steps !== undefined ? result.steps : [])
-    ]);
+    const steps = reindexSteps([...this.steps, ...(resultSteps ?? [])]);
     const toolErrors =
-      result !== undefined && result.toolErrors !== undefined
-        ? [...this.toolErrors, ...result.toolErrors]
-        : [...this.toolErrors];
-    const deliverable = result === undefined ? undefined : result.deliverable;
-    const explicitSignals =
-      result !== undefined && result.failureSignals !== undefined
-        ? [...this.signals, ...result.failureSignals]
-        : [...this.signals];
+      resultToolErrors !== undefined ? [...this.toolErrors, ...resultToolErrors] : [...this.toolErrors];
+    // #72: a missing/unparseable-trajectory sentinel is not a produced
+    // artifact. The sentinel text never enters the frozen record; the steps
+    // (the trajectory channel) stay exactly as collected.
+    const deliverableSentinel =
+      resultDeliverable !== undefined &&
+      typeof resultDeliverable.content === 'string' &&
+      isMissingTrajectorySentinel(resultDeliverable.content);
+    if (deliverableSentinel) {
+      this.diagnostics.push('produced deliverable rejected: missing-trajectory sentinel');
+    }
+    const deliverable = deliverableSentinel ? undefined : resultDeliverable;
+    const explicitSignals: FailureSignal[] = [
+      ...this.signals,
+      ...(resultSignals ?? [])
+    ];
+    // #67: independently recorded channel faults become failure signals —
+    // visible to the taxonomy and the scorer, never merged into the run error.
+    for (const fault of [...this.trajectoryFaults, ...this.deliverableFaults, ...getterFaults]) {
+      explicitSignals.push({
+        kind: 'unknown',
+        message: fault.message,
+        code: 'evidence-render-failed',
+        repairable: true
+      });
+    }
+    if (deliverableSentinel) {
+      explicitSignals.push({
+        kind: 'unknown',
+        message: 'the produced artifact is a missing-trajectory sentinel and was rejected',
+        code: 'missing-trajectory-sentinel',
+        repairable: true
+      });
+    }
     const failureSignals = deriveFailureSignals({
       status,
       error,
@@ -326,7 +455,7 @@ export class TrajectoryCollector {
         toolErrors,
         startedAt: this.startedAt,
         endedAt,
-        usage: result === undefined ? undefined : result.usage,
+        usage: result === undefined ? undefined : resultUsage,
         deliverable
       }),
       steps,
@@ -342,6 +471,45 @@ export class TrajectoryCollector {
       ...(error === undefined ? {} : { error }),
       ...(diagnostics.length === 0 ? {} : { metadata: { diagnostics } })
     };
+
+    // #118/#175: the host-owned integrity scan. The mark is computed HERE, on
+    // the merged content, from the HOST's policy — never from anything a
+    // branch attached to its result. A hit replaces the trajectory with the
+    // neutral quarantine record before it is frozen. The rejected sentinel
+    // deliverable is scanned in its raw form so the mark records WHY it was
+    // withheld, not just that something was.
+    //
+    // rev8 W2-propagation: the OUTER collector must not lose a contamination
+    // fact the INNER collector already acted on. With the default agent-loop
+    // assembly the inner collector (armed with the same host policy) quarantines
+    // the content first and leaves the only mark in `result.metadata.trajectory`
+    // (src/dsh-bridge/agent-loop-executor.ts:517-538). The content that reaches
+    // this collector is therefore already neutral, so the local re-scan cannot
+    // rediscover the hit. The carried mark is read from that ONE documented
+    // channel and is DENY-ONLY: a "clean"/malformed/foreign claim reads as
+    // absent, and it is only ever MERGED with — never a substitute for — the
+    // host's own patch/sentinel rejection, which still runs whenever a policy is
+    // configured. A branch can withhold its own evidence with this channel; it
+    // cannot make anything pass.
+    const integrityPolicy = this.init.evidenceIntegrity;
+    const carriedMark = readCarriedEvidenceIntegrityMark(resultMetadata);
+    if (integrityPolicy !== undefined || carriedMark !== undefined) {
+      const scanTarget =
+        deliverableSentinel && resultDeliverable !== undefined
+          ? { ...trajectory, deliverable: resultDeliverable }
+          : trajectory;
+      const ownMark =
+        integrityPolicy === undefined
+          ? undefined
+          : scanTrajectoryEvidenceIntegrity(scanTarget, integrityPolicy) ??
+            scanPatchEvidenceIntegrity(this.init.patch, integrityPolicy);
+      const mark = mergeEvidenceIntegrityMarks(ownMark, carriedMark);
+      if (mark !== undefined) {
+        const quarantined = quarantineTrajectory(trajectory, mark);
+        this.trajectory = quarantined;
+        return quarantined;
+      }
+    }
 
     this.trajectory = trajectory;
     return trajectory;

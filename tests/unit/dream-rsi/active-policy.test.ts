@@ -16,6 +16,7 @@ import {
 import { createDiscoveryTree } from '../../../src/dream-rsi/discovery-tree';
 import type {
   BatchSlotKind,
+  LiveCyclePlanHistory,
   MetaSearchPolicy,
   PlanGridRequest,
   ProbeTask,
@@ -38,7 +39,10 @@ function planRequest(overrides: Partial<PlanGridRequest> = {}): PlanGridRequest 
     policy: overrides.policy ?? makePolicy(),
     ...(overrides.previousFailures === undefined
       ? {}
-      : { previousFailures: overrides.previousFailures })
+      : { previousFailures: overrides.previousFailures }),
+    ...(overrides.previousLiveCycle === undefined
+      ? {}
+      : { previousLiveCycle: overrides.previousLiveCycle })
   };
 }
 
@@ -1001,5 +1005,266 @@ describe('best-node resolution', () => {
     // pre-fix the scoreless root won the createdAt tie-break, so exploitation
     // deepened from the reference root instead of the real candidate
     expect(exploit?.parentNodeId).toBe('candidate-1');
+  });
+});
+
+describe('planGrid previousLiveCycle bounded sizing (rev8 plan §6.1 item 3)', () => {
+  const policyApi = createActivePolicyFromDefaults();
+
+  /** Consistent completed record: reference + one batch of 2 in one round. */
+  function history(
+    overrides: Partial<LiveCyclePlanHistory> = {}
+  ): LiveCyclePlanHistory {
+    return {
+      runId: overrides.runId ?? 'run-prev',
+      status: overrides.status ?? 'completed',
+      probes: overrides.probes ?? 3,
+      rounds: overrides.rounds ?? 1,
+      batchSizes: overrides.batchSizes ?? [2],
+      effectiveSequentialRounds: overrides.effectiveSequentialRounds ?? 1,
+      // rev8 P2: forwarded so ownership cases can name a task; existing cases
+      // pass none and keep exercising the identity-less (legacy) shape.
+      ...(overrides.taskId === undefined ? {} : { taskId: overrides.taskId })
+    };
+  }
+
+  it('narrows width/depth/budget to the realized shape and names it in the rationale', () => {
+    const plan = policyApi.planGrid(planRequest({ previousLiveCycle: history() }));
+    // baseline (no history) is width 4 / depth 3 / budget 12; the realized
+    // cycle ran ONE batch of 2 candidates in one sequential round.
+    expect(plan.maxWidth).toBe(2);
+    expect(plan.maxDepth).toBe(1);
+    expect(plan.budget).toBe(2);
+    expect(plan.skipProbing).toBe(false);
+    expect(plan.rationale).toContain('previousLiveCycle=completed');
+    expect(plan.rationale).toContain('realizedBatchWidth=2');
+    expect(plan.rationale).toContain('realizedSequentialRounds=1');
+    expect(plan.rationale).toContain('realizedCandidateProbes=2');
+  });
+
+  it('never widens the policy caps no matter what the history realized', () => {
+    const huge = history({
+      probes: 100,
+      rounds: 9,
+      batchSizes: [100],
+      effectiveSequentialRounds: 9
+    });
+    const baseline = policyApi.planGrid(planRequest());
+    const plan = policyApi.planGrid(planRequest({ previousLiveCycle: huge }));
+    expect(plan.maxWidth).toBe(baseline.maxWidth);
+    expect(plan.maxDepth).toBe(baseline.maxDepth);
+    expect(plan.budget).toBe(baseline.budget);
+    expect(plan.budget).toBeLessThanOrEqual(20);
+  });
+
+  it('never trusts the previous PLANNED grid - only realized fields bound', () => {
+    const plannedOnly = {
+      runId: 'run-prev',
+      status: 'completed',
+      probes: null,
+      rounds: null,
+      batchSizes: null,
+      effectiveSequentialRounds: null,
+      // a smuggled planned grid must be ignored outright
+      gridPlan: { maxWidth: 8, maxDepth: 8, budget: 64 }
+    } as unknown as LiveCyclePlanHistory;
+    const baseline = policyApi.planGrid(planRequest());
+    const plan = policyApi.planGrid(planRequest({ previousLiveCycle: plannedOnly }));
+    expect(plan.maxWidth).toBe(baseline.maxWidth);
+    expect(plan.maxDepth).toBe(baseline.maxDepth);
+    expect(plan.budget).toBe(baseline.budget);
+    expect(plan.rationale).toBe(baseline.rationale);
+  });
+
+  it('plans byte-identically without history (missing, null, or not-an-object)', () => {
+    const baseline = policyApi.planGrid(planRequest());
+    for (const absent of [undefined, null]) {
+      const plan = policyApi.planGrid(
+        planRequest({ previousLiveCycle: absent as unknown as LiveCyclePlanHistory })
+      );
+      expect(plan).toEqual(baseline);
+    }
+  });
+
+  it('drops a damaged batchSizes array entirely and falls back to the probes bound', () => {
+    const damaged = policyApi.planGrid(
+      planRequest({
+        previousLiveCycle: history({
+          probes: 5,
+          rounds: 2,
+          batchSizes: [2, 'three' as unknown as number],
+          effectiveSequentialRounds: 3
+        })
+      })
+    );
+    // width keeps the policy size (batch data unusable), depth still bounded
+    // by min(rounds, effSeq)=2, budget by probes-1=4 -> min(12, 4)=4.
+    expect(damaged.maxWidth).toBe(4);
+    expect(damaged.maxDepth).toBe(2);
+    expect(damaged.budget).toBe(4);
+
+    const nonInteger = policyApi.planGrid(
+      planRequest({ previousLiveCycle: history({ batchSizes: [1.5] }) })
+    );
+    // probes-1=2 bounds the budget to 2, and the pre-existing sizing rule
+    // (budget < width collapses width to the budget) then narrows width to 2.
+    expect(nonInteger.maxWidth).toBe(2);
+    expect(nonInteger.maxDepth).toBe(1);
+    expect(nonInteger.budget).toBe(2);
+  });
+
+  it('treats an explicitly empty completed cycle as skip, unknown batch data as budget 0', () => {
+    const empty = policyApi.planGrid(
+      planRequest({ previousLiveCycle: history({ probes: 1, rounds: 1, batchSizes: [] }) })
+    );
+    expect(empty.skipProbing).toBe(true);
+    expect(empty.maxWidth).toBe(0);
+    expect(empty.maxDepth).toBe(0);
+    expect(empty.budget).toBe(0);
+    expect(empty.stopCondition).toBe('first_success');
+    expect(empty.rationale).toContain('no candidate search');
+
+    // batchSizes recorded as unknown (null): no skip, but probes-1=0 bounds
+    // the candidate budget to zero -> no reusable capacity.
+    const unknownBatches = policyApi.planGrid(
+      planRequest({ previousLiveCycle: history({ probes: 1, rounds: 1, batchSizes: null }) })
+    );
+    expect(unknownBatches.skipProbing).toBe(false);
+    expect(unknownBatches.budget).toBe(0);
+    expect(unknownBatches.stopCondition).toBe('budget_exhausted');
+    expect(unknownBatches.rationale).toContain('no reusable search capacity');
+  });
+
+  it('ignores failed and unknown records - a crashed prefix is not evidence of less need', () => {
+    const baseline = policyApi.planGrid(planRequest());
+    for (const status of ['failed', 'unknown'] as const) {
+      const plan = policyApi.planGrid(
+        planRequest({ previousLiveCycle: history({ status }) })
+      );
+      expect(plan.maxWidth).toBe(baseline.maxWidth);
+      expect(plan.maxDepth).toBe(baseline.maxDepth);
+      expect(plan.budget).toBe(baseline.budget);
+      expect(plan.rationale).toBe(baseline.rationale);
+    }
+  });
+
+  it('handles boundary realized values without inventing capacity', () => {
+    // zero-size batch entries are skipped for width, but a real entry still binds
+    const zeros = policyApi.planGrid(
+      planRequest({
+        previousLiveCycle: history({ probes: 4, rounds: 2, batchSizes: [0, 3], effectiveSequentialRounds: 3 })
+      })
+    );
+    expect(zeros.maxWidth).toBe(3);
+    expect(zeros.maxDepth).toBe(2);
+    expect(zeros.budget).toBe(3);
+
+    // effSeq below rounds caps depth at the serial cost
+    const serial = policyApi.planGrid(
+      planRequest({
+        previousLiveCycle: history({ probes: 3, rounds: 3, batchSizes: [2], effectiveSequentialRounds: 1 })
+      })
+    );
+    expect(serial.maxDepth).toBe(1);
+    expect(serial.maxWidth).toBe(2);
+    expect(serial.budget).toBe(2);
+
+    // contradictory record (probes below batches) takes the SMALLER signal
+    const contradictory = policyApi.planGrid(
+      planRequest({ previousLiveCycle: history({ probes: 0, rounds: 1, batchSizes: [2] }) })
+    );
+    expect(contradictory.budget).toBe(0);
+    expect(contradictory.rationale).toContain('no reusable search capacity');
+
+    // MAX_SAFE_INTEGER values are safe integers: bounded, never widened
+    const huge = policyApi.planGrid(
+      planRequest({
+        previousLiveCycle: history({
+          probes: Number.MAX_SAFE_INTEGER,
+          rounds: Number.MAX_SAFE_INTEGER,
+          batchSizes: [Number.MAX_SAFE_INTEGER],
+          effectiveSequentialRounds: Number.MAX_SAFE_INTEGER
+        })
+      })
+    );
+    expect(huge.maxWidth).toBe(4);
+    expect(huge.maxDepth).toBe(3);
+    expect(huge.budget).toBe(12);
+  });
+
+  // rev8 P2 (cross-task ownership): the manifest is ONE file per data
+  // directory shared by every task of a deployment (MCP derives a distinct
+  // taskId per prompt), so a policy must ignore a history that names another
+  // task even when the caller already filtered - the skip path in particular
+  // would turn another task's "no search needed" into a no_probe for THIS
+  // task. The task fixture (this file's `task()` helper) is always
+  // id='task-1', so 'task-other' is by construction a different task.
+  describe('cross-task ownership (rev8 P2)', () => {
+    it('ignores a narrowing history that names a different task - no narrowing, no skip', () => {
+      const baseline = policyApi.planGrid(planRequest());
+
+      // A narrowing-shape record owned by ANOTHER task: must not bound.
+      const foreignNarrowing = policyApi.planGrid(
+        planRequest({ previousLiveCycle: history({ taskId: 'task-other' }) })
+      );
+      expect(foreignNarrowing.maxWidth).toBe(baseline.maxWidth);
+      expect(foreignNarrowing.maxDepth).toBe(baseline.maxDepth);
+      expect(foreignNarrowing.budget).toBe(baseline.budget);
+      expect(foreignNarrowing.rationale).toBe(baseline.rationale);
+
+      // A zero-search record owned by ANOTHER task: must not become a skip.
+      const foreignEmpty = policyApi.planGrid(
+        planRequest({
+          previousLiveCycle: history({ taskId: 'task-other', probes: 1, rounds: 0, batchSizes: [] })
+        })
+      );
+      expect(foreignEmpty.skipProbing).toBe(false);
+      expect(foreignEmpty.maxWidth).toBe(baseline.maxWidth);
+      expect(foreignEmpty.maxDepth).toBe(baseline.maxDepth);
+      expect(foreignEmpty.budget).toBe(baseline.budget);
+    });
+
+    it('still narrows and skips when the history names THIS task', () => {
+      const sameTaskNarrowing = policyApi.planGrid(
+        planRequest({ previousLiveCycle: history({ taskId: 'task-1' }) })
+      );
+      expect(sameTaskNarrowing.maxWidth).toBe(2);
+      expect(sameTaskNarrowing.maxDepth).toBe(1);
+      expect(sameTaskNarrowing.budget).toBe(2);
+      expect(sameTaskNarrowing.rationale).toContain('previousLiveCycle=completed');
+
+      const sameTaskEmpty = policyApi.planGrid(
+        planRequest({
+          previousLiveCycle: history({ taskId: 'task-1', probes: 1, rounds: 1, batchSizes: [] })
+        })
+      );
+      expect(sameTaskEmpty.skipProbing).toBe(true);
+      expect(sameTaskEmpty.maxWidth).toBe(0);
+      expect(sameTaskEmpty.maxDepth).toBe(0);
+      expect(sameTaskEmpty.budget).toBe(0);
+    });
+
+    it('treats an unattributable record without taskId as legacy data (reader owns that gate)', () => {
+      // The orchestrator's read path is the strict gate for identity-less
+      // records; the policy itself cannot attribute them and keeps the
+      // pre-existing sizing behavior for the old history shape.
+      const legacy = policyApi.planGrid(planRequest({ previousLiveCycle: history() }));
+      expect(legacy.maxWidth).toBe(2);
+      expect(legacy.maxDepth).toBe(1);
+      expect(legacy.budget).toBe(2);
+
+      // A declared owner that the request cannot confirm (no task id) is
+      // dropped: ownership must be provable, never assumed.
+      const unprovable = policyApi.planGrid(
+        planRequest({
+          task: { prompt: 'no id', complexity: 'complex' } as unknown as ProbeTask,
+          previousLiveCycle: history({ taskId: 'task-other' })
+        })
+      );
+      const baseline = policyApi.planGrid(planRequest());
+      expect(unprovable.maxWidth).toBe(baseline.maxWidth);
+      expect(unprovable.maxDepth).toBe(baseline.maxDepth);
+      expect(unprovable.budget).toBe(baseline.budget);
+    });
   });
 });

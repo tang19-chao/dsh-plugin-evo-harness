@@ -38,6 +38,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   BUILD_ARTIFACT_PATH,
+  BUILD_MCP_ARTIFACT_PATH,
   BUILD_STAMP_PATH,
   BUILD_STAMP_SCHEMA_VERSION,
   computeBuildStatus,
@@ -288,11 +289,30 @@ describe('build smoke gate: the default export the host mount calls (rev6 GATE-1
     ''
   ].join('\n');
 
+  /**
+   * rev8: the second artifact the fixture ships (import-pure, exactly the
+   * REQUIRED_MCP_EXPORTS surface the gate asserts). Real bytes on disk, no
+   * build needed.
+   */
+  const GOOD_MCP_ARTIFACT = [
+    'export const EVO_MCP_SERVER_NAME = "evo";',
+    'export const EVO_TOOL_NAMES = ["evo_status"];',
+    'export function createEvoMcpServer() { return {}; }',
+    'export function serveEvoMcpStdio() { return { close: async () => undefined }; }',
+    ''
+  ].join('\n');
+
   /** Fixture that can actually be `import()`ed: package.json must declare ESM. */
   function makeImportableFixture(artifact: string): string {
     const { dir } = makeFixture();
     fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"fixture","type":"module"}\n', 'utf8');
     fs.writeFileSync(path.join(dir, BUILD_ARTIFACT_PATH), artifact, 'utf8');
+    // rev8: the smoke gate asserts the SECOND artifact too (existence, export
+    // surface, import purity), so the fixture ships a pure lib/mcp/server.js;
+    // without it the green-path tests below would fail the way a repo without
+    // the dual build legitimately fails.
+    fs.mkdirSync(path.join(dir, BUILD_MCP_ARTIFACT_PATH, '..'), { recursive: true });
+    fs.writeFileSync(path.join(dir, BUILD_MCP_ARTIFACT_PATH), GOOD_MCP_ARTIFACT, 'utf8');
     writeBuildStamp({ cwd: dir });
     return dir;
   }
@@ -344,6 +364,38 @@ describe('build smoke gate: the default export the host mount calls (rev6 GATE-1
     const defaultStep = result.steps.find((step) => step.step === 'default-export');
     expect(defaultStep?.ok).toBe(false);
     expect(defaultStep?.detail).toContain('absent from the default export: inject');
+  });
+
+  it('the smoke gate FAILS a REPLACED second artifact even though the plugin surface is intact (rev8 fail-closed)', async () => {
+    // The dual-artifact hole the rev8 review closed: lib/mcp/server.js swapped
+    // after the stamp was written is stale evidence about the wrong bytes. The
+    // freshness step must say so (mcp-artifact-mismatch) instead of letting the
+    // import-pure replacement pass the gate as fresh.
+    const dir = makeImportableFixture(GOOD_ARTIFACT);
+    fs.writeFileSync(
+      path.join(dir, BUILD_MCP_ARTIFACT_PATH),
+      GOOD_MCP_ARTIFACT.replace('export function createEvoMcpServer', 'export function createEvoMcpServerTampered'),
+      'utf8'
+    );
+    const result = await smokeBuild({ skipBuild: true, cwd: dir });
+    expect(result.ok, JSON.stringify(result.steps, null, 2)).toBe(false);
+    const freshnessStep = result.steps.find((step) => step.step === 'build-freshness');
+    expect(freshnessStep?.ok).toBe(false);
+    expect(freshnessStep?.detail).toContain('mcp-artifact-mismatch');
+  });
+
+  it('the smoke gate FAILS an ABSENT second artifact at the named mcp-artifact-exists step (rev8 fail-closed)', async () => {
+    // Absence is the OTHER half of fail-closed: the freshness check keeps the
+    // pre-rev8 primary-only semantics (no mcp reason) but the additive step 6
+    // refuses to certify a repo whose dual build never ran.
+    const dir = makeImportableFixture(GOOD_ARTIFACT);
+    fs.rmSync(path.join(dir, BUILD_MCP_ARTIFACT_PATH));
+    const result = await smokeBuild({ skipBuild: true, cwd: dir });
+    expect(result.ok, JSON.stringify(result.steps, null, 2)).toBe(false);
+    const freshnessStep = result.steps.find((step) => step.step === 'build-freshness');
+    expect(freshnessStep?.ok).toBe(true);
+    const mcpStep = result.steps.find((step) => step.step === 'mcp-artifact-exists');
+    expect(mcpStep?.ok).toBe(false);
   });
 });
 

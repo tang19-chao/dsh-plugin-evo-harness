@@ -158,35 +158,41 @@ describe('rev6 R0-3: the C-4 replacement is applied, verbatim and surgically', (
     expect(profileLines[120]).toContain('holdout STRICT-IMPROVEMENT');
   });
 
-  it('the replacement is surgical: each file differs from the rev5 baseline on one line only', () => {
-    // The baseline is the rev5 delivery commit's blob, so this answers the same
-    // question before and after rev6 is committed (see rev5BaselineBytes).
-    for (const [rel, lineNo] of [
-      [ADR_0002_REL, 51],
-      [PROFILE_REL, 121]
+  it('the replacement is surgical: the registered lines are the only C-4 drift', () => {
+    // The baseline is the rev5 delivery commit's blob. Since rev5, the C-4
+    // replacement (line 121) is joined by the rev6 review's factual correction
+    // of the guarded-active comment (91-94) and permission reason (116): the
+    // profile no longer claims an evidence gate the mount site does not apply.
+    // Those lines are asserted explicitly here so a NEW unregistered drift still
+    // fails; the line count and the line-121 widening check stay in force.
+    for (const [rel, lineNo, allowed] of [
+      [ADR_0002_REL, 51, [51]],
+      [PROFILE_REL, 121, [91, 92, 93, 94, 116, 121]]
     ] as const) {
       const baselineLines = rev5BaselineBytes(rel).toString('utf8').split('\n');
       const currentLines = lines(rel);
 
       // A REPLACED line keeps the line count identical: that is what separates
       // "surgical" from "rewrite". A rewrite (or a wrapping change) moves this.
-      expect(currentLines.length, `${rel} line count must be unchanged by a one-line replacement`).toBe(
+      expect(currentLines.length, `${rel} line count must be unchanged by targeted replacements`).toBe(
         baselineLines.length
       );
 
-      // Exactly one line differs, and it is the registered coordinate.
+      // Exactly the registered lines differ; any new drift fails.
       const differing = currentLines
         .map((line, i) => (line === baselineLines[i] ? null : i + 1))
         .filter((n): n is number => n !== null);
-      expect(differing, `${rel} may differ from the rev5 baseline on line ${lineNo} only`).toEqual([lineNo]);
+      expect(differing, `${rel} drifted outside the registered line set`).toEqual([...allowed]);
 
       // And the change is a WIDENING of the criterion, not a deletion: the line
       // got longer (the strict-improvement sentence was substituted in place).
-      const before = baselineLines[lineNo - 1] ?? '';
-      const after = currentLines[lineNo - 1] ?? '';
-      expect(after.length, `${rel}:${lineNo} must be longer (strict-improvement text substituted in)`).toBeGreaterThan(
-        before.length
-      );
+      if (rel === PROFILE_REL || lineNo === 51) {
+        const before = baselineLines[lineNo - 1] ?? '';
+        const after = currentLines[lineNo - 1] ?? '';
+        expect(after.length, `${rel}:${lineNo} must be longer (strict-improvement text substituted in)`).toBeGreaterThan(
+          before.length
+        );
+      }
     }
   });
 

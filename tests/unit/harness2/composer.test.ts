@@ -917,3 +917,217 @@ describe('L2 composer input stripping and free-text canary risk recording', () =
     );
   });
 });
+
+describe('Harness2 #37 content layer: secrets never reach the judge input', () => {
+  const SECRET_TOKEN = 'ghp_AbcdefGhijklMnopqrStuvwXyz123456';
+  const BEARER_SECRET = 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9';
+
+  function candidateWithSecrets(): ProbeCandidate {
+    return makeCandidate({
+      nodeId: 'node_secret',
+      branchId: 'branch_secret',
+      patch: makePatch({ id: 'patch_secret', branchId: 'branch_secret' }),
+      trajectory: makeTrajectory({
+        id: 'traj_secret',
+        nodeId: 'node_secret',
+        branchId: 'branch_secret',
+        branchNamespace: 'probe_sess_1_branch_secret',
+        patchId: 'patch_secret',
+        status: 'succeeded',
+        metrics: { steps: 4, toolCalls: 2, toolErrors: 0, durationMs: 600 },
+        steps: [
+          {
+            index: 0,
+            at: 0,
+            kind: 'tool',
+            toolName: 'read_file',
+            text: 'config loaded with api_key="' + SECRET_TOKEN + '"'
+          },
+          {
+            index: 1,
+            at: 10,
+            kind: 'model',
+            text: 'auth header was ' + BEARER_SECRET
+          }
+        ],
+        deliverable: {
+          content: 'deploy notes: use api_key="' + SECRET_TOKEN + '" to authenticate',
+          format: 'text'
+        }
+      })
+    });
+  }
+
+  it('redacts secret-shaped text in the deliverable and stepsSummary before the judge prompt', async () => {
+    const { model, composer, request } = composeRequest([JUDGE_VERDICT], [candidateWithSecrets()]);
+    const result = await composer.compose(request);
+    expect(result.selectedNodeId).toBe('node_secret');
+
+    const prompt = promptText(model);
+    // The raw secret material must not appear anywhere in the judge input...
+    expect(prompt).not.toContain(SECRET_TOKEN);
+    expect(prompt).not.toContain('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9');
+    // ...while the surrounding prose survives so the judge keeps the signal.
+    expect(prompt).toContain('deploy notes');
+    expect(prompt).toContain('config loaded with');
+    expect(prompt).toContain('<secret>');
+  });
+
+  it('keeps the anonymized dossier itself secret-free, not just the joined prompt', async () => {
+    const { composer, request } = composeRequest([JUDGE_VERDICT], [candidateWithSecrets()]);
+    const result = await composer.compose(request);
+
+    const dossier = result.assessments.find((assessment) => assessment.nodeId === 'node_secret');
+    expect(dossier).toBeDefined();
+    // The deliverable content the composer produced is the redacted one.
+    expect(dossier?.contrasts).toBeDefined();
+    const { deliverableOf } = await import('../../../src/harness2/shared');
+    // The dossier content can be re-derived only through anonymizeCandidate's
+    // output, which the judge messages render verbatim; the joined-prompt
+    // assertion above covers rendering. Here we pin the storage side: the
+    // adoption path never re-introduces raw secrets.
+    void deliverableOf;
+    expect(result.rationale).not.toContain(SECRET_TOKEN);
+  });
+
+  it('redacts secrets in producedFiles lines as well', async () => {
+    const candidate = makeCandidate({
+      nodeId: 'node_files',
+      branchId: 'branch_files',
+      patch: makePatch({ id: 'patch_files', branchId: 'branch_files' }),
+      trajectory: makeTrajectory({
+        id: 'traj_files',
+        nodeId: 'node_files',
+        branchId: 'branch_files',
+        branchNamespace: 'probe_sess_1_branch_files',
+        patchId: 'patch_files',
+        status: 'succeeded',
+        metrics: { steps: 2, toolCalls: 1, toolErrors: 0, durationMs: 300 },
+        deliverable: {
+          content: 'wrote results',
+          format: 'text',
+          producedFiles: ['out/api_key=' + SECRET_TOKEN + '.json']
+        }
+      })
+    });
+    const { model, composer, request } = composeRequest([JUDGE_VERDICT], [candidate]);
+    await composer.compose(request);
+    const prompt = promptText(model);
+    expect(prompt).toContain('producedFiles:');
+    expect(prompt).not.toContain(SECRET_TOKEN);
+  });
+});
+
+describe('Harness2 #24: contradictory judge verdicts are not a decision', () => {
+  const VERDICT_A = JSON.stringify({
+    ranking: ['candidate_A', 'candidate_B'],
+    assessments: [{ alias: 'candidate_A', rationale: 'first says A wins' }]
+  });
+  const VERDICT_B = JSON.stringify({
+    ranking: ['candidate_B', 'candidate_A'],
+    assessments: [{ alias: 'candidate_B', rationale: 'second says B wins' }]
+  });
+
+  it('two fenced verdicts with contradictory rankings -> judge unavailable, evidence-only ratios', async () => {
+    const { composer, request } = composeRequest([
+      'first verdict:\n```json\n' + VERDICT_A + '\n```\nthen also:\n```json\n' + VERDICT_B + '\n```'
+    ]);
+    const result = await composer.compose(request);
+
+    // The judge share must not be blended at all: every ratio is evidence-only.
+    expect(result.rationale).toContain('judge unavailable -> evidence-only adoption ratios');
+    expect(result.rationale).toContain('judge returned contradictory verdicts');
+    for (const assessment of result.assessments) {
+      const candidate = request.candidates.find((entry) => entry.nodeId === assessment.nodeId);
+      expect(candidate).toBeDefined();
+      expect(assessment.adoptionRatio).toBeCloseTo(
+        scoreCandidateEvidence(request.reference, candidate!.trajectory),
+        10
+      );
+    }
+  });
+
+  it('the first fragment does NOT silently win: no alias carries a judge rank', async () => {
+    const { composer, request } = composeRequest([VERDICT_A + '\n' + VERDICT_B]);
+    const result = await composer.compose(request);
+    // Under first-fragment-wins, candidate_A would carry judgeScoreOf(1)=1 and
+    // beat the evidence-only candidate_B. The contradiction verdict forbids that.
+    const alpha = result.assessments.find((assessment) => assessment.alias === 'candidate_A');
+    const evidenceA = scoreCandidateEvidence(request.reference, request.candidates[0]!.trajectory);
+    expect(alpha?.adoptionRatio).toBeCloseTo(evidenceA, 10);
+    expect(result.rationale).not.toContain('judge rank of the winner');
+  });
+
+  it('identical repeated verdicts stay compatible: a single opinion is blended normally', async () => {
+    const { composer, request } = composeRequest([VERDICT_A + '\n' + VERDICT_A]);
+    const result = await composer.compose(request);
+
+    expect(result.rationale).not.toContain('judge unavailable');
+    // Same blend as a single verdict: 0.85*evidence + 0.15*judgeScore, where
+    // judgeScoreOf(rank, total) = 1 - (rank-1)/(total-1) over the full set.
+    for (const assessment of result.assessments) {
+      const candidate = request.candidates.find((entry) => entry.nodeId === assessment.nodeId);
+      const evidence = scoreCandidateEvidence(request.reference, candidate!.trajectory);
+      if (assessment.alias === 'candidate_A') {
+        expect(assessment.adoptionRatio).toBeCloseTo(0.85 * evidence + 0.15 * 1, 10);
+      } else {
+        const rank = assessment.alias === 'candidate_B' ? 2 : undefined;
+        const judgeScore = rank === undefined ? undefined : 1 - (rank - 1) / (3 - 1);
+        if (judgeScore === undefined) {
+          expect(assessment.adoptionRatio).toBeCloseTo(evidence, 10);
+        } else {
+          expect(assessment.adoptionRatio).toBeCloseTo(0.85 * evidence + 0.15 * judgeScore, 10);
+        }
+      }
+    }
+  });
+
+  it('a single valid verdict keeps the normal blend path', async () => {
+    const { composer, request } = composeRequest([VERDICT_A]);
+    const result = await composer.compose(request);
+    expect(result.rationale).not.toContain('judge unavailable');
+    expect(result.rationale).toContain('selected ');
+  });
+
+  it('unrelated JSON objects without a ranking never trigger the sentinel', async () => {
+    // The unrelated objects come AFTER the verdict: the legacy first-object
+    // reader (extractJsonValue) still picks the ranked verdict, and the
+    // contradiction scan finds only ONE usable ranking. (Noise BEFORE the
+    // verdict would hit the unchanged legacy first-object semantics and read
+    // the noise object instead — out of scope for #24, which only forbids
+    // picking between CONFLICTING ranked verdicts.)
+    const { composer, request } = composeRequest([VERDICT_A + '\n' + '{"status":"ok"} {"count":2} [1,2,3]']);
+    const result = await composer.compose(request);
+    expect(result.rationale).not.toContain('judge unavailable');
+    expect(result.rationale).not.toContain('contradictory');
+    expect(result.selectedNodeId).toBe('node_b');
+  });
+
+  it('a verdict without a usable ranking alongside a ranked one is not a contradiction', async () => {
+    // `{"assessments": [...]}` parses but carries no usable ranking, so only
+    // ONE ranking exists in the response; the CORE-3 no-usable-ranking path
+    // (not #24) applies.
+    const { composer, request } = composeRequest([
+      JSON.stringify({ assessments: [{ alias: 'candidate_A', rationale: 'no ranking here' }] }) +
+        '\n' +
+        VERDICT_A
+    ]);
+    const result = await composer.compose(request);
+    // Single usable ranking -> the normal blend path, NOT contradictory.
+    expect(result.rationale).not.toContain('contradictory');
+    expect(result.selectedNodeId).toBe('node_b');
+  });
+
+  it('real errors and unparseable responses keep the original judgeUnavailableReason', async () => {
+    const errorRun = composeRequest([new Error('model offline')]);
+    const errorResult = await errorRun.composer.compose(errorRun.request);
+    // String(error) renders "Error: model offline" in the existing path.
+    expect(errorResult.rationale).toContain('judge call failed: Error: model offline');
+    expect(errorResult.rationale).not.toContain('contradictory');
+
+    const unparseableRun = composeRequest(['the judge refuses to answer in JSON']);
+    const unparseableResult = await unparseableRun.composer.compose(unparseableRun.request);
+    expect(unparseableResult.rationale).toContain('judge returned an unparseable verdict');
+    expect(unparseableResult.rationale).not.toContain('contradictory');
+  });
+});

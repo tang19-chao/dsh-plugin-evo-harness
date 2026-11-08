@@ -34,6 +34,7 @@ import type { ToolFaceRegistry } from './tool-face';
 import type { CordisHostAdapter } from './host-adapter';
 import { cloneAndFreezePatch } from './patch-utils';
 import { TrajectoryCollector } from './trajectory-collector';
+import { scanPatchEvidenceIntegrity, type EvidenceIntegrityPolicy } from '../verification/evidence-integrity';
 
 const defaultTrajectoryIds = createBranchIdFactory('traj');
 
@@ -60,6 +61,14 @@ export interface CordisSeamManagerOptions {
   readonly toolFace?: ToolFaceRegistry;
   /** The tools a probe branch may call. An empty array denies every tool. */
   readonly toolAllowlist?: readonly string[];
+  /**
+   * rev8 #118/#175: the HOST-owned evidence-integrity policy. When set, every
+   * probe run scans its patch for answer-key path collisions BEFORE any branch
+   * resource is acquired (#175 pre-rollout rejection) and its trajectory for
+   * answer-key text / sentinel contamination at finalize (#118). Absent =>
+   * byte-identical to the pre-rev8 behaviour.
+   */
+  readonly evidenceIntegrity?: EvidenceIntegrityPolicy;
 }
 
 interface ActiveBranchRecord {
@@ -137,6 +146,7 @@ export class CordisSeamManager implements ICordisSeamManager {
   private readonly onDiagnostic: ((message: string, details?: Readonly<Record<string, unknown>>) => void) | undefined;
   private readonly toolFace: ToolFaceRegistry | undefined;
   private readonly toolAllowlist: readonly string[] | undefined;
+  private readonly evidenceIntegrity: EvidenceIntegrityPolicy | undefined;
   private readonly activeBranches = new Map<string, ActiveBranchRecord>();
   private readonly permanentPatches = new Map<string, PermanentPatchRecord>();
   private sequence = 0;
@@ -174,6 +184,7 @@ export class CordisSeamManager implements ICordisSeamManager {
       });
     }
     this.toolAllowlist = options.toolAllowlist === undefined ? undefined : options.toolAllowlist.slice();
+    this.evidenceIntegrity = options.evidenceIntegrity;
 
     if (!Number.isInteger(this.maxConcurrentBranches) || this.maxConcurrentBranches < 1) {
       throw new CordisSeamError('maxConcurrentBranches must be a positive integer.', {
@@ -231,8 +242,30 @@ export class CordisSeamManager implements ICordisSeamManager {
       ...(request.referenceTrajectoryId === undefined
         ? {}
         : { referenceTrajectoryId: request.referenceTrajectoryId }),
-      ...(request.memoryRecallIds === undefined ? {} : { memoryRecallIds: request.memoryRecallIds })
+      ...(request.memoryRecallIds === undefined ? {} : { memoryRecallIds: request.memoryRecallIds }),
+      ...(this.evidenceIntegrity === undefined ? {} : { evidenceIntegrity: this.evidenceIntegrity })
     });
+
+    // rev8 #175: a patch that would create a component at an answer-key
+    // colliding path is refused BEFORE any branch resource is acquired or the
+    // executor runs — it can never be rolled out, let alone served as
+    // evidence. The mark is produced by the collector's own finalize scan
+    // (same policy), so the refusal record carries the finding detail.
+    if (this.evidenceIntegrity !== undefined) {
+      const patchMark = scanPatchEvidenceIntegrity(request.patch, this.evidenceIntegrity);
+      if (patchMark !== undefined) {
+        collector.recordDiagnostic(
+          'patch rejected before branch acquisition: answer-key path collision(s)'
+        );
+        collector.recordFailureSignal({
+          kind: 'invalid_patch',
+          message: 'patch component paths match answer-key paths; rename the component',
+          code: 'answer-key-path',
+          repairable: true
+        });
+        return collector.finalize({ status: 'failed', endedAt: this.now() });
+      }
+    }
 
     if (request.signal !== undefined && request.signal.aborted) {
       collector.recordDiagnostic('request was already aborted; no branch resources were acquired');

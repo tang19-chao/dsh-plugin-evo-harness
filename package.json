@@ -37,7 +37,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
-    "test:e2e": "vitest run tests/e2e",
+    "test:e2e": "vitest run tests/e2e tests/mcp",
     "check:docs": "node scripts/verify-readme-counts.mjs",
     "check:encoding": "node scripts/eval/check-encoding-policy.mjs",
     "check:clean-tree": "node scripts/eval/check-clean-tree.mjs",
@@ -63,6 +63,7 @@
     "vitest": "3.2.7"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "3.18.4"
+    "@deepseek-ai/schemastery": "3.18.4",
+    "@modelcontextprotocol/server": "2.2.0"
   }
 }

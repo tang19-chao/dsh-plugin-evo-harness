@@ -568,7 +568,7 @@ async function main() {
     const readmeUnitFiles = parseInt(unitMatch[1], 10);
     const readmeUnitTests = parseInt(unitMatch[2], 10);
 
-    const e2eRegex = /\|\s*`pnpm run test:e2e`\s*\|\s*`tests\/e2e`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i;
+    const e2eRegex = /\|\s*`pnpm run test:e2e`\s*\|\s*`tests\/e2e \+ tests\/mcp`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i;
     const e2eMatch = readmeContent.match(e2eRegex);
     if (!e2eMatch) {
       console.error('[docs-verify] ERROR: Could not find pnpm run test:e2e entry in README.md table!');
@@ -598,12 +598,11 @@ async function main() {
     const actualTotalFiles = testReportResults.length;
     const actualTotalTests = testReport.numTotalTests ?? testReportResults.reduce((acc, f) => acc + (f.assertionResults?.length || 0), 0);
 
-    // R-04 (a): TEST-ROOT ATTRIBUTION. Every consumed test file must belong to
-    // one of the two documented roots. A third root (eg. tests/integration/) is
-    // named explicitly instead of being silently dropped from every count, which
-    // is the failure mode this asserts against: unit + e2e would then appear to
-    // close while a whole directory goes uncounted.
-    const DOCUMENTED_TEST_ROOTS = ['/tests/unit/', '/tests/e2e/'];
+    // R-04 (a): TEST-ROOT ATTRIBUTION. The end-to-end bucket contains the
+    // Cordis-plugin and the MCP protocol suites. An unrelated additional root
+    // (eg. tests/integration/) is still rejected instead of disappearing from
+    // the count closure.
+    const DOCUMENTED_TEST_ROOTS = ['/tests/unit/', '/tests/e2e/', '/tests/mcp/'];
     const unattributed = testReportResults
       .map((f) => String(f.name).replace(/\\/g, '/'))
       .filter((norm) => !DOCUMENTED_TEST_ROOTS.some((root) => norm.includes(root)));
@@ -626,7 +625,7 @@ async function main() {
 
     const e2eFiles = testReportResults.filter((f) => {
       const norm = f.name.replace(/\\/g, '/');
-      return norm.includes('/tests/e2e/');
+      return norm.includes('/tests/e2e/') || norm.includes('/tests/mcp/');
     });
     const actualE2eFiles = e2eFiles.length;
     const actualE2eTests = e2eFiles.reduce((acc, f) => acc + (f.assertionResults?.length || 0), 0);
@@ -680,7 +679,7 @@ async function main() {
       process.exitCode = 1;
     } else {
       console.log(
-        '[docs-verify] ✓ Counts close: unit + e2e == total on the README side and the report side, and every test file is attributed to tests/unit or tests/e2e.'
+        '[docs-verify] ✓ Counts close: unit + e2e == total on the README side and the report side, and every test file is attributed to tests/unit or the e2e roots.'
       );
     }
 

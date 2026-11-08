@@ -5,10 +5,16 @@
  * call-count gate (every underlying call must appear in the registry), honest
  * provenance (no ledger = 'none', no semantics = 'unknown', never 'measured'),
  * budget-denial and model-failure records.
+ *
+ * #183/#13 (rev8 audit 2026-11-07): a LOCAL abort (aborted DSH stream, caller
+ * cancel) holds the conservative figure INTERIM and never books it as final paid
+ * spend; the truth arrives only through the existing reconcile channel on the
+ * ORIGINAL callId; a retry meters each attempt under its own callId.
  */
 import { describe, expect, it } from 'vitest';
 import {
   createMeteredModelAdapter,
+  DshModelStreamError,
   globalModelCallRegistry,
   MeteredModelError,
   ModelCallRegistry,
@@ -16,7 +22,11 @@ import {
   STAGE_PURPOSE,
   type MeteringStage
 } from '../../../src/dsh-bridge';
-import { createLedgerReservationManager, createUsagePayload, twoPhaseSettlementFor } from '../../../src/ledger';
+import {
+  createLedgerReservationManager,
+  createUsagePayload,
+  twoPhaseSettlementFor
+} from '../../../src/ledger';
 import type { IModelAdapter, ModelRequest, ModelResponse } from '../../../src/types/contracts';
 
 const RATE_CARD = {
@@ -199,11 +209,35 @@ describe('honest provenance: no ledger never claims measured', () => {
     const record = adapter.records()[0];
     expect(record?.provenance).toBe('none');
     expect(record?.incurredCostMicros).toBeUndefined();
+    // No ledger means NO ring-fence: the record must not claim the 10_000
+    // default estimate was reserved (the interface documents 0 here).
+    expect(record?.reservedMicros).toBe(0);
     const stats = adapter.stats();
+    expect(stats.reserved).toBe(0);
     expect(stats.costMicros).toBe(0);
     expect(stats.measuredCalls).toBe(0);
     expect(stats.estimatedCalls).toBe(0);
     expect(stats.unknownCalls).toBe(0);
+  });
+
+  it('records the ACTUAL ring-fenced amount: observe mode reserves 0, not the estimate', async () => {
+    const manager = createLedgerReservationManager({
+      enabled: true,
+      defaultRateCard: RATE_CARD
+    });
+    const settlement = twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:observe' });
+    const { model } = fakeModel({ rawUsage: { inputTokens: 10, outputTokens: 5 }, semantics: SEMANTICS });
+    const adapter = createMeteredModelAdapter(model, 'propose', { ledgerSettlement: settlement });
+    await adapter.call(requestFor('propose'));
+    const record = adapter.records()[0];
+    expect(record?.reservationId).toBeDefined();
+    expect(record?.settlement).toBe('final');
+    // The assembly path defaults to observe: `beginCall` granted the call but
+    // ring-fenced nothing, so the rendered record must report 0. It used to
+    // report the 10_000 request estimate and inflate stats().reserved.
+    expect(record?.reservedMicros).toBe(0);
+    expect(manager.getBudgetStatus().generalPool.reservedMicros).toBe(0);
+    expect(adapter.stats().reserved).toBe(0);
   });
 
   it('records measured provenance only when usage AND semantics are provider-declared', async () => {
@@ -455,5 +489,249 @@ describe('LEDGER-6: a failed settlement is recorded as settle_failed on EVERY pa
     expect(record?.error).toBe('settle_failed');
     expect(adapter.stats().settleFailures).toBe(1);
     expect(adapter.stats().modelFailures).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #183/#13 (rev8 audit): partial usage on a LOCAL abort.
+//
+// A local abort (a mid-stream DSH abort, a caller cancel) does NOT prove the
+// provider stopped generating, so the conservative figure is HELD interim and
+// the record must never dress it up as final paid spend. The truth arrives only
+// through the already-existing reconcile channel, on the ORIGINAL callId; and a
+// retried call is a NEW callId that meters on its own — never booked twice.
+// ---------------------------------------------------------------------------
+
+describe('#183/#13: partial usage on a local abort settles through reconcile, never as fake final', () => {
+  /** The exact error shape createLlmModelAdapter throws for an aborted DSH stream. */
+  function abortedStreamModel(): IModelAdapter {
+    return {
+      async complete(): Promise<ModelResponse> {
+        throw new DshModelStreamError('the host stream was aborted by the caller', 'aborted');
+      }
+    };
+  }
+
+  it('an aborted-stream call holds the conservative figure INTERIM — no final booking', async () => {
+    const manager = createLedgerReservationManager({
+      enabled: true,
+      enforceHardBounds: true,
+      generalBudgetMicros: 1_000_000,
+      defaultRateCard: RATE_CARD
+    });
+    const adapter = createMeteredModelAdapter(abortedStreamModel(), 'probe', {
+      ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:183' }),
+      idFactory: () => 'mcall_183_abort'
+    });
+
+    await expect(adapter.call(requestFor('probe'))).rejects.toThrow('aborted by the caller');
+
+    const record = adapter.records()[0];
+    // Outcome semantics: an abort is a cancel, not a transport break (VERIF-9).
+    expect(record?.outcome).toBe('cancelled');
+    // THE ASK'S BAR: the held interim figure is never misreported as final paid
+    // spend — incurredCostMicros stays absent and the pool books nothing.
+    expect(record?.settlement).toBe('interim');
+    expect(record?.incurredCostMicros).toBeUndefined();
+    expect(record?.heldCostMicros).toBe(RATE_CARD.conservativeFallbackCostMicros);
+    expect(adapter.stats().settled).toBe(0);
+    expect(adapter.stats().costMicros).toBe(0);
+    expect(manager.getBudgetStatus().generalPool.settledMicros).toBe(0);
+    // The reservation identity survives so late usage can still join.
+    expect(record?.reservationId).toBeDefined();
+    expect(adapter.callIdentities().some((identity) => identity.callId === 'mcall_183_abort')).toBe(true);
+  });
+
+  it('a late partial usage books through the EXISTING reconcile channel on the ORIGINAL callId', async () => {
+    const manager = createLedgerReservationManager({
+      enabled: true,
+      enforceHardBounds: true,
+      generalBudgetMicros: 1_000_000,
+      defaultRateCard: RATE_CARD
+    });
+    const adapter = createMeteredModelAdapter(abortedStreamModel(), 'probe', {
+      ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:183' }),
+      idFactory: () => 'mcall_183_late'
+    });
+    await expect(adapter.call(requestFor('probe'))).rejects.toThrow();
+    const heldRecord = adapter.records()[0];
+    expect(heldRecord?.settlement).toBe('interim');
+
+    // The provider's partial usage for the aborted generation arrives late and
+    // merges into the SAME callId — one reserve attempt, no new reservation.
+    const merged = adapter.reconcileLateUsage({
+      originCallId: 'mcall_183_late',
+      usage: createUsagePayload({ input: 800, output: 120, semantics: SEMANTICS })
+    });
+    expect(merged.mode).toBe('reconciled');
+    expect(merged.callId).toBe('mcall_183_late');
+    expect(merged.incurredCostMicros).toBeGreaterThan(0);
+    expect(adapter.lateUsageSettlements()).toHaveLength(1);
+    expect(adapter.stats().lateUsageSettlements).toBe(1);
+    // The truth replaced the hold: the pool books exactly the reconciled figure.
+    expect(manager.getBudgetStatus().generalPool.settledMicros).toBe(merged.incurredCostMicros);
+    expect(manager.getBudgetStatus().generalPool.reservedMicros).toBe(0);
+    // stats().costMicros reads the booked map, not the interim hold.
+    expect(adapter.stats().costMicros).toBe(merged.incurredCostMicros);
+    // One reserve, one settle bookkeeping: reconcile never opened a second call.
+    expect(manager.getMeteringStatus().reserveAttempts).toBe(1);
+    expect(manager.getMeteringStatus().settleCount).toBe(1);
+    expect(manager.verifyConservationLaw().balanced).toBe(true);
+  });
+
+  it('a redelivered late usage is a no-op, not a second charge on the same callId', async () => {
+    const manager = createLedgerReservationManager({
+      enabled: true,
+      enforceHardBounds: true,
+      generalBudgetMicros: 1_000_000,
+      defaultRateCard: RATE_CARD
+    });
+    const adapter = createMeteredModelAdapter(abortedStreamModel(), 'probe', {
+      ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:183' }),
+      idFactory: () => 'mcall_183_replay'
+    });
+    await expect(adapter.call(requestFor('probe'))).rejects.toThrow();
+    const event = {
+      originCallId: 'mcall_183_replay',
+      usage: createUsagePayload({ input: 800, output: 120, semantics: SEMANTICS })
+    } as const;
+    const merged = adapter.reconcileLateUsage(event);
+    const booked = manager.getBudgetStatus().generalPool.settledMicros;
+    expect(booked).toBe(merged.incurredCostMicros);
+
+    const redelivered = adapter.reconcileLateUsage(event);
+    expect(redelivered.previouslyReconciled).toBe(true);
+    expect(redelivered.incurredCostMicros).toBe(merged.incurredCostMicros);
+    expect(manager.getBudgetStatus().generalPool.settledMicros).toBe(booked);
+    expect(manager.getMeteringStatus().settleCount).toBe(1);
+    expect(manager.getMeteringStatus().reserveAttempts).toBe(1);
+  });
+
+  it('reconciling an UNKNOWN origin stays refused — no new branch for unjoined usage', async () => {
+    const manager = createLedgerReservationManager({
+      enabled: true,
+      enforceHardBounds: true,
+      generalBudgetMicros: 1_000_000,
+      defaultRateCard: RATE_CARD
+    });
+    const adapter = createMeteredModelAdapter(abortedStreamModel(), 'probe', {
+      ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:183' })
+    });
+    await expect(adapter.call(requestFor('probe'))).rejects.toThrow();
+
+    const before = manager.getBudgetStatus();
+    expect(() =>
+      adapter.reconcileLateUsage({
+        originCallId: 'mcall_never_seen',
+        usage: createUsagePayload({ input: 800, output: 120, semantics: SEMANTICS })
+      })
+    ).toThrow('LATE_USAGE_UNKNOWN_CALL');
+    // Not even the marker turns reconcile into the double-booking path.
+    expect(() =>
+      adapter.reconcileLateUsage({
+        originCallId: 'mcall_never_seen',
+        usage: createUsagePayload({ input: 800, output: 120, semantics: SEMANTICS }),
+        newAttemptMarker: 'new-attempt',
+        newAttemptReason: 'the marker alone is not a licence'
+      })
+    ).toThrow('LATE_USAGE_UNKNOWN_CALL');
+    expect(manager.getBudgetStatus().generalPool).toEqual(before.generalPool);
+  });
+
+  it('a marked new attempt books once, audit-only, under a DERIVED callId', async () => {
+    const manager = createLedgerReservationManager({
+      enabled: true,
+      enforceHardBounds: true,
+      generalBudgetMicros: 1_000_000,
+      defaultRateCard: RATE_CARD
+    });
+    const adapter = createMeteredModelAdapter(abortedStreamModel(), 'probe', {
+      ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:183' })
+    });
+    await expect(adapter.call(requestFor('probe'))).rejects.toThrow();
+
+    const event = {
+      originCallId: 'mcall_183_unreachable',
+      usage: createUsagePayload({ input: 800, output: 120, semantics: SEMANTICS }),
+      newAttemptMarker: 'new-attempt',
+      newAttemptReason: 'the origin mapping was not persisted by an older process'
+    } as const;
+    const booked = adapter.bookNewAttempt(event);
+    expect(booked.mode).toBe('new-attempt');
+    // The booking is a correction under its own derived callId — never the
+    // original callId counted twice.
+    expect(booked.callId).not.toBe('mcall_183_unreachable');
+    expect(booked.ledgerEvent?.auditOnly).toBe(true);
+    expect(booked.ledgerEvent?.qualityEvidence).toBe(false);
+    expect(manager.getBudgetStatus().generalPool.settledMicros).toBe(booked.incurredCostMicros);
+
+    // The SAME event redelivered derives the SAME callId: idempotent, no second
+    // booking (the deterministic-derivation rule, P0-3). The counters read 2
+    // because the marked attempt IS a sanctioned new reservation (1 aborted
+    // original + 1 new attempt); the redelivery adds neither.
+    const redelivered = adapter.bookNewAttempt(event);
+    expect(redelivered.previouslyReconciled).toBe(true);
+    expect(redelivered.incurredCostMicros).toBe(booked.incurredCostMicros);
+    expect(manager.getBudgetStatus().generalPool.settledMicros).toBe(booked.incurredCostMicros);
+    expect(manager.getMeteringStatus().reserveAttempts).toBe(2);
+    expect(manager.getMeteringStatus().settleCount).toBe(2);
+  });
+
+  it('a retried attempt is a NEW callId metering ONCE on its own — the aborted callId is never billed twice', async () => {
+    const manager = createLedgerReservationManager({
+      enabled: true,
+      enforceHardBounds: true,
+      generalBudgetMicros: 1_000_000,
+      defaultRateCard: RATE_CARD
+    });
+    let attempt = 0;
+    const retryingModel: IModelAdapter = {
+      async complete(): Promise<ModelResponse> {
+        attempt += 1;
+        if (attempt === 1) {
+          throw new DshModelStreamError('the host stream was aborted by the caller', 'aborted');
+        }
+        return {
+          text: 'ok',
+          finishReason: 'stop',
+          usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 },
+          metadata: {
+            rawUsage: { inputTokens: 500, outputTokens: 100 },
+            countingSemantics: SEMANTICS
+          }
+        };
+      }
+    };
+    let sequence = 0;
+    const adapter = createMeteredModelAdapter(retryingModel, 'probe', {
+      ledgerSettlement: twoPhaseSettlementFor(manager, { consumer: 'metered-model-adapter:183' }),
+      idFactory: (): string => 'mcall_183_attempt_' + String((sequence += 1))
+    });
+
+    // Attempt 1 aborts locally: interim hold, nothing booked.
+    await expect(adapter.call(requestFor('probe'))).rejects.toThrow('aborted by the caller');
+    expect(adapter.records()[0]?.settlement).toBe('interim');
+    expect(manager.getBudgetStatus().generalPool.settledMicros).toBe(0);
+
+    // Attempt 2 (the retry) is its own callId with its own final settlement.
+    const response = await adapter.call(requestFor('probe'));
+    expect(response.finishReason).toBe('stop');
+    const settled = adapter.records()[1];
+    expect(settled?.callId).toBe('mcall_183_attempt_2');
+    expect(settled?.settlement).toBe('final');
+    const booked = manager.getBudgetStatus().generalPool.settledMicros;
+    expect(booked).toBe(settled?.incurredCostMicros);
+
+    // The retry's truth does not touch the aborted callId: attempt 1 still holds
+    // interim with no incurred figure — the two attempts are never merged, so the
+    // same work cannot be paid for twice.
+    expect(adapter.records()[0]?.callId).toBe('mcall_183_attempt_1');
+    expect(adapter.records()[0]?.incurredCostMicros).toBeUndefined();
+    expect(adapter.records()[0]?.heldCostMicros).toBe(RATE_CARD.conservativeFallbackCostMicros);
+    // Exactly one reserve + one settle per attempt, nothing more.
+    expect(manager.getMeteringStatus().reserveAttempts).toBe(2);
+    expect(manager.getMeteringStatus().settleCount).toBe(2);
+    // The booked map keeps per-call figures separate (no summed double count).
+    expect(adapter.stats().costMicros).toBe(booked);
   });
 });

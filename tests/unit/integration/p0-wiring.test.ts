@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   createAgentLoopExecutor,
   createEvoHarnessPlugin,
+  createEvoHarnessPluginForOfflineEvaluation,
   createPersistenceRuntime,
   resolvePersistenceDataDir
 } from '../../../src/index';
@@ -127,7 +128,10 @@ describe('persistence wiring', () => {
 
     // Generation 1: two completed runs with the cadence set to every 2 tasks.
     const runtime1 = await createPersistenceRuntime({ dataDir, maxTrees: 100 });
-    const gen1 = buildE2E({ dreamEveryNTasks: 2, extra: { persistence: runtime1 } });
+    const gen1 = buildE2E({
+      dreamEveryNTasks: 2,
+      extra: { persistence: runtime1, deps: { dreamMinVerifiedTrees: 0 } }
+    });
     for (const runId of ['cad-1', 'cad-2']) {
       const result = await gen1.plugin.run({
         runId,
@@ -148,7 +152,10 @@ describe('persistence wiring', () => {
     // not dream and task 4 dreams again.
     const runtime2 = await createPersistenceRuntime({ dataDir, maxTrees: 100 });
     expect(runtime2.policyStore.counters.completedTasks).toBe(2);
-    const gen2 = buildE2E({ dreamEveryNTasks: 2, extra: { persistence: runtime2 } });
+    const gen2 = buildE2E({
+      dreamEveryNTasks: 2,
+      extra: { persistence: runtime2, deps: { dreamMinVerifiedTrees: 0 } }
+    });
     await gen2.plugin.run({
       runId: 'cad-3',
       sessionId: 'sess-cadence',
@@ -207,6 +214,27 @@ describe('agent-loop executor wiring', () => {
     expect(diagnostics).toContain('agent loop (model -> tool -> result)');
     expect(diagnostics).toContain('no tool runtime');
     expect(diagnostics).toContain('max steps per probe: 4');
+  });
+
+  it('refuses the offline-evaluation-only probeEvaluation seam on the public entrypoint', () => {
+    // A4-3: `legacy` erases the not-evaluable veto, so it must not be reachable
+    // through the documented plugin options. The eval harness has its own
+    // explicitly named entry.
+    expect(() =>
+      createEvoHarnessPlugin({
+        config: { logging: { level: 'silent' }, triggerMode: 'always' },
+        deps: { probeEvaluation: 'legacy' } as never
+      })
+    ).toThrow(/offline-evaluation-only/);
+
+    // The explicitly named offline entry is the supported path and still
+    // accepts the seam. It is not a production shortcut.
+    const offline = createEvoHarnessPluginForOfflineEvaluation({
+      config: { logging: { level: 'silent' }, triggerMode: 'always' },
+      deps: { probeEvaluation: 'legacy' }
+    });
+    expect(offline).toBeDefined();
+    void offline.dispose();
   });
 
   it('keeps an explicit runBranch ahead of the agent-loop executor', async () => {

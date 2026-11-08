@@ -110,8 +110,9 @@ export interface LoggingConfig {
  * The default assembly is baseline execution + shadow suggestion records with
  * ZERO side effects: no permanent patch mount, no policy publish, no real
  * memory write. guarded-active is an explicit opt-in that enables only the
- * patch layer's evidence-gated channel; publish/memory stay denied this round
- * regardless of configuration.
+ * permanent patch layer (mode + `applyWinningPatch`; no host-verdict gate is
+ * applied there); publish/memory stay denied this round regardless of
+ * configuration.
  */
 export interface ExecutionConfig {
   /**
@@ -263,6 +264,27 @@ export interface JitRlConfig {
   minSupportForStrongPrior: number;
   /** Value of unseen actions: 'baseline' (Q = V) or 'zero' (paper). */
   unseenFallback: 'zero' | 'baseline';
+  /**
+   * rev6 audit A4-1 (B5): the evidence gate on ONLINE write-back.
+   *
+   *   - `auto` (default): without a host-injected trusted verifier the gate is
+   *     ON, so every executed probe is written for AUDIT only
+   *     (`learningEligible: false`, `learningTarget: 0`) and L2 selection does
+   *     not learn from unverified signal. With a trusted verifier (an enabled
+   *     host seam whose runner publishes at least one trusted producer) it is
+   *     OFF, i.e. the historical path.
+   *   - `on`: the gate runs regardless of verifier presence. It can only LOWER
+   *     eligibility; it never grants learning.
+   *   - `off`: the historical ungated write-back path: the G-A/G-B evidence
+   *     gate does not judge a record. Other independent scoring rules (the
+   *     A4-3 not-evaluable veto and the A4-4 judge policy) still apply; `off`
+   *     is not a blanket instruction to learn from unverified evidence.
+   *
+   * The value is a REQUEST. A hand-built orchestrator can still override the
+   * resolved boolean through the explicit `deps.writebackGate` seam; the
+   * plugin entrypoint resolves `auto` and reports the result in diagnostics.
+   */
+  writebackGate: 'auto' | 'on' | 'off';
   store: JitRlStoreConfig;
   reward: JitRlRewardConfig;
   hostAdvisor: JitRlHostAdvisorConfig;
@@ -448,6 +470,8 @@ const DEFAULT_CONFIG_VALUES: EvoHarnessConfig = {
     surfaceActions: false,
     minSupportForStrongPrior: 3,
     unseenFallback: 'baseline',
+    // rev6 audit A4-1 (B5): no trusted verifier => audit-only write-back.
+    writebackGate: 'auto',
     store: {
       driver: 'jsonl',
       mirrorToMemoryBridge: false,
@@ -472,7 +496,7 @@ const DEFAULT_CONFIG_VALUES: EvoHarnessConfig = {
       candidateJitBetas: [0.5, 1, 2],
       // INT-3: candidateJitKs / candidateJitSimilarityThresholds are OPTIONAL
       // leaves with NO default entry (see JitRlDreamConfig), so this object -
-      // and therefore the documented 78-leaf configuration reference - is
+      // and therefore the documented 79-leaf configuration reference - is
       // unchanged. Absent, the dreamer keeps DEFAULT_JIT_KS /
       // DEFAULT_JIT_SIMILARITY_THRESHOLDS.
       candidateJitLambdas: [0.02, 0.05, 0.1]
@@ -588,6 +612,8 @@ const JITRL_KEYS = new Set<string>([
   'surfaceActions',
   'minSupportForStrongPrior',
   'unseenFallback',
+  // rev6 audit A4-1: online write-back evidence-gate mode ('auto' | 'on' | 'off').
+  'writebackGate',
   'store',
   'reward',
   'hostAdvisor',
@@ -631,6 +657,7 @@ const JITRL_LEVELS: readonly JitLevel[] = ['meta', 'proposal', 'host_tool'];
 const JITRL_LOGIT_SOURCES: readonly string[] = ['auto', 'verbalized', 'token'];
 const JITRL_SELECTIONS: readonly string[] = ['argmax', 'sample'];
 const JITRL_UNSEEN_FALLBACKS: readonly string[] = ['zero', 'baseline'];
+const JITRL_WRITEBACK_GATE_MODES: readonly string[] = ['auto', 'on', 'off'];
 const JITRL_STORE_DRIVERS: readonly string[] = ['jsonl'];
 const JITRL_HOST_ADVISOR_MODES: readonly string[] = ['advisory', 'gate'];
 const JITRL_REWARD_WEIGHT_KEYS = ['llm', 'surrogate', 'tool', 'turn', 'user'] as const;
@@ -1367,6 +1394,12 @@ function validateJitRlGroup(root: Record<string, unknown>, issues: ConfigValidat
     issues
   );
   validateEnum(jitrl.unseenFallback, 'jitrl.unseenFallback', JITRL_UNSEEN_FALLBACKS, issues);
+  validateEnum(
+    jitrl.writebackGate,
+    'jitrl.writebackGate',
+    JITRL_WRITEBACK_GATE_MODES,
+    issues
+  );
   const store = asGroup(jitrl.store, 'jitrl.store', issues);
   if (store !== null) {
     validateEnum(store.driver, 'jitrl.store.driver', JITRL_STORE_DRIVERS, issues);

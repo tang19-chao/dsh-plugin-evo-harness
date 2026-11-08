@@ -68,6 +68,13 @@ export interface PersistenceRuntimeOptions {
   readonly maxHistory?: number;
   /** Compact the tree log after this many raw records. */
   readonly compactAfterRecords?: number;
+  /**
+   * Compact the tree log after this many appended bytes; defaults to the
+   * store's own 32 MiB ceiling. Exposed so a host with a tight disk budget can
+   * compact sooner (never to disable the byte guard: a value <= 0 falls back to
+   * the default rather than meaning "unbounded").
+   */
+  readonly compactAfterBytes?: number;
   readonly now?: () => number;
 }
 
@@ -107,7 +114,10 @@ export async function createPersistenceRuntime(
     now,
     ...(options.compactAfterRecords === undefined
       ? {}
-      : { compactAfterRecords: options.compactAfterRecords })
+      : { compactAfterRecords: options.compactAfterRecords }),
+    ...(options.compactAfterBytes === undefined
+      ? {}
+      : { compactAfterBytes: options.compactAfterBytes })
   };
   const treePoolStore = await TreePoolStore.open(treeOptions);
   const treePool = await PersistentTreePool.fromStore(treePoolStore, options.maxTrees);

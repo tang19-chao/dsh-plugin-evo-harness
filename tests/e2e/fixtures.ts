@@ -184,6 +184,168 @@ export function createScriptedModel(options: ScriptedModelOptions = {}): Scripte
 }
 
 // ---------------------------------------------------------------------------
+// DSH content-block decoding and a reusable patch-aware host LLM
+// ---------------------------------------------------------------------------
+
+/**
+ * Decode one DSH request message's `content`.
+ *
+ * A REAL DSH request carries a BLOCK ARRAY (`[{ type: 'text', text }]`), not a
+ * string: `toDshMessages` in src/dsh-bridge/model.ts converts every message to
+ * that shape before `ctx.llm.stream` is called. A fake that concatenates
+ * `message.content` directly therefore receives `[object Object]`, silently
+ * fails every prompt route, and can make a broken pipeline look green.
+ *
+ * Contract:
+ *   - a string is returned verbatim;
+ *   - an array concatenates each block's `.text` (non-text/malformed blocks
+ *     contribute nothing);
+ *   - null/undefined/any other value returns ''.
+ *
+ * Deliberately NOT `String(content)`: that is exactly the `[object Object]`
+ * failure this function exists to prevent.
+ */
+export function decodeContent(content: unknown): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    let text = '';
+    for (const block of content) {
+      if (block === null || typeof block !== 'object') {
+        continue;
+      }
+      const value = (block as { text?: unknown }).text;
+      if (typeof value === 'string') {
+        text += value;
+      }
+    }
+    return text;
+  }
+  return '';
+}
+
+/** Minimal DSH GenerateOptions view: the routed messages are all a fake needs. */
+export interface DshHostStreamOptions {
+  readonly messages: ReadonlyArray<{ readonly role: string; readonly content?: unknown }>;
+}
+
+/** One probe dispatch, with the branch identity the prompt header carries. */
+export interface PatchProbeDispatch {
+  /** Decoded full prompt text. */
+  readonly prompt: string;
+  /**
+   * The `branch:` header line, or undefined when the fake could not parse one.
+   * The reference probe's id starts with `reference-`; candidate probes carry
+   * the isolated branch id. Assertions must use THIS, not prompt-content
+   * heuristics: a regression that injects the patch into a subset of candidates
+   * leaves both "some patched" and "some unpatched" true.
+   */
+  readonly branch: string | undefined;
+}
+
+/** A ctx.llm.stream stand-in that answers propose/compose/probe prompts. */
+export interface PatchAwareHostLlm {
+  stream(options: DshHostStreamOptions): AsyncIterable<unknown>;
+  /** Decoded full prompt of every probe dispatch, in call order. */
+  readonly probePrompts: string[];
+  /** Probe dispatches with their branch identity, in call order. */
+  readonly probeDispatches: PatchProbeDispatch[];
+  /** Decoded full prompt of every proposal dispatch, in call order. */
+  readonly proposePrompts: string[];
+  /** Decoded full prompt of every composition dispatch, in call order. */
+  readonly composePrompts: string[];
+  /** Decoded full prompt of every LLM step-judge dispatch, in call order. */
+  readonly judgePrompts: string[];
+}
+
+/** Extract the `branch:` line the default probe header always carries. */
+export function probeBranchOf(prompt: string): string | undefined {
+  const match = /^branch:\s*(.+)$/m.exec(prompt);
+  return match?.[1]?.trim();
+}
+
+export interface PatchAwareHostLlmOptions {
+  /** Proposal payloads cycled per proposer prompt (last one repeats). */
+  readonly proposals?: readonly Record<string, unknown>[];
+  /**
+   * Reply factory for a probe dispatch. Receives the decoded prompt so a test
+   * can make a candidate carrying the patch marker deliver something different
+   * from the unpatched reference (A6 / H4).
+   */
+  readonly probeReply?: (prompt: string) => string;
+}
+
+/**
+ * The reusable patch-aware DSH stream fake.
+ *
+ * Routing is prompt-based because the DSH stream interface carries no purpose
+ * field; every route is matched against the DECODED message text, so the fake
+ * observes exactly what the real adapter sends.
+ */
+export function createPatchAwareHostLlm(options: PatchAwareHostLlmOptions = {}): PatchAwareHostLlm {
+  const probePrompts: string[] = [];
+  const probeDispatches: PatchProbeDispatch[] = [];
+  const proposePrompts: string[] = [];
+  const composePrompts: string[] = [];
+  const judgePrompts: string[] = [];
+  const proposals = options.proposals ?? [proposalPayload()];
+  let proposalIndex = 0;
+  return {
+    probePrompts,
+    probeDispatches,
+    proposePrompts,
+    composePrompts,
+    judgePrompts,
+    async *stream(streamOptions: DshHostStreamOptions): AsyncIterable<unknown> {
+      const joined = streamOptions.messages
+        .map((message) => decodeContent(message.content))
+        .join('\n');
+      let reply: string;
+      if (joined.includes('You are the Harness² proposer')) {
+        proposePrompts.push(joined);
+        const index = Math.min(proposalIndex, proposals.length - 1);
+        proposalIndex += 1;
+        reply = JSON.stringify(proposals[index] ?? proposalPayload());
+      } else if (
+        joined.includes('probe run inside an isolated evolution branch') ||
+        joined.includes('probe agent running inside an isolated evolution branch')
+      ) {
+        probePrompts.push(joined);
+        probeDispatches.push({ prompt: joined, branch: probeBranchOf(joined) });
+        reply =
+          options.probeReply?.(joined) ??
+          'host probe deliverable: the failing build passes with the mounted guardrails';
+      } else if (joined.includes('You judge the quality of each step')) {
+        judgePrompts.push(joined);
+        const indices = [...joined.matchAll(/- step (\d+):/g)].map((match) => Number(match[1]));
+        const score = judgePrompts.length % 2 === 0 ? -1 : 1;
+        reply = JSON.stringify({
+          steps: (indices.length > 0 ? indices : [0]).map((stepIndex) => ({
+            stepIndex,
+            score
+          }))
+        });
+      } else if (/candidate_[A-Z]/.test(joined)) {
+        composePrompts.push(joined);
+        const aliases = [...new Set(joined.match(/candidate_[A-Z]/g) ?? [])];
+        reply = JSON.stringify({
+          ranking: aliases,
+          assessments: aliases.map((alias, index) => ({
+            alias,
+            rationale: 'ranked ' + String(index + 1) + ' by the host judge'
+          }))
+        });
+      } else {
+        reply = JSON.stringify({ lessons: [] });
+      }
+      yield { type: 'text-delta', index: 0, text: reply };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
 // scripted branch executor: the reference run fails, patched candidates recover
 // ---------------------------------------------------------------------------
 

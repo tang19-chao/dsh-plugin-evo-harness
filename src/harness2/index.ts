@@ -34,6 +34,7 @@ export {
   clamp01,
   createDeterministicIdFactory,
   deliverableOf,
+  extractAllJsonValues,
   extractJsonValue,
   hashString,
   redactIdentifiers,

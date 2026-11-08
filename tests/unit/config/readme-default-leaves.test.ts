@@ -3,11 +3,11 @@
  * and the failed/pending refusal of `check:docs`.
  *
  * What is pinned, and why:
- *  - The gate must walk the REAL `DEFAULT_EVO_HARNESS_CONFIG` (75 leaves at
+ *  - The gate must walk the REAL `DEFAULT_EVO_HARNESS_CONFIG` (76 leaves at
  *    the time of writing; arrays count as ONE leaf with a `[]` suffix) plus the
  *    three `MODEL_ROUTE_DEFAULTS` fields, and must fail when the README
  *    Configuration reference is missing a leaf, documents a stale leaf, or
- *    drifts a documented default value. The count 78 is asserted here ONLY as
+ *    drifts a documented default value. The count 79 is asserted here ONLY as
  *    an observation pin (explain text), never as the gate's criterion — the
  *    gate itself hard-codes no number.
  *  - The gate must REFUSE a report that carries failing tests
@@ -128,7 +128,7 @@ function fixtureReadme(referenceRows: string[]): string {
     '| Command | Scope | Suites |',
     '| :--- | :--- | :--- |',
     '| `pnpm run test:unit` | `tests/unit` | 1 files, 2 tests |',
-    '| `pnpm run test:e2e` | `tests/e2e` | 0 files, 0 tests |',
+    '| `pnpm run test:e2e` | `tests/e2e + tests/mcp` | 0 files, 0 tests |',
     '| `pnpm run test` | everything | 1 files, 2 tests |',
     ''
   ].join('\n');
@@ -182,10 +182,10 @@ function assertNoResidue(cwd: string): void {
 }
 
 describe('readme default-leaf docs gate (ADR 0005 §4 D4)', () => {
-  it('walks the real defaults into 78 documented leaf paths (75 DEFAULT + 3 modelRoute, arrays as one)', () => {
+  it('walks the real defaults into 79 documented leaf paths (76 DEFAULT + 3 modelRoute, arrays as one)', () => {
     // The gate criterion is the traversal, never the number; this pin exists
     // so a silent change of the leaf COUNT is at least observable here.
-    expect(expectedLeaves).toHaveLength(78);
+    expect(expectedLeaves).toHaveLength(79);
     expect(expectedLeaves.filter((leaf) => leaf.startsWith('modelRoute.'))).toEqual([
       'modelRoute.provider',
       'modelRoute.model',
@@ -201,14 +201,14 @@ describe('readme default-leaf docs gate (ADR 0005 §4 D4)', () => {
     expect(expectedLeaves).toContain('dreamRsi.holdoutTreeCount');
     expect(expectedLeaves).toContain('execution.mode');
     expect(expectedLeaves).toContain('execution.applyWinningPatch');
-    expect(expectedLeaves.filter((leaf) => leaf.startsWith('jitrl.'))).toHaveLength(37);
+    expect(expectedLeaves.filter((leaf) => leaf.startsWith('jitrl.'))).toHaveLength(38);
   });
 
   it('the shipped README documents every default leaf with the real default values', () => {
     const dir = makeFixtureDir('real', realReadme);
     const run = runGate(dir, ['--docs-only', '--readme', 'README.md']);
     expect({ status: run.status, stderr: run.stderr }).toMatchObject({ status: 0 });
-    expect(run.stdout).toContain('Config reference coverage: 78 documented row(s) vs 78 expected');
+    expect(run.stdout).toContain('Config reference coverage: 79 documented row(s) vs 79 expected');
     expect(run.stdout).toContain('documents every default leaf');
     // D4 §2: the corrected promoteOnComposeSuccess default must be false.
     expect(realReadme).toContain('| `memoryBridge.promoteOnComposeSuccess` | `false` |');
@@ -396,7 +396,7 @@ describe('readme default-leaf docs gate (ADR 0005 §4 D4)', () => {
       defaultLeafCount: number;
       modelRouteLeafCount: number;
     };
-    expect(parsed.defaultLeafCount).toBe(75);
+    expect(parsed.defaultLeafCount).toBe(76);
     expect(parsed.modelRouteLeafCount).toBe(3);
     expect(parsed.modelRouteLeaves).toEqual([
       'modelRoute.provider',
@@ -430,7 +430,8 @@ describe('readme default-leaf docs gate (ADR 0005 §4 D4)', () => {
  *  - The gate asserts unit + e2e == total on BOTH sides (README and report) and
  *    that the summary line equals the table total — WITHOUT depending on any
  *    absolute number, so the assertions stay meaningful while the counts move.
- *  - EVERY consumed test file must live under `tests/unit/` or `tests/e2e/`:
+ *  - EVERY consumed test file must live under `tests/unit/`, `tests/e2e/` or
+ *    the e2e-classified `tests/mcp/`:
  *    a third test root means the documented two-suite breakdown cannot describe
  *    the real run, and the gate must fail by NAME instead of silently dropping
  *    those files from every count it verifies.
@@ -447,7 +448,7 @@ describe('count closure and test-root attribution (R-04)', () => {
   } {
     const summary = readme.match(/reports\s+`(\d+)`\s+test files and\s+`(\d+)`\s+passing tests for\s+`pnpm run test`/i);
     const unit = readme.match(/\|\s*`pnpm run test:unit`\s*\|\s*`tests\/unit`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i);
-    const e2e = readme.match(/\|\s*`pnpm run test:e2e`\s*\|\s*`tests\/e2e`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i);
+    const e2e = readme.match(/\|\s*`pnpm run test:e2e`\s*\|\s*`tests\/e2e \+ tests\/mcp`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i);
     const total = readme.match(/\|\s*`pnpm run test`\s*\|\s*everything\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i);
     expect(summary).not.toBeNull();
     expect(unit).not.toBeNull();
@@ -564,7 +565,7 @@ describe('count closure and test-root attribution (R-04)', () => {
     assertNoResidue(dir);
   });
 
-  it('reports the closure line when the two documented roots close exactly', () => {
+  it('reports the closure line when the documented suite roots close exactly', () => {
     const dir = makeFixtureDir('closed', fixtureReadme(buildReferenceRows()));
     fs.writeFileSync(
       path.join(dir, 'green-report.json'),

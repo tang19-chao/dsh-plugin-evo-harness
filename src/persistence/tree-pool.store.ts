@@ -26,6 +26,7 @@
  */
 
 import path from 'node:path';
+import fs from 'node:fs/promises';
 
 import {
   BATCH_SLOT_KINDS,
@@ -53,6 +54,21 @@ export const TREE_POOL_LOG_FILE = 'tree-pool.jsonl';
 
 /** Default number of raw log records kept before an atomic compaction. */
 export const DEFAULT_COMPACT_AFTER_RECORDS = 512;
+
+/**
+ * Default byte ceiling for the log before a compaction is forced.
+ *
+ * WHY BYTES AS WELL AS RECORDS (rev8 audit): the record COUNT says nothing
+ * about the FILE SIZE. One tree snapshot carries whatever metadata it was
+ * handed, and the evidence-integrity mark is the variable-length part of it —
+ * measured on this tree before the finding cap, a single run's record reached
+ * 31 MB and 560 writes of 2,000-finding records grew the log to 521 MB without
+ * ever reaching the 512-record threshold. A count-only trigger therefore
+ * cannot bound the file. 32 MiB is ~64x a normal pool record (a few hundred
+ * KB), so ordinary operation never compacts early, while a pathological record
+ * can no longer accumulate 500 MB of siblings first.
+ */
+export const DEFAULT_COMPACT_AFTER_BYTES = 32 * 1024 * 1024;
 
 const DISCOVERY_NODE_STATUSES = [
   'proposed',
@@ -224,10 +240,36 @@ export interface TreePoolStoreOptions {
   readonly now?: () => number;
   /** Compact after this many raw records; defaults to 512. */
   readonly compactAfterRecords?: number;
+  /**
+   * Compact after this many bytes have been appended since the last
+   * compaction; defaults to DEFAULT_COMPACT_AFTER_BYTES (32 MiB). The budget is
+   * seeded with the size of an ALREADY EXISTING log at open(), so a file that a
+   * previous process left bloated is compacted on its first write instead of
+   * being ignored — measured before this seeding: a 10,539,040 B log reopened
+   * under a 256 KiB ceiling stayed at 10,540,266 B after an append.
+   */
+  readonly compactAfterBytes?: number;
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Size of an already-persisted log in bytes (0 when it does not exist yet).
+ * Used to seed the append budget so a bloated file is compacted on the first
+ * subsequent write instead of being taken as a fresh baseline.
+ */
+async function existingLogBytes(logPath: string): Promise<number> {
+  try {
+    const stats = await fs.stat(logPath);
+    return stats.isFile() ? stats.size : 0;
+  } catch {
+    // Absent (the normal first run) or unreadable: start the budget at zero.
+    // An unreadable size must never fail startup — the record-count trigger
+    // still runs, and the next successful append re-establishes the baseline.
+    return 0;
+  }
 }
 
 /** Cheap structural equality for two tree snapshots. */
@@ -259,12 +301,15 @@ export class TreePoolStore {
   readonly logPath: string;
   private readonly now: () => number;
   private readonly compactAfterRecords: number;
+  private readonly compactAfterBytes: number;
   private readonly diagnosticsSink: string[] = [];
   private readonly quarantinePaths: string[] = [];
   private records: TreePoolRecord[] = [];
   private queue: Promise<void> = Promise.resolve();
   private repaired = false;
   private loadRecordCount = 0;
+  /** Bytes appended since the last compaction (or since open()). */
+  private appendedBytes = 0;
 
   private constructor(options: TreePoolStoreOptions) {
     this.dataDir = options.dataDir;
@@ -275,6 +320,22 @@ export class TreePoolStore {
         ? DEFAULT_COMPACT_AFTER_RECORDS
         : Math.max(2, Math.floor(options.compactAfterRecords));
     this.compactAfterRecords = threshold;
+    this.compactAfterBytes =
+      options.compactAfterBytes === undefined ||
+      !Number.isFinite(options.compactAfterBytes) ||
+      options.compactAfterBytes <= 0
+        ? DEFAULT_COMPACT_AFTER_BYTES
+        : Math.max(1, Math.floor(options.compactAfterBytes));
+  }
+
+  /** Byte ceiling that forces a compaction. */
+  get compactBytesThreshold(): number {
+    return this.compactAfterBytes;
+  }
+
+  /** Bytes appended since the last compaction. */
+  get pendingBytes(): number {
+    return this.appendedBytes;
   }
 
   /** Open the store, recover a damaged log and report what happened. */
@@ -297,6 +358,15 @@ export class TreePoolStore {
       store.pushDiagnostic(diagnostic);
     }
     await recordDiagnostics(store.dataDir, recovery.diagnostics, store.now);
+    // BYTE BASELINE (rev8 audit, second pass): seed the append budget with the
+    // size of the log that is already on disk. Without this, `appendedBytes`
+    // starts at 0 on every restart, so a log a previous process left at 500 MB
+    // would have to accumulate ANOTHER full ceiling before the byte trigger
+    // fired — and it never fires at all if the process restarts more often than
+    // it appends a ceiling's worth. The documented intent ("a pre-existing large
+    // file is compacted on its first write") now holds: a log already over the
+    // ceiling makes the very first append compact.
+    store.appendedBytes = await existingLogBytes(store.logPath);
     return store;
   }
 
@@ -402,13 +472,23 @@ export class TreePoolStore {
    * Queue one record append. A record that a compaction already absorbed (its
    * effect is in the rewritten file) must not be appended again, otherwise the
    * log would grow with superseded events.
+   *
+   * Compaction fires on EITHER trigger: the record count (existing behaviour)
+   * or the appended bytes (rev8 audit — a count threshold alone cannot bound a
+   * file whose individual records can be megabytes; measured 521 MB at 560
+   * records, all below the 512-record trigger… until it finally fired).
    */
   private enqueueAppend(record: TreePoolRecord): Promise<void> {
     return this.enqueue(async () => {
       if (this.records.includes(record)) {
-        await appendFileDurable(this.logPath, encodeJsonlRecord(record));
+        const encoded = encodeJsonlRecord(record);
+        await appendFileDurable(this.logPath, encoded);
+        this.appendedBytes += Buffer.byteLength(encoded, 'utf8');
       }
-      if (this.records.length >= this.compactAfterRecords) {
+      if (
+        this.records.length >= this.compactAfterRecords ||
+        this.appendedBytes >= this.compactAfterBytes
+      ) {
         await this.writeMinimized();
       }
     });
@@ -420,7 +500,12 @@ export class TreePoolStore {
       return;
     }
     const minimized = minimizeTreePoolRecords(snapshot);
-    await writeFileAtomic(this.logPath, minimized.map(encodeJsonlRecord).join(''));
+    const payload = minimized.map(encodeJsonlRecord).join('');
+    await writeFileAtomic(this.logPath, payload);
+    // The rewritten file is the new baseline: bytes are counted from here, so a
+    // single oversized record triggers ONE compaction per write instead of
+    // re-triggering on every subsequent append.
+    this.appendedBytes = Buffer.byteLength(payload, 'utf8');
     // Only the records this compaction absorbed are replaced; anything appended
     // while the atomic write was in flight stays queued after the minimized set.
     const absorbed = new Set<TreePoolRecord>(snapshot);

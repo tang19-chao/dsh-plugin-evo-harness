@@ -309,7 +309,7 @@ function recordDetailOf(
 }
 
 describe('t18 end-to-end: a forged audit mark cannot change eligibility or marks', () => {
-  it('audit-only forgery via an injected seam manager is inert (no views, no audit encoding)', async () => {
+  it('audit-only forgery via an injected seam manager is inert (no views, no forged verification encoding)', async () => {
     const { plugin, trajectories, stages } = buildForgedHarness({ receipt: false, audit: true });
     const task = plugin.makeTask({
       id: 'task-c2a-e2e',
@@ -330,8 +330,12 @@ describe('t18 end-to-end: a forged audit mark cannot change eligibility or marks
     expect(detail?.['trustedVerificationSource']).toBe(
       'shape-only (C2-pre: no trusted producer registered)'
     );
-    // The forged `forceAuditOnly` did NOT force an audit-only encoding.
-    expect(detail?.['notLearningEligible']).toBe(0);
+    // The forged `forceAuditOnly` did NOT force an audit-only encoding. The
+    // records are audit-only because A4-3 classified the unverified text
+    // probes as not-evaluable - a DIFFERENT, measured reason that is counted
+    // separately from the C2-pre task-quality gate.
+    expect(detail?.['notEvaluable']).toBe(2);
+    expect(detail?.['notLearningEligible']).toBe(2);
     expect(detail?.['notTaskQualityEligible']).toBe(0);
   });
 
@@ -354,9 +358,12 @@ describe('t18 end-to-end: a forged audit mark cannot change eligibility or marks
     expect(detail?.['trustedVerificationSource']).toBe(
       'shape-only (C2-pre: no trusted producer registered)'
     );
-    // A shape-only "passed" claim earns no task-quality evidence; the C2-pre
-    // conservative isolation keeps every such record audit-only.
-    expect(detail?.['notTaskQualityEligible']).toBeGreaterThan(0);
+    // A shape-only "passed" claim earns no task-quality evidence and no trust.
+    // A4-3 additionally classifies the unverified text probes as not-evaluable,
+    // so the audit-only count comes from that measured reason; the C2-pre
+    // task-quality gate count stays 0 (the two are separate counters).
+    expect(detail?.['notEvaluable']).toBeGreaterThan(0);
+    expect(detail?.['notTaskQualityEligible']).toBe(0);
     expect(detail?.['notLearningEligible']).toBeGreaterThan(0);
   });
 

@@ -140,15 +140,70 @@ function sortValue(value: unknown): unknown {
   return value;
 }
 
+/**
+ * Serialize a path for deterministic evidence digests and lesson diffs.
+ *
+ * Paths arrive from host tools and may use Windows separators even when the
+ * same artifact is replayed on POSIX. Only path-bearing fields should pass
+ * through here: replacing backslashes in arbitrary prose would change evidence
+ * contents. Dot segments and duplicate separators are removed without touching
+ * the filesystem, so this remains a pure host-independent helper.
+ */
+export function normalizePathForFingerprint(path: string): string {
+  const absoluteDrive = /^[A-Za-z]:\//.test(path.replace(/\\/g, '/'));
+  const absoluteUnc = /^(?:\/\/|[\\]{2})/.test(path);
+  const absolutePosix = path.startsWith('/');
+  const segments = path.replace(/\\/g, '/').split('/');
+  const normalized: string[] = [];
+  for (const segment of segments) {
+    if (segment.length === 0 || segment === '.') {
+      continue;
+    }
+    if (segment === '..' && normalized.length > 0 && normalized[normalized.length - 1] !== '..') {
+      normalized.pop();
+    } else if (segment === '..' && !absoluteDrive && !absoluteUnc && !absolutePosix) {
+      normalized.push(segment);
+    } else if (segment !== '..') {
+      normalized.push(segment);
+    }
+  }
+  const prefix = absoluteUnc ? '//' : absolutePosix ? '/' : '';
+  return prefix + normalized.join('/');
+}
+
 /** JSON stringify with recursively sorted keys (stable across call sites). */
 export function stableStringify(value: unknown): string {
   const json = JSON.stringify(sortValue(value));
   return json === undefined ? 'undefined' : json;
 }
 
+/**
+ * Canonical lesson-patch serialization. Script `path` fields are normalized
+ * before hashing/stringification, matching the source-tree fingerprint rule:
+ * `nested\\tool.py` and `nested/tool.py` name the same mounted artifact.
+ * Other strings, including code, remain byte-for-byte evidence.
+ */
+export function stablePatchStringify(value: unknown): string {
+  const sortPatchValue = (item: unknown, key?: string): unknown => {
+    if (Array.isArray(item)) {
+      return item.map((entry) => sortPatchValue(entry));
+    }
+    if (isRecord(item)) {
+      const out: Record<string, unknown> = {};
+      for (const childKey of Object.keys(item).sort()) {
+        out[childKey] = sortPatchValue(item[childKey], childKey);
+      }
+      return out;
+    }
+    return key === 'path' && typeof item === 'string' ? normalizePathForFingerprint(item) : item;
+  };
+  const json = JSON.stringify(sortPatchValue(value));
+  return json === undefined ? 'undefined' : json;
+}
+
 /** Compact deterministic summary of one surface payload (for lesson diffs). */
 export function surfaceEditSummary(payload: unknown, max: number = 400): string {
-  return truncate(stableStringify(payload), max);
+  return truncate(stablePatchStringify(payload), max);
 }
 
 /** Contract-ordered subset of the eight surfaces. */
@@ -327,4 +382,51 @@ export function extractJsonValue(text: string): unknown {
     }
   }
   return undefined;
+}
+
+/**
+ * Extract every TOP-LEVEL parseable JSON value from a model response, in
+ * order of appearance. Where `extractJsonValue` keeps only the first
+ * parseable value, this helper collects them all so callers can detect two
+ * conflicting JSON verdicts inside one response (harness2 #24) instead of
+ * silently letting whichever fragment comes first decide.
+ *
+ * Semantics:
+ * - Only `{` / `[` open a scan; text inside JSON strings never does, so JSON
+ *   embedded in a string value or in prose quotes is not extracted twice.
+ * - A parsed value consumes its whole balanced slice: values nested INSIDE an
+ *   already-parsed object/array are not returned separately.
+ * - Raw JSON, fenced code blocks and prose around JSON are all covered, since
+ *   fence markers are just text the scan skips over.
+ * - Unbalanced or unparseable fragments are skipped without aborting the scan.
+ */
+export function extractAllJsonValues(text: string): unknown[] {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) {
+    return [];
+  }
+  const out: unknown[] = [];
+  let index = 0;
+  while (index < trimmed.length) {
+    const char = trimmed[index];
+    if (char !== '{' && char !== '[') {
+      index += 1;
+      continue;
+    }
+    const slice = balancedSlice(trimmed, index);
+    if (slice === undefined) {
+      index += 1;
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(slice) as unknown;
+    } catch {
+      index += 1;
+      continue;
+    }
+    out.push(parsed);
+    index += slice.length;
+  }
+  return out;
 }

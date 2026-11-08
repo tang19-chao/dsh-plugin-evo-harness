@@ -8,7 +8,10 @@ import {
   evaluatePolicy,
   generateCandidatePolicies,
   jitHyperparamIssues,
+  MIN_EVALUATED_NODES_FOR_AUC,
   normalizeRhoPreferences,
+  paretoRewardOfRun,
+  paretoTraceInputsOfTree,
   replayNodeScore,
   replayPolicy,
   replayTree,
@@ -147,6 +150,39 @@ describe('replay primitives', () => {
     ).toBe(0.5);
     expect(replayNodeScore({ ...good, score: 5 })).toBe(1);
     expect(replayNodeScore({ ...good, score: -2 })).toBe(0);
+  });
+
+  it('prefers the A4-2 trusted dreamEvidence score over the frozen node.score', () => {
+    const tree = richTree();
+    const good = tree.nodes.good;
+    if (good === undefined) {
+      throw new Error('fixture missing');
+    }
+    // The online surrogate recorded 1, but the evidence policy recorded 0.07
+    // (a composer-tainted node whose composer terms were zeroed). Replay must
+    // consume the evidence score, otherwise A4-2 would be silently undone here.
+    const evidenced = {
+      ...good,
+      metadata: {
+        ...(good.metadata ?? {}),
+        dreamEvidence: {
+          verdict: 'failed' as const,
+          trusted: true,
+          dreamScore: 0.07,
+          strategy: 'verified-only-selection',
+          verifierId: 'offline-dreamer-test-host',
+          evidenceHash: 'sha256:' + 'b'.repeat(64)
+        }
+      }
+    };
+    expect(replayNodeScore(evidenced)).toBeCloseTo(0.07, 12);
+    // A malformed evidence block falls back to the frozen score (legacy trees).
+    expect(
+      replayNodeScore({
+        ...good,
+        metadata: { dreamEvidence: { dreamScore: 'nope' } }
+      })
+    ).toBe(1);
   });
 
   it('normalizes, clamps, dedupes and sorts rho preferences', () => {
@@ -1201,5 +1237,151 @@ describe('P6 PR5: shadow mode, holdout split and the gate boundary', () => {
       'alpha',
       'gamma'
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rev8 pareto budget-attainment reward: additive projection over the replay
+// ---------------------------------------------------------------------------
+
+describe('rev8 pareto reward projection', () => {
+  it('adds batchSizes/effectiveSequentialRounds only when measureBatches is on', () => {
+    const snapshot = deepTree();
+    const policy = makePolicy({ id: 'pi-measured', maxWidth: 2, maxDepth: 2 });
+    const legacy = replayTree(snapshot, policy, 1);
+    expect('batchSizes' in legacy).toBe(false);
+    expect('effectiveSequentialRounds' in legacy).toBe(false);
+
+    const measured = replayTree(snapshot, policy, 1, { measureBatches: true });
+    // deepTree under width 2: layer 1 probes 2 nodes, layer 2's frontier comes
+    // from the expanded selection; batches reflect the layers actually run.
+    expect(Array.isArray(measured.batchSizes)).toBe(true);
+    expect((measured.batchSizes ?? []).length).toBeGreaterThan(0);
+    expect((measured.batchSizes ?? []).reduce((sum, size) => sum + size, 0)).toBe(
+      measured.probes
+    );
+    // Serial assumption (maxParallelism defaults to 1): rounds = sum of sizes.
+    expect(measured.effectiveSequentialRounds).toBe(
+      (measured.batchSizes ?? []).reduce((sum, size) => sum + size, 0)
+    );
+    // Worker-capped folding matches the upstream conversion.
+    const capped = replayTree(snapshot, policy, 1, {
+      measureBatches: true,
+      maxParallelism: 2
+    });
+    expect(capped.effectiveSequentialRounds).toBeLessThanOrEqual(
+      measured.effectiveSequentialRounds ?? Number.POSITIVE_INFINITY
+    );
+  });
+
+  it('paretoTraceInputsOfTree derives runBest and evaluatedNodes from the snapshot', () => {
+    const inputs = paretoTraceInputsOfTree(deepTree());
+    // Best recorded score on deepTree is d3 = 0.55; 7 scored probe nodes.
+    expect(inputs.runBest).toBeCloseTo(0.55, 12);
+    expect(inputs.evaluatedNodes).toBe(7);
+  });
+
+  it('paretoRewardOfRun scores the budget-attainment curve and skips sub-minimum trees', () => {
+    const tree = deepTree();
+    const policy = makePolicy({ id: 'pi-pareto', maxWidth: 2, maxDepth: 2 });
+    const run = replayPolicy([tree], policy, [0, 1], {
+      measureBatches: true,
+      maxParallelism: 2
+    });
+    const summary = paretoRewardOfRun(run, [tree], {
+      sequentialPenaltyWeight: 0.2,
+      maxParallelism: 2
+    });
+    expect(summary.scoredTraces).toHaveLength(1);
+    const scored = summary.scoredTraces[0];
+    expect(scored?.treeId).toBe('tree-deep');
+    expect(scored?.runBest).toBeCloseTo(0.55, 12);
+    expect(scored?.evaluatedNodes).toBe(7);
+    // Points exist per rho and each carries a trusted rounds figure (measured).
+    expect(summary.sequentialPenalty).not.toBe('unknown');
+    expect(typeof summary.reward).toBe('number');
+    expect(summary.auc).toBeGreaterThanOrEqual(0);
+    expect(summary.auc).toBeLessThanOrEqual(1);
+    // The audit trail names the replay-side reconstruction and the worker cap.
+    expect(summary.method).toContain('replay-side reconstruction');
+    expect(summary.method).toContain('worker cap 2');
+  });
+
+  it('paretoRewardOfRun never fabricates rounds for a replay without batch measurement', () => {
+    const tree = deepTree();
+    const policy = makePolicy({ id: 'pi-legacy', maxWidth: 2, maxDepth: 2 });
+    const run = replayPolicy([tree], policy, [0, 1]);
+    const summary = paretoRewardOfRun(run, [tree], { sequentialPenaltyWeight: 0.2 });
+    expect(summary.auc).toBeGreaterThanOrEqual(0);
+    expect(summary.sequentialPenalty).toBe('unknown');
+    expect(summary.reward).toBe('unknown');
+  });
+
+  it('the dreamer reports paretoReward only when a penalty weight is injected', async () => {
+    const trees = [deepTree()];
+    const baseline = shallowPolicy();
+    const request = dreamRequest({
+      trees,
+      baselinePolicy: baseline,
+      candidatePolicies: [makePolicy({ id: 'pi-deep', maxWidth: 1, maxDepth: 4, version: 2 })]
+    });
+    const without = await createOfflineDreamer({ now: () => 100 }).replay(request);
+    expect('paretoReward' in without).toBe(false);
+
+    const withProjection = await createOfflineDreamer({
+      now: () => 100,
+      sequentialPenaltyWeight: 0.2
+    }).replay(request);
+    const pareto = withProjection.paretoReward;
+    expect(pareto).toBeDefined();
+    if (pareto === undefined) {
+      return;
+    }
+    expect(pareto.sequentialPenaltyWeight).toBe(0.2);
+    expect(pareto.scoredTraces.map((trace) => trace.treeId)).toEqual(['tree-deep']);
+    expect(typeof pareto.auc).toBe('number');
+    // The legacy evaluation is untouched by the projection.
+    expect(withProjection.baseline.hypervolume).toBeCloseTo(0.1875, 6);
+  });
+
+  it('an invalid injected weight falls back to the default without disabling the projection', async () => {
+    const report = await createOfflineDreamer({
+      now: () => 100,
+      sequentialPenaltyWeight: Number.NaN
+    }).replay(
+      dreamRequest({
+        trees: [deepTree()],
+        baselinePolicy: shallowPolicy(),
+        candidatePolicies: []
+      })
+    );
+    expect(report.paretoReward).toBeDefined();
+    expect(report.paretoReward?.sequentialPenaltyWeight).toBeGreaterThan(0);
+  });
+
+  it('the early-exit report carries the empty-pool pareto verdict when configured', async () => {
+    const report = await createOfflineDreamer({
+      now: () => 100,
+      sequentialPenaltyWeight: 0.2
+    }).replay(
+      dreamRequest({
+        trees: [],
+        baselinePolicy: shallowPolicy(),
+        candidatePolicies: [],
+        minReplayTrees: 1
+      })
+    );
+    expect(report.improved).toBe(false);
+    expect(report.paretoReward).toBeDefined();
+    expect(report.paretoReward?.scoredTraces).toEqual([]);
+    expect(report.paretoReward?.reward).toBe('unknown');
+    expect(report.paretoReward?.note).toContain('no trace');
+  });
+
+  it('MAX_PARALLELISM default: a wide layer folds to fewer rounds under a worker cap', () => {
+    // One layer of 4 probes: serial cost 4, capped at 2 workers -> 2.
+    const inputs = paretoTraceInputsOfTree(deepTree());
+    expect(inputs.evaluatedNodes).toBe(7);
+    expect(MIN_EVALUATED_NODES_FOR_AUC).toBe(2);
   });
 });

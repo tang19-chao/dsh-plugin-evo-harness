@@ -62,6 +62,19 @@
  */
 
 import { TrajectoryCollector, toTrajectoryError } from '../cordis-seams/trajectory-collector';
+// rev8 #118/#175: the HOST-owned evidence-integrity policy type. The policy is
+// supplied by the plugin assembly (W1) and forwarded to the per-probe
+// collector below (W2); this module never derives it from a result.
+//
+// W2-propagation (audit fix): `toProbeExecutionResult` below is the ONLY place
+// that hands the inner collector's quarantine mark to the outer
+// `CordisSeamManager` collector. It nests the inner trajectory metadata under
+// the shared `INNER_TRAJECTORY_METADATA_KEY`; the outer reads that one channel
+// and treats the mark as DENY-ONLY (a "clean" claim is never trusted).
+import {
+  INNER_TRAJECTORY_METADATA_KEY,
+  type EvidenceIntegrityPolicy
+} from '../verification/evidence-integrity';
 // rev5 P2-3/P2-4: the composed probe-call safety gate (allowlist + grants).
 // The gate is OPTIONAL and inert when absent, so a host that never opted in
 // keeps the pre-rev5 behaviour byte for byte.
@@ -105,6 +118,9 @@ import type {
   TrajectoryStatus,
   TrajectoryStep
 } from '../types/contracts';
+// A1-b (rev6 audit): the DEFAULT probe prompt renders the branch patch edits.
+// A host-supplied `buildMessages` remains authoritative and is never augmented.
+import { appendPatchSections } from './patch-prompt';
 
 /** Default loop budget when the caller injects none. */
 export const DEFAULT_MAX_STEPS_PER_PROBE = 4;
@@ -335,6 +351,18 @@ export interface AgentLoopAdapters {
   readonly ledgerPhase?: LedgerPhase;
   /** Rate card for the pre-built-manager path (the config path carries its own). */
   readonly ledgerRateCard?: ModelRateCard;
+  /**
+   * rev8 #118/#175 evidence-integrity wiring (audit fix W2): the HOST-owned
+   * evidence-integrity policy forwarded to the collector this executor
+   * constructs per probe. The production plugin assembly passes the SAME
+   * policy it hands to CordisSeamManager, so the agent-loop collector scans
+   * its own merged content for sentinel / answer-key contamination exactly
+   * like the seam-manager collector that finalizes the trajectory. Absent
+   * (hand-built executors) keeps the pre-rev8 shape byte-identically. Never
+   * derived from `result.metadata` — a branch cannot declare its own
+   * evidence clean.
+   */
+  readonly evidenceIntegrity?: EvidenceIntegrityPolicy;
 }
 
 /** Executor plus the recorded identity of what it can do. */
@@ -474,7 +502,18 @@ function assertDecision(decision: unknown): AgentLoopDecision {
   throw new Error('an agent decision kind must be "tool" or "final"');
 }
 
-/** Project a finalized trajectory into the executor's frozen result shape. */
+/**
+ * Project a finalized trajectory into the executor's frozen result shape.
+ *
+ * rev8 W2-propagation: when this collector quarantined the trajectory, the
+ * inner trajectory metadata — which carries the ONLY copy of the contamination
+ * mark — is nested under `INNER_TRAJECTORY_METADATA_KEY`. The outer
+ * `CordisSeamManager` collector reads exactly that channel and merges the mark
+ * with its own re-scan, so the fact cannot be lost between the two collectors.
+ * The channel is deny-only on the reading side (see
+ * `readCarriedEvidenceIntegrityMark`); nothing else from this bag is copied
+ * into the outer trajectory (the c2a discipline is unchanged).
+ */
 function toProbeExecutionResult(
   trajectory: ProbeTrajectory,
   metadata: Readonly<Record<string, unknown>>,
@@ -490,7 +529,9 @@ function toProbeExecutionResult(
     ...(trajectory.error === undefined ? {} : { error: trajectory.error }),
     metadata: {
       ...metadata,
-      ...(trajectory.metadata === undefined ? {} : { trajectory: trajectory.metadata })
+      ...(trajectory.metadata === undefined
+        ? {}
+        : { [INNER_TRAJECTORY_METADATA_KEY]: trajectory.metadata })
     }
   };
 }
@@ -562,7 +603,16 @@ export function createAgentLoopExecutor(
       role: 'candidate',
       patch: context.patch,
       surfaceKeys: context.mountedSurfaces,
-      now
+      now,
+      // rev8 W2 (audit fix): forward the HOST-owned evidence-integrity policy so
+      // this executor's own collector scans its merged content for sentinel /
+      // answer-key contamination exactly like the seam-manager collector that
+      // finalizes the trajectory. The policy object is the one the plugin
+      // assembly built from host-owned inputs — never anything a branch
+      // attached to its result.
+      ...(adapters.evidenceIntegrity === undefined
+        ? {}
+        : { evidenceIntegrity: adapters.evidenceIntegrity })
     });
 
     const diagnostic = (message: string): void => {
@@ -823,7 +873,14 @@ export function createAgentLoopExecutor(
       // or failure signals.
       const guidance = extractToolGuidance(context.patch);
       const messages: readonly ModelMessage[] = (() => {
-        const built = (adapters.buildMessages ?? defaultAgentProbeMessages)(context);
+        // A1-b: the default prompt carries the patch body, not only the patch
+        // id/rationale. `defaultAgentProbeMessages` itself is intentionally
+        // unchanged, so an empty patch still compares byte-for-byte equal; a
+        // host-supplied builder is NEVER augmented (explicit prompts win).
+        const built =
+          adapters.buildMessages === undefined
+            ? appendPatchSections(defaultAgentProbeMessages(context), context)
+            : adapters.buildMessages(context);
         const systemPrompt = adapters.systemPrompt?.(context);
         return systemPrompt === undefined
           ? built

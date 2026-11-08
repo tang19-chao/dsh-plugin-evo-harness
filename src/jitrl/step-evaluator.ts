@@ -53,6 +53,29 @@ export const SURROGATE_DELTA_GATE = 0.2;
 /** Cost gate: judge runs when the trajectory has at least this many steps. */
 export const MIN_STEPS_FOR_LLM_JUDGE = 3;
 
+/**
+ * rev6 audit A4-4 (B3): whether the LLM step judge is cost-gated per trajectory
+ * or runs for EVERY evaluated probe.
+ *
+ *   - `cost-gated` (default, byte-identical to the historical behaviour): the
+ *     judge runs only for steps >= 3, or when the caller passes a
+ *     `selected`/`composed` hint, or when the surrogate delta exceeds 0.2.
+ *     This is exactly what made only the Composer's pick receive a judge score
+ *     in production (single-call probes are one step long), i.e. reward became
+ *     a function of selection.
+ *   - `all`: the gate is removed; the judge runs whenever
+ *     `reward.llmEvaluator` is true and a model adapter exists. The orchestrator
+ *     calls the evaluator once per EXECUTED probe, so every sibling is judged
+ *     by the same rule - symmetry is structural, not a per-trajectory hint.
+ *
+ * The policy changes only WHEN the auxiliary `llm` source is admitted. It does
+ * not change the primary reward: `scoreUnderRewardContract` remains the one
+ * yardstick (see REWARD_CONTRACT.judgePolicy = 'auxiliary-only').
+ */
+export const STEP_JUDGE_POLICIES = ['cost-gated', 'all'] as const;
+export type StepJudgePolicy = (typeof STEP_JUDGE_POLICIES)[number];
+export const DEFAULT_STEP_JUDGE_POLICY: StepJudgePolicy = 'cost-gated';
+
 /** Host user feedback kinds feeding the user signal. */
 export type UserFeedbackKind = 'adopt' | 'rollback' | 'reject';
 
@@ -181,6 +204,13 @@ export interface StepEvaluatorOptions {
    * existing ISurrogateScorer to this narrow shape.
    */
   readonly surrogate?: (trajectory: ProbeTrajectory, reference?: ProbeTrajectory) => number | undefined;
+  /**
+   * rev6 audit A4-4: when `all`, the judge runs for every call (subject only to
+   * `reward.llmEvaluator` + an injected model), so the orchestrator can evaluate
+   * every executed probe symmetrically. Default `cost-gated` preserves the
+   * historical cost rule exactly.
+   */
+  readonly judgePolicy?: StepJudgePolicy;
   /** Injected for determinism; reserved for future latency-aware paths. */
   readonly clock?: () => number;
   /** Injected for determinism; reserved for future stochastic gating. */
@@ -999,8 +1029,14 @@ export function createStepEvaluator(options: StepEvaluatorOptions): JitStepEvalu
       candidateSv !== undefined &&
       referenceSv !== undefined &&
       Math.abs(candidateSv - referenceSv) > SURROGATE_DELTA_GATE;
+    const judgePolicy = options.judgePolicy ?? DEFAULT_STEP_JUDGE_POLICY;
     const gate =
-      steps.length >= MIN_STEPS_FOR_LLM_JUDGE || input.selected === true || input.composed === true || deltaGate;
+      judgePolicy === 'all'
+        ? true
+        : steps.length >= MIN_STEPS_FOR_LLM_JUDGE ||
+          input.selected === true ||
+          input.composed === true ||
+          deltaGate;
     const llmAvailable = options.reward.llmEvaluator && options.model !== undefined;
 
     let judge: JudgeOutcome = { ok: false, scores: new Map<number, number>() };

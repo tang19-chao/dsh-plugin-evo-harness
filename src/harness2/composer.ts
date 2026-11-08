@@ -45,6 +45,7 @@ import {
   clamp01,
   createDeterministicIdFactory,
   deliverableOf,
+  extractAllJsonValues,
   extractJsonValue,
   isRecord,
   nonEmptyString,
@@ -56,6 +57,9 @@ import {
   systemClock,
   truncate
 } from './shared';
+// Harness2 #37 content-layer port: every free-text field handed to a model
+// passes the shared secret redaction before it leaves the process boundary.
+import { redactSecrets } from '../jitrl/redaction';
 
 /** Contract order of the behavioral contrast dimensions. */
 export const CONTRAST_DIMENSIONS: readonly ContrastDimension[] = [
@@ -390,7 +394,10 @@ function anonymizeCandidate(
   const deliverable = deliverableOf(candidate.trajectory);
   // Strip structured advice fragments from deliverable content as well (L2 governance)
   const cleanedContent = stripStructuredAdvice(deliverable.content);
-  const redacted = redactIdentifiers(cleanedContent, identifiers);
+  // Harness2 #37 content layer: secret-shaped text is redacted BEFORE the
+  // identifier pass, so a credential that happens to name a branch/patch id
+  // becomes the stable <secret> placeholder instead of leaking its shape.
+  const redacted = redactIdentifiers(redactSecrets(cleanedContent), identifiers);
   return {
     alias,
     deliverable: {
@@ -401,7 +408,7 @@ function anonymizeCandidate(
     },
     metrics: candidate.trajectory.metrics,
     stepsSummary: summarizeTrajectorySteps(candidate.trajectory.steps).map((line) =>
-      redactIdentifiers(line, identifiers)
+      redactIdentifiers(redactSecrets(line), identifiers)
     )
   };
 }
@@ -453,7 +460,12 @@ function buildJudgeMessages(
       }
     }
     if (dossier.deliverable.producedFiles !== undefined && dossier.deliverable.producedFiles.length > 0) {
-      user.push('producedFiles: ' + redactIdentifiers(dossier.deliverable.producedFiles.join(', '), identifiers));
+      // producedFiles is free text a tool recorded, so it passes the same
+      // secret redaction as the deliverable body (harness2 #37).
+      user.push(
+        'producedFiles: ' +
+          redactIdentifiers(redactSecrets(dossier.deliverable.producedFiles.join(', ')), identifiers)
+      );
     }
     user.push('deliverable:');
     user.push(dossier.deliverable.content);
@@ -489,13 +501,79 @@ function buildJudgeMessages(
   ];
 }
 
-function readJudgeVerdict(text: string, aliases: readonly string[]): JudgeVerdict | undefined {
+/**
+ * Distinct known aliases carried by a parsed verdict's `ranking`, preserving
+ * the order the judge gave. Mirrors the first half of the single-verdict read
+ * path: a `ranking` that is not a string list contributes nothing (readStringList
+ * rejects it), so a verdict without a usable ranking cannot contradict anything.
+ */
+function rankingOf(parsed: Record<string, unknown>, known: ReadonlySet<string>): string[] {
+  const ranking = readStringList(parsed.ranking, 64) ?? [];
+  const ranked: string[] = [];
+  for (const alias of ranking) {
+    if (known.has(alias) && !ranked.includes(alias)) {
+      ranked.push(alias);
+    }
+  }
+  return ranked;
+}
+
+/**
+ * True when two rankings contradict: they agree on the candidate set only if
+ * they are equal element by element. A longer list that merely continues a
+ * prefix, a reordering, or a dropped alias all mean the judge emitted two
+ * different answers, so no single one may be chosen as authoritative.
+ */
+function rankingsContradict(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) {
+    return true;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Harness2 #24: the response carried ≥2 verdict objects with conflicting rankings. */
+const CONTRADICTORY_VERDICT_REASON = 'judge returned contradictory verdicts';
+
+/** Outcome of reading the judge's response text (harness2 #24). */
+type JudgeVerdictRead =
+  | { readonly kind: 'ok'; readonly verdict: JudgeVerdict }
+  | { readonly kind: 'contradictory' }
+  | { readonly kind: 'unparseable' };
+
+function readJudgeVerdict(text: string, aliases: readonly string[]): JudgeVerdictRead {
+  const known = new Set(aliases);
+  // Collect the usable rankings carried by every TOP-LEVEL parseable JSON
+  // object in the response. A repeated verbatim ranking collapses into one
+  // opinion (identical duplicates are compatible); two DIFFERENT rankings are
+  // two answers, so none of them may be chosen as authoritative.
+  const distinctRankings: string[][] = [];
+  for (const value of extractAllJsonValues(text)) {
+    if (!isRecord(value)) {
+      continue;
+    }
+    const ranking = rankingOf(value, known);
+    if (ranking.length === 0) {
+      continue;
+    }
+    if (!distinctRankings.some((existing) => !rankingsContradict(existing, ranking))) {
+      distinctRankings.push(ranking);
+    }
+  }
+  if (distinctRankings.length >= 2) {
+    return { kind: 'contradictory' };
+  }
+  // Single-verdict path is UNCHANGED: extractJsonValue keeps its
+  // first-parseable-object semantics for every other consumer.
   const parsed = readJsonRecord(text);
   if (parsed === undefined) {
-    return undefined;
+    return { kind: 'unparseable' };
   }
   const ranking = readStringList(parsed.ranking, 64) ?? [];
-  const known = new Set(aliases);
   const ranked: string[] = [];
   for (const alias of ranking) {
     if (known.has(alias) && !ranked.includes(alias)) {
@@ -523,7 +601,7 @@ function readJudgeVerdict(text: string, aliases: readonly string[]): JudgeVerdic
       }
     }
   }
-  return { ranking: ranked, rationales, rejectedReasons };
+  return { kind: 'ok', verdict: { ranking: ranked, rationales, rejectedReasons } };
 }
 
 function readJsonRecord(text: string): Record<string, unknown> | undefined {
@@ -723,10 +801,15 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
           metadata: { sessionId: request.sessionId, candidateCount: evaluations.length, anonymous: true }
         };
         const response = await model.call(modelRequest);
-        const verdict = readJudgeVerdict(response.text, aliases);
-        if (verdict === undefined) {
+        const read = readJudgeVerdict(response.text, aliases);
+        if (read.kind === 'contradictory') {
+          // Harness2 #24: two or more fenced verdict objects carrying mutually
+          // contradictory rankings are NOT a decision; the first fragment must
+          // not silently win. Treated like an unparseable verdict (CORE-3).
+          judgeUnavailableReason = 'judge returned contradictory verdicts';
+        } else if (read.kind === 'unparseable') {
           judgeUnavailableReason = 'judge returned an unparseable verdict';
-        } else if (verdict.ranking.length === 0) {
+        } else if (read.verdict.ranking.length === 0) {
           // CORE-3: a parseable verdict without a usable `ranking` (e.g.
           // `{"assessments": [...]}` or `{"ranking": "A > B"}`, which
           // readStringList rejects) is NOT a decision. Previously the empty
@@ -737,8 +820,8 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
           // verdict: judgeUnavailableReason -> evidence-only ratios.
           judgeUnavailableReason = 'judge returned no usable ranking';
           for (const evaluation of evaluations) {
-            evaluation.judgeRationale = verdict.rationales[evaluation.alias];
-            evaluation.judgeRejectedReason = verdict.rejectedReasons[evaluation.alias];
+            evaluation.judgeRationale = read.verdict.rationales[evaluation.alias];
+            evaluation.judgeRejectedReason = read.verdict.rejectedReasons[evaluation.alias];
           }
         } else {
           // CORE-3: blend ONLY the aliases the judge actually ranked. An alias
@@ -746,10 +829,10 @@ export function createAnonymousComposer(options: HarnessComposerOptions): IHarne
           // assigned a trailing rank by position, so an incomplete ranking
           // cannot hand a bonus (or a penalty) to whoever sorted first.
           for (const evaluation of evaluations) {
-            const rank = verdict.ranking.indexOf(evaluation.alias);
+            const rank = read.verdict.ranking.indexOf(evaluation.alias);
             evaluation.judgeRank = rank >= 0 ? rank + 1 : undefined;
-            evaluation.judgeRationale = verdict.rationales[evaluation.alias];
-            evaluation.judgeRejectedReason = verdict.rejectedReasons[evaluation.alias];
+            evaluation.judgeRationale = read.verdict.rationales[evaluation.alias];
+            evaluation.judgeRejectedReason = read.verdict.rejectedReasons[evaluation.alias];
             // The rank scale stays the full candidate set (the judge saw every
             // alias), so a partial ranking cannot condense the scores of the
             // candidates it did rank.

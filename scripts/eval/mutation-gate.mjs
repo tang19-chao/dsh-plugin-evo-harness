@@ -4,7 +4,7 @@
  *
  * WHAT QUESTION THIS ANSWERS
  * --------------------------
- * Four discriminating test groups were written to pin four real defects. A
+ * Five discriminating test groups were written to pin five real defects. A
  * regression test whose verdict never changes when the defect is reintroduced
  * is decoration. This gate reintroduces each defect - ONCE, inside a throwaway
  * copy of the repository - and requires the defect's pinned tests to turn red:
@@ -22,6 +22,9 @@
  *   M4  readLearningTarget gain-first (R3-M2): preferring `learningTarget`
  *       over `observedReturn` must turn the two RewardContract target-field
  *       consumption tests red.
+ *   M5  patch-aware probe prompt reverted (rev6 B1/A1): restoring the
+ *       `defaultBranchMessages` builder makes candidate probes lose the patch
+ *       markers and must turn the host-mount smoke gate red.
  *
  * JUDGEMENT (ADR 0005 §5.1, hard)
  * ------------
@@ -42,8 +45,13 @@
  *     the attestation digest roots (ADR 0005 F-3), and an interrupted in-place
  *     mutation would silently poison `pnpm run attest:verify`.
  *   - ZERO RESIDUE: on every path (success, mutant red, crash) the temp copy is
- *     removed, and the gate re-hashes the four target files in the REPOSITORY
+ *     removed, and the gate re-hashes the targeted files in the REPOSITORY
  *     and requires the digests to be identical to the ones taken at startup.
+ *   - CROSS-MUTANT ISOLATION: inside the shared copy, every mutant's target
+ *     file is restored to its pristine bytes on EVERY exit path (killed,
+ *     not-killed, crashed). Restoring only when a mutant was killed let a
+ *     not-killed mutant poison the NEXT mutant's baseline (`baseline-not-green`
+ *     for a code the next mutant never touched).
  *   - NO NEW DEPENDENCIES: the runner spawns the repository's own vitest
  *     binary with the same node running the gate. No Stryker, no child pnpm.
  *
@@ -60,7 +68,7 @@
  *
  * `tests/unit/eval/mutation-gate.test.ts` imports the PURE functions exported
  * below (spec parsing, anchor application, red-set judgement, path safety,
- * restore semantics) and never spawns a mutant run - running the four mutants
+ * restore semantics) and never spawns a mutant run - running the five mutants
  * inside vitest would be a recursion hazard (ADR 0005 §5.1-6).
  */
 import fs from 'node:fs';
@@ -86,8 +94,8 @@ export const COPY_ENTRIES = ['src', 'tests', 'scripts', 'tsconfig.json', 'vitest
 export const GATE_MUTATION_ROOTS = ['src/', 'tests/', 'scripts/'];
 
 /**
- * The four pinned mutants (ADR 0005 §5.1 table). Anchors are stable TEXT
- * blocks, never line numbers. Every `find` must occur exactly once in the
+ * The five pinned mutants (ADR 0005 §5.1 table + rev6 A1). Anchors are stable
+ * TEXT blocks, never line numbers. Every `find` must occur exactly once in the
  * pristine source; the gate fails closed with a named code otherwise.
  */
 export const MUTANTS = [
@@ -217,10 +225,15 @@ export const MUTANTS = [
         replace: [
           '        // MUTATION M3 (ADR 0005 D5, R3-M1; temp copy only): the pre-P6.1-D',
           '        // private yardstick is restored - the winner takes the step-evaluator',
-          '        // mean while non-winners keep scoreUnderRewardContract.',
-          '        const mutatedWinnerYardstick = winnerStepSummary(winnerRewards);',
-          '        reward = clamp(isWinner ? mutatedWinnerYardstick : evaluation.reward, -3, 3);',
-          '        observedReturn = clamp(isWinner ? mutatedWinnerYardstick : evaluation.reward, -3, 3);'
+          '        // mean while non-winners keep scoreUnderRewardContract. The current',
+          '        // recorder keeps the judge vector per probe in `stepJudgments`, so',
+          '        // the fork is rebuilt from that map and the composer winner identity.',
+          '        const mutatedIsWinner =',
+          '          input.selectedNodeId !== null && probe.nodeId === input.selectedNodeId;',
+          '        const mutatedWinnerYardstick =',
+          '          stepJudge === undefined ? evaluation.reward : stepJudge;',
+          '        reward = clamp(mutatedIsWinner ? mutatedWinnerYardstick : evaluation.reward, -3, 3);',
+          '        observedReturn = clamp(mutatedIsWinner ? mutatedWinnerYardstick : evaluation.reward, -3, 3);'
         ].join('\n')
       }
     ],
@@ -278,6 +291,41 @@ export const MUTANTS = [
       {
         file: 'tests/unit/jitrl/value-estimator.test.ts',
         title: 'estimateStateValue averages the contract target, not the gain field'
+      }
+    ]
+  },
+  {
+    id: 'M5',
+    title: 'patch-aware probe prompt reverted (rev6 B1/A1)',
+    targetDefect:
+      'A probe must be handed the patch EDITS it is supposed to evaluate. Restoring the edit-blind defaultBranchMessages builder silently returns every candidate probe to rationale-only prompting, so the Harness2 contrast measures noise instead of the scaffold.',
+    file: 'src/dsh-bridge/branch.ts',
+    anchor: 'createBranchExecutor() default builder selection inside runBranch',
+    edits: [
+      {
+        label: 'restore the edit-blind defaultBranchMessages default builder',
+        find: [
+          '    const builder = adapters.buildMessages;',
+          '    const baseMessages = builder === undefined ? patchAwareBranchMessages(context) : builder(context);'
+        ].join('\n'),
+        replace: [
+          '    // MUTATION M5 (rev6 B1/A1; temp copy only): the default builder is',
+          '    // reverted to the edit-blind header + task, so a candidate probe sees',
+          '    // only the patch id/rationale again.',
+          '    const builder = adapters.buildMessages;',
+          '    const baseMessages = builder === undefined ? defaultBranchMessages(context) : builder(context);'
+        ].join('\n')
+      }
+    ],
+    testFiles: ['tests/e2e/host-mount-smoke.test.ts', 'tests/e2e/signal-propagation.test.ts'],
+    mustRed: [
+      {
+        file: 'tests/e2e/host-mount-smoke.test.ts',
+        title: 'runs probes through the collaborators resolved from ctx.llm'
+      },
+      {
+        file: 'tests/e2e/signal-propagation.test.ts',
+        title: 'candidate probes carry the patch and deliver differently from the reference'
       }
     ]
   }
@@ -355,7 +403,7 @@ export function applyEdit(text, edit) {
 
 /**
  * Apply every edit of a mutant. All edits must land; the first failure names
- * its edit label. Single-edit mutants only (each M1..M4 has exactly one), so
+ * its edit label. Single-edit mutants only (each M1..M5 has exactly one), so
  * the reverse application (swap find/replace) restores the pristine bytes.
  *
  * @returns {{ok: boolean, code: 'ok'|string, content: string,
@@ -820,6 +868,28 @@ export async function runMutationGate(options = {}) {
         record.ok = true;
       } catch (error) {
         record.failure = { code: 'mutant-run-crashed', detail: String(error?.stack ?? error) };
+      } finally {
+        // CROSS-MUTANT ISOLATION: the restore at step 3f is only reached when
+        // the mutant was KILLED. A not-killed mutant (or a crashed /
+        // report-missing run) used to leave its mutated source inside the
+        // shared copy, so the NEXT mutant's baseline ran against a poisoned
+        // tree and failed `baseline-not-green` (observed: M5 after M3, where
+        // M5's baseline saw M3's orchestrator mutation). Restore the pristine
+        // bytes on EVERY exit path. The success path has already verified byte
+        // equality above, so this can only repair, never mask, a mismatch.
+        try {
+          fs.writeFileSync(copyTarget, pristineFiles.get(mutant.file));
+        } catch (restoreError) {
+          record.ok = false;
+          if (record.failure === null) {
+            record.failure = {
+              code: 'copy-restore-failed',
+              detail:
+                'could not restore pristine bytes in the copy: ' +
+                String(restoreError?.message ?? restoreError)
+            };
+          }
+        }
       }
     }
   }
@@ -987,7 +1057,7 @@ if (isDirectExecution) {
       console.log(JSON.stringify({ gate: GATE_ID, mode: 'validate', ...validation }, null, 2));
     } else {
       for (const problem of validation.problems) console.log('PROBLEM: ' + problem);
-      console.log('anchors: ' + (validation.ok ? 'all 4 mutants resolve against pristine sources' : 'INVALID'));
+      console.log('anchors: ' + (validation.ok ? 'all ' + String(MUTANTS.length) + ' mutants resolve against pristine sources' : 'INVALID'));
     }
     process.exitCode = validation.ok ? 0 : 1;
   } else if (flags.run) {

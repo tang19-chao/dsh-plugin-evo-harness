@@ -37,6 +37,7 @@ import {
   admissionOf,
   rankWithEvidencePolicy,
   scoreWithEvidencePolicy,
+  trustedVerifiableVerdictOf,
   verifiableVerdictOf,
   verifiedWeightFloorWeights
 } from '../../../src/dream-rsi/surrogate-evidence-policy';
@@ -310,6 +311,52 @@ describe('NC-2: evidence-equal candidates are NOT flipped (the negative control)
     );
     expect(ranked.map((entry) => entry.nodeId)).toEqual([tieA.node.id, tieB.node.id]);
   });
+
+  it('strategy B uses the EFFECTIVE host weights, not the compiled default', () => {
+    const custom = {
+      selection: 0.8,
+      adoption: 0.05,
+      efficiency: 0.1,
+      toolErrorPenalty: 0.05
+    } as const;
+    const request = { ...requestOf(verifiedGood, composition), weights: custom };
+    const scored = scoreWithEvidencePolicy(request, 'verified-only-selection');
+    // The corroborated candidate keeps every effective term, so the policy score
+    // must match the default scorer on the SAME weights (delta exactly 0). The
+    // old implementation used DEFAULT_SURROGATE_WEIGHTS here and produced a
+    // different scale, silently ignoring the host override.
+    expect(scored.weights).toEqual(custom);
+    expect(scored.policyScore).toBeCloseTo(scored.baselineScore, 12);
+    expect(scored.delta).toBeCloseTo(0, 12);
+
+    const noVerdict: Candidate = {
+      node: node({ id: 'n-custom-no-verdict', branchId: 'b-custom' }),
+      deliverable: 'result: (no verdict attached)',
+      steps: 7,
+      toolCalls: 4,
+      toolErrors: 0
+    };
+    const gated = scoreWithEvidencePolicy(
+      {
+        ...requestOf(noVerdict, makeComposition({
+          selectedNodeId: noVerdict.node.id,
+          selectedBranchId: noVerdict.node.branchId,
+          adoptionRatios: { [noVerdict.node.id]: 1 }
+        })),
+        weights: custom
+      },
+      'verified-only-selection'
+    );
+    // Composer terms are zeroed, but the evidence weights keep the host's
+    // effective absolute sizes (no renormalization).
+    expect(gated.weights).toEqual({
+      selection: 0,
+      adoption: 0,
+      efficiency: custom.efficiency,
+      toolErrorPenalty: custom.toolErrorPenalty
+    });
+    expect(gated.policyScore).not.toBe(gated.baselineScore);
+  });
 });
 
 describe('NC-3: no verdict means no fabricated I(H*) credit', () => {
@@ -384,5 +431,213 @@ describe('shadow-only: the policy is not wired into the default scorer', () => {
     );
     expect(DEFAULT_SURROGATE_WEIGHTS).toEqual(frozen);
         expect(Object.isFrozen(DEFAULT_SURROGATE_WEIGHTS) || true).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rev6 audit A4-2: the TRUSTED reader and its conflict / negative control
+// ---------------------------------------------------------------------------
+
+const TRUSTED_PRODUCERS: ReadonlySet<string> = new Set(['host-verifier']);
+
+/**
+ * A trusted candidate: the deliverable hash and the receipt's evidence hash are
+ * the SAME string, and the verifierId belongs to the injected producer set.
+ * This is the only shape production may treat as verified evidence.
+ */
+function trustedRequestOf(candidate: Candidate, composition: CompositionResult) {
+  const base = requestOf(candidate, composition);
+  const hash = 'sha256:' + (candidate.verdict === 'passed' ? 'a' : 'b').repeat(64);
+  return {
+    ...base,
+    trajectory: {
+      ...base.trajectory,
+      deliverable: { content: candidate.deliverable, format: 'text' as const, contentHash: hash },
+      metadata: {
+        verification: {
+          status: candidate.verdict ?? 'unknown',
+          verifierId: 'host-verifier',
+          verifierVersion: 'v1',
+          evidenceHash: hash,
+          checks: [{ id: 'check', passed: candidate.verdict === 'passed' }]
+        }
+      }
+    } as ProbeTrajectory
+  };
+}
+
+describe('A4-2 trusted verdict reader', () => {
+  const tieA: Candidate = {
+    node: node({ id: 'n-trusted-tie-a', branchId: 'b-trusted-tie-a' }),
+    deliverable: 'result: PASS',
+    steps: 7,
+    toolCalls: 4,
+    toolErrors: 0,
+    verdict: 'passed'
+  };
+  const tieB: Candidate = {
+    node: node({ id: 'n-trusted-tie-b', branchId: 'b-trusted-tie-b' }),
+    deliverable: 'result: PASS',
+    steps: 7,
+    toolCalls: 4,
+    toolErrors: 0,
+    verdict: 'passed'
+  };
+  const tieComposition = makeComposition({
+    selectedNodeId: tieA.node.id,
+    selectedBranchId: tieA.node.branchId,
+    adoptionRatios: { [tieA.node.id]: 1 }
+  });
+  it('trustedVerifiableVerdictOf requires the producer set AND the bound hash', () => {
+    const trusted = trustedRequestOf(verifiedGood, composition);
+    expect(trustedVerifiableVerdictOf(trusted.trajectory, TRUSTED_PRODUCERS)).toBe('passed');
+    // A different producer set cannot authenticate the same payload.
+    expect(
+      trustedVerifiableVerdictOf(trusted.trajectory, new Set(['someone-else']))
+    ).toBe('unknown');
+    // An empty set is the production no-seam shape: shape is not trust.
+    expect(trustedVerifiableVerdictOf(trusted.trajectory, new Set())).toBe('unknown');
+    // A bound hash mismatch invalidates the receipt even for the right producer.
+    const mismatched: ProbeTrajectory = {
+      ...trusted.trajectory,
+      deliverable: {
+        content: trusted.trajectory.deliverable?.content ?? '',
+        contentHash: 'sha256:' + 'f'.repeat(64)
+      }
+    };
+    expect(trustedVerifiableVerdictOf(mismatched, TRUSTED_PRODUCERS)).toBe('unknown');
+  });
+
+  it('a self-declared "passed" is unknown when the trusted reader is used', () => {
+    const forged = requestOf(
+      { ...verifiedGood, deliverable: 'result: PASS (self declared)' },
+      composition
+    );
+    // Shape-only reader (legacy research mode) sees passed...
+    expect(admissionOf(forged.trajectory, 'verified-only-selection').verdict).toBe('passed');
+    expect(admissionOf(forged.trajectory, 'verified-only-selection').trusted).toBe(false);
+    // ...trusted reader sees nothing.
+    expect(
+      admissionOf(forged.trajectory, 'verified-only-selection', TRUSTED_PRODUCERS).verdict
+    ).toBe('unknown');
+    expect(
+      admissionOf(forged.trajectory, 'verified-only-selection', TRUSTED_PRODUCERS).trusted
+    ).toBe(false);
+  });
+
+  it('conflict fixture: the trusted PASS outranks the composer-selected trusted FAIL', () => {
+    // Same evidence contrast as NC-1, but now both verdicts are host-trusted.
+    // This is the production Dream input: strategy B must not let the
+    // Composer's failed pick keep 0.7 of the scale.
+    const picked = scoreWithEvidencePolicy(
+      trustedRequestOf(composerPick, composition),
+      'verified-only-selection',
+      { trustedProducers: TRUSTED_PRODUCERS }
+    );
+    const good = scoreWithEvidencePolicy(
+      trustedRequestOf(verifiedGood, composition),
+      'verified-only-selection',
+      { trustedProducers: TRUSTED_PRODUCERS }
+    );
+    expect(picked.admission.verdict).toBe('failed');
+    expect(picked.admission.trusted).toBe(true);
+    expect(good.admission.verdict).toBe('passed');
+    expect(good.admission.trusted).toBe(true);
+    expect(good.policyScore).toBeGreaterThan(picked.policyScore);
+    // The frozen absolute weights survive: no renormalization inflated either.
+    expect(good.weights.selection).toBe(DEFAULT_SURROGATE_WEIGHTS.selection);
+    expect(good.weights.adoption).toBe(DEFAULT_SURROGATE_WEIGHTS.adoption);
+    expect(good.weights.efficiency).toBe(DEFAULT_SURROGATE_WEIGHTS.efficiency);
+    expect(picked.weights.selection).toBe(0);
+    expect(picked.weights.adoption).toBe(0);
+  });
+
+  it('NC-2 (trusted): evidence-equal, fully symmetric candidates stay identical', () => {
+    const symmetric = makeComposition({ selectedNodeId: null, selectedBranchId: null, adoptionRatios: {} });
+    const left = scoreWithEvidencePolicy(
+      trustedRequestOf(tieA, symmetric),
+      'verified-only-selection',
+      { trustedProducers: TRUSTED_PRODUCERS }
+    );
+    const right = scoreWithEvidencePolicy(
+      trustedRequestOf(tieB, symmetric),
+      'verified-only-selection',
+      { trustedProducers: TRUSTED_PRODUCERS }
+    );
+    expect(left.policyScore).toBeCloseTo(right.policyScore, 12);
+    expect(left.delta).toBeCloseTo(right.delta, 12);
+    expect(left.admission.trusted).toBe(true);
+    expect(right.admission.trusted).toBe(true);
+  });
+
+  it('NC-2 (trusted): a corroborated composer pick is not overturned by equal evidence', () => {
+    const ranked = rankWithEvidencePolicy(
+      [trustedRequestOf(tieA, tieComposition), trustedRequestOf(tieB, tieComposition)],
+      'verified-only-selection',
+      { trustedProducers: TRUSTED_PRODUCERS }
+    );
+    expect(ranked.map((entry) => entry.nodeId)).toEqual([tieA.node.id, tieB.node.id]);
+    expect(ranked.every((entry) => entry.admission.admitSelection)).toBe(true);
+  });
+
+  // rev8 live-cycle round: pin two fail-closed boundary behaviours the trusted
+  // reader already implements but no assertion locked, so a future edit cannot
+  // silently widen them. Both are the same invariant from the two failure
+  // directions: only a trusted 'passed' admits the composer terms.
+  it('NC-3 (trusted): a trusted producer shipping status `unknown` admits nothing', () => {
+    // isTrustedVerification accepts 'unknown' as a valid status, and
+    // hasTrustedVerificationProvenance does not filter on it - so the ONLY
+    // thing standing between a registered producer's "I could not decide" and
+    // a corroboration is admissionOf's === 'passed' rule. This pins that rule.
+    const undecided = trustedRequestOf(verifiedGood, composition);
+    const trajectory = {
+      ...undecided.trajectory,
+      metadata: {
+        verification: {
+          status: 'unknown',
+          verifierId: 'host-verifier',
+          verifierVersion: 'v1',
+          evidenceHash: (undecided.trajectory.deliverable as { contentHash?: string }).contentHash,
+          checks: [{ id: 'check', passed: false }]
+        }
+      }
+    } as ProbeTrajectory;
+    const admission = admissionOf(trajectory, 'verified-only-selection', TRUSTED_PRODUCERS);
+    expect(admission.verdict).toBe('unknown');
+    expect(admission.admitSelection).toBe(false);
+    expect(admission.admitAdoption).toBe(false);
+    expect(admission.reason).toContain('no verifiable verdict');
+  });
+
+  it('NC-1 (trusted, symmetric): a trusted FAILED pick can never outrank a trusted PASS on equal evidence', () => {
+    // Mirror of the NC-2 tie control in the failure direction: with evidence
+    // otherwise equal, the failed verdict must zero the failed node's composer
+    // terms (0.7 of the frozen scale) so the corroborated pass ranks first -
+    // and the gap must be EVIDENCE-sized (the zeroed selection+adoption), not
+    // an arithmetic artefact of renormalization (weights stay frozen-absolute).
+    const symmetric = makeComposition({ selectedNodeId: null, selectedBranchId: null, adoptionRatios: {} });
+    const passed = trustedRequestOf(tieA, symmetric);
+    const failed = trustedRequestOf(
+      { ...tieB, verdict: 'failed' as const },
+      symmetric
+    );
+    const ranked = rankWithEvidencePolicy(
+      [passed, failed],
+      'verified-only-selection',
+      { trustedProducers: TRUSTED_PRODUCERS }
+    );
+    expect(ranked.map((entry) => entry.nodeId)).toEqual([tieA.node.id, tieB.node.id]);
+    expect(ranked[1]?.admission.verdict).toBe('failed');
+    expect(ranked[1]?.admission.trusted).toBe(true);
+    expect(ranked[1]?.admission.admitSelection).toBe(false);
+    // No renormalization inflation on the refuted node's surviving terms: they
+    // keep their frozen absolute sizes.
+    const scoredFailed = scoreWithEvidencePolicy(failed, 'verified-only-selection', {
+      trustedProducers: TRUSTED_PRODUCERS
+    });
+    expect(scoredFailed.weights.efficiency).toBe(DEFAULT_SURROGATE_WEIGHTS.efficiency);
+    expect(scoredFailed.weights.toolErrorPenalty).toBe(DEFAULT_SURROGATE_WEIGHTS.toolErrorPenalty);
+    expect(scoredFailed.weights.selection).toBe(0);
+    expect(scoredFailed.weights.adoption).toBe(0);
   });
 });

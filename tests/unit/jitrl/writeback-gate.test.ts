@@ -33,6 +33,7 @@ import {
   indexWritebackHistory,
   judgeWriteback,
   writebackHistoryEntryOf,
+  writebackIntegrityViewOf,
   writebackRefusalCode,
   writebackRouteCode,
   type WritebackGateTrajectoryView,
@@ -98,9 +99,12 @@ describe('rev6 R1-2: the preregistered thresholds are the ones in force', () => 
     expect(WRITEBACK_CONVERGENCE_RULES.maxCounterexamples).toBe(0);
   });
 
-  it('there are exactly two admission routes and eight refusal reasons', () => {
+  it('there are exactly two admission routes and nine refusal reasons', () => {
     expect(WRITEBACK_ADMISSION_ROUTES).toEqual(['kept-fail-to-pass', 'kept-verified-convergence']);
-    expect(WRITEBACK_REFUSAL_REASONS.length).toBe(8);
+    // rev8 #118 appended `rejected-contaminated-evidence` LAST, so the numeric
+    // codes of every pre-rev8 reason are unchanged (1..8; the new one is 9).
+    expect(WRITEBACK_REFUSAL_REASONS.length).toBe(9);
+    expect(WRITEBACK_REFUSAL_REASONS[8]).toBe('rejected-contaminated-evidence');
     // Stable numeric codes: 0 means "no code", so every reason must be >= 1 and
     // distinct, otherwise a ledger mark could not identify the refusal.
     const codes = WRITEBACK_REFUSAL_REASONS.map((reason) => writebackRefusalCode(reason));
@@ -407,6 +411,97 @@ describe('rev6 R1-2: fail-closed edges', () => {
     expect(mismatch.counterexample).toBe(true);
     // ...and the failed verdict survives as `status: 'failed'` on the entry.
     expect(mismatch.status).toBe('failed');
+  });
+});
+
+describe('rev8 #118: contaminated evidence is refused before any route', () => {
+  it('a contaminated trajectory is refused with the SPECIFIC reason, not no-verdict', () => {
+    // A quarantined trajectory has status 'failed', so its verdict column would
+    // read 'unknown' — the vague refusal would hide WHY. The contamination flag
+    // wins: the report names the poisoning, not the absence of a verdict.
+    const verdict = judgeWriteback(
+      view({ verificationStatus: 'unknown', contaminated: true }),
+      indexWritebackHistory(failedHistory('action-a', 2))
+    );
+    expect(verdict.admitted).toBe(false);
+    expect(verdict.refusal).toBe('rejected-contaminated-evidence');
+  });
+
+  it('contamination vetoes a trusted pass that would otherwise satisfy G-A', () => {
+    const verdict = judgeWriteback(
+      view({ verificationStatus: 'passed', trustedSource: true, contaminated: true }),
+      indexWritebackHistory(failedHistory('action-a', 2))
+    );
+    expect(verdict.admitted).toBe(false);
+    expect(verdict.refusal).toBe('rejected-contaminated-evidence');
+  });
+
+  it('a contaminated HISTORY entry is a counterexample and vetoes G-B at a perfect rate', () => {
+    const entries: WritebackHistoryEntry[] = [
+      { actionKey: 'action-a', status: 'passed', verified: true, counterexample: false },
+      { actionKey: 'action-a', status: 'passed', verified: true, counterexample: false },
+      { actionKey: 'action-a', status: 'passed', verified: true, counterexample: true, contaminated: true }
+    ];
+    const verdict = judgeWriteback(
+      view({ verificationStatus: 'failed' }),
+      indexWritebackHistory(entries)
+    );
+    expect(verdict.admitted).toBe(false);
+    expect(verdict.refusal).toBe('rejected-verifier-mismatch');
+    expect(verdict.counterexamples).toBe(1);
+  });
+
+  it('a contaminated history entry never satisfies G-A prior-failure (not a repairable failure)', () => {
+    const entry = writebackHistoryEntryOf('action-a', {
+      trustedSource: true,
+      verificationStatus: 'failed',
+      verifierRewardMismatch: false,
+      forceAuditOnly: false,
+      contaminated: true
+    });
+    expect(entry.counterexample).toBe(true);
+    expect(entry.status).toBe('failed');
+    const verdict = judgeWriteback(
+      view({ verificationStatus: 'passed', trustedSource: true }),
+      indexWritebackHistory([entry])
+    );
+    expect(verdict.admitted).toBe(false);
+    expect(verdict.refusal).toBe('rejected-no-prior-failure');
+    expect(verdict.priorFailure).toBe(false);
+  });
+
+  it('absent contamination flag leaves every pre-rev8 verdict unchanged', () => {
+    const withFlag = judgeWriteback(
+      view({ verificationStatus: 'passed', trustedSource: true }),
+      indexWritebackHistory(failedHistory('action-a', 2))
+    );
+    const withoutFlag = judgeWriteback(
+      { ...view({ verificationStatus: 'passed', trustedSource: true }) },
+      indexWritebackHistory(failedHistory('action-a', 2))
+    );
+    expect(withFlag).toEqual(withoutFlag);
+  });
+
+  it('the metadata projection is the production wiring point for the flag', () => {
+    // The orchestrator builds the gate view through this helper: a persisted
+    // mark (written by the collector at finalize) projects onto `contaminated`.
+    const mark = {
+      version: 'rev8-evidence-integrity-v1',
+      contaminated: true,
+      withheld: true,
+      findings: [{ kind: 'answer-key-text', location: 'deliverable' }]
+    };
+    expect(writebackIntegrityViewOf({ metadata: { evidenceIntegrity: mark } })).toEqual({
+      contaminated: true
+    });
+    // Pre-rev8 metadata (no mark) and forged versions project to false.
+    expect(writebackIntegrityViewOf({ metadata: { note: 'legacy' } })).toEqual({ contaminated: false });
+    expect(writebackIntegrityViewOf({ metadata: undefined })).toEqual({ contaminated: false });
+    expect(
+      writebackIntegrityViewOf({
+        metadata: { evidenceIntegrity: { ...mark, version: 'forged' } }
+      })
+    ).toEqual({ contaminated: false });
   });
 });
 

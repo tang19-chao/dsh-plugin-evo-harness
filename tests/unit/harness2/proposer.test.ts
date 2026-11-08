@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import { DshModelStreamError } from '../../../src/dsh-bridge/model';
 import type { MemorySurfaceEdit } from '../../../src/types/contracts';
 import {
   Harness2ProposalError,
   createDualTrackProposer,
   decideProposalGuidance,
+  isTransportClassModelError,
   renderProposalPrompts
 } from '../../../src/harness2/proposer';
 import { createDeterministicIdFactory } from '../../../src/harness2/shared';
@@ -197,6 +199,33 @@ describe('Harness² proposer / deterministic parsing', () => {
     });
   });
 
+  it('rejects contentless right-kind payloads instead of accepting a rationale-only patch', async () => {
+    for (const edits of [
+      { guardrails: { kind: 'guardrails', appendRules: [] } },
+      { guardrails: { kind: 'guardrails', forbiddenActions: [] } },
+      { memory: { kind: 'memory', scopedViewId: 'view-only' } },
+      { memory: { kind: 'memory', workingNotes: [], recallTags: [] } }
+    ]) {
+      const { proposer } = makeProposer([proposalJson({ edits })]);
+      await expect(proposer.propose(makeProposeRequest())).rejects.toMatchObject({
+        code: 'proposal_no_valid_edits',
+        notEvaluable: false
+      });
+    }
+  });
+
+  it('marks a known-but-disabled-only proposal as notEvaluable (A3/B9)', async () => {
+    const request = makeProposeRequest({
+      enabledSurfaces: ['system_prompt', 'guardrails', 'memory', 'tool_guidance', 'skills']
+    });
+    const { proposer } = makeProposer([proposalJson({ edits: { scripts: { kind: 'scripts', scripts: [{ path: 'x.py', language: 'python', code: 'print(1)' }] } } })]);
+    await expect(proposer.propose(request)).rejects.toMatchObject({
+      code: 'proposal_no_valid_edits',
+      notEvaluable: true,
+      droppedSurfaces: ['scripts']
+    });
+  });
+
   it('is byte-for-byte deterministic for identical inputs and fake responses', async () => {
     const request = makeProposeRequest();
     const first = await makeProposer([proposalJson()]).proposer.propose(request);
@@ -213,6 +242,19 @@ describe('Harness² proposer / deterministic parsing', () => {
     expect(messages[0]?.role).toBe('system');
     expect(messages[1]?.role).toBe('user');
     expect(messages[0]?.content).toContain('Surfaces (stable order): system_prompt, guardrails');
+  });
+
+  it('filters the surface legend AND payload contracts to enabledSurfaces (A3/B9)', () => {
+    const allowed = ['system_prompt', 'guardrails', 'memory', 'tool_guidance', 'skills'] as const;
+    const messages = renderProposalPrompts(makeProposeRequest({ enabledSurfaces: [...allowed] }));
+    const system = String(messages[0]?.content ?? '');
+    const user = String(messages[1]?.content ?? '');
+    expect(system).toContain('Surfaces (stable order): ' + allowed.join(', '));
+    for (const disabled of ['scripts', 'subagents', 'plugins']) {
+      expect(system).not.toContain('- ' + disabled + ':');
+    }
+    // The user-visible allowed list is the same intersection.
+    expect(user).toContain('allowedSurfaces: ' + allowed.join(', '));
   });
 
   it('sends a json-formatted propose request with slot metadata', async () => {
@@ -346,5 +388,230 @@ describe('Harness² proposer / multi-candidate path (P3-B)', () => {
       expect(candidate.patch.sourceLessonIds).toEqual([]);
       expect(candidate.patch.metadata?.memoryRecallIds).toEqual([]);
     }
+  });
+});
+
+/**
+ * rev8 plan §3.1 #110/#13: transport-class model failures (gateway 429/5xx,
+ * network reset, aborted stream) used to escape the metered adapter and drop
+ * the whole slot. The proposer now retries them once with a bounded backoff,
+ * and ONLY them - every other failure class reaches the caller untouched.
+ */
+describe('Harness² proposer / transport retry (rev8 #110/#13)', () => {
+  /** A makeProposer variant that also captures the injected sleep log. */
+  function makeRetryingProposer(
+    script: readonly (string | Error)[],
+    overrides: Partial<Parameters<typeof createDualTrackProposer>[0]> = {}
+  ) {
+    const sleptMs: number[] = [];
+    const model = scriptedModel(script);
+    const proposer = createDualTrackProposer({
+      model,
+      now: fixedClock(),
+      newId: createDeterministicIdFactory('test'),
+      transportRetryBackoffMs: 500,
+      sleep: async (ms: number) => {
+        sleptMs.push(ms);
+      },
+      ...overrides
+    });
+    return { model, proposer, sleptMs };
+  }
+
+  /** A gateway-shaped transport error with a provable HTTP status. */
+  function httpError(status: number): Error {
+    const error: Error & { status: number; name: string } = Object.assign(new Error('gateway ' + String(status)), {
+      name: 'GatewayHttpError',
+      status
+    });
+    return error;
+  }
+
+  it('classifies transport-class errors and refuses everything else', () => {
+    expect(isTransportClassModelError(httpError(429))).toBe(true);
+    expect(isTransportClassModelError(httpError(500))).toBe(true);
+    expect(isTransportClassModelError(httpError(503))).toBe(true);
+    expect(isTransportClassModelError(new DshModelStreamError('slow down', 'error', 'RATE_LIMIT'))).toBe(true);
+    expect(isTransportClassModelError(new DshModelStreamError('cut off mid-stream', 'aborted'))).toBe(true);
+    const network: Error & { code: string } = Object.assign(new Error('connection reset'), { code: 'ECONNRESET' });
+    expect(isTransportClassModelError(network)).toBe(true);
+    // undici wraps the real network error inside `fetch failed` (no direct code).
+    const fetchFailed: Error & { cause: Error & { code: string } } = Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('connect timeout'), { code: 'UND_ERR_CONNECT_TIMEOUT' })
+    });
+    expect(isTransportClassModelError(fetchFailed)).toBe(true);
+    // Non-transport classes: application statuses, plain errors, budget denials,
+    // permission failures (AUTH / EACCES), and DSH codes that do not prove transport.
+    expect(isTransportClassModelError(httpError(400))).toBe(false);
+    expect(isTransportClassModelError(httpError(403))).toBe(false);
+    expect(isTransportClassModelError(httpError(404))).toBe(false);
+    expect(isTransportClassModelError(new Error('model produced nonsense'))).toBe(false);
+    expect(isTransportClassModelError(new DshModelStreamError('bad key', 'error', 'AUTH'))).toBe(false);
+    const denied: Error & { code: string } = Object.assign(new Error('not permitted'), { code: 'EACCES' });
+    expect(isTransportClassModelError(denied)).toBe(false);
+    expect(isTransportClassModelError(new Harness2ProposalError('proposal_unparseable', 'm', 'd'))).toBe(false);
+  });
+
+  it('does not retry (and does not sleep) when the first attempt succeeds', async () => {
+    const { model, proposer, sleptMs } = makeRetryingProposer([proposalJson()]);
+    const result = await proposer.propose(makeProposeRequest());
+    expect(model.requests).toHaveLength(1);
+    expect(sleptMs).toEqual([]);
+    expect(result.confidence).toBeCloseTo(0.7, 5);
+    expect((result.patch.metadata?.diagnostics as string[]).join(' ')).not.toContain('transport retry');
+  });
+
+  it('retries once after a 429 and succeeds, with the backoff recorded in diagnostics', async () => {
+    const { model, proposer, sleptMs } = makeRetryingProposer([httpError(429), proposalJson()]);
+    const result = await proposer.propose(makeProposeRequest());
+
+    expect(model.requests).toHaveLength(2);
+    expect(sleptMs).toEqual([500]);
+    // Both attempts carried the SAME rendered request (no re-render, no drift).
+    expect(model.requests[1]).toEqual(model.requests[0]);
+    expect(result.confidence).toBeCloseTo(0.7, 5);
+    const diagnostics = (result.patch.metadata?.diagnostics as string[]).join(' | ');
+    expect(diagnostics).toContain('proposal transport retry: attempt 1 failed with GatewayHttpError (HTTP_429)');
+    expect(diagnostics).toContain('retried after backoff');
+  });
+
+  it('retries a network reset (Node E-code) and succeeds', async () => {
+    const reset: Error & { code: string } = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    const { model, proposer } = makeRetryingProposer([reset, proposalJson()]);
+    const result = await proposer.propose(makeProposeRequest());
+    expect(model.requests).toHaveLength(2);
+    const diagnostics = (result.patch.metadata?.diagnostics as string[]).join(' | ');
+    expect(diagnostics).toContain('attempt 1 failed with Error; retried after backoff');
+  });
+
+  it('gives up after the bounded retries when the transport error persists (5xx)', async () => {
+    const { model, proposer, sleptMs } = makeRetryingProposer([httpError(503), httpError(503), httpError(503)]);
+    await expect(proposer.propose(makeProposeRequest())).rejects.toMatchObject({
+      name: 'GatewayHttpError',
+      status: 503
+    });
+    expect(model.requests).toHaveLength(2);
+    expect(sleptMs).toEqual([500]);
+  });
+
+  it('does NOT retry a 4xx: the error propagates untouched', async () => {
+    const { model, proposer, sleptMs } = makeRetryingProposer([httpError(400), proposalJson()]);
+    await expect(proposer.propose(makeProposeRequest())).rejects.toMatchObject({
+      name: 'GatewayHttpError',
+      status: 400
+    });
+    expect(model.requests).toHaveLength(1);
+    expect(sleptMs).toEqual([]);
+  });
+
+  it('does NOT retry budget denial or purpose mismatch (metered adapter failures)', async () => {
+    // A METERED_MODEL_BUDGET_DENIED surfaces as MeteredModelError; whatever its
+    // shape, a plain Error without transport evidence must not be retried.
+    const { model, proposer, sleptMs } = makeRetryingProposer([
+      new Error('[METERED_MODEL_BUDGET_DENIED] ledger refused the reservation'),
+      proposalJson()
+    ]);
+    await expect(proposer.propose(makeProposeRequest())).rejects.toThrow(/METERED_MODEL_BUDGET_DENIED/);
+    expect(model.requests).toHaveLength(1);
+    expect(sleptMs).toEqual([]);
+  });
+
+  it('does NOT retry validation failures: unparseable output stays a typed error', async () => {
+    const { model, proposer, sleptMs } = makeRetryingProposer(['not json at all', proposalJson()]);
+    await expect(proposer.propose(makeProposeRequest())).rejects.toBeInstanceOf(Harness2ProposalError);
+    expect(model.requests).toHaveLength(1);
+    expect(sleptMs).toEqual([]);
+  });
+
+  it('does NOT retry when the abort signal is already set', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { model, proposer, sleptMs } = makeRetryingProposer([httpError(429), proposalJson()]);
+    const request = makeProposeRequest({
+      metadata: { signal: controller.signal }
+    });
+    // The first failure observes the aborted signal and rethrows instead of
+    // scheduling the retry.
+    await expect(proposer.propose(request)).rejects.toMatchObject({ status: 429 });
+    expect(model.requests).toHaveLength(1);
+    expect(sleptMs).toEqual([]);
+  });
+
+  it('does NOT retry when the abort signal fires during the backoff', async () => {
+    const controller = new AbortController();
+    const { model, proposer } = makeRetryingProposer([httpError(503), proposalJson()], {
+      sleep: async () => {
+        // The slot was withdrawn while the retry backoff was pending.
+        controller.abort();
+      }
+    });
+    const request = makeProposeRequest({ metadata: { signal: controller.signal } });
+    // The ORIGINAL model error is rethrown (not the timer error, not undefined).
+    await expect(proposer.propose(request)).rejects.toMatchObject({ status: 503 });
+    expect(model.requests).toHaveLength(1);
+  });
+
+  it('retries the multi-candidate call on a transport error too', async () => {
+    const payload = (overrides: Record<string, unknown> = {}): Record<string, unknown> =>
+      JSON.parse(proposalJson(overrides)) as Record<string, unknown>;
+    const set = JSON.stringify([
+      payload({ rationale: 'A.', edits: { guardrails: { kind: 'guardrails', formatContract: 'A' } } })
+    ]);
+    const { model, proposer, sleptMs } = makeRetryingProposer([httpError(429), set]);
+    const result = await proposer.proposeCandidates!(makeProposeRequest({ candidateCount: 2 }));
+    expect(model.requests).toHaveLength(2);
+    expect(sleptMs).toEqual([500]);
+    expect(result.candidates).toHaveLength(1);
+    expect(result.candidates[0]?.rationale).toBe('A.');
+    const diagnostics = (result.candidates[0]?.patch.metadata?.diagnostics as string[]).join(' | ');
+    expect(diagnostics).toContain('proposal transport retry: attempt 1 failed with GatewayHttpError (HTTP_429)');
+  });
+
+  it('keeps byte-for-byte determinism for identical inputs (retry machinery adds nothing)', async () => {
+    const request = makeProposeRequest();
+    const first = await makeRetryingProposer([proposalJson()]).proposer.propose(request);
+    const second = await makeRetryingProposer([proposalJson()]).proposer.propose(request);
+    expect(second).toEqual(first);
+    expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+  });
+
+  // rev8 integration fix (independent-review P1): the orchestrator now forwards
+  // the run-level cancel signal on the ProposeRequest metadata channel. These
+  // tests consume exactly that channel shape (`metadata.signal`) so a regression
+  // in the forwarding (or in the channel contract itself) fails here.
+  it('does not retry a cancelled run: signal rides metadata.signal (orchestrator channel)', async () => {
+    const controller = new AbortController();
+    // The orchestrator forwards `metadata: { signal }` and the job-book cancels
+    // the run WHILE the first attempt is in flight: the second attempt is never
+    // scheduled and no backoff is slept.
+    const { model, proposer, sleptMs } = makeRetryingProposer([httpError(429), proposalJson()], {
+      sleep: async () => {
+        controller.abort();
+      }
+    });
+    const request = makeProposeRequest({ metadata: { signal: controller.signal } });
+    await expect(proposer.propose(request)).rejects.toMatchObject({ status: 429 });
+    expect(model.requests).toHaveLength(1);
+    expect(sleptMs).toEqual([]);
+  });
+
+  it('proposeCandidates honours the same metadata.signal channel', async () => {
+    const controller = new AbortController();
+    const payload = JSON.parse(proposalJson()) as Record<string, unknown>;
+    const set = JSON.stringify([
+      { ...payload, edits: { guardrails: { kind: 'guardrails', formatContract: 'A' } } }
+    ]);
+    const { model, proposer, sleptMs } = makeRetryingProposer([httpError(429), set], {
+      sleep: async () => {
+        controller.abort();
+      }
+    });
+    const request = makeProposeRequest({
+      candidateCount: 2,
+      metadata: { signal: controller.signal }
+    });
+    await expect(proposer.proposeCandidates!(request)).rejects.toMatchObject({ status: 429 });
+    expect(model.requests).toHaveLength(1);
+    expect(sleptMs).toEqual([]);
   });
 });

@@ -674,17 +674,36 @@ export function verificationSourceDescription(
   return base + ' (trusted=' + String(summary.trusted) + ', audit-only=' + String(summary.auditOnly) + reasons + ')';
 }
 
-/** Convenience for hosts/tests: fold a disposition into a run summary. */
+/**
+ * Convenience for hosts/tests: fold a disposition into a run summary.
+ *
+ * CONSUMER TRUST, not host authentication: `authenticated` says the HOST
+ * accepted the receipt; it does not say the consumer's trusted-producer set
+ * accepts the verifier. When `trustedProducers` is supplied (production always
+ * supplies the seam's set, even when empty), an attached non-audit-only receipt
+ * counts as `trusted` only if its verifierId is a member. Otherwise it counts
+ * as `auditOnly`. Omitting the set keeps the historical host-view tally for
+ * research callers; it never widens production, which never omits it.
+ */
 export function accumulateVerificationSummary(
   summary: VerificationRunSummary,
-  disposition: VerificationDisposition | undefined
+  disposition: VerificationDisposition | undefined,
+  trustedProducers?: ReadonlySet<string>
 ): VerificationRunSummary {
   if (disposition === undefined) {
     return summary;
   }
+  const attached = disposition.attached === true;
+  const consumerTrusted =
+    attached &&
+    disposition.auditOnly !== true &&
+    (trustedProducers === undefined
+      ? true
+      : disposition.verifierId !== undefined && trustedProducers.has(disposition.verifierId));
+  const auditOnly = disposition.auditOnly === true || (attached && !consumerTrusted);
   return {
-    trusted: summary.trusted + (disposition.attached && !disposition.auditOnly ? 1 : 0),
-    auditOnly: summary.auditOnly + (disposition.auditOnly ? 1 : 0),
+    trusted: summary.trusted + (consumerTrusted ? 1 : 0),
+    auditOnly: summary.auditOnly + (auditOnly ? 1 : 0),
     reasonCodes:
       disposition.reasonCode === undefined
         ? summary.reasonCodes

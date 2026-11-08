@@ -20,9 +20,19 @@ import type {
   EvoHarnessStageEvent,
   OrchestratorJitRl
 } from '../../../src/orchestrator';
-import { EVO_HARNESS_STAGES } from '../../../src/orchestrator';
+import {
+  EVO_HARNESS_STAGES,
+  MAX_CARRIED_PROPOSAL_FAILURES,
+  carryProposalFailure,
+  proposalFailureSignalOf
+} from '../../../src/orchestrator';
+import { DshModelStreamError } from '../../../src/dsh-bridge/model';
+import { MeteredModelError } from '../../../src/dsh-bridge/metered-model-adapter';
+import { Harness2ProposalError } from '../../../src/harness2/proposer';
 import { createDefaultConfig, parseEvoHarnessConfig } from '../../../src/config';
-import { createDiscoveryTreePool } from '../../../src/dream-rsi';
+import { TEXT_PROBE_SURFACES } from '../../../src/runtime/surface-evaluability';
+import { createDiscoveryTreePool, classifyFailure } from '../../../src/dream-rsi';
+import type { FailureDiagnosisRequest, IFailureTaxonomy } from '../../../src/dream-rsi';
 import {
   createMemoryExperienceStore,
   createStoreOptimizer,
@@ -35,7 +45,7 @@ import {
   CURRENT_REWARD_VERSION,
   EXPERIENCE_SCHEMA_VERSION
 } from '../../../src/jitrl/experience-store';
-import { scoreUnderRewardContract } from '../../../src/jitrl/reward-contract';
+import { createHostOwnedVerificationRunner } from '../../../src/verification';
 import type { LessonPatchSource } from '../../../src/jitrl/candidate-augmenter';
 import type {
   BatchPlan,
@@ -48,6 +58,7 @@ import type {
   FailureDiagnosis,
   GuidanceMode,
   IActivePolicy,
+  PlanGridRequest,
   ICordisSeamManager,
   IHarnessComposer,
   IHarnessProposer,
@@ -337,6 +348,33 @@ function patchVariant(id: string, shape: 'guardrails-1' | 'guardrails-2' | 'syst
   } as unknown as EightSurfacePatch;
 }
 
+/**
+ * A3 fixture: a patch whose ONLY edit is a generated script. No text probe can
+ * execute it, so the orchestrator must skip it before node/probe/write-back.
+ * (The real proposer would drop it once allowedSurfaces is restricted; this
+ * fixture exercises the orchestrator guard that also covers injected proposers
+ * and memory-augmented lessons.)
+ */
+function scriptsOnlyPatch(now: () => number): EightSurfacePatch {
+  return {
+    id: 'patch-scripts-only',
+    sessionId: 'session-p3',
+    branchId: 'branch-0',
+    origin: 'domain',
+    purpose: 'explore',
+    guidance: 'memory',
+    label: 'scripts-only',
+    rationale: 'mock proposal that a text probe cannot evaluate',
+    edits: {
+      scripts: {
+        kind: 'scripts',
+        scripts: [{ path: 'probe.sh', language: 'bash', code: 'echo probe' }]
+      }
+    },
+    createdAt: now()
+  } as unknown as EightSurfacePatch;
+}
+
 interface CountingProposer extends IHarnessProposer {
   readonly proposeCalls: number;
   readonly candidateCalls: number;
@@ -345,9 +383,10 @@ interface CountingProposer extends IHarnessProposer {
 
 function makeProposer(
   now: () => number,
-  candidatesPerCall: number
+  candidatesPerCall: number,
+  proposalPatches?: readonly EightSurfacePatch[]
 ): { readonly proposer: CountingProposer; readonly patches: readonly EightSurfacePatch[] } {
-  const patches = [
+  const patches = proposalPatches ?? [
     patchVariant('patch-k1', 'guardrails-1', now),
     patchVariant('patch-k2', 'guardrails-2', now),
     patchVariant('patch-k3', 'system-prompt', now)
@@ -491,6 +530,17 @@ function makeStepEvaluator(rewards: readonly number[], calls: ProbeTrajectory[])
 
 interface HarnessOptions {
   readonly candidatesPerCall?: number;
+  /**
+   * A3 fixtures: replace the proposer's patch set. Used by the
+   * non-evaluable-surface test, which needs a scripts-only proposal the real
+   * proposer could never emit once `allowedSurfaces` is restricted.
+   */
+  readonly proposalPatches?: readonly EightSurfacePatch[];
+  /**
+   * A3 fixture: override the config surface list. Used by the empty-intersection
+   * test, where every enabled surface is non-evaluable.
+   */
+  readonly enabledSurfaces?: readonly HarnessComponentKey[];
   readonly jitrl?: {
     readonly enabled: boolean;
     readonly levels: readonly ('meta' | 'proposal' | 'host_tool')[];
@@ -513,6 +563,29 @@ interface HarnessOptions {
   /** t30: config augmentFromMemory override (false disables augmentation). */
   readonly augmentFromMemory?: boolean;
   readonly minSupportForStrongPrior?: number;
+  /**
+   * rev6 A4-3: install a real host verifier so records are EVALUABLE and can
+   * enter the L1 neighbourhood. Without it, text probes are audit-only by
+   * contract and a support assertion would be testing the absence of data.
+   */
+  readonly trustedVerifier?: boolean;
+  /**
+   * rev8 §3.1 gap 2 fixture: replace the whole proposer (scripted failures).
+   * Used by the proposal-failure-carries-to-plan_grid tests, which need a
+   * proposer whose error class and failure code the test controls exactly.
+   */
+  readonly proposer?: IHarnessProposer;
+  /**
+   * rev8 §3.1 gap 2 fixture: wrap the mock policy (planGrid recorder) so a test
+   * can observe the previousFailures array each plan_grid call received.
+   */
+  readonly policy?: IActivePolicy;
+  /**
+   * rev8 §3.1 gap 2 fixture: taxonomy override so a test can classify the
+   * dropped-proposal signal with the REAL classifier while still recording
+   * every diagnosis request.
+   */
+  readonly taxonomy?: IFailureTaxonomy;
 }
 
 interface Harness {
@@ -550,6 +623,9 @@ function makeHarness(options: HarnessOptions = {}): Harness {
   const resolvedDepth = options.maxDepth ?? 1;
   const config = parseEvoHarnessConfig({
     triggerMode: 'always',
+    ...(options.enabledSurfaces === undefined
+      ? {}
+      : { enabledSurfaces: [...options.enabledSurfaces] }),
     probe: { maxConcurrentProbes: 1, probeTimeoutMs: 5_000 },
     dreamRsi: {
       maxOnlineRolloutBudget: options.maxOnlineRolloutBudget ?? 4,
@@ -561,7 +637,11 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     logging: { level: 'silent' }
   });
 
-  const { proposer, patches } = makeProposer(now, options.candidatesPerCall ?? 3);
+  const { proposer, patches } = makeProposer(
+    now,
+    options.candidatesPerCall ?? 3,
+    options.proposalPatches
+  );
   const store = createMemoryExperienceStore({ now, halfLifeMs: 1_000_000_000 });
   const optimizer = createStoreOptimizer({
     store,
@@ -596,13 +676,19 @@ function makeHarness(options: HarnessOptions = {}): Harness {
         status: 'failed',
         steps: [{ index: 0, at: now(), kind: 'error', text: 'baseline failed' }],
         toolErrors: [],
-        failureSignals: [{ kind: 'tool_error', message: 'baseline failed', repairable: true }]
+        failureSignals: [{ kind: 'tool_error', message: 'baseline failed', repairable: true }],
+        ...(options.trustedVerifier === true
+          ? { deliverable: { content: 'baseline-bad', format: 'text' as const } }
+          : {})
       } as unknown as ProbeExecutionResult;
     }
     return {
       status: 'succeeded',
       steps: [{ index: 0, at: now(), kind: 'message', text: 'recovered' }],
-      deliverable: { content: 'recovered', format: 'text' },
+      deliverable: {
+        content: options.trustedVerifier === true ? 'candidate-ok' : 'recovered',
+        format: 'text'
+      },
       toolErrors: [],
       failureSignals: []
     } as unknown as ProbeExecutionResult;
@@ -620,6 +706,24 @@ function makeHarness(options: HarnessOptions = {}): Harness {
           inner: basePolicy,
           experiences: () => store.snapshot(),
           now,
+          // A4-3: a trusted verdict puts the record on the task-quality track,
+          // which the L1 process-only neighbourhood deliberately excludes. This
+          // test is about the quality track being CONSUMABLE, so it opts into
+          // the documented dual-track consumption switch.
+          ...(options.trustedVerifier === true
+            ? {
+                dualTrack: {
+                  enableQualityTrackConsumption: true,
+                  // The support test observes the SECOND run, so exactly one
+                  // quality record exists at that decision. The production
+                  // default (2) would correctly treat that as insufficient and
+                  // fall back to the empty process track; this test is about
+                  // the key alignment, so it exercises the track with the
+                  // documented 1-sample floor.
+                  minQualityEffectiveSamples: 1
+                }
+              }
+            : {}),
           config: {
             beta: defaults.jitrl.beta,
             k: defaults.jitrl.k,
@@ -637,12 +741,17 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     config,
     memory: makeMemoryBridge(),
     seams: makeSeams(now, probes),
-    policy: decorator ?? basePolicy,
-    proposer,
+    policy: options.policy ?? (decorator ?? basePolicy),
+    // rev8 §3.1 gap 2: a test can inject a scripted proposer (controlled error
+    // class + failure code); the counting default stays for existing tests.
+    proposer: options.proposer ?? proposer,
     composer: makeComposer(),
     reflector: makeReflector(),
     scorer: makeScorer(now),
-    taxonomy: { diagnose: () => NO_FAILURE },
+    // rev8 §3.1 gap 2: a test can inject a REAL recording taxonomy; the
+    // historical constant fallback stays the default so existing assertions
+    // are byte-identical.
+    taxonomy: options.taxonomy ?? { diagnose: () => NO_FAILURE },
     dreamer: makeDreamer(),
     treePool: createDiscoveryTreePool(),
     runBranch,
@@ -650,6 +759,29 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     newId: makeIdFactory('p3'),
     applyWinningPatch: false,
     jitrl: jitSurface,
+    ...(options.trustedVerifier === true
+      ? {
+          verification: {
+            runner: createHostOwnedVerificationRunner({
+              verifierId: 'p3-host',
+              verifierVersion: 'v1',
+              testSetId: 'p3-tests-v1',
+              envId: 'p3-env-v1',
+              cases: [
+                {
+                  taskId: TASK.id,
+                  checks: [
+                    {
+                      id: 'artifact-is-candidate-ok',
+                      run: (artifact) => artifact.content === 'candidate-ok'
+                    }
+                  ]
+                }
+              ]
+            })
+          }
+        }
+      : {}),
     onStage: (event) => events.push(event)
   };
 
@@ -1057,33 +1189,27 @@ describe('evaluate_steps and record_experience', () => {
     expect(recordAt).toBeGreaterThan(evaluateAt);
     expect(commitAt).toBeGreaterThan(recordAt);
 
-    // The evaluator saw the composer's winning trajectory exactly once.
+    // The evaluator saw this run's single executed probe exactly once (A4-4
+    // evaluates every probe; this fixture has one).
     expect(harness.evaluatorCalls).toHaveLength(1);
 
     // P6.1-D RewardContract: every executed probe - winner included - is
-    // scored by the SAME trajectory-signal aggregation (the winner's step
-    // vector survives only as the auxiliary rewardSources.stepJudge entry), so
-    // the expected return is the verifiable-signal reward of the executed
-    // trajectory, not the discounted step-evaluator return.
+    // scored by the SAME trajectory-signal aggregation; the winner's step
+    // vector survives only as the auxiliary rewardSources.stepJudge entry.
     //
-    // P6.2 C1/t6 fixture note: the executor returns a deliverable and makeSeams
-    // forwards it, so the recorded shape is a succeeded run with an UNVERIFIED
-    // deliverable - structural verdict 'unknown', completion 0, trainable
-    // through the process path (the ADR R4 net effect).
-    const executedShape = {
-      ...makeMinimalTrajectory(),
-      status: 'succeeded' as const,
-      metrics: { steps: 1, toolCalls: 0, toolErrors: 0, durationMs: 10 },
-      steps: [{ index: 0, at: 1, kind: 'message' as const, text: 'recovered' }],
-      deliverable: { content: 'recovered', format: 'text' as const },
-      failureSignals: []
-    };
-    const expected = Math.min(3, Math.max(-3, scoreUnderRewardContract(executedShape).reward));
+    // rev6 A4-3: the fixture's deliverable is TEXT and no verifier is injected,
+    // so the main chain correctly classifies the probe as `not-evaluable`: the
+    // frozen reward column stays 0 (it must be finite) and the record is
+    // audit-only. This replaced the old expectation that unreferenced prose
+    // earned a ~0.383 process score.
+    const expected = 0;
     const online = harness.store.snapshot().filter((record) => record.id.startsWith('online-'));
     expect(online.length).toBeGreaterThan(0);
     for (const record of online) {
       expect(record.return).toBeCloseTo(expected, 12);
       expect(record.reward).toBeCloseTo(expected, 12);
+      expect(record.learningEligible).toBe(false);
+      expect(record.rewardSources.notEvaluable).toBe(1);
       // P6.2 C0: explicit decision fields on every record (ADR R8).
       expect(record.decisionMode).toBe('shadow');
       expect(record.actionKeyVocabulary).toBe('signature');
@@ -1210,7 +1336,14 @@ describe('online L1 samples are matchable by the L1 candidate contract', () => {
     // parse - which is exactly the silent online-learning failure.
     const harness = makeHarness({
       candidatesPerCall: 1,
-      withDecorator: true
+      withDecorator: true,
+      // A4-3: an executable, host-verified artifact is what makes the record
+      // learnable and therefore visible as L1 support.
+      trustedVerifier: true,
+      // The trusted record must support the action the L1 prior also chooses;
+      // otherwise the quality track correctly reports insufficient evidence on
+      // the prior and falls back to the empty process track.
+      slots: [{ kind: 'exploit', guidance: 'memory' }]
     });
 
     const first = await harness.orchestrator.run({
@@ -1494,5 +1627,481 @@ describe('memory augmentation is wired into the L2 selection path', () => {
     // The master switch short-circuits before any rehydration work.
     expect(harness.augmentNotices.some((line) => line.includes('augment_rehydrate_failed'))).toBe(false);
     expect(harness.augmentNotices.some((line) => line.includes('augment_isolated'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A3: proposer surface restriction + non-evaluable patch skip
+// ---------------------------------------------------------------------------
+
+describe('A3 evaluability: proposer only sees text-probe evaluable surfaces', () => {
+  it('passes enabledSurfaces ∩ TEXT_PROBE_EVALUABLE to the single proposer', async () => {
+    const harness = makeHarness({
+      candidatesPerCall: 1,
+      jitrl: { enabled: true, levels: ['meta'], candidateCount: 1 }
+    });
+    await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+
+    expect(harness.proposer.requests).toHaveLength(1);
+    const surfaces = harness.proposer.requests[0]?.enabledSurfaces;
+    expect(surfaces).toBeDefined();
+    expect([...(surfaces ?? [])]).toEqual([...TEXT_PROBE_SURFACES]);
+    for (const excluded of ['scripts', 'subagents', 'plugins'] as const) {
+      expect(surfaces ?? []).not.toContain(excluded);
+    }
+  });
+
+  it('passes the same intersection to the K-candidate proposer', async () => {
+    const harness = makeHarness({ candidatesPerCall: 3 });
+    await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+
+    expect(harness.proposer.candidateCalls).toBeGreaterThan(0);
+    for (const request of harness.proposer.requests) {
+      expect([...(request.enabledSurfaces ?? [])]).toEqual([...TEXT_PROBE_SURFACES]);
+    }
+  });
+
+  it('skips the whole run when enabledSurfaces has no text-probe evaluable surface', async () => {
+    const harness = makeHarness({
+      enabledSurfaces: ['scripts', 'subagents', 'plugins'],
+      jitrl: { enabled: true, levels: ['meta'], candidateCount: 1 }
+    });
+    const result = await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+
+    expect(result.outcome).toBe('skipped');
+    expect(result.probesRun).toBe(0);
+    expect(result.metadata?.stopReason).toBe('no_evaluable_surfaces');
+    expect(
+      result.diagnostics.some((line) =>
+        line.startsWith('probe surfaces:') && line.includes('no text-probe evaluable surface')
+      )
+    ).toBe(true);
+    // No reference probe, no proposer call, no experience.
+    expect(harness.probes).toEqual([]);
+    expect(harness.proposer.requests).toHaveLength(0);
+    expect(await harness.store.size()).toBe(0);
+  });
+
+  it('skips a scripts-only proposal before node creation, probing or write-back', async () => {
+    const harness = makeHarness({
+      candidatesPerCall: 1,
+      proposalPatches: [scriptsOnlyPatch(() => CLOCK_START)],
+      jitrl: { enabled: true, levels: ['meta'], candidateCount: 1 }
+    });
+    const result = await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+
+    // The reference still ran; not a single candidate probe did.
+    expect(result.probesRun).toBe(1);
+    expect(candidateProbes(harness.probes)).toEqual([]);
+    expect(result.outcome).toBe('no_probe');
+    expect(result.metadata?.stopReason).toBe('proposals_not_evaluable');
+    expect(
+      result.diagnostics.some((line) =>
+        line.startsWith('proposal-not-evaluable:') &&
+        line.includes('scripts') &&
+        line.includes('no node was added')
+      )
+    ).toBe(true);
+
+    // No node was created beyond the reference root.
+    const tree = result.treeId === undefined ? undefined : harness.orchestrator.treePool.get(result.treeId);
+    expect(tree).toBeDefined();
+    expect(tree?.stats.nodeCount).toBe(1);
+
+    // No online experience was written: the store is byte-identical (empty).
+    expect(await harness.store.size()).toBe(0);
+    expect(harness.evaluatorCalls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rev8 plan §3.1 gap 2 (harness2 #110 companion): a dropped proposal is fed to
+// the failure taxonomy and carried into the NEXT run's plan_grid.
+//
+// Deterministic contract:
+//  - run 1's plan_grid still sees previousFailures: [] (nothing has failed yet);
+//  - the proposer's transport error is classified through the SAME injected
+//    taxonomy the probes use (one diagnose() call per dropped slot);
+//  - a transport-class failure (stream abort / gateway 429) maps to kind
+//    'unknown' + retryable, so the REAL classifier must NOT report
+//    hard_unrecoverable - a flapping gateway is never a model refusal and never
+//    stops the run;
+//  - the metered adapter's typed METERED_MODEL_* denial maps to 'model_refusal',
+//    which the REAL classifier DOES report as hard_unrecoverable - the two
+//    failure classes stay distinguishable end to end;
+//  - run 2's plan_grid receives the carried diagnoses in previousFailures and
+//    the result metadata carries an additive proposerFailures count block;
+//  - a run with no proposal failure clears the carry (previousFailures: []).
+// ---------------------------------------------------------------------------
+
+/** Wraps the file's mock policy, recording every plan_grid request. */
+function makePlanGridRecordingPolicy(base: IActivePolicy): IActivePolicy & {
+  readonly planGridRequests: PlanGridRequest[];
+} {
+  const planGridRequests: PlanGridRequest[] = [];
+  return {
+    planGridRequests,
+    get policy(): MetaSearchPolicy {
+      return base.policy;
+    },
+    planGrid(request: PlanGridRequest): SearchGridPlan {
+      planGridRequests.push(request);
+      return base.planGrid(request);
+    },
+    selectBatch(request: SelectBatchRequest): BatchPlan {
+      return base.selectBatch(request);
+    },
+    update(policy: MetaSearchPolicy): void {
+      base.update(policy);
+    }
+  };
+}
+
+/** Taxonomy over the REAL classifier, recording every diagnosis request. */
+function makeRecordingRealTaxonomy(): IFailureTaxonomy & {
+  readonly requests: FailureDiagnosisRequest[];
+} {
+  const requests: FailureDiagnosisRequest[] = [];
+  return {
+    requests,
+    diagnose(request: FailureDiagnosisRequest) {
+      requests.push(request);
+      return classifyFailure(request);
+    }
+  };
+}
+
+/** A proposer that throws the SAME scripted error for every slot. */
+function makeFailingProposer(errors: readonly unknown[]): IHarnessProposer {
+  let call = 0;
+  return {
+    async propose(): Promise<ProposedPatch> {
+      const error = errors[Math.min(call, errors.length - 1)];
+      call += 1;
+      throw error;
+    }
+  };
+}
+
+describe('proposal failures feed the failure taxonomy and the next plan_grid (rev8 §3.1 gap 2)', () => {
+  it('carries a transport-class proposal failure into the next run plan_grid without hard_unrecoverable', async () => {
+    const basePolicy = makePolicy();
+    const policy = makePlanGridRecordingPolicy(basePolicy);
+    const taxonomy = makeRecordingRealTaxonomy();
+    // One stream abort (the #110/#13 transport surface), forever: every slot of
+    // every round fails the same deterministic way.
+    const harness = makeHarness({
+      proposer: makeFailingProposer([
+        new DshModelStreamError('cut off mid-stream', 'aborted')
+      ]),
+      policy,
+      taxonomy,
+      jitrl: { enabled: true, levels: ['meta'], candidateCount: 1 }
+    });
+
+    const first = await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    void first;
+    expect(policy.planGridRequests.length).toBeGreaterThanOrEqual(1);
+    // Run 1 planned BEFORE any proposal ran: empty carry, byte-identical to rev6.
+    expect(policy.planGridRequests[0]?.previousFailures).toEqual([]);
+
+    // The dropped slot reached the REAL classifier with exactly one typed signal.
+    expect(taxonomy.requests.length).toBeGreaterThanOrEqual(1);
+    const firstSignals = taxonomy.requests[0]?.signals ?? [];
+    const signal = firstSignals[0];
+    expect(signal?.kind).toBe('unknown');
+    expect(signal?.retryable).toBe(true);
+    expect(signal?.message).toContain('cut off mid-stream');
+
+    // The transport signal must NOT be hard_unrecoverable: a flapping gateway
+    // is neither a model refusal nor a budget exhaustion.
+    const diagnosis = classifyFailure({ signals: signal === undefined ? [] : [signal] });
+    expect(diagnosis.category).not.toBe('hard_unrecoverable');
+
+    // Run 2: plan_grid receives run 1's proposal-failure diagnoses.
+    await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    expect(policy.planGridRequests.length).toBeGreaterThanOrEqual(2);
+    const carried = policy.planGridRequests[1]?.previousFailures ?? [];
+    expect(carried.length).toBeGreaterThanOrEqual(1);
+    expect(carried.every((failure) => failure.category !== 'none')).toBe(true);
+    // The diagnosis was produced through the injected taxonomy, not invented.
+    expect(carried[0]?.signals.map((entry) => entry.kind)).toContain('unknown');
+  });
+
+  it('keeps a typed metered budget denial distinguishable from a transport failure', async () => {
+    const taxonomy = makeRecordingRealTaxonomy();
+    const harness = makeHarness({
+      proposer: makeFailingProposer([
+        new MeteredModelError('METERED_MODEL_BUDGET_DENIED', 'ledger refused the reservation')
+      ]),
+      taxonomy,
+      jitrl: { enabled: true, levels: ['meta'], candidateCount: 1 }
+    });
+
+    const first = await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    // The typed denial rides as model_refusal (never as transport retryable),
+    // and the REAL classifier routes it to hard_unrecoverable exactly like a
+    // refused probe.
+    const firstSignals = taxonomy.requests[0]?.signals ?? [];
+    const signal = firstSignals[0];
+    expect(signal?.kind).toBe('model_refusal');
+    expect(signal?.code).toBe('METERED_MODEL_BUDGET_DENIED');
+    expect(signal?.retryable).toBeUndefined();
+    const diagnosis = classifyFailure({ signals: signal === undefined ? [] : [signal] });
+    expect(diagnosis.category).toBe('hard_unrecoverable');
+
+    // The additive metadata block counts the refusal class honestly.
+    const metadata = first.metadata as
+      | { proposerFailures?: { total: number; refusalClass: number; transportClass: number } }
+      | undefined;
+    expect(metadata?.proposerFailures?.total).toBeGreaterThanOrEqual(1);
+    expect(metadata?.proposerFailures?.refusalClass).toBe(metadata?.proposerFailures?.total);
+    expect(metadata?.proposerFailures?.transportClass).toBe(0);
+  });
+
+  it('does not carry a not-evaluable proposal and clears the carry after a clean run', async () => {
+    const basePolicy = makePolicy();
+    const policy = makePlanGridRecordingPolicy(basePolicy);
+    const harness = makeHarness({
+      proposalPatches: [scriptsOnlyPatch(() => CLOCK_START)],
+      policy,
+      jitrl: { enabled: true, levels: ['meta'], candidateCount: 1 }
+    });
+
+    const notEvaluableRun = await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    expect(notEvaluableRun.metadata?.stopReason).toBe('proposals_not_evaluable');
+    // A3 keeps its own route: unevaluable proposals are not proposer failures
+    // and must never enter the failure carry.
+    expect(policy.planGridRequests.length).toBeGreaterThanOrEqual(1);
+
+    // A clean second run plans with an empty previousFailures array again: the
+    // carry was never populated by the A3 skip above.
+    const cleanHarness = makeHarness({
+      policy,
+      jitrl: { enabled: true, levels: ['meta'], candidateCount: 1 }
+    });
+    await cleanHarness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    const secondPlan = policy.planGridRequests.at(-1);
+    expect(secondPlan?.previousFailures).toEqual([]);
+    const cleanResult = await cleanHarness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    expect((cleanResult.metadata as Record<string, unknown>).proposerFailures).toBeUndefined();
+  });
+
+  it('bounds the carry at MAX_CARRIED_PROPOSAL_FAILURES (oldest dropped)', () => {
+    const carried: FailureDiagnosis[] = [];
+    const make = (n: number): FailureDiagnosis => ({
+      category: 'weak_underexplored',
+      confidence: 0.5,
+      repairable: false,
+      recommendedAction: 'deepen',
+      evidence: ['carry probe ' + String(n)],
+      signals: []
+    });
+    for (let index = 0; index < MAX_CARRIED_PROPOSAL_FAILURES + 3; index += 1) {
+      carryProposalFailure(carried, make(index));
+    }
+    expect(carried).toHaveLength(MAX_CARRIED_PROPOSAL_FAILURES);
+    // The OLDEST entries were dropped; the newest 8 remain, in order.
+    expect(carried[0]?.evidence[0]).toBe('carry probe 3');
+    expect(carried[MAX_CARRIED_PROPOSAL_FAILURES - 1]?.evidence[0]).toBe(
+      'carry probe ' + String(MAX_CARRIED_PROPOSAL_FAILURES + 2)
+    );
+  });
+
+  it('maps failure classes exactly: signal vocabulary is the single source of truth', () => {
+    const transport = proposalFailureSignalOf(
+      new DshModelStreamError('gateway stalled', 'error', 'RATE_LIMIT')
+    );
+    expect(transport.kind).toBe('unknown');
+    expect(transport.retryable).toBe(true);
+    expect(transport.code).toBe('RATE_LIMIT');
+
+    const httpTransport = proposalFailureSignalOf(
+      Object.assign(new Error('gateway 503'), { name: 'GatewayHttpError', status: 503 })
+    );
+    expect(httpTransport.kind).toBe('unknown');
+    expect(httpTransport.retryable).toBe(true);
+
+    const denial = proposalFailureSignalOf(
+      new MeteredModelError('METERED_MODEL_PURPOSE_MISMATCH', 'wrong purpose')
+    );
+    expect(denial.kind).toBe('model_refusal');
+    expect(denial.code).toBe('METERED_MODEL_PURPOSE_MISMATCH');
+
+    const parse = proposalFailureSignalOf(
+      new Harness2ProposalError('proposal_unparseable', 'not json', 'detail')
+    );
+    expect(parse.kind).toBe('invalid_patch');
+    expect(parse.code).toBe('proposal_unparseable');
+
+    const unknown = proposalFailureSignalOf(new Error('something else'));
+    expect(unknown.kind).toBe('unknown');
+    expect(unknown.retryable).toBeUndefined();
+    expect(unknown.code).toBeUndefined();
+
+    // The message is bounded; a hostile error body cannot bloat the diagnosis.
+    const hostile = proposalFailureSignalOf(new Error('x'.repeat(5_000)));
+    expect(hostile.message.length).toBeLessThanOrEqual(241);
+  });
+
+  // rev8 integration fix (independent-review P0): a run whose proposals were
+  // dropped attaches `metadata.proposerFailures` via the result() helper's
+  // `extra` spread. Before the fix the extra.metadata object REPLACED the
+  // built-in lifecycle metadata, so exactly the runs that most need their stage
+  // trace (the ones with dropped proposals) lost metadata.lifecycle /
+  // stopReason / rounds — a direct violation of the plan §5.2 evo_run_poll
+  // contract (result=EvoHarnessRunResult with metadata.lifecycle) and of the
+  // job-book stage-trace semantics. The merge must keep both.
+  it('keeps metadata.lifecycle intact on a run whose proposals were dropped', async () => {
+    // The REAL classifier (like the sibling gap-2 tests): the file-default
+    // taxonomy answers NO_FAILURE ('none'), which diagnoseProposalFailure
+    // correctly drops, so no metadata block would ever attach. The bug under
+    // test needs a run that DOES carry proposerFailures.
+    const taxonomy = makeRecordingRealTaxonomy();
+    const harness = makeHarness({
+      proposer: makeFailingProposer([
+        new DshModelStreamError('cut off mid-stream', 'aborted')
+      ]),
+      taxonomy,
+      jitrl: { enabled: true, levels: ['meta'], candidateCount: 1 }
+    });
+
+    const result = await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    const metadata = result.metadata as
+      | {
+          lifecycle?: unknown[];
+          stopReason?: unknown;
+          rounds?: unknown;
+          referenceStatus?: unknown;
+          memoryDriverKind?: unknown;
+          dreamTriggered?: unknown;
+          proposerFailures?: { total: number };
+        }
+      | undefined;
+
+    // The proposer-failure block is present (the trigger for the old bug)…
+    expect(metadata?.proposerFailures?.total).toBeGreaterThanOrEqual(1);
+    // …and the lifecycle block survived the merge, every key populated.
+    expect(Array.isArray(metadata?.lifecycle)).toBe(true);
+    expect((metadata?.lifecycle as unknown[]).length).toBeGreaterThan(0);
+    expect((metadata?.lifecycle as unknown[]).at(-1)).toBe('finalize');
+    expect(typeof metadata?.stopReason).toBe('string');
+    expect(typeof metadata?.rounds).toBe('number');
+    expect(metadata?.referenceStatus).not.toBeNull();
+    expect(typeof metadata?.memoryDriverKind).toBe('string');
+    expect(typeof metadata?.dreamTriggered).toBe('boolean');
+  });
+
+  // rev8 integration fix (independent-review P1): the run-level cancel signal
+  // must reach the proposer requests. The proposer's retry/abort channel reads
+  // `request.metadata.signal` (requestAbortSignal); without the forwarding a
+  // cancelled run kept its in-flight proposal retrying (backoff sleeps, model
+  // re-calls) even though every probe had already turned 'aborted'.
+  it('forwards the run signal to the proposer request metadata', async () => {
+    const harness = makeHarness({
+      jitrl: { enabled: true, levels: ['meta'], candidateCount: 1 }
+    });
+    const controller = new AbortController();
+
+    await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always',
+      signal: controller.signal
+    });
+
+    // The K-candidate path (candidateCount=1 here falls back to propose())…
+    const proposer = harness.proposer;
+    expect(proposer.requests.length).toBeGreaterThanOrEqual(1);
+    expect(proposer.requests[0]?.metadata?.signal).toBe(controller.signal);
+
+    // …and the multi-candidate path too (candidateCount=3 default slots).
+    const multiHarness = makeHarness({});
+    const multiController = new AbortController();
+    await multiHarness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always',
+      signal: multiController.signal
+    });
+    const multiProposer = multiHarness.proposer;
+    const candidateRequest = multiProposer.requests.find(
+      (request) => request.candidateCount !== undefined
+    );
+    expect(candidateRequest).toBeDefined();
+    expect(candidateRequest?.metadata?.signal).toBe(multiController.signal);
+
+    // No request carries a foreign signal.
+    for (const request of multiProposer.requests) {
+      const signal = request.metadata?.signal;
+      expect(signal === undefined || signal === multiController.signal).toBe(true);
+    }
+  });
+
+  // The signal capture is run-scoped: a SECOND run on the same orchestrator
+  // (without a signal) must not see the first run's signal on its proposals.
+  it('does not leak the previous run signal into a later signal-less run', async () => {
+    const harness = makeHarness({
+      jitrl: { enabled: true, levels: ['meta'], candidateCount: 1 }
+    });
+    const controller = new AbortController();
+    await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always',
+      signal: controller.signal
+    });
+    await harness.orchestrator.run({
+      sessionId: 'session-p3',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    const secondRunRequests = harness.proposer.requests.slice(-1);
+    expect(secondRunRequests.length).toBeGreaterThanOrEqual(1);
+    expect(secondRunRequests[0]?.metadata?.signal).toBeUndefined();
   });
 });

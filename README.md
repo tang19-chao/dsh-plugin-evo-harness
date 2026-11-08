@@ -22,6 +22,7 @@ including the module-by-module responsibilities and the end-to-end sequence, is 
 - [Requirements](#requirements)
 - [Install and verify](#install-and-verify)
 - [Quick start configuration](#quick-start-configuration)
+- [Standalone MCP stdio server](#standalone-mcp-stdio-server)
 - [Configuration reference](#configuration-reference)
 - [How it works](#how-it-works)
 - [Project layout](#project-layout)
@@ -93,21 +94,28 @@ transpiles on the fly.
 | `pnpm run typecheck` | `tsc --noEmit` | Full static typecheck of `src/**` and `tests/**` |
 | `pnpm run test` | `vitest run` | Every unit and end-to-end suite |
 | `pnpm run test:unit` | `vitest run tests/unit` | Unit suites only |
-| `pnpm run test:e2e` | `vitest run tests/e2e` | End-to-end suites only |
+| `pnpm run test:e2e` | `vitest run tests/e2e tests/mcp` | Cordis-plugin and MCP end-to-end suites |
 | `pnpm run check:docs` | `node scripts/verify-readme-counts.mjs` | Mechanically validates README test counts against test results and repo hygiene; refuses reports with failed or pending tests and verifies the Configuration reference against the real defaults (one row per leaf, see [Configuration reference](#configuration-reference)) |
 | `pnpm run check:encoding` | `node scripts/eval/check-encoding-policy.mjs` | Every tracked blob must be LF text or a declared `-text` exception |
 | `pnpm run check:build-smoke` | `node scripts/eval/smoke-build.mjs` | Builds the bundle and imports it as ESM, asserting the public surface |
 | `pnpm run check:negative-result` | `node scripts/eval/negative-result-diag.mjs --assert` | Fails if the recorded historical negative result (−0.250) drifts |
 | `pnpm run guarded-regression` | `node scripts/eval/guarded-regression.mjs --json` | ADR 0002 gate #7: release-surface, isolation and trusted-source probes over synthetic fixtures |
-| `pnpm run check:mutation` | `node scripts/eval/mutation-gate.mjs --run` | ADR 0005 D5: reintroduces four pinned defects inside a throwaway copy and requires the pinned test **names** to go red — a surviving mutant fails the gate |
+| `pnpm run check:mutation` | `node scripts/eval/mutation-gate.mjs --run` | ADR 0005 D5: reintroduces five pinned defects inside a throwaway copy and requires the pinned test **names** to go red — a surviving mutant fails the gate (M5 is the A1 patch-prompt regression) |
 | `pnpm run check:metering` | `node scripts/eval/metering-coverage.mjs` | Every production `.complete(...)` / `.planNext(...)` call must route through the MeteredModelAdapter or be an allow-listed delegation; the allowlist pins an exact **count** per file, so a second call inside an allow-listed file fails too |
 | `pnpm run check:orphans` | `node scripts/eval/check-orphan-exports.mjs` | Every `src/**` exported symbol (function, class, const, interface, type alias, enum) needs a reader in `src/` or `tests/`; the allowlist is compared in both directions, so a fixed orphan leaves a stale row that fails. Deliberately blind to a module-**private** uncalled function — that needs a call graph, not an export scan |
 | `pnpm run check:import-coverage` | `node scripts/eval/check-test-import-coverage.mjs` | Every `src/**` module must be imported by a test, directly or through a **barrel** re-export. An internal `src`→`src` import does not count, so a module reachable only via the plugin entry is still a failure |
 | `pnpm run verify` | `pnpm run typecheck && pnpm run test` | The full gate: typecheck, then every suite |
 
-A green checkout currently reports `200` test files and `3290` passing tests for `pnpm run test`
+A green checkout currently reports `237` test files and `3904` passing tests for `pnpm run test`
 (see [Testing](#testing) for the breakdown). This package is `private` and is not published to
 any registry, so there are no publication steps.
+
+For a safe first deployment (shadow mode, five text-evaluable surfaces, `writebackGate: auto`,
+observation, rollback and the staged authorization gates), follow
+[docs/runbooks/rev7-safe-learning-operations.md](docs/runbooks/rev7-safe-learning-operations.md).
+The implementation close-out for the rev6 audit items is
+[docs/reports/rev6-implementation-closeout.md](docs/reports/rev6-implementation-closeout.md); neither
+document is a claim of real-world benefit.
 
 ## Quick start configuration
 
@@ -236,12 +244,109 @@ run's result. `plugin.settle()` is the deterministic join point: it awaits every
 run and returns the results. Teardown awaits it too, so a run started by the last event is not
 aborted mid-flight.
 
+## Standalone MCP stdio server
+
+The same `createEvoHarnessPlugin` assembly has two entry modes: the Cordis plugin entry in
+[src/index.ts](src/index.ts), and a separate, pull-only MCP stdio process in
+[src/mcp/server.ts](src/mcp/server.ts). `pnpm run build` emits `lib/index.js` and
+`lib/mcp/server.js` from those entries ([scripts/build.mjs](scripts/build.mjs)); importing the MCP
+bundle does not start a server, while `node lib/mcp/server.js` serves the `evo` MCP server over
+stdio. Register that absolute command and entry path in an MCP client; do not register it as an
+HTTP/SSE endpoint. The MCP assembly has no Cordis `ctx`, no mounted memory clients, no automatic
+triggers, and only an in-memory host ([src/mcp/assembly.ts](src/mcp/assembly.ts)). This stdio
+**server** is distinct from the plugin's MCP **client** memory bridge.
+
+`tools/list` exposes exactly seven tools ([src/mcp/server.ts](src/mcp/server.ts)):
+
+| Tool | Contract |
+| :--- | :--- |
+| `evo_status` | Read run phase, shadow constants, resolved data directory, JitRL state and dream readiness |
+| `evo_run_submit` | Start a run and immediately return `{runId, status: "started", pollAfterMs}`; `dryRun: true` previews without opening the data directory |
+| `evo_run_poll` | Poll a `runId`; return `running`, `complete`, `failed`, `cancelled` or `timeout`, with the full run result after settlement |
+| `evo_dream` | Use the orchestrator's verified-tree-gated offline dream path; fewer than 12 verified trees means no dream |
+| `evo_jit` | Reuse the `/evo jit` controller for `status`, volatile `on`/`off`, and `reset` with `confirm: true` |
+| `evo_lessons` | Return a bounded, redacted page of lessons and dream reports |
+| `evo_text_probe` | Return the honest `not-evaluable` text-only verdict, never a passing score |
+
+For a real run, submit at least `prompt` and preferably an explicit `sessionId`, then poll the
+returned `runId`. Optional `cwd` is only a provenance label: the server does not resolve, read,
+change into or execute that path. Submissions receive independent job records, while run, dream and
+Jit mutations are serialized to protect the shared orchestrator. The job book is process memory,
+bounded to 128 records by default; after restart an old id returns `unknown_run_id`. Durable trees,
+policy state and counters reopen from the data directory, but job recovery is not claimed.
+
+Starting the process, completing the handshake and listing tools create nothing on disk. The
+assembly — and therefore the data directory, the persistence stores and the JitRL cold-start
+backfill — is built by the first call that actually needs it, so a server that is started and never
+called leaves no directory behind. A `dryRun` preview likewise opens no data directory. `dispose()`
+of a server whose build is still in flight waits for that build and disposes what it produced, and
+after teardown every assembly-touching tool returns a named "disposed" error rather than reopening
+anything.
+
+### Process environment and isolated persistence
+
+The standalone process reads these four actual environment variables; none is a plugin configuration
+leaf or a tool argument:
+
+| Variable | Meaning |
+| :--- | :--- |
+| `EVO_MODEL_BASE_URL` | OpenAI-compatible API base including the version segment; default `http://127.0.0.1:8326/v1`. The adapter POSTs only to `<baseUrl>/chat/completions` without streaming |
+| `EVO_MODEL_ID` | Full model id sent in the JSON body; default `magpie/auto/glm-5.3-flash` |
+| `EVO_GATEWAY_KEY` | Direct gateway credential. If absent, the adapter uses the next variable instead |
+| `EVO_GATEWAY_KEY_FILE` | Path of the credential file. Only the production adapter reads it lazily at request time, never at server construction; there is no built-in key-file path |
+
+Do not put credentials in the MCP tool arguments or logs. `EVO_GATEWAY_KEY` takes precedence over
+`EVO_GATEWAY_KEY_FILE`; if neither is set, adapter construction still succeeds but a model request
+fails with `OPENAI_KEY_MISSING`. The file is cached after a successful read and invalidated after a
+401/403. The adapter retries at most once, and only for HTTP 429, 5xx or transport failure.
+
+Set **`EVO_HARNESS_DATA_DIR`** as well to isolate this process's persistence from the Cordis plugin.
+It is a data **root**: the resolved final directory is
+`<EVO_HARNESS_DATA_DIR>/profiles/<sanitized-profile>`, with `DSH_PROFILE` or `default` supplying the
+profile. The programmatic `assembly.dataDir.dataDir` option instead names the final directory
+verbatim. Precedence is explicit final directory, then explicit root / `EVO_HARNESS_DATA_DIR`, then
+`DSH_DATA_DIR`, then `~/.dsh/evo-harness`. Because the `DSH_DATA_DIR` fallback can collide with the
+plugin's `profiles/<profile>` single-writer directory, an independent `EVO_HARNESS_DATA_DIR` is the
+recommended deployment setting; the assembly warns when that collision is possible
+([src/persistence/data-dir.ts](src/persistence/data-dir.ts)). Use one server process per resolved
+profile directory.
+
+Closing stdin, closing the stdio handle or disposing the server cancels all running jobs, aborts
+their probe signals, waits up to 2000 ms for cancellation to unwind, then flushes and disposes the
+plugin and persistence runtime. Disconnect cleanup releases resources; it does **not** delete the
+isolated data directory. Cancelling the already-returned `evo_run_submit` MCP request is not a run
+cancellation mechanism. A restarted process cannot poll old in-memory job ids.
+
+### Shadow boundary and honest cost reporting
+
+The MCP assembly pins `execution.mode = "shadow"` and `execution.applyWinningPatch = false` after
+configuration validation, forces `jitrl.store.mirrorToMemoryBridge = false`, and refuses attempts to
+replace the execution profile. Branch edits exist only in the in-memory host and are disposed with
+each branch. The resolved shadow profile denies permanent patch mounting, publication and real
+memory writes; no MCP tool input can widen those permissions or the host's own permission/approval
+settings ([src/runtime/execution-profile.ts](src/runtime/execution-profile.ts)).
+
+The OpenAI adapter maps a valid `usage` triple as `prompt_tokens -> inputTokens`,
+`completion_tokens -> outputTokens` and `total_tokens -> totalTokens`, and preserves the original
+values in `metadata.rawUsage` with explicit `countingSemantics`. Missing usage remains `undefined`
+rather than becoming a measured zero; a malformed partial or non-numeric triple fails with
+`OPENAI_MALFORMED_USAGE`. The token mapping describes the gateway response, not proof of billing.
+
+The standalone assembly supplies `options.model` and `agentLoop.model`, but **no
+`agentLoop.ledgerSettlement`**. Consequently its metered adapters have `metering: "unmetered"` and
+records have `settlement: "none"`: they can retain reported token usage, but there is no ledger
+reservation, settlement or booked monetary total. Do not infer an invoice or cost from that usage.
+Only an explicitly integrated host settlement would enable ledger accounting; the stdio entry does
+not provide one ([src/dsh-bridge/metered-model-adapter.ts](src/dsh-bridge/metered-model-adapter.ts)).
+This section documents source behavior and offline protocol/lifecycle coverage; it is not a claim
+that a real DSH host installation or a real gateway run has been verified.
+
 ## Configuration reference
 
 Defaults are the frozen values in [src/config.ts](src/config.ts) `DEFAULT_EVO_HARNESS_CONFIG` (plus the
 `modelRoute` fields from `MODEL_ROUTE_DEFAULTS`, which live outside that object); the section below matches
 ARCHITECTURE.md section 6.2. The table below is one row per default leaf: the gate `pnpm run check:docs`
-walks the real defaults at run time (75 `DEFAULT_EVO_HARNESS_CONFIG` leaves + 3 `modelRoute` fields = 78;
+walks the real defaults at run time (76 `DEFAULT_EVO_HARNESS_CONFIG` leaves + 3 `modelRoute` fields = 79;
 arrays count as one leaf, suffixed `[]` exactly like the implementation path) and fails on a missing row,
 a stale row or a drifted Default column, so this table cannot silently rot.
 Validation is strict: unknown keys, wrong types, out-of-range numbers, duplicate surfaces and unnormalized
@@ -252,9 +357,9 @@ in `cordis.yml` fails fast instead of silently disabling a safety feature.
 | Option | Default | Meaning |
 | :--- | :--- | :--- |
 | `enabled` | `true` | Mount the plugin at all |
-| `enabledSurfaces[]` | `["system_prompt","guardrails","memory","tool_guidance","skills","scripts","subagents","plugins"]` | Surfaces eligible for patching, in mounting order |
+| `enabledSurfaces[]` | `["system_prompt","guardrails","memory","tool_guidance","skills","scripts","subagents","plugins"]` | Surfaces eligible for patching, in mounting order. The PROPOSER only ever sees the intersection with the five text-probe evaluable surfaces (`system_prompt`, `guardrails`, `memory`, `tool_guidance`, `skills`); a proposal whose every edit lands on `scripts` / `subagents` / `plugins` is skipped before a node or probe is created, with a `proposal-not-evaluable:` diagnostic and no write-back |
 | `execution.applyWinningPatch` | `false` | PERMANENT winning-patch mount after probing; only legal together with `execution.mode: guarded-active` (rejected fail-closed in every other mode) |
-| `execution.mode` | `"shadow"` | Declared execution mode: `shadow` (record suggestions with zero side effects), `baseline`, `guarded-active` (enables the patch layer's evidence-gated channel) or `off` |
+| `execution.mode` | `"shadow"` | Declared execution mode: `shadow` (record suggestions with zero side effects), `baseline`, `guarded-active` (the permanent patch layer requires BOTH this mode and `applyWinningPatch: true`; no host-trusted verdict gate is applied) or `off` |
 | `logging.includeTrajectorySummaries` | `false` | When true the run-outcome log line also carries the run's trajectory summary (`lifecycle` / `stopReason` / `referenceStatus`); false keeps the bare probe/lesson counts |
 | `logging.level` | `"info"` | Plugin log threshold: `debug` / `info` / `warn` / `error` / `silent` (`silent` drops every line, `error` keeps only errors) |
 | `memoryBridge.customMapping.commitToolName` | `"my_custom_upsert"` | Commit tool name used when `customMapping.enabled` is true |
@@ -304,7 +409,7 @@ in `cordis.yml` fails fast instead of silently disabling a safety feature.
 | `jitrl.exploration.lambda` | `0.05` | Probability of optimistic exploration for an action without support |
 | `jitrl.gamma` | `0.5` | Return discount along step/tree paths |
 | `jitrl.hostAdvisor.adviseThreshold` | `-0.5` | Mean neighbour return below which the advisor suggests an alternative |
-| `jitrl.hostAdvisor.enabled` | `false` | L3 host tool-call advisor switch (experimental) |
+| `jitrl.hostAdvisor.enabled` | `false` | L3 host tool-call advisor switch (experimental). Explicit opt-in: host-tool PROCESS records are collected and stay learning-eligible without a trusted verifier (the write-back gate governs probe records, not this L3 track) |
 | `jitrl.hostAdvisor.gateThreshold` | `-0.8` | Mean neighbour return below which `gate` mode requests user confirmation (it never automatically denies) |
 | `jitrl.hostAdvisor.minSupport` | `5` | Minimum neighbour support before the advisor acts |
 | `jitrl.hostAdvisor.mode` | `"advisory"` | `advisory` annotates decisions; `gate` requests user confirmation and never automatically denies |
@@ -315,7 +420,7 @@ in `cordis.yml` fails fast instead of silently disabling a safety feature.
 | `jitrl.privacy.redactSecrets` | `true` | Redact secrets from persisted states and summaries |
 | `jitrl.privacy.storeRawText` | `false` | Store raw task/observation text alongside abstract states |
 | `jitrl.reward.clip[]` | `[-3,3]` | `[min, max]` clip applied to fused rewards; `clip[0]` must be strictly smaller than `clip[1]` |
-| `jitrl.reward.llmEvaluator` | `true` | Enable the LLM step judge (purpose `evaluate_steps`) |
+| `jitrl.reward.llmEvaluator` | `true` | Enable the LLM step judge (purpose `evaluate_steps`); it uses the same model as propose/compose, including the ctx.llm-resolved adapter, and production judges EVERY executed probe (`judgePolicy: 'all'`) |
 | `jitrl.reward.weights.llm` | `0.4` | Step-reward weight (LLM judge); the five weights must sum to 1 |
 | `jitrl.reward.weights.surrogate` | `0.3` | Step-reward weight (surrogate score); the five weights must sum to 1 |
 | `jitrl.reward.weights.tool` | `0.2` | Step-reward weight (tool signal); the five weights must sum to 1 |
@@ -329,6 +434,7 @@ in `cordis.yml` fails fast instead of silently disabling a safety feature.
 | `jitrl.store.mirrorToMemoryBridge` | `false` | Also mirror appended experience records into the host memory bridge |
 | `jitrl.surfaceActions` | `false` | L1 action-space opt-in: one candidate per slotKind × focusSurface (up to 4 × 8 = 32) instead of one per slotKind |
 | `jitrl.unseenFallback` | `"baseline"` | Value of unseen actions: `baseline` (Q = V) or `zero` (paper) |
+| `jitrl.writebackGate` | `"auto"` | Online write-back evidence gate: `auto` runs the gate when no host-trusted verifier exists (experience is written for audit only: `learningEligible=false`, `learningTarget=0`), `on` always runs it, `off` disables the G-A/G-B gate but leaves the independent A4-3 not-evaluable veto in force (an unverified text probe stays audit-only; the fully historical path is the offline eval harness's `probeEvaluation:'legacy'` seam, which is NOT a public plugin option and is refused by `createEvoHarnessPlugin`) |
 
 `modelRoute` applicability: `provider` / `model` / `reasoningEffort` are the **second-level settings page /
 `cordis.patch.yml` modelRoute group** — a host-specific group that `splitModelRoute` lifts out of the raw
@@ -404,7 +510,7 @@ dsh-plugin-evo-harness/
 ├── package.json             # engines, packageManager, scripts, devDependencies
 ├── tsconfig.json            # strict ES2022 / Bundler typecheck, noEmit
 ├── scripts/
-│   ├── build.mjs            # esbuild bundle to lib/index.js
+│   ├── build.mjs            # esbuild bundles to lib/index.js + lib/mcp/server.js
 │   ├── build-manifest.mjs   # build-freshness stamp (source + dependency digests)
 │   ├── verify-readme-counts.mjs # mechanical verification of README metrics in CI
 │   ├── eval-jitrl.mjs       # deterministic offline JitRL evaluation CLI (`pnpm run eval:jitrl`)
@@ -414,6 +520,7 @@ dsh-plugin-evo-harness/
 │   └── fixtures/            # offline ledger fixtures (rate cards, scenarios, payloads)
 ├── src/
 │   ├── index.ts             # Cordis entrypoint: apply(ctx), /evo command, auto_fallback hook, evoHarness service
+│   ├── mcp/                 # standalone stdio server, shared assembly, job book, OpenAI adapter
 │   ├── config.ts            # schema, frozen defaults, deterministic validation
 │   ├── orchestrator.ts      # the 15-stage lifecycle
 │   ├── host-triggers.ts     # verified DSH event classification and payload normalization
@@ -435,6 +542,7 @@ dsh-plugin-evo-harness/
     │   ├── dream-rsi/       # tree/prefix views, taxonomy, batching, scoring, replay
     │   └── memory-bridge/   # auto-discovery, governance gate, isolation, firewall, drivers
     └── e2e/                 # plugin entrypoint, full lifecycle, memory backends, offline dream, governance
+    └── mcp/                 # protocol handshake, exactly-seven tools, submit/poll, restart and real stdio disconnect
 ```
 
 ## Testing
@@ -451,9 +559,9 @@ cross-session promotion, and the offline dream trigger and model wiring.
 
 | Command | Scope | Suites at the time of writing |
 | :--- | :--- | :--- |
-| `pnpm run test:unit` | `tests/unit` | 175 files, 2963 tests |
-| `pnpm run test:e2e` | `tests/e2e` | 25 files, 327 tests |
-| `pnpm run test` | everything | 200 files, 3290 tests |
+| `pnpm run test:unit` | `tests/unit` | 199 files, 3498 tests |
+| `pnpm run test:e2e` | `tests/e2e + tests/mcp` | 38 files, 406 tests |
+| `pnpm run test` | everything | 237 files, 3904 tests |
 | `pnpm run verify` | typecheck + everything | the gate to run before a change lands |
 
 Individual files can be run the usual Vitest way, for example
@@ -567,14 +675,67 @@ Stated plainly, because they matter when you evaluate this plugin:
     ScopeRegistry; there is no `allowAnonymous` switch
     ([docs/adr/0001](docs/adr/0001-p61-security-contract-and-boundary-rulings.md)).
   When no seam or hook is discoverable the plugin mounts an in-process in-memory host adapter so the lifecycle
-  still runs deterministically; that in-memory host is **not** a sandbox, and the repository's own tests never talk to a real Cordis host or a real MCP server.
+  still runs deterministically; that in-memory host is **not** a sandbox. The repository tests use
+  simulated Cordis hosts and scripted MCP backends; the MCP protocol tests include a real stdio child
+  process, but they do not mount the server into a real DSH desktop host or contact a real gateway.
 - **Branch isolation is delegated to the host.** `runInIsolatedBranch` disposes everything it
   mounted on success, failure, timeout and abort, and the memory side gets a deterministic
   branch namespace, but real filesystem/process isolation only exists if the injected host
   honours the `branchId`/`namespace` it is handed (`options.host` / `ctx.fork`).
-- **Real runs need injections.** Without an `IModelAdapter`, propose/compose/reflect fail loudly;
-  without a `BranchExecutor`, every probe returns a deterministic failure instead of touching a
-  sandbox. Neither is bundled.
+- **Real runs need injections.** The Cordis entry needs an `IModelAdapter` and a `BranchExecutor`;
+  without them the relevant stages fail loudly instead of touching a sandbox. The standalone MCP
+  entry supplies an OpenAI-compatible adapter and a model-only, no-tools agent-loop executor, but
+  still needs `EVO_GATEWAY_KEY` or `EVO_GATEWAY_KEY_FILE` plus a reachable gateway; its
+  `cwd` argument is not a filesystem execution boundary. Neither entry supplies a trusted verifier
+  or a real host sandbox by itself.
+- **Only five surfaces are text-probe evaluable (A3 / B9).** The proposer's LEGEND and payload
+  contracts are filtered to
+  `enabledSurfaces ∩ {system_prompt, guardrails, memory, tool_guidance, skills}`, and a key whose
+  payload renders nothing (e.g. `guardrails: {appendRules: []}`, `memory: {scopedViewId}` alone) is
+  not admitted as evaluable. A proposal whose every edit lands on `scripts`, `subagents` or
+  `plugins` is skipped before node creation, candidate probing or experience write-back
+  (`proposal-not-evaluable:`, `stopReason=proposals_not_evaluable`); an empty intersection skips the
+  whole run (`probe surfaces:` / `no_evaluable_surfaces`). This is honest budget accounting, not a
+  failure.
+- **Learning needs evidence (A4-1 / A4-3).** The default `jitrl.writebackGate: auto` turns the
+  write-back evidence gate ON when no host-trusted verifier exists: records are physically appended
+  for audit (`learningEligible:false`, `learningTarget:0`) but `admittedToL2` stays 0. Acceptance is
+  therefore stated as `admittedToL2=0` / `auditedOnly=N` / `physical append=N`, never as
+  "appended=0". Text/artifact probes without a trusted verdict also persist
+  `rewardSources.notEvaluable=1` and are not trained; `reward=0` is an audit placeholder, never a
+  score that participates in an average.
+- **Dream needs verified trees (A4-2).** Production offline dreaming runs only when at least
+  `MIN_VERIFIED_TREES_FOR_DREAM` (12) trees are fully verified by host-trusted verdicts; a smaller
+  pool is skipped with `offline dream skipped: ...`, not replayed on mixed scales. Every
+  **verified** evidence block carries the pinned strategy plus the producer id and evidence hash; the
+  read-time gate (`nodeIsVerified`) requires a non-empty producer id and evidence hash (a
+  boolean-only block is rejected) and re-checks the producer against the host set. The tree pool is
+  still local-trusted data (no signature): an attacker who rewrites the JSONL and copies a valid
+  verifier/hash pair is outside the gate's threat model. The online active-policy still uses the frozen surrogate score; A4-2
+  changes the DREAM input, not online selection. `dreamMinVerifiedTrees: 0` restores full-pool
+  selection only; nodes carrying evidence still replay at `dreamScore`.
+- **The verification runner is host-provided (A4-5).** A trusted verdict exists only when the host
+  injects `deps.verification.runner`; no config field produces one. An enabled runner with an empty
+  `trustedProducers` set is reported as `conservative-degraded`, the run summary reports
+  `trusted=0` / `audit-only=N`, and records stay audit-only. Shape-only or self-declared
+  `metadata.verification` is never consumer-trusted and never task-quality evidence; its public
+  `verification.status` can still read `passed` because that is the payload's CLAIM. This repository
+  does not ship a worktree / read-only-tool verification runner; the host must provide the
+  executable-artifact checks.
+- **Branch-scoped hook mounts are unavailable in the DSH rc.3 observation (A5); rc.4/rc.5 are not
+  measured.** The rc.3 host smoke observed hook dispatches carrying no `branchId`, so a branch-class
+  mount fails closed and the plugin reports
+  `branch-scoped hook mount: unavailable (host dispatch carries no branchId)`. Probe differences come
+  from the prompt (A1) or the agent-loop tool executor (A1-b), not from hooks. Do not extrapolate the
+  rc.3 observation to rc.4/rc.5: re-measure there before claiming either availability or
+  unavailability. Permanent host-class mounting requires BOTH `execution.mode: guarded-active` and
+  `applyWinningPatch: true`; this code does NOT inspect a host verdict before mounting, and the mount
+  diagnostic says so explicitly.
+- **Probe metering is wired through `agentLoop.ledgerSettlement` (B8).** A ledger-only `agentLoop`
+  (settlement without a model) leaves the DSH-resolved same-process executor in charge, and that
+  executor receives the host settlement through `branch.metering`; a full agent loop meters itself.
+  The public 26-key options still have no independent settlement seam, so a host that supplies no
+  `agentLoop` at all leaves the same-process probes unmetered.
 - **Memory capability is bounded by the backend.** The governance polyfill compensates for
   backends without CCG validation, metadata filtering or branch isolation (falling back to
   prefix-scoped namespaces, ARCHITECTURE.md section 4.3), but it cannot add capabilities a
@@ -586,7 +747,7 @@ Stated plainly, because they matter when you evaluate this plugin:
   registry. On push and pull requests to `main` (`.github/workflows/ci.yml`) CI runs `tsc --noEmit`,
   the full Vitest suite, mechanical docs hygiene verification, the guarded-regression probes
   (ADR 0002 gate #7) together with the `node --test` parity/attestation suites, the attestation-target
-  binding gate (ADR 0005 D1, its own job), the four-mutant mutation gate (ADR 0005 D5, its own job)
+  binding gate (ADR 0005 D1, its own job), the five-mutant mutation gate (ADR 0005 D5, its own job)
   and a three-OS
   (Linux/macOS/Windows) fingerprint matrix whose parity job requires
   `--expect-commit "${{ github.sha }}"`, so "the three platforms agree" is checked against the
@@ -601,6 +762,7 @@ Stated plainly, because they matter when you evaluate this plugin:
 [ARCHITECTURE.md](ARCHITECTURE.md) is the normative design: section 3 maps the eight surfaces
 onto Cordis seams, section 4 defines the Canonical Lesson Envelope and the governance
 polyfill, section 5 covers the online/offline Dream-RSI loop, section 6 the directory layout,
-the interfaces and the example `cordis.yml`, and section 7 the end-to-end sequence.
+the interfaces and the example `cordis.yml`, section 7 the end-to-end sequence, and section 8 the
+shared dual-mode Cordis/MCP architecture, its seven-tool surface and its cost-accounting boundary.
 `src/types/contracts.ts` is the frozen contract surface shared by the implementation modules.
 

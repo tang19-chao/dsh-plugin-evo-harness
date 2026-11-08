@@ -919,7 +919,7 @@ describe('PR-4B assembly: the config opt-in reaches every dreamer door', () => {
       jitrl: { enabled: true, levels: ['meta'] }
     });
     const T0 = 1_700_000_000_000;
-    const plugin = createEvoHarnessPlugin({ config, now: () => T0 });
+    const plugin = createEvoHarnessPlugin({ config, now: () => T0, deps: { dreamMinVerifiedTrees: 0 } });
     plugin.orchestrator.treePool.add(mkTree('m1', 'task-m1', 1_000));
     plugin.orchestrator.treePool.add(mkTree('m2', 'task-m2', 2_000));
     const diagnostics: string[] = [];

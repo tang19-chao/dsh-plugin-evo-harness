@@ -46,6 +46,7 @@ import {
   CURRENT_PROVENANCE_VERSION,
   CURRENT_REWARD_VERSION
 } from '../../../src/jitrl/experience-store';
+import { createHostOwnedVerificationRunner } from '../../../src/verification';
 import {
   COMPLETION_SIGNAL,
   MISSING_DELIVERABLE_SIGNAL,
@@ -299,7 +300,7 @@ function makeTrajectory(input: {
         metrics: { steps: steps.length, toolCalls: 1, toolErrors: 0, durationMs: 10 },
         steps,
         toolErrors,
-        deliverable: { content: 'done', format: 'text' },
+        deliverable: input.result.deliverable ?? { content: 'done', format: 'text' },
         failureSignals: []
       } as ProbeTrajectory;
     case 'timeout':
@@ -349,6 +350,10 @@ function makeTrajectory(input: {
         metrics: { steps: steps.length, toolCalls: 2, toolErrors: 1, durationMs: 10 },
         steps,
         toolErrors,
+        // A4-3: a failed execution with an executable artifact can still carry
+        // a trusted failed verdict (the verifier judges the artifact, not the
+        // outcome), which is what keeps the negative sample learnable.
+        ...(input.result.deliverable === undefined ? {} : { deliverable: input.result.deliverable }),
         failureSignals: [{ kind: 'tool_error', message: 'the tool failed', repairable: true }]
       } as ProbeTrajectory;
   }
@@ -602,6 +607,15 @@ interface HarnessOptions {
   readonly evaluatorThrows?: boolean;
   /** P6.1-D ②: replace the step evaluator with one returning no steps. */
   readonly evaluatorEmpty?: boolean;
+  /**
+   * rev6 audit A4-3/A4-2: install a REAL host-owned verifier so the harness has
+   * an executable observable to judge. Without it every text probe is
+   * `not-evaluable` (reward 0, audit only) by contract; the numeric
+   * attribution distinctions can only be asserted when the evidence exists.
+   * The verifier accepts only 'candidate-ok' artifacts, so the succeed/fail
+   * split is independent of the composer.
+   */
+  readonly trustedVerifier?: boolean;
 }
 
 interface Harness {
@@ -701,13 +715,23 @@ function makeHarness(options: HarnessOptions): Harness {
         status: 'failed',
         steps: [{ index: 0, at: now(), kind: 'error', text: 'baseline failed' }],
         toolErrors: [],
-        failureSignals: [{ kind: 'tool_error', message: 'baseline failed', repairable: true }]
+        failureSignals: [{ kind: 'tool_error', message: 'baseline failed', repairable: true }],
+        // A4-3: an executable artifact is what the host verifier judges. The
+        // reference artifact is deliberately NOT the accepted value, so the
+        // reference earns a trusted failure (which still counts as a receipt).
+        ...(options.trustedVerifier === true
+          ? { deliverable: { content: 'baseline-bad', format: 'text' as const } }
+          : {})
       } as unknown as ProbeExecutionResult;
     }
+    const branchOutcome = options.outcomes[context.branchId] ?? 'succeed';
     return {
       status: 'succeeded',
       steps: [{ index: 0, at: now(), kind: 'message', text: 'ran' }],
-      deliverable: { content: 'ok', format: 'text' },
+      deliverable: {
+        content: branchOutcome === 'succeed' ? 'candidate-ok' : 'candidate-bad',
+        format: 'text'
+      },
       toolErrors: [],
       failureSignals: []
     } as unknown as ProbeExecutionResult;
@@ -730,6 +754,29 @@ function makeHarness(options: HarnessOptions): Harness {
     newId: makeIdFactory('pr4'),
     applyWinningPatch: false,
     jitrl: jitSurface,
+    ...(options.trustedVerifier === true
+      ? {
+          verification: {
+            runner: createHostOwnedVerificationRunner({
+              verifierId: 'credit-attribution-host',
+              verifierVersion: 'v1',
+              testSetId: 'credit-tests-v1',
+              envId: 'credit-env-v1',
+              cases: [
+                {
+                  taskId: TASK.id,
+                  checks: [
+                    {
+                      id: 'artifact-is-candidate-ok',
+                      run: (artifact) => artifact.content === 'candidate-ok'
+                    }
+                  ]
+                }
+              ]
+            })
+          }
+        }
+      : {}),
     onStage: (event) => events.push(event)
   };
 
@@ -789,6 +836,9 @@ describe('6.6 (1): a batch never shares one winner return', () => {
       },
       maxDepth: 1,
       outcomes: { 'r1-branch-0': 'succeed', 'r1-branch-1': 'fail' },
+      // A4-3: the numeric PASS/FAIL contrast needs an executable observable.
+      // The harness verifier supplies it independently of the composer.
+      trustedVerifier: true,
       // A strongly positive winner vector: the pre-fix code copied its return to
       // BOTH slots, so the failed slot came out positive too.
       stepRewards: [3, 3]
@@ -809,8 +859,9 @@ describe('6.6 (1): a batch never shares one winner return', () => {
     expect(succeeded).toBeDefined();
     expect(failed).toBeDefined();
 
-    // The winner's return came from the step evaluator...
-    expect(harness.evaluatorCalls).toHaveLength(1);
+    // rev6 A4-4: the judge is symmetric, so BOTH executed slots are evaluated
+    // (the pre-A4-4 winner-only call is the bias being removed).
+    expect(harness.evaluatorCalls).toHaveLength(2);
     expect(succeeded?.outcome).toBe('succeeded');
     expect(succeeded?.return).toBeGreaterThan(0);
 
@@ -860,8 +911,9 @@ describe('6.6 (1): a batch never shares one winner return', () => {
 
     const meta = metaRecords(harness.store);
     expect(meta).toHaveLength(2);
-    // Exactly one evaluation happened (cost is not multiplied per slot).
-    expect(harness.evaluatorCalls).toHaveLength(1);
+    // rev6 A4-4: every executed probe is evaluated symmetrically (the old
+    // winner-only call is precisely the selection bias A4-4 removes).
+    expect(harness.evaluatorCalls).toHaveLength(2);
     const winnerTrajectoryId = harness.evaluatorCalls[0]?.id;
     const winnerRecord = meta.find((record) => record.trajectoryId === winnerTrajectoryId);
     const siblingRecord = meta.find((record) => record.trajectoryId !== winnerTrajectoryId);
@@ -869,18 +921,20 @@ describe('6.6 (1): a batch never shares one winner return', () => {
     expect(siblingRecord).toBeDefined();
     // The sibling's primary target is its OWN verifiable-signal score...
     expect(siblingRecord?.observedReturn).toBe(siblingRecord?.return);
-    expect(siblingRecord?.rewardSources.stepJudge).toBeUndefined();
     // ...identical to the winner's because the trajectories are identical and
     // the yardstick is one (this is the P6.1-D fix: no winner-private scale).
+    // A4-3: both are text-only and unverified, so that shared value is 0.
     expect(siblingRecord?.return).toBeCloseTo(winnerRecord?.return ?? Number.NaN, 12);
-    // The winner's evaluator vector survives ONLY as the auxiliary entry.
+    // Both records carry their OWN auxiliary judge mean (same fake vector [3,3]).
     expect(winnerRecord?.rewardSources.stepJudge).toBeCloseTo(3, 12);
-    // And the primary scale is the RewardContract aggregation, not the
-    // evaluator mean.
-    const expected = scoreUnderRewardContract(
-      harness.seams.trajectories.get('r1-branch-0') as ProbeTrajectory
-    ).reward;
-    expect(winnerRecord?.return).toBeCloseTo(expected, 12);
+    expect(siblingRecord?.rewardSources.stepJudge).toBeCloseTo(3, 12);
+    // A4-3: no verifier means the text-only probe is not-evaluable, so the
+    // frozen score is 0 (not the 0.433 the raw aggregation would produce).
+    // The equality still pins "same trajectory, same scale": there is no
+    // winner-private formula, only ONE not-evaluable classification.
+    expect(winnerRecord?.return).toBe(0);
+    expect(winnerRecord?.rewardSources.notEvaluable).toBe(1);
+    expect(siblingRecord?.rewardSources.notEvaluable).toBe(1);
   });
 });
 
@@ -900,6 +954,7 @@ describe('6.6 (2): every round is recorded, not just the last', () => {
         'r1-branch-0': 'succeed',
         'r2-branch-0': 'fail'
       },
+      trustedVerifier: true,
       stepRewards: [2]
     });
 
@@ -957,16 +1012,21 @@ describe('6.6 (3): no winner still leaves explainable failures', () => {
     expect(meta).toHaveLength(2);
     for (const record of meta) {
       expect(record.outcome).not.toBe('succeeded');
-      expect(record.learningEligible).toBe(true);
-      expect(record.return).toBeLessThanOrEqual(0);
+      // A4-3: without an executable observable these text-only failures are
+      // AUDIT-only. The record still exists and keeps its outcome/evidence -
+      // "not measured" is not "measured as zero".
+      expect(record.learningEligible).toBe(false);
+      expect(record.return).toBe(0);
+      expect(record.rewardSources.notEvaluable).toBe(1);
       // Explainable: the record says how it ended and carries its own evidence.
       expect(record.rewardSources).toBeTypeOf('object');
     }
     // The outcomes stay distinguishable: a timeout is not a plain failure.
     const outcomes = meta.map((record) => record.outcome).sort();
     expect(outcomes).toEqual(['failed', 'timeout']);
-    // No step evaluation was spent on a run without a winner.
-    expect(harness.evaluatorCalls).toHaveLength(0);
+    // rev6 A4-4: evaluation is symmetric even without a winner, so the two
+    // executed probes are judged (their records stay audit-only above).
+    expect(harness.evaluatorCalls).toHaveLength(2);
     expect(result.outcome).not.toBe('composed');
   });
 
@@ -1616,6 +1676,7 @@ describe('6.6 (6): reverting to a shared winner return must fail', () => {
       },
       maxDepth: 1,
       outcomes: { 'r1-branch-0': 'succeed', 'r1-branch-1': 'fail' },
+      trustedVerifier: true,
       stepRewards: [3, 3],
       candidateCount: 3
     });
@@ -1645,21 +1706,23 @@ describe('6.6 (6): reverting to a shared winner return must fail', () => {
       expect(record.return).toBeCloseTo(record.observedReturn ?? Number.NaN, 6);
     }
 
-    // The winner's step vector appears exactly once (on the winner's own
-    // record), never replicated across the batch.
-    const winnerTrajectoryId = harness.evaluatorCalls[0]?.id;
-    const withWinnerVector = records.filter(
-      (record) => record.trajectoryId === winnerTrajectoryId
+    // rev6 A4-4: the judge is symmetric now - every executed probe carries its
+    // own auxiliary mean, so "the winner's vector appears once" is no longer
+    // the invariant. What matters is that no record got another one's return.
+    const withJudge = records.filter(
+      (record) => record.rewardSources.stepJudge !== undefined
     );
-    expect(withWinnerVector.length).toBeGreaterThan(0);
-    for (const record of withWinnerVector) {
-      expect(record.return).toBeGreaterThan(0);
+    expect(withJudge).toHaveLength(records.length);
+    for (const record of records) {
+      expect(record.rewardSources.stepJudge).toBeCloseTo(3, 12);
     }
-    const others = records.filter((record) => record.trajectoryId !== winnerTrajectoryId);
-    expect(others.length).toBeGreaterThan(0);
-    for (const record of others) {
-      expect(record.return).toBeLessThanOrEqual(0);
-    }
+    // The successful execution and the failed one must still differ in the
+    // primary column; a shared `returnG` would make them equal.
+    const succeeded = records.find((record) => record.outcome === 'succeeded');
+    const failed = records.find((record) => record.outcome !== 'succeeded');
+    expect(succeeded).toBeDefined();
+    expect(failed).toBeDefined();
+    expect(succeeded?.return ?? 0).toBeGreaterThan(failed?.return ?? 0);
   });
 
   it('does not carry a winner return across rounds', async () => {
@@ -1670,6 +1733,7 @@ describe('6.6 (6): reverting to a shared winner return must fail', () => {
       },
       maxDepth: 2,
       outcomes: { 'r1-branch-0': 'fail', 'r2-branch-0': 'succeed' },
+      trustedVerifier: true,
       stepRewards: [3, 3]
     });
     await harness.orchestrator.run({
@@ -1721,8 +1785,8 @@ describe('P6.1-D 7.4: one RewardContract, one yardstick', () => {
 
     const meta = metaRecords(harness.store);
     expect(meta).toHaveLength(2);
-    // The winner was still evaluated exactly once (cost is unchanged)...
-    expect(harness.evaluatorCalls).toHaveLength(1);
+    // rev6 A4-4: both probes are evaluated; symmetry is the point.
+    expect(harness.evaluatorCalls).toHaveLength(2);
     const winnerTrajectoryId = harness.evaluatorCalls[0]?.id;
     const winnerRecord = meta.find((record) => record.trajectoryId === winnerTrajectoryId);
     const siblingRecord = meta.find((record) => record.trajectoryId !== winnerTrajectoryId);
@@ -1733,31 +1797,91 @@ describe('P6.1-D 7.4: one RewardContract, one yardstick', () => {
     expect(winnerRecord?.reward).toBeCloseTo(siblingRecord?.reward ?? Number.NaN, 12);
     expect(winnerRecord?.observedReturn).toBeCloseTo(siblingRecord?.observedReturn ?? Number.NaN, 12);
     expect(winnerRecord?.return).toBeCloseTo(siblingRecord?.return ?? Number.NaN, 12);
-    // And that scale is the RewardContract aggregation, not the evaluator
-    // mean (stepRewards [3,3] would give 3 under the old winner path).
-    const expected = scoreUnderRewardContract(
-      harness.seams.trajectories.get('r1-branch-0') as ProbeTrajectory
-    ).reward;
-    expect(winnerRecord?.reward).toBeCloseTo(expected, 12);
-    // The winner's step vector survives ONLY as the auxiliary stepJudge source.
+    // And that scale is the ONE not-evaluable classification (A4-3), not the
+    // evaluator mean (stepRewards [3,3] would give 3 under the old path) and
+    // not a second, winner-private formula.
+    expect(winnerRecord?.reward).toBe(0);
+    expect(winnerRecord?.rewardSources.notEvaluable).toBe(1);
+    // rev6 A4-4: BOTH records carry their own auxiliary judge mean; before
+    // A4-4 only the composer's winner did.
     expect(winnerRecord?.rewardSources.stepJudge).toBeCloseTo(3, 12);
-    expect(siblingRecord?.rewardSources.stepJudge).toBeUndefined();
+    expect(siblingRecord?.rewardSources.stepJudge).toBeCloseTo(3, 12);
     // Every record is stamped with the contract version and one scale.
     for (const record of meta) {
       expect(record.rewardVersion).toBe(REWARD_CONTRACT.version);
     }
+
+    // A4-3 made the unverified scenario NOT-EVALUABLE for BOTH records, so the
+    // equality above is 0 = 0. That alone cannot prove the winner did not get a
+    // private scale: only an ELIGIBLE (consumable) record has a measured target.
+    // Re-run the identical twins WITH a host-trusted verifier (both artifacts
+    // pass) and require the same equality on the measured scale. The defect
+    // this test exists for is precisely a winner whose primary target is the
+    // step-evaluator mean (3) while the identical sibling keeps the contract
+    // score; with the fork restored the two values differ and this test fails.
+    const verified = makeHarness({
+      rounds: {
+        1: [
+          { kind: 'explore_domain', guidance: 'memory' },
+          { kind: 'explore_domain', guidance: 'memory' }
+        ]
+      },
+      maxDepth: 1,
+      outcomes: { 'r1-branch-0': 'succeed', 'r1-branch-1': 'succeed' },
+      trustedVerifier: true,
+      stepRewards: [3, 3]
+    });
+    await verified.orchestrator.run({
+      sessionId: 'session-p61d-verified',
+      task: TASK as never,
+      trigger: 'always'
+    });
+    const verifiedMeta = metaRecords(verified.store);
+    expect(verifiedMeta).toHaveLength(2);
+    expect(verified.evaluatorCalls).toHaveLength(2);
+    const verifiedWinnerId = verified.evaluatorCalls[0]?.id;
+    const verifiedWinner = verifiedMeta.find((record) => record.trajectoryId === verifiedWinnerId);
+    const verifiedSibling = verifiedMeta.find((record) => record.trajectoryId !== verifiedWinnerId);
+    expect(verifiedWinner).toBeDefined();
+    expect(verifiedSibling).toBeDefined();
+    // Both records are CONSUMABLE here, so the comparison is on measured
+    // targets, never on the not-evaluable zero.
+    for (const record of verifiedMeta) {
+      expect(record.learningEligible).toBe(true);
+      expect(record.rewardSources.notEvaluable).toBeUndefined();
+      expect(record.rewardSources.verificationTrusted).toBe(1);
+    }
+    // Same trajectory, same measured primary target - winner or not.
+    expect(verifiedWinner?.reward).toBeCloseTo(verifiedSibling?.reward ?? Number.NaN, 12);
+    expect(verifiedWinner?.observedReturn).toBeCloseTo(
+      verifiedSibling?.observedReturn ?? Number.NaN,
+      12
+    );
+    expect(verifiedWinner?.return).toBeCloseTo(verifiedSibling?.return ?? Number.NaN, 12);
+    expect(verifiedWinner?.learningTarget).toBeCloseTo(
+      verifiedSibling?.learningTarget ?? Number.NaN,
+      12
+    );
+    // The shared value is the RewardContract score, never the judge mean (the
+    // fake judge returns 3; the contract score lies strictly below the clip).
+    expect(verifiedWinner?.rewardSources.stepJudge).toBeCloseTo(3, 12);
+    expect(verifiedSibling?.rewardSources.stepJudge).toBeCloseTo(3, 12);
+    expect(verifiedWinner?.reward ?? 0).toBeGreaterThan(0);
+    expect(verifiedWinner?.reward ?? 0).not.toBeCloseTo(3, 6);
   });
 
   // ②judge 缺失或失败不改变 rewardVersion 隐含语义
   it('② a missing or failed judge leaves the rewardVersion semantics unchanged', async () => {
     const runOnce = async (
-      mode: 'healthy' | 'throws' | 'empty'
+      mode: 'healthy' | 'throws' | 'empty',
+      verified = false
     ): Promise<readonly ExperienceRecord[]> => {
       const harness = makeHarness({
         rounds: { 1: [{ kind: 'explore_domain', guidance: 'memory' }] },
         maxDepth: 1,
         outcomes: { 'r1-branch-0': 'succeed' },
         stepRewards: [3, 3],
+        ...(verified ? { trustedVerifier: true } : {}),
         ...(mode === 'healthy' ? {} : mode === 'throws' ? { evaluatorThrows: true } : { evaluatorEmpty: true })
       });
       await harness.orchestrator.run({
@@ -1789,6 +1913,40 @@ describe('P6.1-D 7.4: one RewardContract, one yardstick', () => {
     }
     // Only the healthy judge produced the auxiliary entry.
     expect(healthy[0]?.rewardSources.stepJudge).toBeTypeOf('number');
+
+    // A4-3: the three unverified runs above are ALL not-evaluable (reward 0),
+    // so their equality cannot distinguish a judge-derived winner scale from
+    // the contract scale. Repeat the comparison on the CONSUMABLE track: a
+    // host-trusted verdict makes every run eligible, and the judge's presence
+    // or failure still must not move reward / observedReturn / learningTarget.
+    // With the removed pre-P6.1-D fork the healthy run's record would take the
+    // evaluator mean (3) while the judge-less runs keep the contract score.
+    const verifiedHealthy = await runOnce('healthy', true);
+    const verifiedThrowing = await runOnce('throws', true);
+    const verifiedEmpty = await runOnce('empty', true);
+    for (const records of [verifiedHealthy, verifiedThrowing, verifiedEmpty]) {
+      expect(records).toHaveLength(1);
+      expect(records[0]?.learningEligible).toBe(true);
+      expect(records[0]?.rewardSources.notEvaluable).toBeUndefined();
+    }
+    const verifiedExpected = verifiedHealthy[0]?.reward;
+    expect(verifiedExpected ?? 0).toBeGreaterThan(0);
+    expect(verifiedExpected ?? 0).not.toBeCloseTo(3, 6);
+    expect(verifiedHealthy[0]?.rewardSources.stepJudge).toBeCloseTo(3, 12);
+    for (const records of [verifiedThrowing, verifiedEmpty]) {
+      const record = records[0];
+      expect(record?.rewardVersion).toBe(verifiedHealthy[0]?.rewardVersion);
+      expect(record?.reward).toBeCloseTo(verifiedExpected ?? Number.NaN, 12);
+      expect(record?.observedReturn).toBeCloseTo(
+        verifiedHealthy[0]?.observedReturn ?? Number.NaN,
+        12
+      );
+      expect(record?.learningTarget).toBeCloseTo(
+        verifiedHealthy[0]?.learningTarget ?? Number.NaN,
+        12
+      );
+      expect(record?.rewardSources.stepJudge).toBeUndefined();
+    }
   });
 
   // ③任务要求交付物时缺交付物不能与验证完成得相同目标

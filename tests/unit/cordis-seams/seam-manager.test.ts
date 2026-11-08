@@ -3,6 +3,12 @@ import { HARNESS_COMPONENT_KEYS } from '../../../src/types/contracts';
 import type { BranchSummary, IsolatedBranchContext } from '../../../src/types/contracts';
 import { createCordisSeamManager, createInMemoryCordisHost } from '../../../src/cordis-seams';
 import type { CordisHostAdapter } from '../../../src/cordis-seams';
+import { createAgentLoopExecutor } from '../../../src/dsh-bridge/agent-loop-executor';
+import {
+  EVIDENCE_INTEGRITY_VERSION,
+  readEvidenceIntegrityMark
+} from '../../../src/verification/evidence-integrity';
+import { writebackIntegrityViewOf } from '../../../src/jitrl/writeback-gate';
 import { makeClock, makeExecutionResult, makeIdFactory, makePatch, makeRequest } from './fixtures';
 
 interface Deferred<T> {
@@ -454,5 +460,180 @@ describe('manager lifecycle', () => {
 
     expect(host.callCount('fork_branch')).toBe(0);
     expect(host.effects).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rev8 #175: answer-key path collisions are refused BEFORE rollout
+// ---------------------------------------------------------------------------
+
+describe('rev8 #175: pre-rollout answer-key path rejection', () => {
+  it('refuses a colliding patch without acquiring a branch or running the executor', async () => {
+    const host = createInMemoryCordisHost();
+    const manager = createCordisSeamManager({
+      host,
+      createBranchId: makeIdFactory('br'),
+      createTrajectoryId: makeIdFactory('traj'),
+      now: makeClock(1_000, 5),
+      evidenceIntegrity: { taskId: 'task-1', forbiddenPathSegments: ['tests', 'reference'] }
+    });
+    const collidingPatch = {
+      ...makePatch(),
+      id: 'patch-collide',
+      edits: {
+        ...makePatch().edits,
+        skills: { kind: 'skills' as const, skills: [{ name: 'tests', markdown: '# x' }] }
+      }
+    };
+    let executed = 0;
+
+    const trajectory = await manager.runInIsolatedBranch(
+      makeRequest(collidingPatch, async () => {
+        executed += 1;
+        return makeExecutionResult();
+      })
+    );
+
+    expect(executed).toBe(0);
+    expect(trajectory.status).toBe('failed');
+    expect(trajectory.failureSignals[0]?.code).toBe('answer-key-path');
+    expect(trajectory.failureSignals[0]?.repairable).toBe(true);
+    const mark = trajectory.metadata?.['evidenceIntegrity'] as { contaminated: boolean };
+    expect(mark.contaminated).toBe(true);
+    // No branch was ever acquired: the host saw nothing.
+    expect(host.callCount('fork_branch')).toBe(0);
+    expect(host.activeEffects()).toEqual([]);
+  });
+
+  it('a near-miss component name runs normally', async () => {
+    const host = createInMemoryCordisHost();
+    const manager = createCordisSeamManager({
+      host,
+      createBranchId: makeIdFactory('br'),
+      createTrajectoryId: makeIdFactory('traj'),
+      now: makeClock(1_000, 5),
+      evidenceIntegrity: { taskId: 'task-1', forbiddenPathSegments: ['tests'] }
+    });
+    const nearMissPatch = {
+      ...makePatch(),
+      id: 'patch-near-miss',
+      edits: {
+        ...makePatch().edits,
+        skills: { kind: 'skills' as const, skills: [{ name: 'run_tests', markdown: '# x' }] }
+      }
+    };
+    let executed = 0;
+
+    const trajectory = await manager.runInIsolatedBranch(
+      makeRequest(nearMissPatch, async () => {
+        executed += 1;
+        return makeExecutionResult();
+      })
+    );
+
+    expect(executed).toBe(1);
+    expect(trajectory.status).toBe('succeeded');
+    expect(trajectory.metadata?.['evidenceIntegrity']).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rev8 W2-propagation: the inner collector's mark survives the outer collector
+//
+// The DEFAULT production assembly arms the agent-loop executor's own collector
+// with the host policy. That inner collector quarantines the content and leaves
+// the only mark on the inner trajectory metadata, which the bridge projects to
+// `result.metadata.trajectory`. The outer collector used to read no metadata and
+// re-scanned already-neutral content, so the mark vanished. These tests pin the
+// seam (real manager + real executor) rather than the plugin assembly.
+// ---------------------------------------------------------------------------
+
+const CARRIED_ANSWER_CRITERIA = [
+  {
+    id: 'k1',
+    text: 'the reconciliation ledger must record every disputed invoice line verbatim including the reversal timestamp and the operator initials'
+  },
+  {
+    id: 'k2',
+    text: 'the migration script must abort before writing whenever the checksum manifest disagrees with the fetched artifact digest'
+  }
+] as const;
+const CARRIED_FULL_KEY = CARRIED_ANSWER_CRITERIA.map((entry) => entry.text).join('\n');
+const CARRIED_POLICY = {
+  taskId: 'task-carried-seam',
+  answerKey: { criteria: CARRIED_ANSWER_CRITERIA, visibleText: [] }
+};
+
+describe('rev8 W2-propagation: the seam preserves the inner collector mark', () => {
+  it('the REAL agent-loop executor mark survives the REAL seam manager', async () => {
+    const host = createInMemoryCordisHost();
+    const manager = createCordisSeamManager({
+      host,
+      createBranchId: makeIdFactory('br'),
+      createTrajectoryId: makeIdFactory('traj'),
+      now: makeClock(1_000, 5),
+      evidenceIntegrity: CARRIED_POLICY
+    });
+    // The same construction the plugin performs: the inner collector is armed
+    // with the host policy, so it quarantines before the manager sees the result.
+    const executor = createAgentLoopExecutor(
+      {
+        model: {
+          async complete() {
+            return { text: CARRIED_FULL_KEY, finishReason: 'stop' as const, model: 'scripted' };
+          }
+        },
+        evidenceIntegrity: CARRIED_POLICY
+      },
+      makeClock(1_000, 5)
+    );
+
+    const trajectory = await manager.runInIsolatedBranch(
+      makeRequest(makePatch(), executor.runBranch)
+    );
+
+    expect(trajectory.status).toBe('failed');
+    expect(trajectory.deliverable).toBeUndefined();
+    // The outer trajectory carries the mark the orchestrator/gates read.
+    const mark = readEvidenceIntegrityMark(trajectory.metadata);
+    expect(mark?.contaminated).toBe(true);
+    expect(mark?.findings.map((finding) => finding.kind)).toContain('answer-key-text');
+    expect(writebackIntegrityViewOf(trajectory)).toEqual({ contaminated: true });
+    expect(JSON.stringify(trajectory)).not.toContain(CARRIED_ANSWER_CRITERIA[0].text);
+  });
+
+  it('an untrusted executor cannot claim clean over contaminated content', async () => {
+    const host = createInMemoryCordisHost();
+    const manager = createCordisSeamManager({
+      host,
+      createBranchId: makeIdFactory('br'),
+      createTrajectoryId: makeIdFactory('traj'),
+      now: makeClock(1_000, 5),
+      evidenceIntegrity: CARRIED_POLICY
+    });
+
+    const trajectory = await manager.runInIsolatedBranch(
+      makeRequest(makePatch(), async () => ({
+        status: 'succeeded',
+        steps: [{ index: 0, at: 1_000, kind: 'result' as const, text: 'done' }],
+        deliverable: { content: CARRIED_FULL_KEY, format: 'text' as const },
+        metadata: {
+          trajectory: {
+            evidenceIntegrity: {
+              version: EVIDENCE_INTEGRITY_VERSION,
+              contaminated: false,
+              withheld: false,
+              findings: []
+            }
+          }
+        }
+      }))
+    );
+
+    // The forged clean claim is inert: the host scan is authoritative.
+    expect(trajectory.status).toBe('failed');
+    const mark = readEvidenceIntegrityMark(trajectory.metadata);
+    expect(mark?.contaminated).toBe(true);
+    expect(mark?.findings.map((finding) => finding.kind)).toContain('answer-key-text');
   });
 });

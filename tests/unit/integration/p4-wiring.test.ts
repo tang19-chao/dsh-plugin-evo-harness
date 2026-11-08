@@ -32,7 +32,8 @@ describe('P4 dual loop through the plugin entrypoint', () => {
   it('injects the replay hook and reports the perturbed candidate jit values', async () => {
     const harness = buildE2E({
       dreamEveryNTasks: 1,
-      config: { jitrl: { dream: FULL_GRID } }
+      config: { jitrl: { dream: FULL_GRID } },
+      extra: { deps: { dreamMinVerifiedTrees: 0 } }
     });
     const plugin = harness.plugin;
     const result = await runOneDream(plugin, 'task-p4-grid');
@@ -92,7 +93,8 @@ describe('P4 dual loop through the plugin entrypoint', () => {
             candidateJitLambdas: [0.02, 0.05, 0.1]
           }
         }
-      }
+      },
+      extra: { deps: { dreamMinVerifiedTrees: 0 } }
     });
     const plugin = harness.plugin;
     const result = await runOneDream(plugin, 'task-p4-drift');
@@ -117,7 +119,8 @@ describe('P4 dual loop through the plugin entrypoint', () => {
   it('leaves dreaming on the plain dreamer when JitRL is switched off', async () => {
     const harness = buildE2E({
       dreamEveryNTasks: 1,
-      config: { jitrl: { enabled: false } }
+      config: { jitrl: { enabled: false } },
+      extra: { deps: { dreamMinVerifiedTrees: 0 } }
     });
     const plugin = harness.plugin;
     const result = await runOneDream(plugin, 'task-p4-off');

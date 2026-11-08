@@ -57,7 +57,8 @@
  * This module is pure and dependency-light so the online path, the eval script
  * and the unit tests all execute the SAME rule set rather than a test-local copy.
  */
-import type { ExperienceRecord } from '../types/contracts';
+import type { ExperienceRecord, ProbeTrajectory } from '../types/contracts';
+import { readEvidenceIntegrityMark } from '../verification/evidence-integrity';
 
 /** The two preregistered admission routes (preregistration §5). */
 export const WRITEBACK_ADMISSION_ROUTES = [
@@ -85,7 +86,13 @@ export const WRITEBACK_REFUSAL_REASONS = [
   /** The snapshot could not be read, so G-B cannot be evaluated (fail-closed). */
   'history-unusable',
   /** The record is already learning-ineligible for its own reasons (audit-only). */
-  'rejected-record-ineligible'
+  'rejected-record-ineligible',
+  /**
+   * rev8 #118: the trajectory's own evidence-integrity scan withheld it
+   * (answer-key text, sentinel, or colliding path). Appended LAST so the
+   * stable numeric codes of every pre-existing reason are unchanged.
+   */
+  'rejected-contaminated-evidence'
 ] as const;
 export type WritebackRefusalReason = (typeof WRITEBACK_REFUSAL_REASONS)[number];
 
@@ -152,6 +159,14 @@ export interface WritebackGateTrajectoryView {
   readonly verifierRewardMismatch: boolean;
   /** Host disposition: this execution may not train regardless of verdict. */
   readonly forceAuditOnly: boolean;
+  /**
+   * rev8 #118: the evidence-integrity scan (sentinel / answer-key text /
+   * colliding path) withheld this trajectory. A counterexample shape: one
+   * contaminated execution vetoes every route, exactly like a verifier
+   * mismatch — poisoning is not outvoted. Optional so pre-rev8 callers are
+   * unchanged (absent reads as false).
+   */
+  readonly contaminated?: boolean;
   /** The record's own learning eligibility (false = already audit-only). */
   readonly recordLearningEligible: boolean;
 }
@@ -181,6 +196,12 @@ export interface WritebackHistoryEntry {
   readonly status: 'passed' | 'failed' | 'unknown';
   readonly verified: boolean;
   readonly counterexample: boolean;
+  /**
+   * rev8 #118: the persisted record was withheld by the evidence-integrity
+   * scan. Such a record is a counterexample for G-B and can never satisfy
+   * G-A's prior-failure half (contamination is not a repairable failure).
+   */
+  readonly contaminated?: boolean;
 }
 
 /**
@@ -198,7 +219,7 @@ export interface WritebackHistoryEntry {
  */
 export function writebackHistoryEntryOf(
   actionKey: string,
-  signals: Pick<WritebackGateTrajectoryView, 'trustedSource' | 'verificationStatus' | 'verifierRewardMismatch' | 'forceAuditOnly'>
+  signals: Pick<WritebackGateTrajectoryView, 'trustedSource' | 'verificationStatus' | 'verifierRewardMismatch' | 'forceAuditOnly' | 'contaminated'>
 ): WritebackHistoryEntry {
   const verified = signals.trustedSource && signals.verificationStatus === 'passed';
   return {
@@ -208,7 +229,8 @@ export function writebackHistoryEntryOf(
         ? signals.verificationStatus
         : 'unknown',
     verified,
-    counterexample: signals.verifierRewardMismatch || signals.forceAuditOnly
+    counterexample: signals.verifierRewardMismatch || signals.forceAuditOnly || signals.contaminated === true,
+    ...(signals.contaminated === true ? { contaminated: true } : {})
   };
 }
 
@@ -265,12 +287,15 @@ export type WritebackGateRules = typeof WRITEBACK_CONVERGENCE_RULES;
  *
  * Order of evaluation matters and is part of the frozen contract:
  *   1. record-ineligible (the record already declares itself audit-only);
- *   2. no-verdict (nothing to reason about);
- *   3. current-run counterexample (verifier/reward mismatch or the host's own
+ *   2. contaminated evidence (rev8 #118: the integrity scan withheld it — a
+ *      specific refusal beats the vague "no verdict", and the withheld shape
+ *      must not be laundered into `rejected-no-verdict`);
+ *   3. no-verdict (nothing to reason about);
+ *   4. current-run counterexample (verifier/reward mismatch or the host's own
  *      audit-only veto - the same poisoning shapes that veto G-B from history);
- *   4. G-A  fail->pass  (the cheapest, most specific evidence);
- *   5. G-B  convergence (support / verified-rate / counterexamples);
- *   6. first refusal reason wins, so the report can name why, not just "no".
+ *   5. G-A  fail->pass  (the cheapest, most specific evidence);
+ *   6. G-B  convergence (support / verified-rate / counterexamples);
+ *   7. first refusal reason wins, so the report can name why, not just "no".
  */
 export function judgeWriteback(
   signals: WritebackGateTrajectoryView,
@@ -299,12 +324,22 @@ export function judgeWriteback(
     return { admitted: false, refusal: 'rejected-record-ineligible', ...base };
   }
 
-  // 2. No verdict at all: there is no evidence to reason about.
+  // 2. rev8 #118: the evidence-integrity scan withheld this trajectory. There
+  //    is no evidence to reason about, and the reason must stay specific — a
+  //    withheld record must not be laundered into `rejected-no-verdict`.
+  //    Sits BEFORE the no-verdict check so the report names the contamination,
+  //    AFTER record-ineligible so the pre-rev8 ordering of that first refusal
+  //    is unchanged.
+  if (signals.contaminated === true) {
+    return { admitted: false, refusal: 'rejected-contaminated-evidence', ...base };
+  }
+
+  // 3. No verdict at all: there is no evidence to reason about.
   if (signals.verificationStatus === 'unknown') {
     return { admitted: false, refusal: 'rejected-no-verdict', ...base };
   }
 
-  // 3. A CURRENT-RUN counterexample vetoes every route, exactly as its history
+  // 4. A CURRENT-RUN counterexample vetoes every route, exactly as its history
   //    counterparts veto G-B (preregistration §5: any record with
   //    `verifierRewardMismatch === true` or `forceAuditOnly === true` counts as
   //    a counterexample, and one is enough). Audit JITRL-6: both channels were
@@ -317,7 +352,7 @@ export function judgeWriteback(
     return { admitted: false, refusal: 'rejected-verifier-mismatch', ...base };
   }
 
-  // 3. G-A: a trusted pass that repairs a recorded failure of the same action.
+  // 5. G-A: a trusted pass that repairs a recorded failure of the same action.
   if (signals.verificationStatus === 'passed') {
     if (!trustedReceipt) {
       // Keep the most specific reason: the receipt is present but not trusted.
@@ -329,7 +364,7 @@ export function judgeWriteback(
     return { admitted: true, route: 'kept-fail-to-pass', ...base };
   }
 
-  // 4. G-B: preregistered convergence. Note that G-B is reachable for a `failed`
+  // 6. G-B: preregistered convergence. Note that G-B is reachable for a `failed`
   //    verdict as well: 12 of 12 verified records with one failure and zero
   //    counterexamples is still convergence, and refusing it would keep the gate
   //    from ever learning from a mostly-good action. The pass-rate floor is what
@@ -415,4 +450,19 @@ export function writebackRouteCode(route: WritebackAdmissionRoute | undefined): 
   }
   const index = WRITEBACK_ADMISSION_ROUTES.indexOf(route);
   return index < 0 ? 0 : index + 1;
+}
+
+/**
+ * rev8 #118: project the persisted evidence-integrity mark onto the gate's
+ * view field. The mark is written by the collector at finalize time from the
+ * HOST's policy, so a refused scan is visible to the write-back decision even
+ * when the verdict/reward columns look perfect — the exact laundering shape
+ * this gate exists to refuse. Pre-rev8 trajectories carry no mark and project
+ * to `contaminated: false`.
+ */
+export function writebackIntegrityViewOf(
+  trajectory: Pick<ProbeTrajectory, 'metadata'>
+): { readonly contaminated: boolean } {
+  const mark = readEvidenceIntegrityMark(trajectory.metadata);
+  return { contaminated: mark?.contaminated === true };
 }

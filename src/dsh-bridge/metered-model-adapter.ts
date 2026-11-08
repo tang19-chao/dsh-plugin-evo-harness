@@ -510,6 +510,10 @@ export function createMeteredModelAdapter(
       }
 
       let reservationId: string | undefined;
+      // The amount the ledger ACTUALLY ring-fenced. `estimatedCostMicros` is the
+      // request, not the reservation: observe-mode reserves 0, and a route cap
+      // can reserve less. With no settlement nothing is reserved at all.
+      let reservedMicros = 0;
       if (settlement !== undefined) {
         // beginCall records the durable callId -> reservationId mapping BEFORE the
         // provider is called, so late usage can always be joined back (contract 1).
@@ -551,6 +555,7 @@ export function createMeteredModelAdapter(
           throw error;
         }
         reservationId = decision.reservationId;
+        reservedMicros = decision.reservedCostMicros;
       }
 
       let response: ModelResponse;
@@ -600,7 +605,7 @@ export function createMeteredModelAdapter(
           ...(incurred === undefined ? {} : { incurredCostMicros: incurred }),
           ...(heldCostMicros === undefined ? {} : { heldCostMicros }),
           settlement: settlementPhase,
-          reservedMicros: estimatedCostMicros,
+          reservedMicros,
           provenance,
           error: settleFailure ? 'settle_failed' : error instanceof Error ? error.name : 'model_error'
         });
@@ -659,7 +664,7 @@ export function createMeteredModelAdapter(
         ...(incurred === undefined ? {} : { incurredCostMicros: incurred }),
         ...(heldCostMicros === undefined ? {} : { heldCostMicros }),
         settlement: settlementPhase,
-        reservedMicros: estimatedCostMicros,
+        reservedMicros,
         provenance,
         ...(settleFailure ? { error: 'settle_failed' as const } : {})
       });

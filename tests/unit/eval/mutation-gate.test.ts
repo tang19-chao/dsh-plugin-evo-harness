@@ -5,7 +5,7 @@
  * functions - spec validation, text-anchored mutation application, restore
  * semantics, red-set subset judgement, baseline judgement, path safety - plus
  * static assertions that the CI/package wiring stays append-only. They never
- * spawn a vitest run and never apply a mutant to a real file: running the four
+ * spawn a vitest run and never apply a mutant to a real file: running the five
  * mutants inside vitest would be a recursion hazard, and mutating the worktree
  * would poison the attestation digest roots.
  *
@@ -129,9 +129,9 @@ function reverseMutant(mutant: GateMutant): GateMutant {
 }
 
 describe('mutation gate spec (ADR 0005 §5.1)', () => {
-  it('pins exactly the four documented mutants in order', () => {
-    expect(gate.MUTANTS.map((entry) => entry.id)).toEqual(['M1', 'M2', 'M3', 'M4']);
-    expect(new Set(gate.MUTANTS.map((entry) => entry.title)).size).toBe(4);
+  it('pins exactly the five documented mutants in order', () => {
+    expect(gate.MUTANTS.map((entry) => entry.id)).toEqual(['M1', 'M2', 'M3', 'M4', 'M5']);
+    expect(new Set(gate.MUTANTS.map((entry) => entry.title)).size).toBe(5);
     expect(gate.GATE_ID).toBe('mutation-gate-v1');
   });
 
@@ -157,6 +157,7 @@ describe('mutation gate spec (ADR 0005 §5.1)', () => {
     expect(mutantById('M2').mustRed).toHaveLength(3);
     expect(mutantById('M3').mustRed).toHaveLength(2);
     expect(mutantById('M4').mustRed).toHaveLength(2);
+    expect(mutantById('M5').mustRed).toHaveLength(2);
   });
 
   it('keeps the copy list free of node_modules (it is linked, never copied)', () => {
@@ -405,7 +406,7 @@ describe('path safety', () => {
   });
 
   it('rejects specs that name files the gate may never touch', () => {
-    const broken: GateMutant = { ...mutantById('M4'), id: 'M5', file: 'docs/reports/final-attestation.json' };
+    const broken: GateMutant = { ...mutantById('M4'), id: 'M6', file: 'docs/reports/final-attestation.json' };
     const problems = gate.validateMutantSpec(broken);
     expect(problems.some((problem) => problem.includes('outside gate roots'))).toBe(true);
     const orphanMustRed: GateMutant = {
@@ -496,7 +497,7 @@ describe('CI and package wiring stays append-only (t2 → t8 order, ADR 0005 §6
     expect(verify).toContain("node-version: '22'");
   });
 
-  it('adds exactly check:mutation to package.json without touching attestation keys or deps', () => {
+  it('adds exactly check:mutation to package.json without touching attestation keys or the gate-era deps', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')) as {
       scripts: Record<string, string>;
       devDependencies: Record<string, string>;
@@ -516,6 +517,19 @@ describe('CI and package wiring stays append-only (t2 → t8 order, ADR 0005 §6
       typescript: '5.9.3',
       vitest: '3.2.7'
     });
-    expect(pkg.dependencies).toEqual({ '@deepseek-ai/schemastery': '3.18.4' });
+    // The gate-era dependency set is pinned as a SUPERSET assertion, not a
+    // strict equality: the rev8 MCP dual-artifact work added
+    // '@modelcontextprotocol/server' (plan §5.1, "新增 dependency"), and this
+    // test's job is to catch the gate's own deps being TOUCHED, not to freeze
+    // the manifest against additive growth. The two named entries must keep
+    // their exact pinned versions.
+    expect(Object.keys(pkg.devDependencies).sort()).toEqual(
+      ['@types/node', 'esbuild', 'typescript', 'vitest'].sort()
+    );
+    expect(pkg.dependencies['@deepseek-ai/schemastery']).toBe('3.18.4');
+    expect(pkg.dependencies['@modelcontextprotocol/server']).toBe('2.2.0');
+    expect(Object.keys(pkg.dependencies).sort()).toEqual(
+      ['@deepseek-ai/schemastery', '@modelcontextprotocol/server'].sort()
+    );
   });
 });

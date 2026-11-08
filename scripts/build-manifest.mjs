@@ -41,7 +41,15 @@
  *     database blobs, not the worktree);
  *   - the composite is a single SHA256 over the concatenation, and the stamp
  *     also records the file count and the per-file digests so a reviewer can
- *     re-derive it.
+ *     re-derive it;
+ *   - (rev8 dual-artifact, ADDITIVE) the stamp additionally records an
+ *     `artifactMcp` block for `lib/mcp/server.js` (the MCP stdio entry) with
+ *     the same {path, bytes, sha256} shape. Its absence (null) never makes a
+ *     stamp stale by itself: the smoke gate asserts the SECOND artifact's
+ *     presence, while `computeBuildStatus` only adds the
+ *     `mcp-artifact-missing` / `mcp-artifact-mismatch` reasons when the caller
+ *     passes `requireMcpArtifact: true`. Every pre-existing field and reason
+ *     keeps its exact meaning.
  *
  * `commit` is `git rev-parse HEAD` at build time. (1.1.0) a recorded commit
  * that no longer matches HEAD is a staleness reason (`commit-mismatch`): the
@@ -75,6 +83,13 @@ export const BUILD_STAMP_SCHEMA_VERSION = '1.1.0';
 export const BUILD_STAMP_PATH = 'lib/build-stamp.json';
 /** POSIX-relative path of the build artifact asserted by the smoke gate. */
 export const BUILD_ARTIFACT_PATH = 'lib/index.js';
+/**
+ * POSIX-relative path of the SECOND build artifact, the MCP stdio entry
+ * (rev8 plan §5.1/§5.6: lib/mcp/server.js, an ESM node20 bundle of
+ * src/mcp/server.ts). Described additively in the stamp's `artifactMcp`
+ * block; the primary artifact's fields and semantics are unchanged.
+ */
+export const BUILD_MCP_ARTIFACT_PATH = 'lib/mcp/server.js';
 
 /**
  * Dependency identity files folded into the stamp (schema 1.1.0): the bundle
@@ -214,12 +229,15 @@ function readHeadCommit(cwd) {
 /**
  * Build (but do not write) the stamp for a repository.
  *
- * @param {{cwd?: string, artifactPath?: string}} [options]
+ * @param {{cwd?: string, artifactPath?: string, mcpArtifactPath?: string}} [options]
  * @returns {any} the stamp object
  */
 export function buildStamp(options = {}) {
   const cwd = options.cwd ?? rootDir;
   const artifactRelative = (options.artifactPath ?? BUILD_ARTIFACT_PATH).split(path.sep).join('/');
+  const mcpArtifactRelative = (options.mcpArtifactPath ?? BUILD_MCP_ARTIFACT_PATH)
+    .split(path.sep)
+    .join('/');
   const source = computeSrcTreeSha256({ cwd });
   const dependencies = computeDependencySha256({ cwd });
   const artifactAbsolute = path.join(cwd, artifactRelative);
@@ -227,6 +245,16 @@ export function buildStamp(options = {}) {
   if (fs.existsSync(artifactAbsolute)) {
     const bytes = fs.readFileSync(artifactAbsolute);
     artifact = { path: artifactRelative, bytes: bytes.length, sha256: sha256Hex(bytes) };
+  }
+  // rev8 dual-artifact: the MCP entry is described the same way, additively.
+  // A missing MCP artifact records `artifactMcp: null` (never a fake entry) —
+  // the reader that asserts its presence adds its own reason, so a stamp
+  // written before this field existed stays interpretable.
+  const mcpArtifactAbsolute = path.join(cwd, mcpArtifactRelative);
+  let artifactMcp = null;
+  if (fs.existsSync(mcpArtifactAbsolute)) {
+    const bytes = fs.readFileSync(mcpArtifactAbsolute);
+    artifactMcp = { path: mcpArtifactRelative, bytes: bytes.length, sha256: sha256Hex(bytes) };
   }
   const head = readHeadCommit(cwd);
   return {
@@ -239,6 +267,7 @@ export function buildStamp(options = {}) {
     dependencyFileCount: dependencies.fileCount,
     dependencyFiles: dependencies.files,
     artifact,
+    artifactMcp,
     commit: head.commit,
     commitError: head.error,
     commitSource: 'git rev-parse --verify HEAD^{commit}',
@@ -261,7 +290,7 @@ export function buildStamp(options = {}) {
 /**
  * Build the stamp and write it to `<cwd>/lib/build-stamp.json`.
  *
- * @param {{cwd?: string, artifactPath?: string, stampPath?: string}} [options]
+ * @param {{cwd?: string, artifactPath?: string, mcpArtifactPath?: string, stampPath?: string}} [options]
  * @returns {any} the written stamp
  */
 export function writeBuildStamp(options = {}) {
@@ -269,7 +298,8 @@ export function writeBuildStamp(options = {}) {
   const stampRelative = (options.stampPath ?? BUILD_STAMP_PATH).split(path.sep).join('/');
   const stamp = buildStamp({
     cwd,
-    ...(options.artifactPath === undefined ? {} : { artifactPath: options.artifactPath })
+    ...(options.artifactPath === undefined ? {} : { artifactPath: options.artifactPath }),
+    ...(options.mcpArtifactPath === undefined ? {} : { mcpArtifactPath: options.mcpArtifactPath })
   });
   const stampAbsolute = path.join(cwd, stampRelative);
   fs.mkdirSync(path.dirname(stampAbsolute), { recursive: true });
@@ -342,6 +372,22 @@ function readStamp(absolutePath) {
       return { stamp: null, error: 'stamp-invalid: artifact block is malformed' };
     }
   }
+  // (rev8 dual-artifact) The MCP block is OPTIONAL: a stamp written before it
+  // existed (or by a fixture that never produced a second artifact) records
+  // null and stays valid. When PRESENT it must carry the same shape as the
+  // primary artifact block - a malformed block is not interpretable evidence,
+  // so it invalidates the whole stamp (fail-closed, same as the primary).
+  if (stamp.artifactMcp !== null && stamp.artifactMcp !== undefined) {
+    if (
+      typeof stamp.artifactMcp !== 'object' ||
+      typeof stamp.artifactMcp.path !== 'string' ||
+      typeof stamp.artifactMcp.bytes !== 'number' ||
+      typeof stamp.artifactMcp.sha256 !== 'string' ||
+      !SHA256_HEX.test(stamp.artifactMcp.sha256)
+    ) {
+      return { stamp: null, error: 'stamp-invalid: artifactMcp block is malformed' };
+    }
+  }
   return { stamp, error: null };
 }
 
@@ -365,9 +411,18 @@ function readStamp(absolutePath) {
  *                             a moved HEAD is stale evidence. Skipped when
  *                             either side has no commit to compare.
  *
+ * rev8 dual-artifact (ADDITIVE, only when `requireMcpArtifact` is true):
+ *   - `mcp-artifact-missing`  `lib/mcp/server.js` does not exist;
+ *   - `mcp-artifact-mismatch` the MCP artifact's sha256/bytes differ from the
+ *                             stamp's `artifactMcp` block.
+ * Without `requireMcpArtifact` the MCP artifact is DESCRIBED
+ * (`artifactMcp` block in the return value) but never gates staleness, so a
+ * fixture repository (and any pre-rev8 consumer) keeps the exact freshness
+ * semantics it had before: the default stays the primary-artifact check.
+ *
  * `stale` is TRUE whenever any reason is present.
  *
- * @param {{cwd?: string, artifactPath?: string, stampPath?: string}} [options]
+ * @param {{cwd?: string, artifactPath?: string, mcpArtifactPath?: string, stampPath?: string, requireMcpArtifact?: boolean}} [options]
  * @returns {{
  *   ok: boolean,
  *   stale: boolean,
@@ -376,6 +431,10 @@ function readStamp(absolutePath) {
  *   artifactPath: string,
  *   artifactBytes: number|null,
  *   artifactSha256: string|null,
+ *   artifactMcp: 'present'|'absent',
+ *   artifactMcpPath: string,
+ *   artifactMcpBytes: number|null,
+ *   artifactMcpSha256: string|null,
  *   stampPath: string,
  *   stampPresent: boolean,
  *   srcTreeSha256: {current: string, recorded: string|null, currentFileCount: number},
@@ -387,8 +446,12 @@ function readStamp(absolutePath) {
 export function computeBuildStatus(options = {}) {
   const cwd = options.cwd ?? rootDir;
   const artifactRelative = (options.artifactPath ?? BUILD_ARTIFACT_PATH).split(path.sep).join('/');
+  const mcpArtifactRelative = (options.mcpArtifactPath ?? BUILD_MCP_ARTIFACT_PATH)
+    .split(path.sep)
+    .join('/');
   const stampRelative = (options.stampPath ?? BUILD_STAMP_PATH).split(path.sep).join('/');
   const artifactAbsolute = path.join(cwd, artifactRelative);
+  const mcpArtifactAbsolute = path.join(cwd, mcpArtifactRelative);
   const stampAbsolute = path.join(cwd, stampRelative);
 
   const source = computeSrcTreeSha256({ cwd });
@@ -405,6 +468,17 @@ export function computeBuildStatus(options = {}) {
     artifactSha256 = sha256Hex(bytes);
   } else {
     reasons.push('artifact-missing');
+  }
+
+  const mcpArtifactPresent = fs.existsSync(mcpArtifactAbsolute);
+  let mcpArtifactBytes = null;
+  let mcpArtifactSha256 = null;
+  if (mcpArtifactPresent) {
+    const bytes = fs.readFileSync(mcpArtifactAbsolute);
+    mcpArtifactBytes = bytes.length;
+    mcpArtifactSha256 = sha256Hex(bytes);
+  } else if (options.requireMcpArtifact === true) {
+    reasons.push('mcp-artifact-missing');
   }
 
   const { stamp, error: stampError } = readStamp(stampAbsolute);
@@ -424,6 +498,21 @@ export function computeBuildStatus(options = {}) {
         stamp.artifact.bytes !== artifactBytes)
     ) {
       reasons.push('artifact-mismatch');
+    }
+    if (options.requireMcpArtifact === true && mcpArtifactPresent) {
+      // Only a stamp that DESCRIBES the MCP artifact can mismatch against it:
+      // `artifactMcp: null` plus requireMcpArtifact already produced
+      // mcp-artifact-missing above when the file is absent; when the file is
+      // PRESENT but the stamp predates the second entry, the missing
+      // description is its own named reason.
+      if (stamp.artifactMcp === null || stamp.artifactMcp === undefined) {
+        reasons.push('mcp-artifact-mismatch');
+      } else if (
+        stamp.artifactMcp.sha256 !== mcpArtifactSha256 ||
+        stamp.artifactMcp.bytes !== mcpArtifactBytes
+      ) {
+        reasons.push('mcp-artifact-mismatch');
+      }
     }
   }
 
@@ -466,6 +555,12 @@ export function computeBuildStatus(options = {}) {
   if (reasons.includes('artifact-mismatch')) {
     detailParts.push('lib/index.js does not match the stamp; run `pnpm run build`');
   }
+  if (reasons.includes('mcp-artifact-missing')) {
+    detailParts.push('lib/mcp/server.js is absent; run `pnpm run build` (dual-artifact build)');
+  }
+  if (reasons.includes('mcp-artifact-mismatch')) {
+    detailParts.push('lib/mcp/server.js does not match the stamp artifactMcp block; run `pnpm run build`');
+  }
   if (reasons.includes('commit-mismatch')) {
     detailParts.push(
       'HEAD is ' +
@@ -487,6 +582,10 @@ export function computeBuildStatus(options = {}) {
     artifactPath: artifactRelative,
     artifactBytes,
     artifactSha256,
+    artifactMcp: mcpArtifactPresent ? 'present' : 'absent',
+    artifactMcpPath: mcpArtifactRelative,
+    artifactMcpBytes: mcpArtifactBytes,
+    artifactMcpSha256: mcpArtifactSha256,
     stampPath: stampRelative,
     stampPresent: stamp !== null,
     srcTreeSha256: {

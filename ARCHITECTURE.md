@@ -14,6 +14,7 @@
 5. [核心模块三：融合 Dream-RSI 的在线自适应探测与离线做梦引擎](#5-核心模块三融合-dream-rsi-的在线自适应探测与离线做梦引擎)
 6. [插件目录结构与核心接口定义](#6-插件目录结构与核心接口定义)
 7. [端到端运行时序](#7-端到端运行时序-end-to-end-execution-flow)
+8. [双模入口：Cordis 插件与独立 MCP stdio 服务](#8-双模入口cordis-插件与独立-mcp-stdio-服务)
 
 ---
 
@@ -365,3 +366,82 @@ plugins:
    - Reflector 将本次胜出的修改与失败探测分支分别提炼为正向与负向 `CanonicalLesson`。
    - GovernancePolyfill 执行客户端前置闸门校验（确保六要素完整、包含克制条款与对比证据），通过后调用底层 MCP 插件的写入接口持久化到全局命名空间。
    - 当累计完成 N 个任务后，后台唤醒 OfflineDreamer，在 TreePool 上零成本重放并进化元探索策略 `π_{t+1}`，实现**“脚手架组件库”与“搜索调度算法”的双螺旋自进化**。
+
+---
+
+## 8. 双模入口：Cordis 插件与独立 MCP stdio 服务
+
+rev8 增加的不是第二套进化引擎，而是同一 `createEvoHarnessPlugin` 装配的第二种进程入口。
+`src/index.ts` 继续承担 Cordis 挂载、`/evo`、宿主事件与可注入协作者；`src/mcp/server.ts`
+通过 `buildEvoAssembly` 复用真实插件装配，但固定使用 `ctx=undefined`、内存 Cordis host、
+`clients=[]`、关闭协作者探测/自动触发/空闲做梦，形成无宿主上下文的 pull-only MCP 进程。
+后者与第 4 节的“插件作为 MCP 客户端连接记忆后端”方向相反，不能混为同一个连接。
+
+`scripts/build.mjs` 以相同 esbuild ESM/node20 选项分别产出 `lib/index.js` 与
+`lib/mcp/server.js`。直接执行 `node lib/mcp/server.js` 才启动 stdio；导入 bundle 不占用 stdin。
+服务端名为 `evo`，通过 `@modelcontextprotocol/server` 的标准 `registerTool` 注册，而非手写
+JSON-RPC 协议实现。
+
+### 8.1 恰好七工具与 submit/poll 时序
+
+| 工具 | 实现边界 |
+| :--- | :--- |
+| `evo_status` | 只读投影：运行阶段、shadow 常量、数据目录、JitRL 与做梦就绪度 |
+| `evo_run_submit` | 立即返回 `{runId, status:"started", pollAfterMs}`；`dryRun:true` 不创建装配或数据目录 |
+| `evo_run_poll` | 返回 `running / complete / failed / cancelled / timeout`；结束后携带真实 `EvoHarnessRunResult` |
+| `evo_dream` | 仅经 orchestrator 的 12 棵 verified-tree 门控路径 |
+| `evo_jit` | 复用 `/evo jit` 控制器；`on/off` 仅进程内 volatile，`reset` 要求 `confirm:true` |
+| `evo_lessons` | 有界、深度脱敏的 lessons 与 dream reports 页面 |
+| `evo_text_probe` | 文本探测恒为 `not-evaluable`，不伪造通过或分数 |
+
+`evo_run_submit` 只启动任务，不在工具调用内等待长任务完成；调用方拿 `runId` 后调用
+`evo_run_poll`。每个 runId 有独立 AbortController 和内存 JobBook 记录，但 run/dream/jit 的
+内部变更经同一串行链，避免 orchestrator 的实例级运行状态互相覆盖。JobBook 默认最多保留
+128 条且进程重启即丢失；重启后旧 runId 返回 `unknown_run_id`。tree pool、policy 与 counters
+可从数据目录恢复，但这不等于 JobBook 可恢复。
+
+### 8.2 独立数据目录与断连清理
+
+生产 stdio 进程实际使用四个模型/网关 env：
+
+- `EVO_MODEL_BASE_URL`：含版本段的 OpenAI 兼容 base URL，默认 `http://127.0.0.1:8326/v1`；
+  唯一请求端点为 `<baseUrl>/chat/completions`，非流式。
+- `EVO_MODEL_ID`：请求体中的完整模型 id，默认 `magpie/auto/glm-5.3-flash`。
+- `EVO_GATEWAY_KEY`：直接凭证，优先于文件路径。
+- `EVO_GATEWAY_KEY_FILE`：凭证文件路径；只由生产 adapter 在请求时懒读，构造时不读，且
+  没有内置默认文件路径。缺失两者时构造仍成功，真实请求才报 `OPENAI_KEY_MISSING`。
+
+部署还应设置 `EVO_HARNESS_DATA_DIR` 作为独立持久化根。最终目录为
+`<root>/profiles/<sanitized-profile>`，profile 来自 `DSH_PROFILE` 或 `default`；解析优先级是
+显式最终 `dataDir` > 显式 `rootDir` / `EVO_HARNESS_DATA_DIR` > `DSH_DATA_DIR` >
+`~/.dsh/evo-harness`。最后两级前的 `DSH_DATA_DIR` fallback 可能让 MCP 与 Cordis 插件落到同一
+`profiles/<profile>` 单写者目录，装配层会发出不含路径值的命名警告；独立部署应显式设置
+`EVO_HARNESS_DATA_DIR`，且一个最终 profile 目录只由一个进程写入。
+
+stdin close 或 stdio close 会触发 transport `onclose`：先 `cancelAll` 取消仍在运行的 job，
+把 abort 传到探针，最多等待 2000ms 让取消退出，再依次 flush/dispose 插件与持久化运行时，
+避免空 stdin 句柄背后遗留运行任务。这里的“清理”是取消、刷新与资源释放，**不是删除独立
+数据目录**。`evo_run_submit` 已返回后，对该 MCP 请求发送取消通知并不能取消后台 run；
+真正的运行取消路径是客户端断连或服务端 dispose。
+
+### 8.3 Shadow 权限边界
+
+`buildEvoAssembly` 在配置校验后强制 `execution.mode="shadow"`、
+`execution.applyWinningPatch=false`、`jitrl.store.mirrorToMemoryBridge=false`，并拒绝通过
+`options.deps.executionProfile` 替换已固定 profile。探针中的八表面修改只挂到内存 host，
+分支结束即 dispose；resolved shadow profile 对永久 patch、publish、真实 memory write 均为
+deny。工具入参不能放宽这些权限，也不改变 DSH 宿主自身的权限或审批配置。
+
+### 8.4 OpenAI usage 与无 ledgerSettlement 的成本口径
+
+适配器将合法响应的 `usage.prompt_tokens`、`completion_tokens`、`total_tokens` 分别映射为
+`inputTokens`、`outputTokens`、`totalTokens`，并在 `metadata.rawUsage` 中原值保留，附显式
+`countingSemantics`。usage 缺失时 `ModelResponse.usage` 保持 `undefined`，绝不把未知改写成
+已测量的 0；出现字段子集或非有限数值时以 `OPENAI_MALFORMED_USAGE` 明确失败。
+
+必须区分 **usage 观测** 与 **账本计费**：MCP 装配显式注入 `options.model` 与
+`agentLoop.model`，但不注入 `agentLoop.ledgerSettlement`。因此默认 stdio 路径的
+MeteredModelAdapter 为 `metering:"unmetered"`，调用记录为 `settlement:"none"`，没有 reservation、
+settlement 或已入账金额；即使保留 token usage，也不能称为账单成本。只有另行集成宿主提供的
+ledgerSettlement 才会进入两阶段账本，当前 stdio 入口没有这一步。以上是源码与离线协议/生命
+周期测试所定义的边界，不代表真实 DSH 桌面宿主挂载或真实网关端到端调用已经验收。

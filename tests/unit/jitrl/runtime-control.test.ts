@@ -257,7 +257,11 @@ function makeTask(plugin: ReturnType<typeof buildE2E>['plugin'], id: string) {
 
 describe('F1 (dreamJit): the offline replay surface is consumed in production', () => {
   it('off: the dream still triggers and reports, but no Jit replay happens; on: hookCalls > 0', async () => {
-    const harness = buildE2E({ dreamEveryNTasks: 1, config: JIT_CONFIG });
+    const harness = buildE2E({
+      dreamEveryNTasks: 1,
+      config: JIT_CONFIG,
+      extra: { deps: { dreamMinVerifiedTrees: 0 } }
+    });
     const { plugin } = harness;
 
     // --- baseline ON: prove the hook is genuinely reachable, so the off

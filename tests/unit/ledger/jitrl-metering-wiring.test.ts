@@ -69,7 +69,7 @@ function makeTrajectory(): ProbeTrajectory {
 
 describe('LEDGER-9: jitrl probe and judge spend goes through the ledger', () => {
   it('a metering-wired kernel reserves and settles for BOTH the logit probe and the judge', async () => {
-    const manager = createLedgerReservationManager({ enabled: true, defaultRateCard: RATE_CARD });
+    const manager = createLedgerReservationManager({ enabled: true, enforceHardBounds: true, defaultRateCard: RATE_CARD });
     const settlement = twoPhaseSettlementFor(manager, { consumer: 'jitrl:ledgers' });
     const registry = new ModelCallRegistry();
     const target = judgeableModel();
@@ -108,7 +108,7 @@ describe('LEDGER-9: jitrl probe and judge spend goes through the ledger', () => 
   });
 
   it('WITHOUT the wiring the same two calls stay unmetered (the pre-fix behaviour, pinned)', async () => {
-    const manager = createLedgerReservationManager({ enabled: true, defaultRateCard: RATE_CARD });
+    const manager = createLedgerReservationManager({ enabled: true, enforceHardBounds: true, defaultRateCard: RATE_CARD });
     const settlement = twoPhaseSettlementFor(manager, { consumer: 'jitrl:ledgers' });
     const registry = new ModelCallRegistry();
     const kernel = createJitRl({

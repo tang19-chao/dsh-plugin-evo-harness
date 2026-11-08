@@ -48,6 +48,7 @@ import type {
   ExperienceRecord,
   FailureCategory,
   FailureDiagnosis,
+  FailureSignal,
   IActivePolicy,
   ICordisSeamManager,
   IDiscoveryTreePool,
@@ -63,6 +64,7 @@ import type {
   JitLevel,
   GuidanceMode,
   LearningTrack,
+  LiveCyclePlanHistory,
   HarnessComponentKey,
   IOfflineDreamer,
   ISurrogateScorer,
@@ -73,6 +75,7 @@ import type {
   ProbeCandidate,
   ProbeTask,
   ProbeTrajectory,
+  DiscoveryTreeSnapshot,
   ProposedPatch,
   ProposedPatchSet,
   ProposeRequest,
@@ -104,8 +107,13 @@ import {
 } from './jitrl/candidate-augmenter';
 import {
   classifyTrajectoryOutcome,
-  isLearningOutcome
+  isLearningOutcome,
+  verificationFromTrajectory
 } from './jitrl/step-evaluator';
+import {
+  classifyProbeEvaluability,
+  textProbeReasonCode
+} from './jitrl/text-probe-evaluation';
 import {
   decideReplacement,
   shouldReleaseReservation
@@ -118,12 +126,25 @@ import {
   indexWritebackHistory,
   judgeWriteback,
   writebackHistoryEntryOf,
+  writebackIntegrityViewOf,
   writebackRefusalCode,
   writebackRouteCode,
   type WritebackGateSummary,
   type WritebackGateVerdict,
   type WritebackHistoryEntry
 } from './jitrl/writeback-gate';
+// rev8 evidence-integrity trio (harness2 #67/#72/#118/#175; audit fixes W3/W4):
+// the orchestrator READS the marks the host-armed collectors persisted. It never
+// writes one from a branch-supplied claim — the only producer is the collector's
+// finalize scan under the host's own policy.
+import {
+  boundEvidenceIntegrityFindings,
+  EVIDENCE_INTEGRITY_VERSION,
+  readEvidenceIntegrityMark,
+  type EvidenceIntegrityFinding,
+  type EvidenceIntegrityMark,
+  type EvidenceIntegrityPolicy
+} from './verification/evidence-integrity';
 import { CURRENT_PROVENANCE_VERSION, EXPERIENCE_SCHEMA_VERSION } from './jitrl/experience-store';
 import {
   REWARD_CONTRACT,
@@ -132,8 +153,21 @@ import {
   isLearningEligibleRecord,
   scoreUnderRewardContract
 } from './jitrl/reward-contract';
+// A3 (rev6 B9): the typed proposer error carries the "known but disabled"
+// distinction, so the orchestrator can route an unevaluable proposal to its
+// own stop reason instead of reporting a proposer failure.
+// rev8 plan §3.1 gap 2 (harness2 #110/#13 companion): the transport classifier
+// the proposer retries with is ALSO the orchestrator's evidence source when a
+// proposal still fails, so "retryable here" and "already retried there" share
+// one vocabulary and a gateway 429 can never masquerade as a model refusal.
+import { Harness2ProposalError, isTransportClassModelError } from './harness2/proposer';
 import type { JitRuntimeControl, JitSurface } from './jitrl/runtime-control';
 import { recordModeOf, resolveExecutionProfile, type ExecutionProfile } from './runtime/execution-profile';
+import {
+  assessPatchEvaluability,
+  effectiveProbeSurfaces,
+  TEXT_PROBE_SURFACES
+} from './runtime/surface-evaluability';
 import {
   accumulateVerificationSummary,
   readVerificationDisposition,
@@ -151,6 +185,16 @@ import {
   type VerificationRunSummary,
   type VerificationView
 } from './verification';
+import {
+  DEFAULT_EVIDENCE_POLICY_STRATEGY,
+  scoreWithEvidencePolicy
+} from './dream-rsi/surrogate-evidence-policy';
+import {
+  assessDreamReadiness,
+  DREAM_EVIDENCE_STRATEGY,
+  normalizeVerifiedTreeMinimum,
+  type DreamEvidence
+} from './dream-rsi';
 import { createDiscoveryTree } from './dream-rsi';
 import type {
   DiscoveryTree,
@@ -158,6 +202,15 @@ import type {
   DreamReplayReportWithShadow,
   IFailureTaxonomy
 } from './dream-rsi';
+// rev8 plan §6.1 item 3 (live-cycle manifest): the cross-cycle record seam.
+// Imported through the dream-rsi barrel (the module is pure data + on-demand
+// fs like the rest of the layer) — the orchestrator is its FIRST and ONLY
+// in-src consumer (see the module's own header for the wiring contract).
+import {
+  effectiveSequentialRoundsOf,
+  readLiveCycleManifest,
+  writeLiveCycleManifest
+} from './dream-rsi/live-cycle-manifest';
 
 /**
  * C2b F11: narrow a recorder-derived verification context to a COMPLETE host
@@ -173,6 +226,15 @@ function completeQualityBindingContext(
 ): QualityProvenanceContext | undefined {
   return isCompleteQualityBinding(candidate) ? candidate : undefined;
 }
+
+/**
+ * rev6 audit A4-2: the producer set production passes when NO trusted verifier
+ * exists. It is an explicit EMPTY set (not `undefined`), because `undefined`
+ * selects the legacy shape reader in the evidence policy; production must
+ * always use the trusted reader so a self-declared receipt can never steer
+ * Dream.
+ */
+const NO_TRUSTED_PRODUCERS: ReadonlySet<string> = new Set<string>();
 
 /** Ordered lifecycle stages recorded for every run. */
 export const EVO_HARNESS_STAGES = [
@@ -222,6 +284,101 @@ export interface OrchestratorTaskCounter {
   recordDream?(by?: number): Promise<number>;
 }
 
+// ---------------------------------------------------------------------------
+// rev8 W4 (audit fix): the TREE-LEVEL evidence-integrity mark.
+//
+// The audit found verified-tree-gate.ts's tree-metadata check
+// (`readEvidenceIntegrityMark(tree.metadata)?.contaminated`) alive on the
+// production dream path but with NO producer: the only mark writer was the
+// collector's quarantine path, which was itself gated behind an evidence
+// policy no production assembly passed. W1 arms the collectors; W4 closes the
+// consumer loop by AGGREGATING the marks of the trajectories a run actually
+// committed onto the tree snapshot BEFORE it enters the pool.
+//
+// Trust direction: the aggregation reads only what the HOST-armed collector
+// wrote into `trajectory.metadata.evidenceIntegrity` (the mark is produced by
+// the finalize scan under the host's own policy). A branch-supplied "I am
+// clean" claim has no effect here — absence aggregates to absence, and a
+// forged clean mark is indistinguishable from no mark, which is exactly the
+// fail-open direction this must never take.
+// ---------------------------------------------------------------------------
+
+/**
+ * Aggregate the evidence-integrity findings of one run's trajectories into one
+ * tree-level mark. `undefined` when none of the trajectories carries a
+ * contaminated mark (the snapshot then stays metadata-absent, byte-identical
+ * to the pre-rev8 shape).
+ *
+ * BOUNDED (rev8 audit): this is the LAST producer before the mark becomes part
+ * of a persisted tree-pool record, and it aggregates one list per trajectory
+ * of the run. Unbounded it grew with (trajectories x findings-per-trajectory):
+ * measured 40,000 findings / 2.06 MB for 20 trajectories, and the whole record
+ * (not the mark) is what the pool writes. The concatenation is therefore capped
+ * with the same helper every other producer uses and `droppedFindings` is
+ * summed across the sources. Concatenation WITHOUT dedupe is kept deliberately:
+ * that is the pre-fix behaviour, and two runs legitimately hitting the same
+ * location are two facts, not one.
+ *
+ * NEVER LAUNDERS CONTAMINATION (rev8 audit, second pass): the "did anything
+ * fire" decision is a SEPARATE boolean from "is there a sample to show".
+ * Deciding it on `findings.length` lost the verdict whenever a mark was
+ * contaminated with an EMPTY (or wholly malformed) list — `findings: []` read
+ * back as `contaminated: true`, aggregated to `undefined`, and the snapshot
+ * went metadata-absent, so `verified-tree-gate` saw a clean tree. Both cases
+ * are reachable from a persisted record, so the flag, not the sample, decides.
+ */
+export function treeEvidenceIntegrityMark(
+  trajectories: readonly ProbeTrajectory[]
+): EvidenceIntegrityMark | undefined {
+  const findings: EvidenceIntegrityFinding[] = [];
+  let droppedFindings = 0;
+  let contaminated = false;
+  for (const trajectory of trajectories) {
+    if (trajectory === undefined || trajectory === null) {
+      continue;
+    }
+    const mark = readEvidenceIntegrityMark(trajectory.metadata);
+    if (mark === undefined || mark.contaminated !== true) {
+      continue;
+    }
+    contaminated = true;
+    droppedFindings += mark.droppedFindings ?? 0;
+    for (const finding of mark.findings) {
+      findings.push(finding);
+    }
+  }
+  if (!contaminated) {
+    return undefined;
+  }
+  return {
+    version: EVIDENCE_INTEGRITY_VERSION,
+    contaminated: true,
+    withheld: true,
+    ...boundEvidenceIntegrityFindings(findings, droppedFindings)
+  };
+}
+
+/**
+ * Attach the tree-level mark to a snapshot's metadata (additive: the pre-rev8
+ * snapshot shape is unchanged when `mark` is undefined; an existing metadata
+ * bag — e.g. a prefix-view anchor record — is preserved).
+ */
+export function snapshotWithEvidenceIntegrityMark(
+  snapshot: DiscoveryTreeSnapshot,
+  mark: EvidenceIntegrityMark | undefined
+): DiscoveryTreeSnapshot {
+  if (mark === undefined) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    metadata: {
+      ...(snapshot.metadata ?? {}),
+      evidenceIntegrity: mark
+    }
+  };
+}
+
 /** Every collaborator the orchestration needs; all are injected. */
 export interface EvoHarnessOrchestratorDeps {
   readonly config: EvoHarnessConfig;
@@ -235,6 +392,32 @@ export interface EvoHarnessOrchestratorDeps {
   readonly taxonomy: IFailureTaxonomy;
   readonly dreamer: IOfflineDreamer;
   readonly treePool: IDiscoveryTreePool;
+  /**
+   * rev6 audit A4-2 (B4): minimum number of VERIFIED trees before offline
+   * dreaming runs. Hand-built orchestrators default to 0 (gate disabled, so
+   * the full pool is replayed); the production plugin passes
+   * {@link MIN_VERIFIED_TREES_FOR_DREAM} (12). When > 0, only verified trees
+   * are handed to the dreamer, and a pool below the floor is skipped with a
+   * diagnostic - never silently shrunk.
+   *
+   * `0` restores ONLY the full-POOL selection. It does NOT restore the
+   * historical `node.score` scoring: A4-2's replay still prefers
+   * `metadata.dreamEvidence.dreamScore` for every node that carries one.
+   */
+  readonly dreamMinVerifiedTrees?: number;
+  /**
+   * rev6 audit A4-3 research seam. `trusted` (default) runs the main-chain
+   * `not-evaluable` classifier, so an unverified text/artifact probe never
+   * trains. `legacy` is the EXPLICIT offline-evaluation assembly mode: it keeps
+   * the historical process scoring used by the deterministic synthetic harness
+   * (`scripts/eval/jitrl-eval-lib.ts`), where the "probe" is a synthetic
+   * measurement fixture and no host verifier exists by construction.
+   *
+   * It is deps-only BY DESIGN: no config field, no public plugin option and no
+   * production wiring can produce it. A host that wants production learning
+   * must inject a trusted verifier, not this flag.
+   */
+  readonly probeEvaluation?: 'trusted' | 'legacy';
   /** Host-provided task runner executed inside an isolated branch. */
   readonly runBranch: BranchExecutor;
   /**
@@ -242,6 +425,40 @@ export interface EvoHarnessOrchestratorDeps {
    * restarts from zero in every process.
    */
   readonly taskCounter?: OrchestratorTaskCounter;
+  /**
+   * rev8 plan §6.1 item 3 (live-cycle manifest): the data directory the
+   * cross-cycle manifest is written to and read back from. The plugin
+   * entrypoint injects ITS OWN resolved persistence data directory
+   * (persistence.dataDir), so one run records the realized shape of its cycle
+   * for the NEXT run of the same assembly and never shares another process's
+   * data (the MCP assembly passes an independent EVO_HARNESS_DATA_DIR-rooted
+   * directory; the single-host rule of src/persistence applies to this file
+   * like to every other file in that directory). Absent (or empty) keeps the
+   * seam UNWIRED: no manifest is read before plan_grid and none is written —
+   * the lifecycle is byte-identical to the pre-rev8 behaviour.
+   *
+   * The directory is touched ONLY through src/persistence/data-dir's atomic
+   * write and tolerant read (one file: live-cycle-manifest.json).
+   */
+  readonly liveCycleDataDir?: string;
+  /**
+   * rev8 evidence-integrity trio (harness2 #67/#72/#118/#175; audit fix W1):
+   * the HOST-owned evidence-integrity policy. The PLUGIN ASSEMBLY consumes it
+   * (src/index.ts `buildOrchestratorDeps`): it arms CordisSeamManager's #175
+   * pre-branch path scan and every TrajectoryCollector's #72/#118 finalize
+   * scan — including the direct one in the agent-loop executor (W2). The
+   * orchestrator itself never scans; it only READS the marks those collectors
+   * persisted (writeback gate W3, tree pool W4), so the field is declared here
+   * because `options.deps` is typed by this interface and the host seam must
+   * be nameable, not because the orchestrator consumes it.
+   *
+   * There is deliberately NO config field that produces this policy: answer-key
+   * criteria are per-task host data ("Never derivable from branch-supplied
+   * metadata", evidence-integrity.ts) and forbidden path segments are the
+   * host's own naming decisions. When the host supplies none, the assembly
+   * still arms the empty default so the sentinel scan is live (see index.ts).
+   */
+  readonly evidenceIntegrity?: EvidenceIntegrityPolicy;
   readonly now?: () => number;
   readonly newId?: () => string;
   readonly createTree?: (options: DiscoveryTreeOptions) => DiscoveryTree;
@@ -268,9 +485,15 @@ export interface EvoHarnessOrchestratorDeps {
    */
   readonly conservativeGate?: boolean;
   /**
-   * rev6 R1-2 (t9): the EVIDENCE GATE on online write-back. Defaults to FALSE
-   * (absent = the historical behaviour, byte-identical: every executed probe is
-   * written into L2 experience).
+   * rev6 R1-2 (t9) + A4-1: the EVIDENCE GATE on online write-back.
+   *
+   * This is the EFFECTIVE boolean. A hand-built orchestrator that omits it
+   * keeps FALSE (the historical path); the plugin entrypoint resolves
+   * `config.jitrl.writebackGate` (`auto`/`on`/`off`) through
+   * `src/runtime/writeback-policy.ts` and passes the result here, while an
+   * explicit `deps.writebackGate` still overrides it. `auto` therefore turns
+   * the gate ON for a host with no trusted verifier and OFF for one with a
+   * trusted verifier.
    *
    * When true, `recordOnlineExperience` consults `src/jitrl/writeback-gate.ts`
    * before letting an executed trajectory steer L2 selection: only a record
@@ -278,13 +501,12 @@ export interface EvoHarnessOrchestratorDeps {
    * convergence) stays learning-eligible; everything else persists for AUDIT
    * with `learningEligible: false` and a zero learning target.
    *
-   * WHY IT IS OPT-IN AND NOT A DEFAULT: the historical negative result
-   * (`C3-online − C3-frozen` = −0.250, `gateFired: 0`) is the evidence that the
-   * ungated path is unsafe, but flipping the gate ON by default would change
-   * production learning semantics on the strength of a SYNTHETIC pool where no
-   * trajectory carries a trusted receipt. The gate therefore ships OFF, the
-   * experiment (t9) reports it as a measured policy change, and promotion stays
-   * the captain's adjudication. This is the same pattern as `conservativeGate`.
+   * WHY THE DEFAULT IS NOW AUDIT-ONLY (A4-1): the historical negative result
+   * (`C3-online − C3-frozen` = −0.250, `gateFired: 0`) is evidence that the
+   * ungated path is unsafe. `auto` makes production honest without forcing a
+   * policy change on a host that DOES carry a trusted verifier: the gate is off
+   * exactly when verdicts can be authenticated, on otherwise. The explicit
+   * `on`/`off` values remain available for the measured ablation arms.
    */
   readonly writebackGate?: boolean;
   /**
@@ -618,13 +840,15 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 /**
- * P6.1-D RewardContract: the winner's step-evaluator vector, kept as ONE
- * auxiliary `stepJudge` entry (mean of the per-step rewards). It never defines
- * the primary target, so a missing or failed evaluation cannot change what
- * rewardVersion means. Clipped to the reward range so the auxiliary field stays
- * comparable to the primary scale for calibration sampling.
+ * P6.1-D RewardContract: one executed probe's step-evaluator vector, kept as
+ * ONE auxiliary `stepJudge` entry (mean of the per-step rewards). It never
+ * defines the primary target, so a missing or failed evaluation cannot change
+ * what rewardVersion means. Clipped to the reward range so the auxiliary field
+ * stays comparable to the primary scale for calibration sampling.
+ *
+ * rev6 audit A4-4: called for EVERY executed probe (not only the winner).
  */
-function winnerStepSummary(rewards: readonly StepReward[] | undefined): number {
+function stepJudgeSummary(rewards: readonly StepReward[] | undefined): number {
   if (rewards === undefined || rewards.length === 0) {
     return 0;
   }
@@ -699,6 +923,89 @@ function errorMessage(error: unknown): string {
 
 function nodeStatusFor(status: ProbeTrajectory['status']): 'succeeded' | 'failed' {
   return status === 'succeeded' ? 'succeeded' : 'failed';
+}
+
+/**
+ * rev8 plan §3.1 gap 2 (harness2 #110 companion): the failure SIGNAL one dropped
+ * proposal contributes to the failure taxonomy.
+ *
+ * The taxonomy's own evidence classes decide the category, so the mapping here
+ * only carries what the error PROVES:
+ *  - `model_refusal`  : the metered adapter's typed budget/purpose denials
+ *                       (METERED_MODEL_*). A real refusal-like outcome, never a
+ *                       transport hiccup.
+ *  - `invalid_patch`  : the proposer's own typed parse/empty-edits rejection.
+ *  - transport-class errors (gateway 429/5xx, stream abort, network reset) get
+ *    kind 'unknown' with the PROVABLE failure code carried as `code` and
+ *    `retryable: true` - deliberately NOT model_refusal/budget_exhausted, so a
+ *    flapping gateway can never produce the terminal hard_unrecoverable stop.
+ *  - everything else: kind 'unknown', evidence-free, retryable left unset.
+ * The message is bounded (240 chars) so a hostile error body cannot bloat the
+ * diagnosis; no error `stack` or other payload is copied anywhere.
+ */
+const PROPOSAL_FAILURE_SIGNAL_MESSAGE_CAP = 240;
+
+export function proposalFailureSignalOf(error: unknown): FailureSignal {
+  const raw = errorMessage(error);
+  const message =
+    raw.length > PROPOSAL_FAILURE_SIGNAL_MESSAGE_CAP
+      ? raw.slice(0, PROPOSAL_FAILURE_SIGNAL_MESSAGE_CAP) + '…'
+      : raw;
+  const meteredCode =
+    typeof (error as { code?: unknown } | null)?.code === 'string'
+      ? ((error as { code: string }).code.startsWith('METERED_MODEL_')
+          ? (error as { code: string }).code
+          : undefined)
+      : undefined;
+  const failureCode =
+    typeof (error as { failureCode?: unknown } | null)?.failureCode === 'string'
+      ? (error as { failureCode: string }).failureCode
+      : undefined;
+  if (meteredCode !== undefined) {
+    return { kind: 'model_refusal', message, code: meteredCode };
+  }
+  if (error instanceof Harness2ProposalError) {
+    return { kind: 'invalid_patch', message, code: error.code };
+  }
+  if (isTransportClassModelError(error)) {
+    return {
+      kind: 'unknown',
+      message,
+      retryable: true,
+      ...(failureCode === undefined ? {} : { code: failureCode })
+    };
+  }
+  return { kind: 'unknown', message };
+}
+
+/**
+ * rev8 plan §3.1 gap 2: diagnose one dropped proposal through the INJECTED
+ * taxonomy. `trajectory` is omitted on purpose - no probe ever ran for this
+ * slot - so classifyFailure sees only the signal evidence and never a fake
+ * node status that could dress the failure up as a probe outcome.
+ */
+function diagnoseProposalFailure(
+  taxonomy: IFailureTaxonomy,
+  slot: BatchSlotPlan,
+  error: unknown
+): FailureDiagnosis | undefined {
+  const signals: FailureSignal[] = [proposalFailureSignalOf(error)];
+  try {
+    const diagnosis = taxonomy.diagnose({
+      signals,
+      attemptIndex: slot.slotIndex + 1,
+      hasUnexploredDirections: true
+    });
+    if (diagnosis.category === 'none') {
+      return undefined;
+    }
+    return diagnosis;
+  } catch {
+    // A taxonomy that cannot classify a dropped proposal must not break the
+    // admission loop; the diagnostic line (pushed by the caller) already
+    // records the raw failure. Silently continuing IS the pre-rev8 behaviour.
+    return undefined;
+  }
 }
 
 /**
@@ -934,6 +1241,56 @@ export function resolvePreviousFailure(
   return incoming;
 }
 
+/**
+ * rev8 plan §3.1 gap 2: bounded accumulation of one run's dropped-proposal
+ * diagnoses for the NEXT run's plan_grid. Each slot contributes ONE diagnosis;
+ * the array is capped at MAX_CARRIED_PROPOSAL_FAILURES (oldest dropped) so a
+ * proposer that fails every slot of every round cannot grow the carry without
+ * bound, and the rank-merged `previousFailure` single-diagnosis channel used by
+ * selectBatch stays independent of this list.
+ */
+export const MAX_CARRIED_PROPOSAL_FAILURES = 8;
+
+export function carryProposalFailure(
+  carried: FailureDiagnosis[],
+  incoming: FailureDiagnosis
+): void {
+  if (carried.length >= MAX_CARRIED_PROPOSAL_FAILURES) {
+    carried.shift();
+  }
+  carried.push(incoming);
+}
+
+/**
+ * rev8 plan §3.1 gap 2: observability metadata for a run whose proposals were
+ * dropped. Counts and category totals only - never a success claim, and the
+ * field is absent entirely when no proposal failed (additive, optional).
+ */
+export function runProposalFailureMetadata(
+  failures: readonly FailureDiagnosis[]
+): Readonly<Record<string, unknown>> {
+  const byCategory: Record<string, number> = {};
+  let transport = 0;
+  let refusal = 0;
+  for (const failure of failures) {
+    byCategory[failure.category] = (byCategory[failure.category] ?? 0) + 1;
+    const signal = failure.signals.find((entry) => entry.kind !== 'unknown');
+    if (signal?.retryable === true) {
+      transport += 1;
+    } else if (signal?.kind === 'model_refusal') {
+      refusal += 1;
+    }
+  }
+  return {
+    proposerFailures: {
+      total: failures.length,
+      byCategory,
+      transportClass: transport,
+      refusalClass: refusal
+    }
+  };
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return undefined;
@@ -977,6 +1334,41 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
   private verificationView: VerificationView[] = [];
   private lessons: readonly CanonicalLesson[] = [];
   private plan: SearchGridPlan | null = null;
+  /**
+   * rev8 plan §3.1 gap 2: failure diagnoses accumulated by the PREVIOUS run's
+   * dropped proposals, handed to THIS run's plan_grid as `previousFailures` so
+   * the active policy can react to a proposer-channel fault instead of only to
+   * probe outcomes. Bounded (oldest dropped) and cleared the moment they are
+   * consumed by plan_grid, exactly like `trace`/`plan`. Without any proposal
+   * failure the array stays empty and the request is byte-identical to rev6.
+   */
+  private carriedProposalFailures: FailureDiagnosis[] = [];
+  /**
+   * rev8 plan §6.1 item 3: FIFO chain serializing the live-cycle manifest
+   * writes of overlapping runs on THIS instance. The atomic write itself
+   * (writeFileAtomic) can never tear a file, but without serialization two
+   * overlapping runs could land their read-guard/write pairs interleaved; the
+   * chain makes each write observe the previous one's outcome. The MCP server
+   * serializes runs externally; this queue makes the guarantee hold for the
+   * Cordis plugin path too (trigger runs overlap by design).
+   */
+  private liveCycleWriteQueue: Promise<void> = Promise.resolve();
+  /**
+   * rev8 plan §6.1 item 3: the recordedAt of the newest manifest THIS instance
+   * wrote (same injected clock as startedAt/endedAt). A cycle that completed
+   * strictly BEFORE it is a stale write and is refused - an old cycle can
+   * never overwrite a newer record.
+   */
+  private liveCycleLastRecordedAt = 0;
+  /**
+   * rev8 integration fix: the CURRENT run's cancellation signal, captured at
+   * run() entry and cleared at exit. `selectProposal` builds its ProposeRequest
+   * deep inside the round loop without the run request in scope, so this field
+   * carries the signal to both proposer call sites (propose + proposeCandidates)
+   * — the proposer's retry/abort path reads `request.metadata.signal`
+   * (requestAbortSignal, proposer.ts). Undefined outside a run.
+   */
+  private runSignal: AbortSignal | undefined = undefined;
   private count = 0;
   private disposed = false;
   /**
@@ -1015,6 +1407,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
    * it may steer L2 (see `writeback-gate.ts`). False = historical path.
    */
   private readonly writebackGate: boolean;
+  /** rev6 audit A4-2: verified-tree floor for offline dreaming (0 = disabled). */
+  private readonly dreamMinVerifiedTrees: number;
+  /** A4-3: `trusted` (default) or the explicit offline-evaluation legacy seam. */
+  private readonly probeEvaluation: 'trusted' | 'legacy';
   /** P6.2 C1: the resolved execution profile (fail-closed defaults when absent). */
   private readonly executionProfile: ExecutionProfile;
 
@@ -1063,6 +1459,17 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     // permanent patch, while this gate is about which EXECUTED probes may train
     // L2 at all. Default off = the historical ungated path, byte for byte.
     this.writebackGate = deps.writebackGate === true;
+    // rev6 audit A4-2: hand-built default 0 preserves the historical Dream
+    // mechanics; the production entrypoint passes 12. Only an explicit 0
+    // disables the gate - NaN/negative/Infinity are refused instead of silently
+    // becoming "disabled" (the old fail-open normalization).
+    this.dreamMinVerifiedTrees = normalizeVerifiedTreeMinimum(
+      deps.dreamMinVerifiedTrees,
+      0
+    );
+    // A4-3: trusted by default; only an explicit hand-built research assembly
+    // can request the historical process path.
+    this.probeEvaluation = deps.probeEvaluation === 'legacy' ? 'legacy' : 'trusted';
     this.treePool = deps.treePool;
   }
 
@@ -1183,6 +1590,8 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     this.plan = null;
     // C2a: the host-authenticated verification views are per-run state.
     this.verificationView = [];
+    // rev8 integration fix: the proposer call sites read this (see runSignal).
+    this.runSignal = request.signal;
 
     let probesRun = 0;
     let lessonsCommitted = 0;
@@ -1192,6 +1601,15 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     let driverKind = 'unbound';
     let appliedPatchId: string | undefined;
     let dreamTriggered = false;
+    // rev8 plan §6.1 item 3 (live-cycle manifest): declared OUTSIDE the try so
+    // a crashed lifecycle can still record what it observed. roundBatchSizes
+    // holds each round's REALIZED candidate count (index = round - 1); the
+    // reference probe is deliberately NOT a batch entry (it is counted in
+    // probes only, per the manifest schema). runGrid captures this run's own
+    // plan for the failure path - never this.plan, which a second overlapping
+    // run could have replaced by the time the catch runs.
+    const roundBatchSizes: number[] = [];
+    let runGrid: SearchGridPlan | null = null;
 
     const stage = (name: EvoHarnessStage, detail?: Readonly<Record<string, unknown>>): void => {
       trace.push(name);
@@ -1204,28 +1622,42 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     const result = (
       outcome: EvoHarnessRunOutcome,
       extra: Partial<EvoHarnessRunResult> = {}
-    ): EvoHarnessRunResult => ({
-      runId,
-      sessionId,
-      taskId: task.id,
-      outcome,
-      trigger: request.trigger,
-      probesRun,
-      lessonsCommitted,
-      diagnostics,
-      startedAt,
-      endedAt: this.now(),
-      metadata: {
-        lifecycle: [...trace],
-        stopReason,
-        rounds,
-        referenceStatus,
-        memoryDriverKind: driverKind,
-        dreamTriggered,
-        ...(appliedPatchId === undefined ? {} : { appliedPatchId })
-      },
-      ...extra
-    });
+    ): EvoHarnessRunResult => {
+      // Every return path builds its result exactly once through this helper;
+      // from here on no proposer call of THIS run can start, so the run-scoped
+      // signal is released (undefined outside a run, like trace/plan).
+      this.runSignal = undefined;
+      return {
+        runId,
+        sessionId,
+        taskId: task.id,
+        outcome,
+        trigger: request.trigger,
+        probesRun,
+        lessonsCommitted,
+        diagnostics,
+        startedAt,
+        endedAt: this.now(),
+        ...extra,
+        // rev8 integration fix (plan §5.2 poll contract): `extra.metadata` is
+        // MERGED onto the lifecycle metadata, not spread over it — a shallow
+        // `{...base, ...extra}` would let a caller-supplied metadata object
+        // (e.g. the proposer-failure counts) REPLACE the whole object and drop
+        // lifecycle/stopReason/rounds from every run that had a dropped proposal
+        // (exactly the runs that most need their stage trace). Every OTHER extra
+        // field (failure, treeId, …) still wins, exactly as before.
+        metadata: {
+          lifecycle: [...trace],
+          stopReason,
+          rounds,
+          referenceStatus,
+          memoryDriverKind: driverKind,
+          dreamTriggered,
+          ...(appliedPatchId === undefined ? {} : { appliedPatchId }),
+          ...extra.metadata
+        }
+      };
+    };
 
     if (this.disposed) {
       diagnostics.push('orchestrator has been disposed');
@@ -1247,6 +1679,32 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       stage('finalize');
       return result('skipped');
     }
+
+    // rev6 audit A3 (B9): the proposer is restricted to the text-probe
+    // evaluable subset of enabledSurfaces. When that subset is EMPTY, no
+    // candidate could ever be measured, so the run is skipped BEFORE recall,
+    // the reference probe or any write-back. This is also what prevents an
+    // empty `allowedSurfaces` list from reaching the proposer: its
+    // `allowedSurfacesFor` treats [] as "all eight", which would be the exact
+    // opposite of the restriction.
+    const probeSurfaces = this.probeSurfaces();
+    if (probeSurfaces.length === 0) {
+      diagnostics.push(
+        'probe surfaces: enabledSurfaces=[' +
+          config.enabledSurfaces.join(', ') +
+          '] contains no text-probe evaluable surface (' +
+          TEXT_PROBE_SURFACES.join(', ') +
+          '); the run was skipped before recall/probing and nothing was written back'
+      );
+      stopReason = 'no_evaluable_surfaces';
+      stage('finalize');
+      return result('skipped');
+    }
+
+    // rev8 plan §3.1 gap 2: this run's dropped-proposal diagnoses. Declared
+    // OUTSIDE the try so a crashed lifecycle still carries them (the catch
+    // below re-populates the cross-run carry), and consumed by plan_grid.
+    const proposalFailures: FailureDiagnosis[] = [];
 
     try {
       stage('initialize');
@@ -1283,18 +1741,65 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         maxDepth: Math.min(basePolicy.maxDepth, budget.maxDepth)
       };
 
+      // rev8 plan §6.1 item 3 (live-cycle manifest): read the PREVIOUS cycle's
+      // manifest BEFORE the planner runs, so plan_grid is grounded in what
+      // previous rounds ACTUALLY ran. The read is tolerant: a missing file is
+      // simply no history, a damaged file is quarantined by the reader and
+      // reported as diagnostics, and any other read error degrades the same
+      // way - never a run blocker. Only REALIZED values ride into the request;
+      // the previous cycle's PLANNED grid is never substituted for them.
+      const previousLiveCycle = await this.readLiveCycleHistory(diagnostics, task.id);
       stage('plan_grid');
+      // rev8 plan §3.1 gap 2: the PREVIOUS run's dropped-proposal diagnoses ride
+      // into the planner (and only into it), then the carry is consumed. A run
+      // with no prior proposer failure passes the historical empty array.
+      const carriedFailures = this.carriedProposalFailures;
+      this.carriedProposalFailures = [];
       const grid = this.deps.policy.planGrid({
         task,
         memoryConfidence: recall.confidence,
         budgetRemaining: budget.maxOnlineRolloutBudget,
         currentDepth: 0,
         exploredNodes: 0,
-        previousFailures: [],
+        previousFailures: carriedFailures,
+        ...(previousLiveCycle === undefined ? {} : { previousLiveCycle }),
         policy: runPolicy
       });
       this.plan = grid;
+      runGrid = grid;
       diagnostics.push('plan_grid: ' + grid.rationale);
+      // rev8 plan §6.1 item 3: the history is planning context AND diagnostic
+      // observability - the realized numbers are named, unknowns say unknown.
+      if (previousLiveCycle !== undefined) {
+        diagnostics.push(
+          'live-cycle: previous run ' +
+            previousLiveCycle.runId +
+            ' (' +
+            previousLiveCycle.status +
+            ') actually ran probes=' +
+            String(previousLiveCycle.probes ?? 'unknown') +
+            ', rounds=' +
+            String(previousLiveCycle.rounds ?? 'unknown') +
+            ', batchSizes=' +
+            (previousLiveCycle.batchSizes === null
+              ? 'unknown'
+              : '[' + previousLiveCycle.batchSizes.join(', ') + ']') +
+            ', effectiveSequentialRounds=' +
+            String(previousLiveCycle.effectiveSequentialRounds ?? 'unknown')
+        );
+      }
+      if (carriedFailures.length > 0) {
+        const counts = new Map<string, number>();
+        for (const failure of carriedFailures) {
+          counts.set(failure.category, (counts.get(failure.category) ?? 0) + 1);
+        }
+        diagnostics.push(
+          'plan_grid carried ' +
+            String(carriedFailures.length) +
+            ' previous-run proposal failure(s): ' +
+            [...counts.entries()].map(([category, n]) => category + '=' + String(n)).join(', ')
+        );
+      }
 
       if (grid.skipProbing || request.dryRun === true) {
         stopReason = grid.skipProbing ? 'plan_grid_skip' : 'dry_run';
@@ -1337,7 +1842,10 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         treeId: tree.id,
         nodeId: rootNode.id,
         memoryRecallIds: recall.lessons.map((lesson) => lesson.id),
-        timeoutMs: config.probe.probeTimeoutMs
+        timeoutMs: config.probe.probeTimeoutMs,
+        // rev8 stage-2: the run request's cancellation signal reaches every
+        // probe, so an MCP-side cancel/disconnect aborts the reference too.
+        ...(request.signal === undefined ? {} : { signal: request.signal })
       });
       // C2a (ADR 0003 §4.4): the reference goes through the SAME verification
       // rules as every candidate, so the baseline and the probe are scored on
@@ -1439,6 +1947,9 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         // slot reserves one candidate-rollout unit up front, so the wave can never
         // launch more probes than the remaining grid/config budget allows.
         const prepared: PreparedProbe[] = [];
+        // A3: proposals whose every edit is outside the evaluable set. Counted
+        // only to give the "nothing to probe" exit its own stopReason.
+        let notEvaluableProposals = 0;
         for (const slot of orderBatchSlots(batch.slots)) {
           // The plan_grid budget bounds candidate rollouts. The reference anchor is
           // instrumentation for the contrast, not an exploration rollout, so it is
@@ -1514,15 +2025,56 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
                 parentNode,
                 ...(parentCandidate === undefined ? {} : { parentPatch: parentCandidate.patch }),
                 referenceTrajectory: reference,
-                enabledSurfaces: config.enabledSurfaces,
+                enabledSurfaces: probeSurfaces,
                 attemptIndex: slot.slotIndex + 1,
-                totalBudget: grid.budget
+                totalBudget: grid.budget,
+                // rev8 integration fix (plan §3.1 gap 1 pairing): the run-level
+                // cancel signal reaches the proposal channel too — the proposer's
+                // retry/abort path reads `request.metadata.signal`
+                // (requestAbortSignal, proposer.ts), so a cancelled run no longer
+                // keeps backing off or re-calls the model for a dead run.
+                ...(request.signal === undefined ? {} : { metadata: { signal: request.signal } })
               });
             }
           } catch (error) {
-            diagnostics.push(
-              'proposal failed for slot ' + slot.slot + ': ' + errorMessage(error)
-            );
+            // A3 (rev6 B9): a response that only touched KNOWN-but-disabled
+            // surfaces is not a proposer failure. It is the same "nothing a text
+            // probe can evaluate" case the post-propose guard below handles, but
+            // the real Harness² parser rejects it first (it would otherwise
+            // create an empty patch). Count it as not-evaluable and keep the
+            // diagnostic truthful; every other error stays a proposal failure.
+            if (error instanceof Harness2ProposalError && error.notEvaluable) {
+              notEvaluableProposals += 1;
+              diagnostics.push(
+                'proposal-not-evaluable: slot ' +
+                  slot.slot +
+                  ' dropped known surface(s) ' +
+                  (error.droppedSurfaces.length === 0
+                    ? '(none)'
+                    : error.droppedSurfaces.join(', ')) +
+                  ' because this run allows only ' +
+                  (probeSurfaces.length === 0 ? '(none)' : probeSurfaces.join(', ')) +
+                  '; no node was added, no candidate probe ran and nothing was written back (the reference probe is kept)'
+              );
+            } else {
+              // rev8 plan §3.1 gap 2 (harness2 #110): the dropped proposal is
+              // classified through the SAME injected taxonomy as a failed probe
+              // and retained for the NEXT run's plan_grid previousFailures, so
+              // ActivePolicy can plan around a proposer-channel fault instead of
+              // only around probe outcomes. One bounded array, rank-merged, no
+              // success evidence is ever claimed from it.
+              const proposalFailure = diagnoseProposalFailure(
+                this.deps.taxonomy,
+                slot,
+                error
+              );
+              if (proposalFailure !== undefined) {
+                carryProposalFailure(proposalFailures, proposalFailure);
+              }
+              diagnostics.push(
+                'proposal failed for slot ' + slot.slot + ': ' + errorMessage(error)
+              );
+            }
             continue;
           }
           if (selection !== undefined) {
@@ -1534,6 +2086,35 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
                 offered: selection.offered
               }
             });
+          }
+
+          // rev6 audit A3 (B9): a patch whose every edit lands on a surface a
+          // text probe cannot evaluate (scripts/subagents/plugins) - or on an
+          // evaluable surface this assembly has disabled - cannot produce a
+          // behavioural contrast. Skipping HERE, before tree.addNode, is what
+          // saves the probe budget AND keeps the experience store untouched:
+          // the reference probe stays as the run's only trajectory. The
+          // diagnostic names the decision so an operator never reads the
+          // resulting no-candidate exit as a silent failure.
+          const patchEvaluability = assessPatchEvaluability(proposed.patch, {
+            surfaces: probeSurfaces
+          });
+          if (!patchEvaluability.evaluable) {
+            notEvaluableProposals += 1;
+            diagnostics.push(
+              'proposal-not-evaluable: slot ' +
+                slot.slot +
+                ' patch ' +
+                proposed.patch.id +
+                ' edits ' +
+                (patchEvaluability.editedSurfaces.length === 0
+                  ? '(none)'
+                  : patchEvaluability.editedSurfaces.join(', ')) +
+                '; a text probe can evaluate only ' +
+                (probeSurfaces.length === 0 ? '(none)' : probeSurfaces.join(', ')) +
+                '; no node was added, no candidate probe ran and nothing was written back (the reference probe is kept)'
+            );
+            continue;
           }
 
           const node: DiscoveryNode = tree.addNode({
@@ -1632,7 +2213,8 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
                   recallIds: recall.lessons.map((lesson) => lesson.id),
                   runId,
                   referenceReceiptMissing: !referenceHasReceipt,
-                  diagnostics
+                  diagnostics,
+                  ...(request.signal === undefined ? {} : { signal: request.signal })
                 });
               }
             ),
@@ -1708,6 +2290,15 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
               referenceTrajectory: reference,
               weights: config.dreamRsi.surrogateWeights
             });
+            // A4-2: the evidence-policy score is recorded beside the frozen
+            // `node.score`; replay consumes THIS one (never a re-weighting of
+            // the online surrogate).
+            const dreamEvidence = this.dreamEvidenceFor({
+              node: scoredNode,
+              trajectory,
+              referenceTrajectory: reference,
+              weights: config.dreamRsi.surrogateWeights
+            });
 
             tree.recordProbe(node.id, {
               trajectoryId: trajectory.id,
@@ -1716,7 +2307,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
               ...(diagnosis.category === 'none' ? {} : { failure: diagnosis }),
               // surfaceKeys is what ActivePolicy.surfacesFromMetadata reads to focus
               // exploit/recover slots on the surfaces that actually moved.
-              metadata: { slot: slot.slot, surfaceKeys: [...trajectory.surfaceKeys] }
+              metadata: { slot: slot.slot, surfaceKeys: [...trajectory.surfaceKeys], dreamEvidence }
             });
             // The execution status is now COMMITTED, so this probe becomes a
             // credit-attribution unit (plan section 6.2: never record a "success
@@ -1759,13 +2350,24 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
               previousFailure = resolvePreviousFailure(previousFailure, diagnosis);
             }
           }
+          // rev8 plan §6.1 item 3: this round's REALIZED batch size - the number
+          // of slots that actually executed and committed (the wave settled, or
+          // the commit loop would have thrown), not the planned width. Rounds
+          // that admitted nothing record no entry (upstream skips size<=0
+          // batches in the sequential-round arithmetic as well).
+          roundBatchSizes.push(prepared.length);
         }
 
         if (candidates.length === 0) {
           diagnostics.push('no candidate probe completed; probing stops');
           // CORE-8: the other stop-free exit - every admitted slot failed to
-          // produce a candidate, so there is nothing to compose.
-          stopReason = 'no_candidates';
+          // produce a candidate, so there is nothing to compose. A3 keeps its
+          // own name when the reason was "the proposal cannot be evaluated"
+          // rather than a probe failure.
+          stopReason =
+            prepared.length === 0 && notEvaluableProposals > 0
+              ? 'proposals_not_evaluable'
+              : 'no_candidates';
           break;
         }
 
@@ -1804,9 +2406,23 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           const assessment = composition.assessments.find(
             (entry) => entry.nodeId === candidate.nodeId
           );
+          // A4-2: recompute the evidence score WITH the composition (the
+          // pre-compose pass could not see selection/adoption), and merge it
+          // into the node's existing metadata so `slot`/`surfaceKeys` survive.
+          const finalEvidence = this.dreamEvidenceFor({
+            node: currentNode,
+            trajectory: candidate.trajectory,
+            referenceTrajectory: reference,
+            composition,
+            weights: config.dreamRsi.surrogateWeights
+          });
           tree.updateNode(candidate.nodeId, {
             score: finalScore.score,
-            ...(assessment === undefined ? {} : { adoptionRatio: assessment.adoptionRatio })
+            ...(assessment === undefined ? {} : { adoptionRatio: assessment.adoptionRatio }),
+            metadata: {
+              ...(currentNode.metadata ?? {}),
+              dreamEvidence: finalEvidence
+            }
           });
           if (candidate.trajectory.status === 'succeeded' && finalScore.score > bestFinalScore) {
             bestFinalScore = finalScore.score;
@@ -1931,7 +2547,11 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
           this.patchDisposers.push(disposer);
           composedPatchId = winningPatch.id;
           appliedPatchId = winningPatch.id;
-          diagnostics.push('permanently mounted scaffold ' + winningPatch.id);
+          diagnostics.push(
+            'permanently mounted scaffold ' +
+              winningPatch.id +
+              ' (guarded-active explicit opt-in: mode + applyWinningPatch; NO host-trusted verdict gate is applied)'
+          );
         } else if (winningPatch !== null && this.applyWinningPatch) {
           diagnostics.push(
             'apply_patch: winning patch NOT mounted - the execution profile denies the ' +
@@ -1946,7 +2566,21 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       }
 
       tree.setCompleted(true);
-      this.treePool.add(tree.snapshot());
+      // rev8 W4 (audit fix): aggregate the evidence-integrity marks of every
+      // trajectory this run committed (executed candidates AND the reference —
+      // reference contamination must be visible too) onto the snapshot's
+      // metadata BEFORE persistence, so `isVerifiedTree`'s tree-level check
+      // (verified-tree-gate.ts) has a real producer and a contaminated run can
+      // never enter the verified-tree pool, whatever its node blocks claim.
+      this.treePool.add(
+        snapshotWithEvidenceIntegrityMark(
+          tree.snapshot(),
+          treeEvidenceIntegrityMark([
+            ...executed.map((entry) => entry.trajectory),
+            reference
+          ])
+        )
+      );
       this.count += 1;
       // Record the completed task in the durable counter (when one is injected)
       // before deciding to dream, so the cadence is continuous across restarts.
@@ -1976,20 +2610,280 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
             ? 'composed'
             : 'probed';
 
-      return result(outcome, {
+      // rev8 plan §3.1 gap 2: hand this run's dropped-proposal diagnoses to the
+      // NEXT run's plan_grid. Consumed (and re-cleared) at the next plan_grid.
+      this.carriedProposalFailures = proposalFailures.slice();
+
+      const runResult = result(outcome, {
         treeId: tree.id,
         ...(selectedNodeId === undefined ? {} : { selectedNodeId }),
         ...(selectedBranchId === undefined ? {} : { selectedBranchId }),
         ...(selectedTrajectoryId === undefined ? {} : { selectedTrajectoryId }),
-        ...(composedPatchId === undefined ? {} : { composedPatchId })
+        ...(composedPatchId === undefined ? {} : { composedPatchId }),
+        ...(proposalFailures.length > 0
+          ? { metadata: runProposalFailureMetadata(proposalFailures) }
+          : {})
       });
+      // rev8 plan §6.1 item 3: the completed cycle records its REALIZED shape
+      // (probes includes the reference anchor; batchSizes do not). The write
+      // resolves before run() returns, so the next cycle - even in a fresh
+      // process - reads this record. Write failures are diagnostics only:
+      // recordLiveCycle never rejects, and this belt-and-braces catch keeps a
+      // successful run from ever becoming a fake failure through the seam.
+      try {
+        await this.recordLiveCycle(
+          {
+            runId,
+            status: 'completed',
+            startedAt,
+            endedAt: runResult.endedAt,
+            stopReason,
+            outcome,
+            taskId: task.id,
+            sessionId,
+            gridPlan: runGrid,
+            probes: probesRun,
+            rounds,
+            batchSizes: roundBatchSizes
+          },
+          diagnostics
+        );
+      } catch (manifestError) {
+        diagnostics.push(
+          'live-cycle: recording the completed cycle crashed (' +
+            errorMessage(manifestError) +
+            '); the run result is unaffected'
+        );
+      }
+      return runResult;
     } catch (error) {
+      // rev8 plan §3.1 gap 2: a crashed run still carries whatever proposal
+      // failures were diagnosed before the crash, so the next plan_grid sees
+      // the channel fault even when the lifecycle itself died later.
+      if (proposalFailures.length > 0) {
+        this.carriedProposalFailures = proposalFailures.slice();
+      }
       diagnostics.push('lifecycle failed: ' + errorMessage(error));
       stage('finalize');
-      return result('failed', {
+      const failedResult = result('failed', {
         failure: { category: 'hard_unrecoverable', message: errorMessage(error) }
       });
+      // rev8 plan §6.1 item 3: the FAILED cycle is also recorded, so the next
+      // plan_grid sees the crash instead of a stale completed record. The
+      // realized prefix observed before the crash is kept (each entry is a
+      // fact); fields the crash left unknown were never invented upstream. The
+      // stop reason keeps the loop's real terminal fact when one exists, and
+      // names the crash itself when the loop never reached a stop site.
+      // The write resolves before run() returns (try/finally semantics: an
+      // async exception inside the write cannot skip this state) and never
+      // rethrows, so a manifest problem can never mask the real failure.
+      try {
+        await this.recordLiveCycle(
+          {
+            runId,
+            status: 'failed',
+            startedAt,
+            endedAt: failedResult.endedAt,
+            stopReason: stopReason === 'not_started' ? 'lifecycle_failed' : stopReason,
+            outcome: 'failed',
+            taskId: task.id,
+            sessionId,
+            gridPlan: runGrid,
+            probes: probesRun,
+            rounds,
+            batchSizes: roundBatchSizes
+          },
+          diagnostics
+        );
+      } catch (manifestError) {
+        diagnostics.push(
+          'live-cycle: recording the failed cycle crashed (' +
+            errorMessage(manifestError) +
+            '); the failed result is returned unchanged'
+        );
+      }
+      return failedResult;
     }
+  }
+
+  /**
+   * rev8 plan §6.1 item 3: read the previous cycle's live-cycle manifest as
+   * plan_grid history. NEVER throws and NEVER blocks the run: a missing file is
+   * simply no history (a first cycle), a damaged file is quarantined by the
+   * tolerant reader and reported as diagnostics, and any other read error
+   * degrades the same way. The returned values are exactly what the previous
+   * cycle RECORDED (or undefined) - a planned grid is never substituted for a
+   * realized one.
+   *
+   * rev8 P2 (cross-task ownership): the manifest is ONE file per data
+   * directory, shared by every task of the deployment (the MCP entrypoint
+   * derives a distinct taskId per prompt). Only a record whose taskId matches
+   * the CURRENT task's id may enter the planner: another task's realized shape
+   * would narrow (or outright skip) an unrelated task's search. A record with
+   * a different taskId, an empty one, or a legacy record without any task
+   * identity is treated as no history and reported via diagnostics - the write
+   * path always records taskId, so a missing identity only ever comes from a
+   * record this code did not write.
+   */
+  private async readLiveCycleHistory(
+    diagnostics: string[],
+    taskId: string
+  ): Promise<LiveCyclePlanHistory | undefined> {
+    const dataDir = this.deps.liveCycleDataDir;
+    if (dataDir === undefined || dataDir.length === 0) {
+      return undefined;
+    }
+    try {
+      const recovery = await readLiveCycleManifest(dataDir);
+      for (const line of recovery.diagnostics) {
+        diagnostics.push('live-cycle: ' + line);
+      }
+      if (recovery.value === undefined) {
+        if (recovery.existed) {
+          diagnostics.push(
+            'live-cycle: the previous manifest was unreadable; planning without cross-cycle history'
+          );
+        }
+        return undefined;
+      }
+      // Seed the staleness ledger from what is on disk, so even a record this
+      // instance did not write (a restarted host reusing the directory) counts
+      // as "already recorded" for the refuse-stale-write guard below. Under the
+      // single-host rule this is the same writer's own record (a no-op max());
+      // a foreign later record can then only refuse, never be clobbered. This
+      // seeding stays ABOVE the ownership gate on purpose: staleness is a
+      // property of the DIRECTORY, not of the task, so even another task's
+      // record must keep protecting itself from being clobbered.
+      this.liveCycleLastRecordedAt = Math.max(
+        this.liveCycleLastRecordedAt,
+        recovery.value.recordedAt
+      );
+      const manifest = recovery.value;
+      // rev8 P2 (cross-task ownership gate): only the SAME task's record rides
+      // into the planner. The diagnostics name the reason without echoing the
+      // foreign task id (it embeds a prompt prefix; diagnostics must stay
+      // leak-free).
+      if (typeof manifest.taskId !== 'string' || manifest.taskId.length === 0) {
+        diagnostics.push(
+          'live-cycle: the previous manifest carries no task identity; planning without cross-cycle history'
+        );
+        return undefined;
+      }
+      if (manifest.taskId !== taskId) {
+        diagnostics.push(
+          'live-cycle: the previous manifest was recorded for a different task; planning without cross-cycle history'
+        );
+        return undefined;
+      }
+      // PROJECT down to the realized-history shape: the manifest's planned
+      // gridPlan (and its identity/timestamp enrichment) must NOT ride into
+      // the planner - only realized values do. Returning the manifest object
+      // directly would leak gridPlan through structural typing. The record's
+      // own taskId is projected additively so downstream consumers can verify
+      // ownership instead of trusting the caller.
+      return {
+        runId: manifest.runId,
+        status: manifest.status,
+        probes: manifest.probes,
+        rounds: manifest.rounds,
+        batchSizes: manifest.batchSizes === null ? null : [...manifest.batchSizes],
+        effectiveSequentialRounds: manifest.effectiveSequentialRounds,
+        taskId: manifest.taskId
+      };
+    } catch (error) {
+      diagnostics.push(
+        'live-cycle: reading the previous manifest failed (' +
+          errorMessage(error) +
+          '); planning without cross-cycle history'
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * rev8 plan §6.1 item 3: record ONE cycle's realized execution shape in the
+   * wired data directory. Contract:
+   *  - never throws and never changes the run's outcome: a write failure is a
+   *    diagnostic, so a successful run can never be turned into a fake failure
+   *    and a failed result can never be masked;
+   *  - writes from overlapping runs on THIS instance serialize through the
+   *    FIFO chain, and a cycle that completed strictly BEFORE the already
+   *    recorded one is refused - an old cycle can never overwrite a newer
+   *    record;
+   *  - recordedAt is the cycle's own end stamp (the SAME injected clock as
+   *    startedAt/endedAt), so the ordering axis is deterministic under test
+   *    clocks too (Date.now() at write time would mix two clocks and make the
+   *    staleness ledger meaningless for a scripted clock);
+   *  - only values the run actually observed are written: probes includes the
+   *    reference anchor while batchSizes never do, and every round entry is a
+   *    committed fact (upstream `effective_sequential_rounds` arithmetic,
+   *    env/trace_env.py:259-269, with the run's own clamped
+   *    config.probe.maxConcurrentProbes as the worker count).
+   */
+  private async recordLiveCycle(
+    cycle: {
+      readonly runId: string;
+      readonly status: 'completed' | 'failed';
+      readonly startedAt: number;
+      readonly endedAt: number;
+      readonly stopReason: string;
+      readonly outcome: string;
+      readonly taskId: string;
+      readonly sessionId: string;
+      readonly gridPlan: SearchGridPlan | null;
+      readonly probes: number;
+      readonly rounds: number;
+      readonly batchSizes: readonly number[];
+    },
+    diagnostics: string[]
+  ): Promise<void> {
+    const dataDir = this.deps.liveCycleDataDir;
+    if (dataDir === undefined || dataDir.length === 0) {
+      return;
+    }
+    const write = async (): Promise<void> => {
+      try {
+        if (cycle.endedAt < this.liveCycleLastRecordedAt) {
+          diagnostics.push(
+            'live-cycle: refused a stale manifest write for run ' +
+              cycle.runId +
+              ' (a cycle that completed later is already recorded); the newer record was kept'
+          );
+          return;
+        }
+        await writeLiveCycleManifest(dataDir, {
+          runId: cycle.runId,
+          status: cycle.status,
+          recordedAt: cycle.endedAt,
+          startedAt: cycle.startedAt,
+          endedAt: cycle.endedAt,
+          stopReason: cycle.stopReason,
+          outcome: cycle.outcome,
+          taskId: cycle.taskId,
+          sessionId: cycle.sessionId,
+          gridPlan: cycle.gridPlan,
+          probes: cycle.probes,
+          rounds: cycle.rounds,
+          batchSizes: [...cycle.batchSizes],
+          effectiveSequentialRounds: effectiveSequentialRoundsOf(
+            cycle.batchSizes,
+            resolveProbeConcurrency(this.deps.config)
+          )
+        });
+        this.liveCycleLastRecordedAt = Math.max(this.liveCycleLastRecordedAt, cycle.endedAt);
+      } catch (error) {
+        // Diagnostics only: the manifest is observability, never a gate.
+        diagnostics.push(
+          'live-cycle: manifest write failed (' +
+            errorMessage(error) +
+            '); the run result is unaffected'
+        );
+      }
+    };
+    const previous = this.liveCycleWriteQueue.catch(() => undefined);
+    const queued = previous.then(write);
+    this.liveCycleWriteQueue = queued;
+    await queued;
   }
 
   /**
@@ -2074,6 +2968,19 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * rev6 audit A3 (B9): the surfaces a text probe can actually evaluate in
+   * THIS assembly: `config.enabledSurfaces` intersected with
+   * `TEXT_PROBE_EVALUABLE` (src/runtime/surface-evaluability.ts).
+   *
+   * This is what the proposer is told it may edit. It is NOT the seam manager's
+   * mount list: mounting still obeys the full config, so an existing saved
+   * patch touching scripts/subagents/plugins remains applicable outside a probe.
+   */
+  private probeSurfaces(): readonly HarnessComponentKey[] {
+    return effectiveProbeSurfaces(this.deps.config.enabledSurfaces);
   }
 
   /**
@@ -2233,7 +3140,14 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
             // itself so a historical poisoning stays visible to every later gate.
             verifierRewardMismatch:
               verdictCode === 2 && (record.learningTarget ?? 0) > 0,
-            forceAuditOnly: marks.verificationAuditOnly === 1
+            forceAuditOnly: marks.verificationAuditOnly === 1,
+            // rev8 W3 (audit fix): the SAME numeric scalar encoding as
+            // `verificationTrusted` — the recorder persisted
+            // `evidenceContaminated: 1` when the HOST-armed scan withheld the
+            // source trajectory. Such a record is a counterexample for G-B and
+            // can never satisfy G-A's prior-failure half, so contaminated
+            // history cannot pass either admission route.
+            contaminated: marks.evidenceContaminated === 1
           })
         );
       }
@@ -2284,13 +3198,18 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
    * runs, never inside one. Every round's records are written, not just the last
    * round's, so "cross-run" loses nothing.
    *
-   * COST (plan section 6.3)
-   * -----------------------
-   * The (possibly model-backed) step evaluator is called at most ONCE per run, for
-   * the composer's winner, exactly as before. Every other executed probe is scored
-   * from verifiable signals already present in its trajectory (tool status,
-   * repeated errors, completion, step count, failure type), so per-slot scoring
-   * never multiplies the model bill. No LLM judge is introduced by this round.
+   * COST (plan section 6.3; revised by rev6 A4-4)
+   * ---------------------------------------------
+   * The (possibly model-backed) step evaluator is called once per EXECUTED
+   * probe, not once for the composer's winner. That is the symmetry A4-4
+   * requires: a single-step, unselected sibling gets the same judge opportunity
+   * as the picked winner, so the auxiliary `stepJudge` entry cannot encode the
+   * Composer's choice. The evaluator's own `judgePolicy` decides whether a model
+   * call actually happens: production passes `all`, while the default
+   * `cost-gated` still suppresses the call for short/unhinted trajectories.
+   * Every probe is also scored from its own verifiable signals (tool status,
+   * repeated errors, completion, step count, failure type), and those remain
+   * the PRIMARY target. A failed/empty/absent judge never deletes a sample.
    *
    * Silent no-op when the kernel is absent or JitRL is disabled/off.
    * Returns the number of records appended (0 when nothing was written).
@@ -2338,38 +3257,62 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       return left.nodeId < right.nodeId ? -1 : left.nodeId > right.nodeId ? 1 : 0;
     });
 
-    // The composer's winner still justifies the (possibly model-backed) step
-    // evaluation: its per-step vector is an AUXILIARY signal under the
-    // RewardContract (judge-policy), it no longer defines the winner's primary
-    // target. A run without a winner evaluates nothing and still records every
-    // executed probe from verifiable signals.
-    const winner = ordered.find((probe) => probe.nodeId === input.selectedNodeId);
-    let winnerRewards: readonly StepReward[] | undefined;
-    if (winner !== undefined) {
-      input.stage('evaluate_steps', { round: input.round, detail: { nodeId: winner.nodeId } });
+    // rev6 audit A4-4 (B3): evaluate EVERY executed probe, not only the
+    // Composer's winner. The judge vector is an AUXILIARY signal under the
+    // RewardContract (judge-policy = auxiliary-only); the PRIMARY target still
+    // comes from scoreUnderRewardContract below. Symmetry matters here: before
+    // A4-4 a single-step, unselected sibling never got a judge call, while the
+    // selected winner did - so the auxiliary signal encoded the Composer's
+    // choice instead of a quality contrast. The evaluator's own `judgePolicy`
+    // (`all` in production) decides whether a model call actually happens; the
+    // orchestrator only guarantees the SAME call opportunity for every sibling.
+    const stepJudgments = new Map<string, number>();
+    if (ordered.length > 0) {
+      input.stage('evaluate_steps', {
+        round: input.round,
+        detail: { probes: ordered.length }
+      });
       // Snapshot the switch before the (external) model-backed evaluation. The
-      // evaluator may spend a real model call; if `/evo jit off` lands while it is
-      // in flight, that call is not withdrawn, but its result must not become
-      // training data (plan P6 section 5.1 "执行中关闭").
+      // evaluator may spend real model calls; if `/evo jit off` lands while they
+      // are in flight, those calls are not withdrawn, but their results must not
+      // become training data (plan P6 section 5.1 "执行中关闭").
       const generationBeforeEvaluate = this.runtimeGeneration();
-      try {
-        const rewards = await evaluator.evaluate(winner.trajectory, {
-          task: input.task,
-          reference: input.reference
-        });
-        if (rewards.length > 0) {
-          winnerRewards = rewards;
-        } else {
+      for (const probe of ordered) {
+        if (
+          !this.surfaceEnabled('onlineRecord') ||
+          this.runtimeGeneration() !== generationBeforeEvaluate
+        ) {
           input.diagnostics.push(
-            'evaluate_steps produced no steps for the winner; its verifiable signals are used instead'
+            'jitrl: JitRL was switched while evaluate_steps was in flight; the step rewards were discarded and no experience was recorded'
+          );
+          return 0;
+        }
+        try {
+          const rewards = await evaluator.evaluate(probe.trajectory, {
+            task: input.task,
+            reference: input.reference
+          });
+          if (rewards.length > 0) {
+            stepJudgments.set(probe.trajectory.id, stepJudgeSummary(rewards));
+          } else {
+            input.diagnostics.push(
+              'evaluate_steps produced no steps for ' +
+                probe.nodeId +
+                '; its verifiable signals are used instead'
+            );
+          }
+        } catch (error) {
+          // A failed evaluation must not delete the run's negative samples: the
+          // probe falls back to its own verifiable signals, exactly like every
+          // other judge-free sibling.
+          input.diagnostics.push(
+            'evaluate_steps failed for ' +
+              probe.nodeId +
+              ': ' +
+              errorMessage(error) +
+              '; verifiable signals are used instead'
           );
         }
-      } catch (error) {
-        // A failed evaluation must not delete the run's negative samples: the
-        // winner falls back to the same verifiable signals as its siblings.
-        input.diagnostics.push(
-          'evaluate_steps failed: ' + errorMessage(error) + '; verifiable signals are used instead'
-        );
       }
       if (
         !this.surfaceEnabled('onlineRecord') ||
@@ -2381,11 +3324,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         return 0;
       }
     } else {
-      input.diagnostics.push(
-        'jitrl: the run has no winning candidate; ' +
-          String(ordered.length) +
-          ' executed probe(s) are recorded from their own verifiable signals'
-      );
+      input.diagnostics.push('jitrl: no executed probe, nothing to judge');
     }
 
     // P6.1-D RewardContract: ONE yardstick per rewardVersion. The baseline (the
@@ -2405,13 +3344,18 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     // constant claim). No seam => the exact pre-C2a literal is emitted below.
     let verificationSummary: VerificationRunSummary = accumulateVerificationSummary(
       { trusted: 0, auditOnly: 0, reasonCodes: [] },
-      readVerificationDisposition(input.reference)
+      readVerificationDisposition(input.reference),
+      trustedProducers
     );
     const createdAt = this.now();
     const records: ExperienceRecord[] = [];
     const outcomes: string[] = [];
     let ineligible = 0;
     let notTaskQuality = 0;
+    // rev6 audit A4-3: probes the main chain classifies as `not-evaluable`.
+    // Counted SEPARATELY from failures and from the C2-pre task-quality gate:
+    // "we could not measure this" is honest, not a negative outcome.
+    let notEvaluable = 0;
     // P6.2 C0 (ADR R8): the mode/vocabulary stamps are resolved ONCE per run
     // from the execution profile, so every record of the run declares the same
     // explicit decisionMode (baseline/shadow/guarded-active).
@@ -2469,9 +3413,28 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       }
       // P6.2 C0 (ADR 0002 R4): ONE evaluation object per executed trajectory;
       // the record consumes it (reward / outcome / eligibility) instead of
-      // re-deriving anything. The winner's step rewards remain an AUXILIARY
+      // re-deriving anything. Each probe's OWN step rewards remain an AUXILIARY
       // stepJudge source (judge-policy), never the yardstick.
       const evaluation = scoreUnderRewardContract(probe.trajectory, scoreOptions);
+      // rev6 audit A4-3 (B6): the SAME main chain now asks whether this probe
+      // is evaluable at all. A text-only probe without a trusted verdict (and
+      // any produced artifact without one) is `not-evaluable`, not a 0-scored
+      // sample: hidden zeros would still enter the average and teach the policy
+      // that "nothing measurable" means "bad". The classifier reads ONLY the
+      // trajectory + the evaluation's own verification facts.
+      const evaluability = classifyProbeEvaluability({
+        trajectory: probe.trajectory,
+        verification: {
+          status: evaluation.verification.status,
+          trustedSource: evaluation.verification.trustedSource,
+          implicit: evaluation.verification.implicit
+        }
+      });
+      const probeNotEvaluable =
+        this.probeEvaluation === 'trusted' && !evaluability.evaluable;
+      if (probeNotEvaluable) {
+        notEvaluable += 1;
+      }
       const outcome = evaluation.outcome;
       outcomes.push(outcome);
       // t10/V3b (t9 finding): the recorder reads the SEPARATED flags instead of
@@ -2507,8 +3470,12 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         verificationDisposition?.forceAuditOnly === true ||
         verificationDisposition?.reasonCode === 'falsified-success-claim';
       const consumptionEligible = evaluation.taskQualityLearningEligible && !forcedAuditOnly;
-      const eligible = consumptionEligible;
-      if (!eligible && outcomeEligible) {
+      // A4-3: `not-evaluable` is a veto on CONSUMPTION only - it never changes
+      // the outcome, never becomes a failure, and never enters the task-quality
+      // denominator. `notTaskQuality` therefore counts ONLY the C2-pre shape
+      // cases; the not-evaluable count is reported on its own.
+      const eligible = consumptionEligible && !probeNotEvaluable;
+      if (!eligible && outcomeEligible && !probeNotEvaluable) {
         notTaskQuality += 1;
       }
       if (!eligible) {
@@ -2516,13 +3483,13 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       }
       // C2a: the host-authenticated view of this trajectory (undefined when no
       // seam is configured, in which case NO verification marks are persisted).
-      verificationSummary = accumulateVerificationSummary(verificationSummary, verificationDisposition);
+      verificationSummary = accumulateVerificationSummary(verificationSummary, verificationDisposition, trustedProducers);
       const verificationMarks = verificationRewardMarks({
         disposition: verificationDisposition,
         verdict: evaluation.verification.status,
         trustedSource: evaluation.verification.trustedSource,
         outcomeEligible,
-        consumed: consumptionEligible
+        consumed: eligible
       });
       // P6.2 t7/V3 + t10/V3b (ADR 0002 5.2a-4): the EXPLICIT learning track,
       // stamped from the evaluation's own separated fields. The task-quality
@@ -2533,7 +3500,7 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       const learningTrack: LearningTrack = evaluation.taskQualityEvidence
         ? 'task-quality'
         : 'process';
-      const isWinner = winnerRewards !== undefined && probe.nodeId === input.selectedNodeId;
+      const stepJudge = stepJudgments.get(probe.trajectory.id);
       let reward: number;
       let observedReturn: number;
       let rewardSources: Readonly<Record<string, number>>;
@@ -2582,6 +3549,16 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
                   })
             }
           : {};
+      // rev8 W3 (audit fix): the trajectory's own evidence-integrity mark —
+      // written by the HOST-armed collector at finalize (#72 sentinel / #118
+      // answer-key text / #175 colliding path) — is the contamination source
+      // the write-back gate reads. The mark is a structural fact produced under
+      // the host's policy; nothing a branch attached to its result can declare
+      // this trajectory clean. The SAME flag is persisted on the record
+      // (`evidenceContaminated: 1`, the same 0/1 scalar encoding as
+      // `verificationTrusted`) so `readWritebackHistory` can veto G-A/G-B for
+      // every LATER run that would otherwise cite this record.
+      const contaminatedEvidence = writebackIntegrityViewOf(probe.trajectory).contaminated;
       if (!eligible) {
         // Audit-only: user cancellation / abort / infrastructure failure say
         // nothing about action quality (plan section 6.2), and - C2-pre (ADR
@@ -2596,7 +3573,28 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         // `outcomeEligible` mark below (1 = audit encoding, 0 = outcome veto).
         reward = 0;
         observedReturn = 0;
-        rewardSources = { outcome: 1, ...verificationMarks, ...decisionMarks };
+        rewardSources = {
+          outcome: 1,
+          ...verificationMarks,
+          ...decisionMarks,
+          // A4-4: the judge vector is per-probe and present on audit-only
+          // records too, so a refused/sibling outcome still reports what the
+          // SAME judge saw (never the winner's vector).
+          ...(stepJudge === undefined ? {} : { stepJudge }),
+          // A4-3: an explicit, persisted marker + numeric reason code. The
+          // reward columns stay 0 because the frozen ExperienceRecord requires
+          // a finite reward, but the reader can tell "not measured" from
+          // "measured as zero" via this mark (and the stage counter).
+          ...(probeNotEvaluable
+            ? {
+                notEvaluable: 1,
+                notEvaluableReason: textProbeReasonCode(evaluability.reason)
+              }
+            : {}),
+          // rev8 W3: persisted regardless of gate state — the contamination
+          // fact outlives this run's gate configuration.
+          ...(contaminatedEvidence ? { evidenceContaminated: 1 } : {})
+        };
       } else {
         // P6.1-D RewardContract: ONE primary target for every executed probe -
         // winner or not - under the same rewardVersion. The composer's winner
@@ -2607,9 +3605,11 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         reward = clamp(evaluation.reward, -3, 3);
         observedReturn = clamp(evaluation.reward, -3, 3);
         rewardSources = {
-          ...(isWinner ? { ...evaluation.sources, stepJudge: winnerStepSummary(winnerRewards) } : evaluation.sources),
+          ...evaluation.sources,
+          ...(stepJudge === undefined ? {} : { stepJudge }),
           ...verificationMarks,
-          ...decisionMarks
+          ...decisionMarks,
+          ...(contaminatedEvidence ? { evidenceContaminated: 1 } : {})
         };
       }
       // rev6 R1-2 (t9): judge this executed trajectory ONCE, BEFORE the record
@@ -2640,6 +3640,16 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
             // same two facts, so the gate and that diagnostic cannot drift.
             verifierRewardMismatch: evaluation.verification.status === 'failed' && reward > 0,
             forceAuditOnly: forcedAuditOnly,
+            // rev8 W3 (audit fix): the evidence-integrity mark the HOST-armed
+            // collector persisted at finalize. This is what makes the gate's
+            // 9th refusal code (`rejected-contaminated-evidence`) reachable in
+            // production: before this line the signals object had no
+            // `contaminated` field at all, so a withheld trajectory could only
+            // ever be refused for some vaguer reason — and a contaminated
+            // record could never veto its own admission. One contaminated
+            // execution vetoes every route, exactly like a verifier mismatch
+            // ("poisoning is not outvoted", writeback-gate.ts).
+            contaminated: contaminatedEvidence,
             recordLearningEligible: eligible && outcomeEligible
           },
           // Inside `if (this.writebackGate)` the index is definitionally built
@@ -2894,6 +3904,9 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         rounds: new Set(ordered.map((probe) => probe.round)).size,
         outcomes,
         notLearningEligible: ineligible,
+        // rev6 audit A4-3: "we could not measure this" is its own count, never
+        // folded into failures or into the C2-pre task-quality count.
+        notEvaluable,
         // P6.2 C0/t6: executions whose verdict carried no trusted provenance
         // and were therefore audit-only on the task-quality track (the C2
         // unfinished item: trusted-failure learning).
@@ -3053,9 +4066,17 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         // drops records whose reward/schema version cannot be proven current -
         // which is the same "may this train?" question, not a wider one.
         //
-        // WHEN GATE IS OFF the option is ABSENT, so the query is byte-identical
+// WHEN GATE IS OFF the option is ABSENT, so the query is byte-identical
         // to the historical shape and the pre-t9 path is unchanged. This is the
         // task contract's "default writebackGate=false keeps history equivalent".
+        //
+        // The review noted that in trusted mode a not-evaluable record can still
+        // be RETURNED by this raw query when the gate is off. It cannot steer
+        // learning: the augmenter drops `return <= 0` (not-evaluable records are
+        // persisted at 0) and the L2 optimizer always applies
+        // learningFacingFilterOptions. Widening this query was tried and reverted
+        // because it changed the pinned historical gate-off shape; the residual
+        // is diagnostic-only and is recorded in the closeout.
         //
         // It is NOT tied to `enableQualityTrackConsumption`/dual-track: the gate
         // decides whether refused evidence may train, which is orthogonal to
@@ -3176,10 +4197,16 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       parentNode: input.parentNode,
       ...(input.parentCandidate === undefined ? {} : { parentPatch: input.parentCandidate.patch }),
       referenceTrajectory: input.reference,
-      enabledSurfaces: this.deps.config.enabledSurfaces,
+      // A3: the K-candidate path sees the SAME evaluable intersection as the
+      // single proposer path. Passing config.enabledSurfaces would let a
+      // scripts/subagents/plugins candidate be selected and then skipped.
+      enabledSurfaces: this.probeSurfaces(),
       attemptIndex: input.slot.slotIndex + 1,
       totalBudget: input.grid.budget,
-      candidateCount: kernel.config.candidateCount
+      candidateCount: kernel.config.candidateCount,
+      // rev8 integration fix: the run-level cancel signal rides the same
+      // metadata channel as the single propose() path (see that call site).
+      ...(this.runSignal === undefined ? {} : { metadata: { signal: this.runSignal } })
     };
     let set: ProposedPatchSet;
     // Snapshot before the K-candidate model call: `/evo jit off` may land while
@@ -3554,6 +4581,8 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
     /** C2a (ADR 0003 §4.4.2): no reference receipt => candidate receipt audit-only. */
     readonly referenceReceiptMissing: boolean;
     readonly diagnostics: string[];
+    /** rev8 stage-2: run-level cancellation signal, forwarded to the branch. */
+    readonly signal?: AbortSignal;
   }): Promise<ProbeTrajectory> {
     const config = this.deps.config;
     let handle: MemoryIsolationHandle | undefined;
@@ -3579,7 +4608,8 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
         nodeId: input.nodeId,
         referenceTrajectoryId: input.referenceTrajectoryId,
         memoryRecallIds: input.recallIds,
-        timeoutMs: config.probe.probeTimeoutMs
+        timeoutMs: config.probe.probeTimeoutMs,
+        ...(input.signal === undefined ? {} : { signal: input.signal })
       });
       // C2a: verify BEFORE the trajectory enters the tree, the composer or the
       // recorder, so every downstream consumer sees the same authenticated
@@ -3646,6 +4676,50 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
       return undefined;
     }
     return seam.runner.trustedProducers;
+  }
+
+  /**
+   * rev6 audit A4-2 (B4): the DREAM-side score for one scored node under the
+   * verified-only-selection strategy.
+   *
+   * The node's `score` column stays the frozen surrogate score (online
+   * selection semantics are deliberately untouched). This evidence block is the
+   * ONLY value replay consumes, and it is computed with the trusted verdict
+   * reader: without a host-registered producer + bound evidence hash, the
+   * composer's selection/adoption terms contribute NOTHING (verdict unknown).
+   * The surviving efficiency/penalty weights keep their frozen absolute size -
+   * no renormalization, so every node is measured on one scale.
+   */
+  private dreamEvidenceFor(
+    request: Parameters<typeof scoreWithEvidencePolicy>[0]
+  ): DreamEvidence {
+    const trustedProducers = this.verificationTrustedProducers();
+    const result = scoreWithEvidencePolicy(request, DEFAULT_EVIDENCE_POLICY_STRATEGY, {
+      // Production ALWAYS uses the trusted reader; the empty set is explicit.
+      trustedProducers: trustedProducers ?? NO_TRUSTED_PRODUCERS
+    });
+    // A4-2 read-time re-check: persist the producer identity and the evidence
+    // hash the trusted reader actually used, so the tree gate can verify the
+    // producer set again after a restart instead of trusting a bare boolean.
+    const verification = verificationFromTrajectory(request.trajectory);
+    // rev8 W4 (audit fix): the source trajectory's evidence-integrity mark (the
+    // HOST-armed collector's finalize scan) rides into the node's evidence
+    // block. A contaminated node must not be persisted as trusted evidence:
+    // `nodeIsVerified` (verified-tree-gate.ts) refuses any block whose
+    // `contaminated === true`, regardless of verdict/score, so the node-level
+    // claim can never outrank the withheld-evidence fact. Reading the mark is
+    // the trusted direction — it was written by the collector from the host's
+    // policy, never by a branch.
+    const integrityMark = readEvidenceIntegrityMark(request.trajectory.metadata);
+    return {
+      verdict: result.admission.verdict,
+      trusted: result.admission.trusted,
+      dreamScore: result.policyScore,
+      strategy: DREAM_EVIDENCE_STRATEGY,
+      ...(verification.verifierId.length === 0 ? {} : { verifierId: verification.verifierId }),
+      ...(verification.evidenceHash.length === 0 ? {} : { evidenceHash: verification.evidenceHash }),
+      ...(integrityMark?.contaminated === true ? { contaminated: true } : {})
+    };
   }
 
   private async commitLessons(
@@ -3793,7 +4867,33 @@ export class EvoHarnessOrchestratorImpl implements EvoHarnessOrchestrator {
   ): Promise<DreamReplayReportWithShadow | null> {
     try {
       const baseline = this.deps.policy.policy;
-      const trees = this.treePool.list();
+      const retained = this.treePool.list();
+      // rev6 audit A4-2 (B4/H10): production requires >= 12 VERIFIED trees and
+      // replays ONLY those. The floor is a gate, not a hint: a smaller pool is
+      // skipped with an explicit diagnostic instead of being replayed anyway
+      // (which would optimize composer-tainted / unverified scores).
+      const readiness = assessDreamReadiness(
+        retained,
+        this.dreamMinVerifiedTrees,
+        // Re-check the persisted producer identity against the SAME host set the
+        // scorer used. An empty set (seam present, no trusted producer) verifies
+        // nothing; no seam at all leaves the set undefined and keeps the
+        // hand-built/test path readable.
+        (() => {
+          const trustedProducers = this.verificationTrustedProducers();
+          return trustedProducers === undefined ? {} : { trustedProducers };
+        })()
+      );
+      diagnostics.push(readiness.reason);
+      if (!readiness.ready) {
+        return null;
+      }
+      // minimum 0 is the documented hand-built/test seam: replay the FULL POOL.
+      // It does not restore the historical node.score basis - nodes carrying
+      // dreamEvidence still replay at dreamScore. Any positive minimum passes
+      // ONLY verified trees.
+      const trees =
+        this.dreamMinVerifiedTrees > 0 ? readiness.verifiedTrees : retained;
       const report = (await this.deps.dreamer.replay({
         trees,
         baselinePolicy: baseline,

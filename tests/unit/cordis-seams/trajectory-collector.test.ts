@@ -213,3 +213,239 @@ describe('helpers', () => {
     expect(toTrajectoryError(new Error('boom')).name).toBe('Error');
   });
 });
+
+// ---------------------------------------------------------------------------
+// rev8 evidence-integrity trio (#67 / #72 / #118 / #175)
+// ---------------------------------------------------------------------------
+
+const ANSWER_CRITERIA = [
+  {
+    id: 'c1',
+    text: 'the reconciliation report must list the signed total of every ledger row including credits and refunds before closing the period'
+  },
+  {
+    id: 'c2',
+    text: 'the filing timeline must start the statutory waiting period before the financing condition lapses and state the order of both steps'
+  },
+  {
+    id: 'c3',
+    text: 'every counterparty whose consent is required must be listed with the clause of the agreement that requires their consent'
+  }
+] as const;
+const FULL_KEY = ANSWER_CRITERIA.map((entry) => entry.text).join('\n');
+
+function makeIntegrityCollector(
+  overrides: Partial<ConstructorParameters<typeof TrajectoryCollector>[0]> = {}
+) {
+  return makeCollector({
+    evidenceIntegrity: {
+      taskId: 'task-1',
+      answerKey: { criteria: ANSWER_CRITERIA, visibleText: [] }
+    },
+    ...overrides
+  });
+}
+
+describe('rev8 #67: the two artifact channels fail independently', () => {
+  it('a deliverable-channel failure keeps the full trajectory (upstream #67 direction 2)', () => {
+    const collector = makeCollector();
+    collector.appendStep({ kind: 'model', text: 'plan' });
+    collector.appendStep({ kind: 'result', text: 'body' });
+    collector.recordDeliverableFault(new Error('deliverable extraction failed'));
+
+    const trajectory = collector.finalize({ status: 'succeeded', endedAt: 1_100 });
+
+    // The execution status stays truthful; the artifact channel reports its own failure.
+    expect(trajectory.status).toBe('succeeded');
+    expect(trajectory.steps.map((step) => step.text)).toEqual(['plan', 'body']);
+    expect(trajectory.deliverable).toBeUndefined();
+    expect(trajectory.failureSignals.map((signal) => signal.code)).toContain('evidence-render-failed');
+    expect(trajectory.failureSignals.map((signal) => signal.kind)).toContain('no_deliverable');
+  });
+
+  it('a trajectory-channel failure keeps a rendered deliverable (upstream #67 direction 1)', () => {
+    const collector = makeCollector();
+    collector.appendStep({ kind: 'model', text: 'plan' });
+    collector.recordTrajectoryFault(new Error('trajectory render failed'));
+
+    const trajectory = collector.finalize({
+      status: 'succeeded',
+      endedAt: 1_100,
+      result: { status: 'succeeded', deliverable: { content: 'artifact body', format: 'text' } }
+    });
+
+    expect(trajectory.status).toBe('succeeded');
+    expect(trajectory.deliverable?.content).toBe('artifact body');
+    expect(trajectory.failureSignals.map((signal) => signal.code)).toContain('evidence-render-failed');
+    expect(trajectory.failureSignals.map((signal) => signal.message)).toContain('trajectory render failed');
+  });
+
+  it('a throwing result getter on one channel cannot erase the other channels', () => {
+    const collector = makeCollector();
+    collector.appendStep({ kind: 'model', text: 'kept step' });
+    const hostileResult = {
+      get steps() {
+        return [{ index: 9, at: 1, kind: 'model' as const, text: 'executor step' }];
+      },
+      get deliverable(): never {
+        throw new Error('deliverable extraction failed');
+      }
+    } as unknown as NonNullable<Parameters<typeof collector.finalize>[0]>['result'];
+
+    const trajectory = collector.finalize({ status: 'succeeded', endedAt: 1_100, result: hostileResult });
+
+    // The steps that read successfully survive; the failing channel is a fault.
+    expect(trajectory.steps.map((step) => step.text)).toContain('kept step');
+    expect(trajectory.steps.map((step) => step.text)).toContain('executor step');
+    expect(trajectory.deliverable).toBeUndefined();
+    expect(trajectory.failureSignals.map((signal) => signal.code)).toContain('evidence-render-failed');
+  });
+
+  it('a recorded terminal error cannot be swallowed by a later success', () => {
+    const collector = makeCollector();
+    collector.recordError(new Error('late terminal failure'));
+
+    const trajectory = collector.finalize({ status: 'succeeded', endedAt: 1_100 });
+
+    expect(trajectory.status).toBe('failed');
+    expect(trajectory.error?.message).toBe('late terminal failure');
+  });
+
+  it('the same demotion applies to an executor error declared with a succeeded status', () => {
+    const collector = makeCollector();
+    const trajectory = collector.finalize({
+      status: 'succeeded',
+      endedAt: 1_100,
+      result: { status: 'succeeded', error: { name: 'Error', message: 'settled after the flag' } }
+    });
+
+    expect(trajectory.status).toBe('failed');
+  });
+});
+
+describe('rev8 #72: missing-trajectory sentinels are rejected', () => {
+  it('a sentinel deliverable is dropped, the steps survive, a signal fires', () => {
+    const collector = makeCollector();
+    collector.appendStep({ kind: 'model', text: 'the only real step' });
+
+    const trajectory = collector.finalize({
+      status: 'succeeded',
+      endedAt: 1_100,
+      result: {
+        status: 'succeeded',
+        deliverable: { content: '(no parseable events in trajectory)', format: 'text' }
+      }
+    });
+
+    expect(trajectory.deliverable).toBeUndefined();
+    expect(trajectory.steps.map((step) => step.text)).toEqual(['the only real step']);
+    expect(trajectory.failureSignals.map((signal) => signal.code)).toContain('missing-trajectory-sentinel');
+    // The sentinel text itself never enters the frozen record.
+    expect(JSON.stringify(trajectory)).not.toContain('no parseable events');
+  });
+
+  it('an empty produced artifact is the same failure', () => {
+    const collector = makeCollector();
+    const trajectory = collector.finalize({
+      status: 'succeeded',
+      endedAt: 1_100,
+      result: { status: 'succeeded', deliverable: { content: '   ' } }
+    });
+    expect(trajectory.deliverable).toBeUndefined();
+    expect(trajectory.failureSignals.map((signal) => signal.code)).toContain('missing-trajectory-sentinel');
+  });
+
+  it('a real deliverable passes through untouched', () => {
+    const collector = makeCollector();
+    const trajectory = collector.finalize({
+      status: 'succeeded',
+      endedAt: 1_100,
+      result: { status: 'succeeded', deliverable: { content: 'done' } }
+    });
+    expect(trajectory.deliverable?.content).toBe('done');
+    expect(trajectory.failureSignals.map((signal) => signal.code)).not.toContain('missing-trajectory-sentinel');
+  });
+});
+
+describe('rev8 #118: answer-key contamination is quarantined at finalize', () => {
+  it('a deliverable carrying the task key is replaced by the neutral record', () => {
+    const collector = makeIntegrityCollector();
+    const trajectory = collector.finalize({
+      status: 'succeeded',
+      endedAt: 1_100,
+      result: { status: 'succeeded', deliverable: { content: FULL_KEY, format: 'text' } }
+    });
+    const serialized = JSON.stringify(trajectory);
+
+    expect(trajectory.status).toBe('failed');
+    expect(trajectory.deliverable).toBeUndefined();
+    expect(serialized).not.toContain('reconciliation');
+    expect(trajectory.metadata?.['evidenceIntegrity']).toBeDefined();
+    const mark = trajectory.metadata?.['evidenceIntegrity'] as { contaminated: boolean };
+    expect(mark.contaminated).toBe(true);
+    expect(trajectory.failureSignals[0]?.code).toBe('evidence-contaminated');
+  });
+
+  it('key text inside a JSON-escaped tool result is caught too', () => {
+    const collector = makeIntegrityCollector();
+    const trajectory = collector.finalize({
+      status: 'succeeded',
+      endedAt: 1_100,
+      result: {
+        status: 'succeeded',
+        deliverable: { content: 'innocent summary' },
+        steps: [
+          {
+            index: 0,
+            at: 1_050,
+            kind: 'tool',
+            toolName: 'http',
+            toolResult: JSON.stringify({ body: FULL_KEY })
+          }
+        ]
+      }
+    });
+
+    expect(trajectory.status).toBe('failed');
+    expect(JSON.stringify(trajectory)).not.toContain('reconciliation');
+  });
+
+  it('clean evidence with a policy passes through byte-identically (no mark, no quarantine)', () => {
+    const collector = makeIntegrityCollector();
+    const withPolicy = collector.finalize({
+      status: 'succeeded',
+      endedAt: 1_100,
+      result: { status: 'succeeded', deliverable: { content: 'a clean answer' } }
+    });
+    const withoutPolicy = makeCollector().finalize({
+      status: 'succeeded',
+      endedAt: 1_100,
+      result: { status: 'succeeded', deliverable: { content: 'a clean answer' } }
+    });
+
+    expect(withPolicy.metadata?.['evidenceIntegrity']).toBeUndefined();
+    expect(withPolicy.status).toBe('succeeded');
+    expect(withPolicy).toEqual(withoutPolicy);
+  });
+
+  it('a patch whose component path collides is refused even with clean content', () => {
+    const collidingPatch = {
+      ...makePatch(),
+      id: 'patch-collide',
+      edits: {
+        ...makePatch().edits,
+        skills: { kind: 'skills' as const, skills: [{ name: 'tests', markdown: '# x' }] }
+      }
+    };
+    const collector = makeCollector({
+      patch: collidingPatch,
+      evidenceIntegrity: { taskId: 'task-1', forbiddenPathSegments: ['tests'] }
+    });
+    const trajectory = collector.finalize({ status: 'succeeded', endedAt: 1_100 });
+
+    expect(trajectory.status).toBe('failed');
+    expect(trajectory.failureSignals[0]?.code).toBe('answer-key-path');
+    expect(trajectory.failureSignals[0]?.repairable).toBe(true);
+    expect(trajectory.metadata?.['evidenceIntegrity']).toBeDefined();
+  });
+});

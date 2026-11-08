@@ -388,14 +388,18 @@ describe('c2a recorder: host-authenticated verdicts become task-quality records'
     expect(record?.rewardSources).not.toHaveProperty('verificationVerdict');
     expect(record?.rewardSources).not.toHaveProperty('verificationAuditOnly');
     expect(record?.rewardSources).not.toHaveProperty('outcomeEligible');
-    expect(record?.learningEligible).toBe(true);
+    // rev6 A4-3: the text-only probe has no executable observable and no
+    // trusted verdict, so the record is audit-only BECAUSE IT WAS NOT
+    // EVALUABLE - not because the forged audit mark was honoured.
+    expect(record?.learningEligible).toBe(false);
     expect(record?.learningTrack).toBe('process');
-    expect(record?.reward).not.toBe(0);
+    expect(record?.reward).toBe(0);
+    expect(record?.rewardSources.notEvaluable).toBe(1);
     const detail = recordStageDetail(h.stages);
     expect(detail?.['trustedVerificationSource']).toBe(
       'shape-only (C2-pre: no trusted producer registered)'
     );
-    expect(detail?.['notLearningEligible']).toBe(0);
+    expect(detail?.['notEvaluable']).toBe(1);
   });
 
   it('idempotency: the same trajectory never produces a second record', async () => {
@@ -427,14 +431,20 @@ describe('c2a recorder: host-authenticated verdicts become task-quality records'
     expect(h.appended).toHaveLength(1);
   });
 
-  it('with no seam the record is byte-identical to the C2-pre shape (no marks, old literal)', async () => {
+  it('with no seam keeps the C2-pre source literal and adds only the A4-3 marker', async () => {
     const h = harness(undefined);
     const raw = trajectory({ id: 'traj-no-seam' });
     const reference = trajectory({ id: 'traj-ref-no-seam', role: 'reference' });
     await h.record({ executed: [probeEntry(raw)], reference });
     const record = h.appended[0];
-    expect(record?.learningEligible).toBe(true);
+    // A4-3: a persisted text-only probe with no verifier is not evaluable, so
+    // the frozen record is audit-only. The C2-pre shape is preserved: no
+    // verification marks and the exact source literal, with the new explicit
+    // not-evaluable marker added by the main chain.
+    expect(record?.learningEligible).toBe(false);
     expect(record?.learningTrack).toBe('process');
+    expect(record?.reward).toBe(0);
+    expect(record?.rewardSources.notEvaluable).toBe(1);
     expect(record?.rewardSources).not.toHaveProperty('verificationVerdict');
     expect(record?.rewardSources).not.toHaveProperty('outcomeEligible');
     const stage = recordStageDetail(h.stages);

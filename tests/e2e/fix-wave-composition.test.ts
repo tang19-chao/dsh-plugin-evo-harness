@@ -459,7 +459,8 @@ describe('fix-wave composition', () => {
         clients: [server.client],
         runBranch: createScriptedRunner(now),
         now,
-        newId: makeIdFactory('disposal-dream')
+        newId: makeIdFactory('disposal-dream'),
+        deps: { dreamMinVerifiedTrees: 0 }
       },
       ctx
     );

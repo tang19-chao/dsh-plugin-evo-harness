@@ -35,6 +35,8 @@ import type {
 } from '../types/contracts';
 import { BATCH_SLOT_KINDS, HARNESS_COMPONENT_KEYS } from '../types/contracts';
 import { DEFAULT_EVO_HARNESS_CONFIG } from '../config';
+import { resolveGridPlan } from './grid-plan-resolution';
+import type { GridResolutionAudit } from './grid-plan-resolution';
 
 /** Complexity multiplier applied to the width/depth caps. */
 export const COMPLEXITY_FACTORS: Readonly<Record<TaskComplexity, number>> = {
@@ -152,6 +154,138 @@ function clampInt(value: number, min: number, max: number): number {
 
 function finiteOr(value: number, fallback: number): number {
   return Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * Realized limits from the previous live cycle. These are upper bounds, not a
+ * target to reach again: otherwise a cycle that ended early would keep
+ * donating its remaining serial budget to every later cycle.
+ *
+ * Only a COMPLETED cycle bounds the next plan (upstream grounds planning in
+ * `completed_history`, i.e. completed cycles; a failed/unknown cycle's prefix
+ * is an unfinished search, not evidence the task needs less). Unknown fields
+ * impose no limit. A known-empty successful cycle is the one exception: its
+ * realized zero means that no search was needed, not that data was missing.
+ */
+interface LiveCycleSizing {
+  readonly width: number;
+  readonly depth: number;
+  readonly budget: number;
+  readonly skipProbing: boolean;
+  readonly rationale: string;
+}
+
+function realizedNonNegativeInt(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function previousLiveCycleSizing(request: PlanGridRequest): LiveCycleSizing | null {
+  const history = request.previousLiveCycle;
+  if (history === undefined || history === null || typeof history !== 'object') {
+    return null;
+  }
+  const raw = history as {
+    readonly status?: unknown;
+    readonly probes?: unknown;
+    readonly rounds?: unknown;
+    readonly batchSizes?: unknown;
+    readonly effectiveSequentialRounds?: unknown;
+    readonly taskId?: unknown;
+  };
+  // rev8 P2 (cross-task ownership, defense in depth): a history that names
+  // ANOTHER task is not this task's evidence and is ignored ENTIRELY - no
+  // narrowing, no skip. The orchestrator's read path already filters (one
+  // manifest file per data directory is shared by every task of the
+  // deployment), but the policy must not be safe only because the caller is:
+  // the skip decision in particular turns another task's "no search needed"
+  // into a no_probe for THIS task. A record that carries NO identity cannot
+  // be attributed either way and keeps the pre-existing behavior; the strict
+  // identity gate lives in the orchestrator's read.
+  const ownerTaskId = raw.taskId;
+  if (typeof ownerTaskId === 'string' && ownerTaskId.length > 0) {
+    const currentTaskId = (request.task as { readonly id?: unknown } | undefined)?.id;
+    if (currentTaskId !== ownerTaskId) {
+      return null;
+    }
+  }
+  if (raw.status !== 'completed') {
+    return null;
+  }
+  const probes = realizedNonNegativeInt(raw.probes);
+  const rounds = realizedNonNegativeInt(raw.rounds);
+  const effectiveRounds = realizedNonNegativeInt(raw.effectiveSequentialRounds);
+  let batchMax: number | null = null;
+  let batchTotal = 0;
+  let batchesValid = raw.batchSizes === null || raw.batchSizes === undefined;
+  if (Array.isArray(raw.batchSizes)) {
+    batchesValid = true;
+    for (const entry of raw.batchSizes) {
+      const size = realizedNonNegativeInt(entry);
+      if (size === null) {
+        batchesValid = false;
+        break;
+      }
+      batchMax = Math.max(batchMax ?? 0, size);
+      batchTotal += size;
+    }
+  }
+  if (!batchesValid) {
+    // One damaged entry poisons the whole array: drop it entirely and fall
+    // back to the probes-derived bound instead of trusting a valid prefix.
+    batchMax = null;
+    batchTotal = 0;
+  }
+  // `probes` includes the reference probe; batchSizes do not. When both are
+  // readable they agree (sum(batchSizes) = probes - 1); a contradictory record
+  // is bounded by the SMALLER signal, never manufactured upward.
+  const probesFallback = probes === null ? null : Math.max(0, probes - 1);
+  const batchBudget = batchMax === null ? null : batchTotal;
+  const candidateBudget =
+    batchBudget !== null && probesFallback !== null
+      ? Math.min(batchBudget, probesFallback)
+      : (batchBudget ?? probesFallback);
+  // Selection rounds cap depth; the serial cost (effectiveSequentialRounds)
+  // caps it further when known - this is the bound that stops a later cycle
+  // from re-paying the previous plan's unparallelized tail.
+  const sequentialDepth =
+    rounds !== null && effectiveRounds !== null
+      ? Math.min(rounds, effectiveRounds)
+      : (rounds ?? effectiveRounds);
+
+  // A completed cycle that realized NO candidate search (zero recorded rounds,
+  // or an explicitly empty batch list with at most the reference probe) says
+  // the task needed no search - the one realized zero that may become a skip.
+  // A null batchSizes (recorded unknown) never does.
+  const skipProbing =
+    (rounds === 0 && (probes === null || probes <= 1)) ||
+    (batchesValid &&
+      raw.batchSizes !== null &&
+      raw.batchSizes !== undefined &&
+      batchTotal === 0 &&
+      (probes === null || probes <= 1));
+
+  const limits: string[] = [];
+  if (batchMax !== null) {
+    limits.push('realizedBatchWidth=' + String(batchMax));
+  }
+  if (sequentialDepth !== null) {
+    limits.push('realizedSequentialRounds=' + String(sequentialDepth));
+  }
+  if (candidateBudget !== null) {
+    limits.push('realizedCandidateProbes=' + String(candidateBudget));
+  }
+  if (limits.length === 0 && !skipProbing) {
+    return null;
+  }
+  return {
+    width: batchMax ?? Number.POSITIVE_INFINITY,
+    depth: sequentialDepth ?? Number.POSITIVE_INFINITY,
+    budget: candidateBudget ?? Number.POSITIVE_INFINITY,
+    skipProbing,
+    rationale:
+      ' previousLiveCycle=completed ' +
+      (limits.length > 0 ? limits.join(' ') : 'no realized search')
+  };
 }
 
 /** Coerce slot weights into a valid, non-negative, non-zero-sum vector. */
@@ -362,6 +496,18 @@ export interface ActivePolicyOptions {
 /** Active policy handle with an audit trail of applied policy ids. */
 export interface ActivePolicy extends IActivePolicy {
   readonly appliedPolicyIds: readonly string[];
+  /**
+   * rev8 plan §6.1 P1 (GridPlan resolver port): audit of the LAST planGrid
+   * resolution - fallback/clamp/out_of_support reasons, additive over the
+   * SearchGridPlan itself. Optional deliberately: making it required would
+   * break the additive compatibility of existing ActivePolicy implementers
+   * outside this task's file set (the persistence decorator and test stubs
+   * implement the interface without it). The concrete policy created by
+   * createActivePolicy always provides it: null before the first planGrid,
+   * replaced (not accumulated) on every call. Delegating wrappers (persistence
+   * store, jitrl) do not surface it - read the audit from the base policy.
+   */
+  readonly lastGridResolution?: GridResolutionAudit | null;
 }
 
 /**
@@ -389,6 +535,8 @@ class ActivePolicyImpl implements ActivePolicy {
   private readonly maxRecoverySlots: number;
   private readonly defaultFocusSurfaces: readonly HarnessComponentKey[];
   private readonly applied: string[] = [];
+  /** rev8 P1: audit of the most recent planGrid resolution (see ActivePolicy). */
+  private lastResolution: GridResolutionAudit | null = null;
 
   constructor(options: ActivePolicyOptions) {
     this.current = options.policy ?? createDefaultPolicy({}, options.now);
@@ -412,9 +560,30 @@ class ActivePolicyImpl implements ActivePolicy {
     return this.applied;
   }
 
+  get lastGridResolution(): GridResolutionAudit | null {
+    return this.lastResolution;
+  }
+
   /**
    * Size the search grid for one task. Bounded by the policy caps and by the
    * remaining budget; never widens what the policy allows.
+   *
+   * rev8 plan §6.1 item 3 (history sizing): when the request carries
+   * `previousLiveCycle`, the PREVIOUS COMPLETED cycle's realized shape bounds
+   * this plan - width by the largest realized batch, depth by the realized
+   * rounds / effective sequential rounds, and the candidate budget by the
+   * realized probes. The bounds only narrow (never widen a policy cap), a
+   * failed/unknown or unreadable record changes nothing, a record that names
+   * another task changes nothing (cross-task ownership, defense in depth),
+   * and the previous cycle's PLANNED grid is never consulted.
+   *
+   * rev8 plan §6.1 P1: the sized plan is audited through the GridPlan resolver
+   * (grid-plan-resolution.ts, ported from upstream grid_planning.py:88-162)
+   * before it leaves this method. The base sizing arithmetic is unchanged;
+   * the resolver only repairs an out-of-contract shape (fallback/clamp) and
+   * records fallback/clamp/out_of_support reasons into lastGridResolution. A
+   * well-formed plan passes through byte-identical (identity), so normal
+   * supported requests cannot become fallbacks.
    */
   planGrid(request: PlanGridRequest): SearchGridPlan {
     const policy = request.policy;
@@ -427,11 +596,14 @@ class ActivePolicyImpl implements ActivePolicy {
     const minConfidence = clamp01(policy.minMemoryConfidenceForSkip);
     const earlyStop = clamp01(policy.earlyStopThreshold);
     const simpleTask = complexity === 'trivial' || complexity === 'simple';
+    const history = previousLiveCycleSizing(request);
     const skipProbing =
-      budgetRemaining > 0 && policyWidth > 0 && simpleTask && confidence >= minConfidence;
+      budgetRemaining > 0 &&
+      policyWidth > 0 &&
+      ((simpleTask && confidence >= minConfidence) || history?.skipProbing === true);
 
     if (skipProbing) {
-      return {
+      return this.finalizePlan(request, {
         maxWidth: 0,
         maxDepth: 0,
         budget: 0,
@@ -439,20 +611,23 @@ class ActivePolicyImpl implements ActivePolicy {
         stopCondition: 'first_success',
         complexity,
         rationale:
-          'skip probing: ' +
-          complexity +
-          ' task with memory confidence ' +
-          confidence.toFixed(2) +
-          ' >= ' +
-          minConfidence.toFixed(2) +
-          ' and budget ' +
-          String(budgetRemaining),
+          history?.skipProbing === true
+            ? 'skip probing: previous completed live cycle realized no candidate search' +
+              (history?.rationale ?? '')
+            : 'skip probing: ' +
+              complexity +
+              ' task with memory confidence ' +
+              confidence.toFixed(2) +
+              ' >= ' +
+              minConfidence.toFixed(2) +
+              ' and budget ' +
+              String(budgetRemaining),
         policyId: policy.id
-      };
+      });
     }
 
     if (budgetRemaining <= 0 || policyWidth <= 0 || policyDepth <= 0) {
-      return {
+      return this.finalizePlan(request, {
         maxWidth: 0,
         maxDepth: 0,
         budget: 0,
@@ -467,7 +642,7 @@ class ActivePolicyImpl implements ActivePolicy {
           ' policyDepth=' +
           String(policyDepth),
         policyId: policy.id
-      };
+      });
     }
 
     const confidenceDiscount = 1 - 0.5 * confidence;
@@ -475,6 +650,11 @@ class ActivePolicyImpl implements ActivePolicy {
     let depth = clampInt(policyDepth * factor, 1, policyDepth);
     const capacity = Math.max(1, width * depth);
     let budget = Math.max(1, Math.min(capacity, budgetRemaining));
+    if (history !== null) {
+      width = Math.min(width, history.width);
+      depth = Math.min(depth, history.depth);
+      budget = Math.min(budget, history.budget);
+    }
     if (budget < width) {
       width = budget;
     }
@@ -482,6 +662,20 @@ class ActivePolicyImpl implements ActivePolicy {
       depth = budget;
     }
     budget = Math.min(budget, width * depth);
+    if (width <= 0 || depth <= 0 || budget <= 0) {
+      return this.finalizePlan(request, {
+        maxWidth: 0,
+        maxDepth: 0,
+        budget: 0,
+        skipProbing: false,
+        stopCondition: 'budget_exhausted',
+        complexity,
+        rationale:
+          'previous live cycle realized no reusable search capacity' +
+          (history?.rationale ?? ''),
+        policyId: policy.id
+      });
+    }
 
     let stopCondition: StopCondition = 'budget_exhausted';
     if (request.currentDepth >= depth) {
@@ -492,7 +686,7 @@ class ActivePolicyImpl implements ActivePolicy {
       stopCondition = 'diminishing_returns';
     }
 
-    return {
+    return this.finalizePlan(request, {
       maxWidth: width,
       maxDepth: depth,
       budget,
@@ -519,9 +713,24 @@ class ActivePolicyImpl implements ActivePolicy {
         ') budget=' +
         String(budget) +
         ' remaining=' +
-        String(budgetRemaining),
+        String(budgetRemaining) +
+        (history?.rationale ?? ''),
       policyId: policy.id
-    };
+    });
+  }
+
+  /**
+   * rev8 P1 (GridPlan resolver port): run the sized plan through
+   * resolveGridPlan and record the audit. No trace-support caps are passed
+   * here - the online path has no frozen trace to be out of support of; the
+   * support layer stays available to offline replay via the pure function.
+   * The resolver is total (it catches its own validation), so this can only
+   * return a well-formed SearchGridPlan.
+   */
+  private finalizePlan(request: PlanGridRequest, candidate: SearchGridPlan): SearchGridPlan {
+    const resolved = resolveGridPlan(request, candidate);
+    this.lastResolution = resolved.audit;
+    return resolved.plan;
   }
 
   /**

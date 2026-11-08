@@ -35,6 +35,8 @@ const DEFAULT_JITRL = {
   surfaceActions: false,
   minSupportForStrongPrior: 3,
   unseenFallback: 'baseline',
+  // rev6 audit A4-1: the online write-back evidence gate defaults to auto.
+  writebackGate: 'auto',
   store: {
     driver: 'jsonl',
     mirrorToMemoryBridge: false,
@@ -90,6 +92,19 @@ describe('jitrl config group (P1-6)', () => {
     expect(config.jitrl.k).toBe(10);
   });
 
+  it('exposes the A4-1 write-back gate enum with auto as the default', () => {
+    // `auto` is the honest default: the plugin resolves it to ON when no
+    // trusted verifier exists (see src/runtime/writeback-policy.ts). The two
+    // explicit values must remain reachable so an operator can force the
+    // historical path (off) or the stricter path (on) without editing code.
+    expect(createDefaultConfig().jitrl.writebackGate).toBe('auto');
+    for (const value of ['auto', 'on', 'off'] as const) {
+      expect(resolveEvoHarnessConfig({ jitrl: { writebackGate: value } }).jitrl.writebackGate).toBe(
+        value
+      );
+    }
+  });
+
   it('replaces level arrays and reward clip tuples whole', () => {
     const config = resolveEvoHarnessConfig({
       jitrl: {
@@ -127,6 +142,7 @@ describe('jitrl config group (P1-6)', () => {
       ['jitrl.logitSource', { jitrl: { logitSource: 'psychic' } }],
       ['jitrl.selection', { jitrl: { selection: 'roulette' } }],
       ['jitrl.unseenFallback', { jitrl: { unseenFallback: 'random' } }],
+      ['jitrl.writebackGate', { jitrl: { writebackGate: 'sometimes' } }],
       ['jitrl.store.driver', { jitrl: { store: { driver: 'sqlite' } } }],
       ['jitrl.hostAdvisor.mode', { jitrl: { hostAdvisor: { mode: 'yolo' } } }]
     ];

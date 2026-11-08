@@ -26,7 +26,7 @@
 
 import { performance } from 'node:perf_hooks';
 
-import { createEvoHarnessPlugin } from '../../src/index';
+import { createEvoHarnessPluginForOfflineEvaluation } from '../../src/index';
 import { createAnonymousComposer, createEvidenceReflector } from '../../src/harness2';
 import { createMemoryExperienceStore } from '../../src/jitrl/stores/memory.store';
 import { abstractMetaState, abstractProposalState } from '../../src/jitrl/state-abstraction';
@@ -1365,7 +1365,7 @@ export async function runCondition(
   const textChannels: string[] = [];
 
   const model = createEvalModel(modelCounters);
-  const plugin = createEvoHarnessPlugin(
+  const plugin = createEvoHarnessPluginForOfflineEvaluation(
     {
       config: conditionConfig(spec),
       model,
@@ -1382,6 +1382,13 @@ export async function runCondition(
         return 'eval-' + String(idSequence);
       },
       deps: {
+        // The synthetic suite is an OFFLINE measurement harness with no host
+        // verifier by construction. It explicitly opts into the historical
+        // process scoring and the ungated write-back path the P5-c report
+        // measured, instead of pretending its fixtures were host-verified.
+        // Neither member is reachable from config or production wiring.
+        probeEvaluation: 'legacy',
+        writebackGate: false,
         proposer: createEvalProposer(tasksById, proposerState),
         // Injecting `proposer` makes src/index.ts build the collaborators itself
         // with model = undefined (it only falls back to options.model when no

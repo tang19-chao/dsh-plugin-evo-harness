@@ -74,7 +74,7 @@ interface ReadmeCounts {
 function readmeCounts(): ReadmeCounts {
   const summary = realReadme.match(/reports\s+`(\d+)`\s+test files and\s+`(\d+)`\s+passing tests for\s+`pnpm run test`/i);
   const unit = realReadme.match(/\|\s*`pnpm run test:unit`\s*\|\s*`tests\/unit`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i);
-  const e2e = realReadme.match(/\|\s*`pnpm run test:e2e`\s*\|\s*`tests\/e2e`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i);
+  const e2e = realReadme.match(/\|\s*`pnpm run test:e2e`\s*\|\s*`tests\/e2e \+ tests\/mcp`\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i);
   const total = realReadme.match(/\|\s*`pnpm run test`\s*\|\s*everything\s*\|\s*(\d+)\s+files,\s*(\d+)\s+tests\s*\|/i);
   if (summary === null || unit === null || e2e === null || total === null) {
     throw new Error('README count rows are missing; the J-1 fixture cannot derive current counts');

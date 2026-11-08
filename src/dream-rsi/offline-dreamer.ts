@@ -23,9 +23,12 @@
  *
  * Zero-execution honesty: a recovery probe cannot observe the post-repair
  * outcome, so replay charges it one probe and credits the failed node's
- * recorded score. Policies that spend recovery slots on trees where repair
- * never paid off therefore score lower, which is exactly the lesson the
- * offline optimizer is supposed to learn.
+ * recorded score. Since rev6 A4-2, the trusted-evidence value in
+ * `metadata.dreamEvidence.dreamScore` takes precedence over the frozen
+ * `node.score`; a legacy tree without the evidence block keeps the old
+ * fallback. Policies that spend recovery slots on trees where repair never
+ * paid off therefore score lower, which is exactly the lesson the offline
+ * optimizer is supposed to learn.
  */
 
 import type {
@@ -63,6 +66,19 @@ import {
   normalizeSlotWeights,
   validatePolicy
 } from './active-policy';
+// rev6 audit A4-2: replay prefers the trusted-evidence (strategy B) score the
+// orchestrator recorded, never the composer-tainted frozen node.score.
+import { dreamEvidenceOf } from './verified-tree-gate';
+// rev8 (plan §6.1 P2): normalized budget-attainment AUC + sequential penalty.
+import {
+  batchesToSequentialRounds,
+  computeParetoReward,
+  MIN_EVALUATED_NODES_FOR_AUC,
+  resolveSequentialPenaltyWeight,
+  type ParetoPointInput,
+  type ParetoRewardSummary,
+  type ParetoTraceInput
+} from './pareto-reward';
 
 function clamp01(value: number): number {
   if (Number.isNaN(value)) {
@@ -385,6 +401,16 @@ function jitHyperparamsOf(policy: MetaSearchPolicy): JitHyperparams {
 
 /** Score credited to one historical node during replay. */
 export function replayNodeScore(node: DiscoveryNode): number {
+  // rev6 audit A4-2 (B4): the orchestrator records `metadata.dreamEvidence`
+  // with the strategy-B score (composer terms admitted only under a
+  // host-trusted verdict). Replay must consume THAT score first; falling back
+  // to `node.score` would replay the self-referential frozen surrogate and
+  // silently undo the evidence policy. The fallback stays for legacy trees and
+  // for hand-built snapshots that never carried the evidence block.
+  const evidence = dreamEvidenceOf(node);
+  if (evidence !== undefined) {
+    return clamp01(evidence.dreamScore);
+  }
   if (node.score !== undefined && Number.isFinite(node.score)) {
     return clamp01(node.score);
   }
@@ -428,6 +454,22 @@ export interface ReplayTreeOutcome {
    * JitReplayHook was injected, so a hook-free replay keeps the legacy shape.
    */
   readonly jitDiagnostics?: DreamJitDiagnostics;
+  /**
+   * Additive (rev8 pareto reward): per-candidate-layer batch sizes, one entry
+   * per executed candidate layer (the recovery probe is not a layer and is
+   * not counted). Present only when the replay was asked to measure batches
+   * ({@link ReplayTreeOptions.measureBatches}), so every pre-rev8 caller keeps
+   * the exact legacy shape (tests/unit/dream-rsi/jit-dream.test.ts pins it).
+   */
+  readonly batchSizes?: readonly number[];
+  /**
+   * Additive (rev8 pareto reward): ceil(size / maxParallelism) summed over
+   * {@link batchSizes} - the sequential-round cost a worker-capped scheduler
+   * would pay for this replay (upstream effective_sequential_rounds). Present
+   * only under the same opt-in as batchSizes; absent otherwise, never zero by
+   * default.
+   */
+  readonly effectiveSequentialRounds?: number;
 }
 
 /** Options for one tree replay. */
@@ -444,6 +486,24 @@ export interface ReplayTreeOptions {
   readonly jitHook?: JitReplayHook;
   /** Drift down-weight factor forwarded to the hook (config jitrl.dream.driftRho). */
   readonly driftRho?: number;
+  /**
+   * Additive (rev8 pareto reward): record per-candidate-layer batch sizes and
+   * their worker-capped sequential-round equivalent on the outcome. Strictly
+   * opt-in: unset keeps the replay output byte-identical to the pre-rev8 shape.
+   *
+   * NOTE the honesty boundary: these numbers are a property of the REPLAY
+   * loop (one layer = one batch of up to `width` ordered nodes), not a
+   * measurement of the historical run's actual batch structure. Only the
+   * pareto projection may consume them, and the projection labels them as
+   * replay-side reconstruction.
+   */
+  readonly measureBatches?: boolean;
+  /**
+   * Additive (rev8 pareto reward): worker cap used to fold batch sizes into
+   * sequential rounds when `measureBatches` is on. Defaults to 1 (serial), the
+   * only assumption the replay itself can make without an injected host fact.
+   */
+  readonly maxParallelism?: number;
 }
 
 function childrenOfSnapshot(
@@ -1337,6 +1397,14 @@ export function replayTree(
   let quality = 0;
   let earlyStopped = false;
   let probes = 0;
+  // rev8 pareto reward: batch instrumentation is opt-in (measureBatches), so a
+  // replay without it never allocates the array and never widens its output.
+  const measureBatches = options.measureBatches === true;
+  const maxParallelism = Math.max(
+    1,
+    Math.floor(finiteOr(options.maxParallelism ?? 1, 1))
+  );
+  const batchSizes: number[] = [];
 
   // The root is the reference run every policy inherits: visit it first and leave
   // it out of the candidate budget.
@@ -1387,6 +1455,9 @@ export function replayTree(
       }
     }
     const expanded: DiscoveryNode[] = [];
+    // rev8 pareto reward: this layer IS one batch - up to `width` nodes were
+    // ordered and probed together against the same frontier.
+    let layerBatch = 0;
     for (const node of selected) {
       if (probes >= budget) {
         break;
@@ -1397,6 +1468,7 @@ export function replayTree(
       seen.add(node.id);
       visited.push(node.id);
       probes += 1;
+      layerBatch += 1;
       const score = replayNodeScore(node);
       if (score > quality) {
         quality = score;
@@ -1406,6 +1478,9 @@ export function replayTree(
         break;
       }
       expanded.push(node);
+    }
+    if (measureBatches && layerBatch > 0) {
+      batchSizes.push(layerBatch);
     }
     if (earlyStopped || probes >= budget) {
       break;
@@ -1510,7 +1585,13 @@ export function replayTree(
     visitedNodeIds: visited,
     earlyStopped,
     evidence,
-    ...(jitDiagnostics === undefined ? {} : { jitDiagnostics })
+    ...(jitDiagnostics === undefined ? {} : { jitDiagnostics }),
+    ...(measureBatches
+      ? {
+          batchSizes: [...batchSizes],
+          effectiveSequentialRounds: batchesToSequentialRounds(batchSizes, maxParallelism)
+        }
+      : {})
   };
 }
 
@@ -1606,6 +1687,141 @@ export function toPolicyEvaluation(
     treesEvaluated: run.treeIds.length
   };
 }
+
+/** Options of {@link paretoRewardOfRun}. */
+export interface ParetoRewardOfRunOptions {
+  /** Explicit sequential-round penalty weight lambda (injected, never inferred). */
+  readonly sequentialPenaltyWeight: number;
+  /**
+   * Worker cap the replay assumed when folding batches into sequential rounds.
+   * Echoed on the summary's inputs; defaults to the replay-side serial
+   * assumption (1), matching {@link ReplayTreeOptions.maxParallelism}.
+   */
+  readonly maxParallelism?: number;
+}
+
+/**
+ * Project a replay run onto the pareto budget-attainment reward (rev8, plan
+ * §6.1 P2; upstream eval.py `_pareto_summary`).
+ *
+ * Per tree the points are the run's per-rho (probes, quality) observations,
+ * attainment normalized by the tree's OWN ceiling `runBest` - the best
+ * replay-creditable score over ALL of the tree's nodes (the same score basis
+ * replayTree can reach, computed here from the full snapshot so a rho that
+ * never reaches the ceiling still normalizes correctly). The exhaustive
+ * reference `evaluatedNodes` counts nodes a full visit would charge:
+ * succeeded or failed nodes (mirroring upstream's "nodes that were actually
+ * run"). Trees below MIN_EVALUATED_NODES_FOR_AUC are skipped by the reward -
+ * reported in skippedTraces, never scored as 0.
+ *
+ * Sequential rounds come from the replay-side batch reconstruction
+ * (`measureBatches`), a property of the replay loop, NOT of the historical
+ * run's actual batching. The projection therefore does NOT pretend an
+ * existing replay without batch instrumentation has a measured serial cost:
+ * traces whose outcomes carry no `effectiveSequentialRounds` yield an
+ * 'unknown' penalty and, if none are instrumented, an 'unknown' reward -
+ * while `auc` still scores the budget<->attainment curve. The legacy
+ * scalarized-utility hypervolume (PolicyEvaluation.hypervolume) remains the
+ * selection criterion; these are different quantities in different fields.
+ */
+export function paretoRewardOfRun(
+  run: PolicyReplayRun,
+  trees: readonly DiscoveryTreeSnapshot[],
+  options: ParetoRewardOfRunOptions
+): ParetoRewardSummary {
+  const maxParallelism = Math.max(
+    1,
+    Math.floor(finiteOr(options.maxParallelism ?? 1, 1))
+  );
+  const byTree = new Map<string, DiscoveryTreeSnapshot>();
+  for (const tree of trees) {
+    byTree.set(tree.id, tree);
+  }
+  const traces: ParetoTraceInput[] = [];
+  for (const treeId of run.treeIds) {
+    const tree = byTree.get(treeId);
+    if (tree === undefined) {
+      continue;
+    }
+    // The trace's own ceiling: the best replay-creditable score over all
+    // nodes (replayNodeScore, matching the basis the replay itself spends).
+    let runBest = 0;
+    let evaluatedNodes = 0;
+    for (const node of Object.values(tree.nodes)) {
+      const score = replayNodeScore(node);
+      if (score > runBest) {
+        runBest = score;
+      }
+      if (node.status === 'succeeded' || node.status === 'failed') {
+        evaluatedNodes += 1;
+      }
+    }
+    const points: ParetoPointInput[] = [];
+    for (const rho of run.rhos) {
+      const outcome = (run.outcomes[String(rho)] ?? []).find(
+        (entry) => entry.treeId === treeId
+      );
+      if (outcome === undefined) {
+        continue;
+      }
+      points.push({
+        rho,
+        budget: outcome.cost,
+        best: outcome.quality,
+        // Only a replay that actually measured batches contributes a rounds
+        // figure; an existing replay is never attributed a fabricated one.
+        ...(outcome.effectiveSequentialRounds === undefined
+          ? {}
+          : { effectiveSequentialRounds: outcome.effectiveSequentialRounds })
+      });
+    }
+    traces.push({
+      treeId,
+      runBest,
+      evaluatedNodes,
+      points
+    });
+  }
+  const summary = computeParetoReward(traces, {
+    sequentialPenaltyWeight: options.sequentialPenaltyWeight
+  });
+  // Audit trail: which replay assumption produced the rounds figures.
+  return {
+    ...summary,
+    method:
+      summary.method +
+      ' [replay-side reconstruction: one candidate layer = one batch, ' +
+      'worker cap ' +
+      String(maxParallelism) +
+      ']'
+  };
+}
+
+/**
+ * Derive the per-tree pareto inputs a projection needs directly from
+ * snapshots (exported for tests and for callers that hold snapshots but not a
+ * run). `runBest` is the best replay-creditable score over all nodes;
+ * `evaluatedNodes` counts succeeded/failed nodes.
+ */
+export function paretoTraceInputsOfTree(
+  tree: DiscoveryTreeSnapshot
+): { runBest: number; evaluatedNodes: number } {
+  let runBest = 0;
+  let evaluatedNodes = 0;
+  for (const node of Object.values(tree.nodes)) {
+    const score = replayNodeScore(node);
+    if (score > runBest) {
+      runBest = score;
+    }
+    if (node.status === 'succeeded' || node.status === 'failed') {
+      evaluatedNodes += 1;
+    }
+  }
+  return { runBest, evaluatedNodes };
+}
+
+/** The minimum evaluated-nodes floor, re-exported for callers and tests. */
+export { MIN_EVALUATED_NODES_FOR_AUC };
 
 /**
  * Convenience: evaluate one policy. Pass a shared costCeiling when comparing
@@ -1983,6 +2199,23 @@ export interface OfflineDreamerOptions {
    * effective profile permissions.publish.allowed. Defaults to false.
    */
   readonly publishAuthorized?: boolean;
+  /**
+   * Additive (rev8 pareto reward): explicit sequential-round penalty weight
+   * lambda for the pareto budget-attainment projection. Injecting a value
+   * (finite, >= 0; anything else falls back to the module default per
+   * {@link resolveSequentialPenaltyWeight}) ENABLES the projection: the dreamer
+   * turns on replay batch measurement and the report gains a `paretoReward`
+   * block. Leaving it undefined keeps the report without that block entirely -
+   * the pre-rev8 shape, byte for byte.
+   */
+  readonly sequentialPenaltyWeight?: number;
+  /**
+   * Additive (rev8 pareto reward): worker cap used to reconstruct sequential
+   * rounds from replay batch sizes (see
+   * {@link ReplayTreeOptions.maxParallelism}). Defaults to 1 (serial) - the
+   * only assumption the replay can make without an injected host fact.
+   */
+  readonly maxParallelism?: number;
 }
 
 /** One candidate's comparison against the incumbent, for the shadow log. */
@@ -2074,6 +2307,17 @@ export interface DreamReplayReportWithShadow extends DreamReplayReport {
   readonly shadow: DreamShadowRecord;
   /** Dimensions this cycle did not search, with the reason (§7.2). */
   readonly ignoredDimensions: readonly JitIgnoredDimension[];
+  /**
+   * Additive (rev8 pareto reward): normalized budget-attainment AUC reward for
+   * the BASELINE policy, present only when the dreamer was configured with an
+   * explicit `sequentialPenaltyWeight`. The reward is a DIFFERENT quantity
+   * from PolicyEvaluation.hypervolume (mean scalarized utility over rho); the
+   * two never substitute for each other and the hypervolume stays the sole
+   * selection criterion. Per-candidate projections can be derived with
+   * {@link paretoRewardOfRun}; the report carries the baseline's as the
+   * reference point.
+   */
+  readonly paretoReward?: ParetoRewardSummary;
 }
 
 class OfflineDreamerImpl implements IOfflineDreamer {
@@ -2091,6 +2335,8 @@ class OfflineDreamerImpl implements IOfflineDreamer {
   private readonly shadowMode: boolean;
   private readonly holdoutTreeCount: number;
   private readonly publishAuthorized: boolean;
+  private readonly paretoWeight: number | undefined;
+  private readonly maxParallelism: number;
 
   constructor(options: OfflineDreamerOptions) {
     this.now = options.now ?? ((): number => Date.now());
@@ -2107,6 +2353,18 @@ class OfflineDreamerImpl implements IOfflineDreamer {
       Math.floor(finiteOr(options.holdoutTreeCount ?? 0, 0))
     );
     this.publishAuthorized = options.publishAuthorized === true;
+    // rev8 pareto reward: undefined keeps the projection off entirely (the
+    // pre-rev8 report shape); a value switches it on. Invalid values fall back
+    // to the module default inside resolveSequentialPenaltyWeight, so a
+    // misconfigured lambda can never silently disable the projection.
+    this.paretoWeight =
+      options.sequentialPenaltyWeight === undefined
+        ? undefined
+        : resolveSequentialPenaltyWeight(options.sequentialPenaltyWeight);
+    this.maxParallelism = Math.max(
+      1,
+      Math.floor(finiteOr(options.maxParallelism ?? 1, 1))
+    );
     this.driftRho =
       options.driftRho === undefined
         ? undefined
@@ -2176,7 +2434,12 @@ class OfflineDreamerImpl implements IOfflineDreamer {
           },
           boundary: REPLAY_GATE_BOUNDARY
         },
-        ignoredDimensions: JIT_IGNORED_DIMENSIONS
+        ignoredDimensions: JIT_IGNORED_DIMENSIONS,
+        // Projection configured: report the empty-pool verdict on the pareto
+        // axis too, so the field's presence never depends on pool size.
+        ...(this.paretoWeight === undefined
+          ? {}
+          : { paretoReward: computeParetoReward([], { sequentialPenaltyWeight: this.paretoWeight }) })
       };
     }
 
@@ -2203,7 +2466,12 @@ class OfflineDreamerImpl implements IOfflineDreamer {
     const replayOptions: ReplayTreeOptions = {
       ...(this.experiences === undefined ? {} : { experiences: this.experiences }),
       ...(this.jitHook === undefined ? {} : { jitHook: this.jitHook }),
-      ...(this.driftRho === undefined ? {} : { driftRho: this.driftRho })
+      ...(this.driftRho === undefined ? {} : { driftRho: this.driftRho }),
+      // rev8 pareto reward: batch measurement only when the projection is on,
+      // so a projection-free replay never widens the outcome shape.
+      ...(this.paretoWeight === undefined
+        ? {}
+        : { measureBatches: true, maxParallelism: this.maxParallelism })
     };
 
     if (this.treePool !== undefined) {
@@ -2419,6 +2687,17 @@ class OfflineDreamerImpl implements IOfflineDreamer {
       boundary: REPLAY_GATE_BOUNDARY
     };
 
+    // rev8 pareto reward: project the baseline run onto the budget-attainment
+    // axis as the reference point. The projection never feeds selection; the
+    // hypervolume comparison above stays the sole criterion.
+    const baselinePareto =
+      this.paretoWeight === undefined
+        ? undefined
+        : paretoRewardOfRun(baselineRun, selectionTrees, {
+            sequentialPenaltyWeight: this.paretoWeight,
+            maxParallelism: this.maxParallelism
+          });
+
     return {
       ranAt,
       baseline: baselineEvaluation,
@@ -2431,7 +2710,8 @@ class OfflineDreamerImpl implements IOfflineDreamer {
       rhoPreferences: rhos,
       publication,
       shadow,
-      ignoredDimensions: JIT_IGNORED_DIMENSIONS
+      ignoredDimensions: JIT_IGNORED_DIMENSIONS,
+      ...(baselinePareto === undefined ? {} : { paretoReward: baselinePareto })
     };
   }
 }

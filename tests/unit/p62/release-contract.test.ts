@@ -1770,7 +1770,11 @@ describe("C1.1 Dreamer release boundary and safe defaults (ADR-0003 §3)", () =>
     const harness = createEvoHarnessPlugin({
       config,
       persistence,
-      now
+      now,
+      // The production verified-tree floor (12) is the subject of
+      // tests/unit/dream-rsi/verified-tree-gate.test.ts; this suite exercises
+      // the Dream mechanics themselves, so the explicit seam lowers it to 0.
+      deps: { dreamMinVerifiedTrees: 0 }
     });
     const { orchestrator } = harness;
     orchestrator.treePool.add(tree);

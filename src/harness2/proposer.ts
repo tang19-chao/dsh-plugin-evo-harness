@@ -42,12 +42,17 @@ import {
   type SubagentSpec,
   type SubagentsSurfaceEdit,
   type SupportedSurfacePayload,
+  type ModelResponse,
   type SystemPromptSurfaceEdit,
   type ToolGuidanceSurfaceEdit,
   type ToolPrecondition
 } from '../types/contracts';
 // P3-B: every model call leaves this module through the unified metered boundary.
 import { createMeteredModelAdapter, type MeteredModelOptions } from '../dsh-bridge/metered-model-adapter';
+// rev8 #110/#13: transport-class classification recognizes the DSH stream error
+// surface; the class import keeps the instanceof fast path, with a structural
+// fallback below so a cross-bundle twin of the same shape still classifies.
+import { DshModelStreamError } from '../dsh-bridge/model';
 import {
   type Clock,
   type IdFactory,
@@ -81,6 +86,22 @@ export interface HarnessProposerOptions {
   readonly temperature?: number;
   /** Response token cap; defaults to 2048. */
   readonly maxTokens?: number;
+  /**
+   * rev8 #110/#13: number of transport-error RETRIES after the first attempt.
+   * Defaults to 1 (the plan's "one bounded backoff retry"); 0 disables retrying.
+   */
+  readonly transportRetries?: number;
+  /**
+   * rev8 #110/#13: base backoff before the first retry, in milliseconds.
+   * Defaults to 1000 (the plan's 1-2s window); retry N waits baseMs * N.
+   */
+  readonly transportRetryBackoffMs?: number;
+  /**
+   * rev8 #110/#13: injectable sleep used between retries. Defaults to a real
+   * timer; tests pass an immediate fake. Returning a promise lets tests and
+   * hosts plug abort-aware waits without this module owning timers.
+   */
+  readonly sleep?: (ms: number) => Promise<void>;
 }
 
 /** Failure modes of one proposal attempt. */
@@ -90,13 +111,270 @@ export type Harness2ProposalFailure = 'proposal_unparseable' | 'proposal_no_vali
 export class Harness2ProposalError extends Error {
   readonly code: Harness2ProposalFailure;
   readonly detail: string;
+  /**
+   * A3 (rev6 B9): true when the model produced only edits on KNOWN surfaces that
+   * are disabled for this run. This is not a proposer failure - it is a
+   * proposal that cannot be evaluated, and the orchestrator must route it to
+   * `proposals_not_evaluable` instead of `no_candidates`.
+   */
+  readonly notEvaluable: boolean;
+  /** The known-but-disabled surfaces behind {@link notEvaluable}. */
+  readonly droppedSurfaces: readonly HarnessComponentKey[];
 
-  constructor(code: Harness2ProposalFailure, message: string, detail: string) {
+  constructor(
+    code: Harness2ProposalFailure,
+    message: string,
+    detail: string,
+    extra: {
+      readonly notEvaluable?: boolean;
+      readonly droppedSurfaces?: readonly HarnessComponentKey[];
+    } = {}
+  ) {
     super(message);
     this.name = 'Harness2ProposalError';
     this.code = code;
     this.detail = detail;
+    this.notEvaluable = extra.notEvaluable === true;
+    this.droppedSurfaces = extra.droppedSurfaces ?? [];
   }
+}
+
+/**
+ * rev8 plan §3.1 #110/#13: a transport-level model failure (gateway 429/5xx,
+ * network reset, aborted stream) currently escapes the metered adapter and the
+ * orchestrator drops the whole slot after recording one diagnostic line. Upstream
+ * fixed this with one bounded retry for transport-class errors only. Ported here
+ * as a proposer-internal wrapper so every stage that builds proposals shares it:
+ *
+ * - ONLY provably transport-class errors retry: an HTTP status that says so
+ *   (429, 5xx), the DSH stream error surface, and Node network/system errors.
+ *   Validation, budget, purpose-mismatch and permission failures never retry -
+ *   repeating them would just double-spend the failure.
+ * - At most `transportRetries` retries with a linear backoff (baseMs * attempt).
+ * - A caller-supplied abort signal wins over the retry: an aborted wait or an
+ *   abort observed before/at a retry rethrows the ORIGINAL error (or the abort
+ *   reason), so an in-flight `/evo jit off` still takes effect. `ProposeRequest`
+ *   has no first-class `signal` field (contracts.ts), so the signal is read
+ *   structurally from `request.metadata.signal` when the host supplies one;
+ *   hosts that never pass it are unaffected (backward compatible).
+ * - The wrapper never inspects or re-renders request payloads, so nothing about
+ *   the call (or any secret the host attached) is copied anywhere.
+ */
+
+/** Minimum delay between retries; keeps a misconfigured baseMs bounded below. */
+const TRANSPORT_RETRY_MIN_BACKOFF_MS = 100;
+
+/** Linear-backoff ceiling so a huge baseMs cannot stall a run indefinitely. */
+const TRANSPORT_RETRY_MAX_BACKOFF_MS = 30_000;
+
+/** Minimal structural AbortSignal probe (realm-safe; no DOM lib dependency). */
+function isAbortSignalLike(value: unknown): value is AbortSignal {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { aborted?: unknown }).aborted === 'boolean' &&
+    typeof (value as { addEventListener?: unknown }).addEventListener === 'function'
+  );
+}
+
+/**
+ * Read the per-call abort signal from `request.metadata.signal`. Structural on
+ * purpose: adding a first-class field to ProposeRequest is a contracts.ts
+ * change outside this module's scope, and ContractMetadata is already the
+ * run's general-purpose channel.
+ */
+export function requestAbortSignal(request: ProposeRequest): AbortSignal | undefined {
+  const candidate = (request.metadata as { signal?: unknown } | undefined)?.signal;
+  return isAbortSignalLike(candidate) ? candidate : undefined;
+}
+
+/**
+ * A transport-class error with a PROVABLE HTTP status attached, e.g. the gateway
+ * error objects a host adapter builds from a failed fetch. Structural probing:
+ * any error carrying a numeric `status` in the retryable ranges qualifies,
+ * regardless of its class name, so the adapter needs no new exported marker.
+ */
+function provableHttpStatus(error: unknown): number | undefined {
+  if (!(error instanceof Error)) {
+    return undefined;
+  }
+  const candidate = (error as { status?: unknown; statusCode?: unknown; httpStatus?: unknown }).status ??
+    (error as { statusCode?: unknown }).statusCode ??
+    (error as { httpStatus?: unknown }).httpStatus;
+  return typeof candidate === 'number' && Number.isFinite(candidate) ? candidate : undefined;
+}
+
+/** Network/system errors whose `code` Node itself assigns (read-only probe). */
+function nodeErrorCode(error: unknown): string | undefined {
+  if (!(error instanceof Error)) {
+    return undefined;
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+/**
+ * Node/undici codes that PROVE a network/transport break. An allowlist, not a
+ * prefix rule: EACCES (permission) and ERR_* (internal assertions) also start
+ * with "E" and must NOT retry.
+ */
+const NETWORK_ERROR_CODES: ReadonlySet<string> = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'EPIPE',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ENETDOWN'
+]);
+
+/** DSH failure codes that PROVE a rate-limit (gateway 429 surfaces as this). */
+const RATE_LIMIT_STREAM_CODES: ReadonlySet<string> = new Set(['RATE_LIMIT']);
+
+/** Whether one DshModelStreamError surface is PROVABLY transport-class. */
+function dshStreamErrorIsTransport(
+  finishKind: 'error' | 'aborted' | undefined,
+  failureCode: string | undefined
+): boolean {
+  // A mid-stream abort is a broken connection (the ask's 流中止). A caller who
+  // aborted on purpose wins anyway: the retry loop checks the signal first.
+  if (finishKind === 'aborted') {
+    return true;
+  }
+  // A provider-RESPONDED error finish is only transport when the DSH code says
+  // so. AUTH (permission) and unknown codes are not provable and do not retry.
+  return failureCode !== undefined && RATE_LIMIT_STREAM_CODES.has(failureCode);
+}
+
+/**
+ * True when this error is PROVABLY transport-class. The ask's bar: retry only
+ * what evidence classifies - an HTTP 429/5xx status, a DSH stream abort or
+ * rate-limit code, or a Node/undici network error code. Everything else (a
+ * parse failure, a budget denial, an AUTH/permission error, an unknown Error)
+ * is someone else's failure mode and reaches the caller untouched.
+ */
+export function isTransportClassModelError(error: unknown): boolean {
+  if (error instanceof DshModelStreamError) {
+    return dshStreamErrorIsTransport(error.finishKind, error.failureCode);
+  }
+  // Structural twin of DshModelStreamError (cross-bundle adapters).
+  if (error instanceof Error && error.name === 'DshModelStreamError') {
+    const shape = error as { finishKind?: unknown; failureCode?: unknown };
+    return dshStreamErrorIsTransport(
+      shape.finishKind === 'error' || shape.finishKind === 'aborted' ? shape.finishKind : undefined,
+      typeof shape.failureCode === 'string' ? shape.failureCode : undefined
+    );
+  }
+  // The error itself, then ONE level of `cause` (undici wraps the real network
+  // error inside `TypeError: fetch failed`). Bounded depth: no cycle walks.
+  for (const candidate of [error, error instanceof Error ? error.cause : undefined]) {
+    const code = nodeErrorCode(candidate);
+    if (
+      code !== undefined &&
+      (NETWORK_ERROR_CODES.has(code) || code.startsWith('UND_ERR_') || code.startsWith('und_err_'))
+    ) {
+      return true;
+    }
+  }
+  // Provable HTTP transport status on any error shape.
+  const status = provableHttpStatus(error);
+  if (status !== undefined && (status === 429 || (status >= 500 && status <= 599))) {
+    return true;
+  }
+  return false;
+}
+
+/** One call attempt through the retry wrapper, for diagnostics. */
+export interface TransportRetryAttempt {
+  /** 1-based attempt number that failed with this error. */
+  readonly attempt: number;
+  readonly errorName: string;
+  /** DSH failureCode or numeric HTTP status when the error exposed one. */
+  readonly failureCode?: string;
+}
+
+export interface TransportRetryOutcome<T> {
+  readonly value: T;
+  /** Failures that were retried past; empty when the first attempt succeeded. */
+  readonly retriedErrors: readonly TransportRetryAttempt[];
+}
+
+/** Default abort-aware sleep: a plain timer that resolves early on abort. */
+const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('proposer retry backoff aborted before it started'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, Math.max(0, ms));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error('proposer retry backoff aborted'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+
+/**
+ * Call `fn` once, retrying only transport-class errors with a bounded linear
+ * backoff. `signal` short-circuits both the backoff and the decision to retry.
+ */
+async function callWithTransportRetry<T>(
+  fn: () => Promise<T>,
+  options: {
+    readonly retries: number;
+    readonly backoffMs: number;
+    readonly signal?: AbortSignal;
+    readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+  }
+): Promise<TransportRetryOutcome<T>> {
+  const retriedErrors: TransportRetryAttempt[] = [];
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= options.retries + 1; attempt += 1) {
+    if (attempt > 1) {
+      const backoff = Math.min(
+        TRANSPORT_RETRY_MAX_BACKOFF_MS,
+        Math.max(TRANSPORT_RETRY_MIN_BACKOFF_MS, options.backoffMs * (attempt - 1))
+      );
+      try {
+        await options.sleep(backoff, options.signal);
+      } catch {
+        // Abort during the backoff: the caller withdrew the slot. Rethrow the
+        // ORIGINAL model error (still the truthful cause), not the timer error.
+        throw lastError;
+      }
+      if (options.signal?.aborted) {
+        throw lastError;
+      }
+    }
+    try {
+      const value = await fn();
+      return { value, retriedErrors };
+    } catch (error) {
+      lastError = error;
+      const isLast = attempt >= options.retries + 1;
+      if (options.signal?.aborted || isLast || !isTransportClassModelError(error)) {
+        throw error;
+      }
+      const status = provableHttpStatus(error);
+      retriedErrors.push({
+        attempt,
+        errorName: error instanceof Error ? error.name : 'unknown',
+        ...(typeof (error as { failureCode?: unknown }).failureCode === 'string'
+          ? { failureCode: (error as { failureCode: string }).failureCode }
+          : status !== undefined
+            ? { failureCode: 'HTTP_' + String(status) }
+            : {})
+      });
+    }
+  }
+  // Unreachable: the loop returns or throws on every path.
+  throw lastError;
 }
 
 /** Resolved guidance decision for one proposal. */
@@ -136,16 +414,30 @@ export function decideProposalGuidance(request: ProposeRequest): ProposalGuidanc
   return { memoryAllowed: true, sanitized: false, reason: 'domain guidance with recalled lessons' };
 }
 
-const SURFACE_PAYLOAD_CONTRACT: readonly string[] = [
-  '- system_prompt: { "kind": "system_prompt", "mode": "append"|"replace", "content": string, "segment"?: string, "priority"?: number }',
-  '- guardrails: { "kind": "guardrails", "appendRules"?: string[], "forbiddenActions"?: string[], "formatContract"?: string, "toolPreconditions"?: [{"toolName": string, "rule": string}] } (at least one field)',
-  '- memory: { "kind": "memory", "scopedViewId"?: string, "workingNotes"?: string[], "recallTags"?: string[] } (at least one field)',
-  '- tool_guidance: { "kind": "tool_guidance", "descriptions": {"<tool>": string}, "priorityOrder"?: string[], "examples"?: [{"toolName": string, "example": string}] }',
-  '- skills: { "kind": "skills", "skills": [{"name": string, "markdown": string, "description"?: string, "activate"?: boolean}] }',
-  '- scripts: { "kind": "scripts", "scripts": [{"path": string, "language": "python"|"bash"|"typescript"|"javascript", "code": string, "executable"?: boolean}] }',
-  '- subagents: { "kind": "subagents", "agents": [{"name": string, "description": string, "systemPrompt"?: string, "tools"?: string[], "model"?: string}] }',
-  '- plugins: { "kind": "plugins", "middleware": [{"name": string, "hook": "before_tool"|"after_tool"|"around_tool", "language": "typescript"|"javascript", "code": string, "description"?: string}] }'
-];
+/**
+ * The payload contract, keyed by the canonical surface name. `renderProposalPrompts`
+ * renders ONLY the entries the caller actually allows (`enabledSurfaces`), so a
+ * text-probe run never teaches the model the scripts/subagents/plugins payload
+ * shapes it would then have to silently drop (rev6 A3/B9).
+ */
+const SURFACE_PAYLOAD_CONTRACT: Readonly<Record<HarnessComponentKey, string>> = {
+  system_prompt:
+    '- system_prompt: { "kind": "system_prompt", "mode": "append"|"replace", "content": string, "segment"?: string, "priority"?: number }',
+  guardrails:
+    '- guardrails: { "kind": "guardrails", "appendRules"?: string[], "forbiddenActions"?: string[], "formatContract"?: string, "toolPreconditions"?: [{"toolName": string, "rule": string}] } (at least one NON-EMPTY field)',
+  memory:
+    '- memory: { "kind": "memory", "scopedViewId"?: string, "workingNotes"?: string[], "recallTags"?: string[] } (at least one of workingNotes/recallTags with content; scopedViewId alone is not text-evaluable)',
+  tool_guidance:
+    '- tool_guidance: { "kind": "tool_guidance", "descriptions": {"<tool>": string}, "priorityOrder"?: string[], "examples"?: [{"toolName": string, "example": string}] }',
+  skills:
+    '- skills: { "kind": "skills", "skills": [{"name": string, "markdown": string, "description"?: string, "activate"?: boolean}] }',
+  scripts:
+    '- scripts: { "kind": "scripts", "scripts": [{"path": string, "language": "python"|"bash"|"typescript"|"javascript", "code": string, "executable"?: boolean}] }',
+  subagents:
+    '- subagents: { "kind": "subagents", "agents": [{"name": string, "description": string, "systemPrompt"?: string, "tools"?: string[], "model"?: string}] }',
+  plugins:
+    '- plugins: { "kind": "plugins", "middleware": [{"name": string, "hook": "before_tool"|"after_tool"|"around_tool", "language": "typescript"|"javascript", "code": string, "description"?: string}] }'
+};
 
 function referenceRunLines(reference: ProbeTrajectory): string[] {
   const lines: string[] = [];
@@ -240,11 +532,17 @@ export function renderProposalPrompts(
     decision.memoryAllowed && request.guidance.mode === 'domain' ? request.guidance.memory : undefined;
 
   const system: string[] = [];
+  // A3/B9: the prompt is part of the restriction, not only the parser. When the
+  // caller supplies `enabledSurfaces` (the orchestrator passes the effective
+  // text-probe set), the legend AND the payload contracts are filtered to that
+  // set. Otherwise the model is shown scripts/subagents/plugins, emits edits the
+  // parser must silently drop, and the run ends in a misleading proposer error.
+  const promptSurfaces = allowedSurfacesFor(request);
   system.push('You are the Harness² proposer for a DeepSeek Harness (Cordis) agent.');
   system.push(
-    'You edit the eight harness surfaces that wrap a frozen model. Model weights never change; only the scaffold around them changes.'
+    'You edit the allowed harness surfaces that wrap a frozen model. Model weights never change; only the scaffold around them changes.'
   );
-  system.push('Surfaces (stable order): ' + HARNESS_COMPONENT_KEYS.join(', ') + '.');
+  system.push('Surfaces (stable order): ' + promptSurfaces.join(', ') + '.');
   const shapeLine =
     '{ "rationale": string, "focusSurfaces": string[], "confidence": number in [0,1], "expectedStepsDelta": number, "edits": { <surface>: <payload> } }';
   const candidateCount = options?.candidateCount ?? 1;
@@ -259,8 +557,8 @@ export function renderProposalPrompts(
     system.push(shapeLine);
   }
   system.push('Payload shapes (the "kind" field is mandatory):');
-  for (const line of SURFACE_PAYLOAD_CONTRACT) {
-    system.push(line);
+  for (const surface of promptSurfaces) {
+    system.push(SURFACE_PAYLOAD_CONTRACT[surface]);
   }
   system.push(
     'Rules: only edit surfaces listed as allowed; keep each edit minimal and directly testable; never invent tool names or files that the task did not mention.'
@@ -466,13 +764,15 @@ function validateGuardrails(payload: Record<string, unknown>): ValidationResult<
     }
     toolPreconditions = rules;
   }
-  if (
-    appendRules === undefined &&
-    forbiddenActions === undefined &&
-    formatContract === undefined &&
-    toolPreconditions === undefined
-  ) {
-    return invalid('at least one guardrails field is required');
+  // A1/A3 content-level requirement: a key whose arrays are all present-but-
+  // empty renders NOTHING into the probe. Accepting it would spend a candidate
+  // rollout on a rationale-only prompt (the exact B1 failure), so the payload
+  // must carry at least one non-empty field.
+  const hasAppendRules = appendRules !== undefined && appendRules.length > 0;
+  const hasForbiddenActions = forbiddenActions !== undefined && forbiddenActions.length > 0;
+  const hasToolPreconditions = toolPreconditions !== undefined && toolPreconditions.length > 0;
+  if (!hasAppendRules && !hasForbiddenActions && formatContract === undefined && !hasToolPreconditions) {
+    return invalid('at least one non-empty guardrails field is required');
   }
   return valid({ kind: 'guardrails', appendRules, forbiddenActions, formatContract, toolPreconditions });
 }
@@ -490,8 +790,14 @@ function validateMemorySurface(payload: Record<string, unknown>): ValidationResu
   if (payload.recallTags !== undefined && recallTags === undefined) {
     return invalid('recallTags must be an array of non-empty strings');
   }
-  if (scopedViewId === undefined && workingNotes === undefined && recallTags === undefined) {
-    return invalid('at least one memory field is required');
+  // A1 renders workingNotes + recallTags only; `scopedViewId` alone has no probe
+  // content (the backend is never exercised by a text probe). Requiring
+  // renderable content keeps A3's evaluability decision and the proposer's
+  // accepted payloads aligned.
+  const hasWorkingNotes = workingNotes !== undefined && workingNotes.length > 0;
+  const hasRecallTags = recallTags !== undefined && recallTags.length > 0;
+  if (!hasWorkingNotes && !hasRecallTags) {
+    return invalid('at least one of workingNotes/recallTags with content is required (scopedViewId alone is not text-evaluable)');
   }
   return valid({ kind: 'memory', scopedViewId, workingNotes, recallTags });
 }
@@ -656,39 +962,54 @@ function validateSurfacePayload(
   }
 }
 
+interface ParsedEdits {
+  readonly edits: Partial<Record<HarnessComponentKey, SupportedSurfacePayload>>;
+  readonly dropped: string[];
+  /** Known surfaces rejected ONLY because `allowed` excluded them. */
+  readonly disallowed: HarnessComponentKey[];
+  /** Unknown keys, malformed payloads or validation failures. */
+  readonly otherDrops: number;
+}
+
 function parseEdits(
   raw: unknown,
   allowed: readonly HarnessComponentKey[],
   dropped: string[]
-): Partial<Record<HarnessComponentKey, SupportedSurfacePayload>> {
+): ParsedEdits {
   const edits: Partial<Record<HarnessComponentKey, SupportedSurfacePayload>> = {};
+  const disallowed: HarnessComponentKey[] = [];
+  let otherDrops = 0;
   if (!isRecord(raw)) {
     dropped.push('edits: missing or not a JSON object');
-    return edits;
+    return { edits, dropped, disallowed, otherDrops: 1 };
   }
   const allowedSet = new Set<string>(allowed);
   for (const key of Object.keys(raw)) {
-    if (!isSurfaceKey(key)) {
+    if (isSurfaceKey(key) === false) {
       dropped.push(key + ': unknown harness surface');
+      otherDrops += 1;
       continue;
     }
     if (!allowedSet.has(key)) {
       dropped.push(key + ': surface is not enabled for this run');
+      disallowed.push(key);
       continue;
     }
     const payload = raw[key];
     if (!isRecord(payload)) {
       dropped.push(key + ': payload is not a JSON object');
+      otherDrops += 1;
       continue;
     }
     const result = validateSurfacePayload(key, payload);
     if (!result.ok) {
       dropped.push(key + ': ' + result.reason);
+      otherDrops += 1;
       continue;
     }
     edits[key] = result.value;
   }
-  return edits;
+  return { edits, dropped, disallowed, otherDrops };
 }
 
 /** Remove external-memory channels from edits destined for an invariant branch. */
@@ -705,8 +1026,7 @@ function stripExternalMemoryChannels(
     dropped.push('memory.recallTags stripped: guidance-free branches must not recall external memory');
   }
   const keepsOtherFields =
-    memoryEdit.scopedViewId !== undefined ||
-    (memoryEdit.workingNotes !== undefined && memoryEdit.workingNotes.length > 0);
+    memoryEdit.workingNotes !== undefined && memoryEdit.workingNotes.length > 0;
   if (!keepsOtherFields) {
     delete edits.memory;
     if (hasRecallTags) {
@@ -756,6 +1076,35 @@ export function createDualTrackProposer(options: HarnessProposerOptions): IHarne
   const newId = options.newId ?? createDeterministicIdFactory('propose');
   const maxLessons = options.maxLessonsPerSection ?? 8;
   const model = createMeteredModelAdapter(options.model, 'propose', options.metering);
+  // rev8 #110/#13: bounded transport retry. Defaults keep the plan's shape
+  // (one retry, ~1s backoff); 0 retries or a <=0 backoff disables the wait.
+  const transportRetries = options.transportRetries ?? 1;
+  const transportBackoffMs = options.transportRetryBackoffMs ?? 1000;
+  const sleep = options.sleep ?? ((ms: number, signal?: AbortSignal) => defaultSleep(ms, signal));
+
+  const callModelWithRetry = async (
+    modelRequest: ModelRequest,
+    diagnostics: string[],
+    signal?: AbortSignal
+  ): Promise<ModelResponse> => {
+    const outcome = await callWithTransportRetry(() => model.call(modelRequest), {
+      retries: Math.max(0, transportRetries),
+      backoffMs: Math.max(0, transportBackoffMs),
+      ...(signal === undefined ? {} : { signal }),
+      sleep
+    });
+    for (const attempt of outcome.retriedErrors) {
+      diagnostics.push(
+        'proposal transport retry: attempt ' +
+          String(attempt.attempt) +
+          ' failed with ' +
+          attempt.errorName +
+          (attempt.failureCode === undefined ? '' : ' (' + attempt.failureCode + ')') +
+          '; retried after backoff'
+      );
+    }
+    return outcome.value;
+  };
 
   const proposer: IHarnessProposer = {
     async propose(request: ProposeRequest): Promise<ProposedPatch> {
@@ -780,7 +1129,11 @@ export function createDualTrackProposer(options: HarnessProposerOptions): IHarne
           attemptIndex: request.attemptIndex
         }
       };
-      const response = await model.call(modelRequest);
+      const response = await callModelWithRetry(
+        modelRequest,
+        diagnostics,
+        requestAbortSignal(request)
+      );
       const parsed = extractJsonValue(response.text);
       const record = isRecord(parsed) ? parsed : undefined;
       if (record === undefined) {
@@ -793,16 +1146,27 @@ export function createDualTrackProposer(options: HarnessProposerOptions): IHarne
 
       const allowed = allowedSurfacesFor(request);
       const dropped: string[] = [];
-      const edits = parseEdits(record.edits, allowed, dropped);
+      const parsedEdits = parseEdits(record.edits, allowed, dropped);
+      const edits = parsedEdits.edits;
       if (!decision.memoryAllowed) {
         stripExternalMemoryChannels(edits, dropped);
       }
       const editedSurfaces = surfaceKeysInOrder(Object.keys(edits));
       if (editedSurfaces.length === 0) {
+        // A3 (rev6 B9): if every recognized edit was merely DISABLED (not
+        // malformed), this is an unevaluable proposal, not a proposer crash.
+        // Only the disallowed-only shape maps here; a mixed response with an
+        // invalid payload on an allowed surface stays a proposal failure.
+        const notEvaluable =
+          parsedEdits.disallowed.length > 0 && parsedEdits.otherDrops === 0;
         throw new Harness2ProposalError(
           'proposal_no_valid_edits',
           'Harness² proposer produced no valid surface edit for this slot.',
-          dropped.length > 0 ? dropped.join(' | ') : 'model returned an empty edits object'
+          dropped.length > 0 ? dropped.join(' | ') : 'model returned an empty edits object',
+          {
+            notEvaluable,
+            droppedSurfaces: notEvaluable ? parsedEdits.disallowed : []
+          }
         );
       }
 
@@ -893,7 +1257,7 @@ export function createDualTrackProposer(options: HarnessProposerOptions): IHarne
         candidateCount: k
       }
     };
-    const response = await model.call(modelRequest);
+    const response = await callModelWithRetry(modelRequest, diagnostics, requestAbortSignal(request));
     const parsed = extractJsonValue(response.text);
     const rawCandidates: unknown[] = Array.isArray(parsed)
       ? parsed.slice(0, k)
@@ -910,7 +1274,8 @@ export function createDualTrackProposer(options: HarnessProposerOptions): IHarne
         continue;
       }
       const dropped: string[] = [];
-      const edits = parseEdits(entry.edits, allowed, dropped);
+      const parsed = parseEdits(entry.edits, allowed, dropped);
+      const edits = parsed.edits;
       if (!decision.memoryAllowed) {
         stripExternalMemoryChannels(edits, dropped);
       }

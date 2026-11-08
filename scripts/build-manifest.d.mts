@@ -39,6 +39,8 @@ export interface BuildStamp {
   dependencyFileCount: number;
   dependencyFiles: SrcFileDigest[];
   artifact: BuildStampArtifact | null;
+  /** rev8 dual-artifact: the MCP stdio entry (absent when not built). */
+  artifactMcp: BuildStampArtifact | null;
   commit: string | null;
   commitError: string | null;
   commitSource: string;
@@ -65,6 +67,11 @@ export interface BuildStatus {
   artifactPath: string;
   artifactBytes: number | null;
   artifactSha256: string | null;
+  /** rev8 dual-artifact: the MCP entry's presence (descriptive, never gating by itself). */
+  artifactMcp: 'present' | 'absent';
+  artifactMcpPath: string;
+  artifactMcpBytes: number | null;
+  artifactMcpSha256: string | null;
   stampPath: string;
   stampPresent: boolean;
   srcTreeSha256: {
@@ -88,23 +95,37 @@ export interface BuildStatus {
 export declare const BUILD_STAMP_SCHEMA_VERSION: string;
 export declare const BUILD_STAMP_PATH: string;
 export declare const BUILD_ARTIFACT_PATH: string;
+/** rev8 dual-artifact: the MCP stdio entry artifact path. */
+export declare const BUILD_MCP_ARTIFACT_PATH: string;
 
 export declare function computeSrcTreeSha256(options?: { cwd?: string }): SrcTreeSummary;
 
 export declare function computeDependencySha256(options?: { cwd?: string }): DependencySummary;
 
-export declare function buildStamp(options?: { cwd?: string; artifactPath?: string }): BuildStamp;
+export declare function buildStamp(options?: {
+  cwd?: string;
+  artifactPath?: string;
+  mcpArtifactPath?: string;
+}): BuildStamp;
 
 export declare function writeBuildStamp(options?: {
   cwd?: string;
   artifactPath?: string;
+  mcpArtifactPath?: string;
   stampPath?: string;
 }): BuildStamp;
 
 export declare function computeBuildStatus(options?: {
   cwd?: string;
   artifactPath?: string;
+  mcpArtifactPath?: string;
   stampPath?: string;
+  /**
+   * rev8: add the named mcp-artifact-* staleness reasons (default false).
+   * `smokeBuild` passes `requireMcpArtifact: existsSync(mcpArtifact)` so the
+   * second artifact is stamp-verified whenever it exists on disk.
+   */
+  requireMcpArtifact?: boolean;
 }): BuildStatus;
 
 export declare function formatBuildStatus(status: BuildStatus): string[];

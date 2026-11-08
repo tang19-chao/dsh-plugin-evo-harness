@@ -1,5 +1,6 @@
 /**
- * rev6 R1-3 (t10): the surrogate DE-SELF-REFERENCE evidence policy.
+ * rev6 R1-3 (t10) + rev6 A4-2 (B4): the surrogate DE-SELF-REFERENCE evidence
+ * policy.
  *
  * THE DEFECT THIS MODULE ADDRESSES
  * -----------------------------------
@@ -17,11 +18,17 @@
  *
  * WHAT THIS MODULE IS
  * -------------------
- * A SHADOW-ONLY policy layer that re-weights the two evidence-bearing signals so
+ * The evidence-policy layer that re-weights the two evidence-bearing signals so
  * the ranking follows the verifiable evidence rather than the composer's
- * opinion. It is deliberately NOT wired into the default scorer: the frozen
- * weights and clamp stay byte-identical (verified by the suite), and the
- * production assembly keeps using `scoreSurrogate` exactly as before.
+ * opinion. The frozen ONLINE scorer (`scoreSurrogate`) is untouched: its
+ * weights and clamp stay byte-identical, and online active-policy selection
+ * keeps using it exactly as before.
+ *
+ * rev6 A4-2 wires strategy B into the DREAM input only: the orchestrator
+ * records `metadata.dreamEvidence.dreamScore` from
+ * `scoreWithEvidencePolicy(..., { trustedProducers })`, and offline replay
+ * consumes that value (`replayNodeScore`). The trusted-reader overload is what
+ * keeps a self-declared `metadata.verification` payload from steering Dream.
  *
  * TWO CANDIDATE STRATEGIES (preregistration §1.1, contract §5.5 Do.1)
  * ------------------------------------------------------------------
@@ -36,7 +43,9 @@
  *      rather than "whatever the composer said".
  *
  * Both are evaluated against the same counterexample; the SHADOW report states
- * which one is selected and why (preregistration §4). Neither is enabled.
+ * which one is selected and why (preregistration §4). Strategy B is now the
+ * production DREAM strategy (A4-2); strategy A remains research-only. Neither
+ * changes the online scorer.
  *
  * THE LOAD-BEARING ASYMMETRY
  * --------------------------
@@ -50,9 +59,14 @@
  */
 import type { ProbeTrajectory, SurrogateScoreWeights } from '../types/contracts';
 import {
+  hasTrustedVerificationProvenance,
+  verificationFromTrajectory
+} from '../jitrl/step-evaluator';
+import {
   DEFAULT_SURROGATE_WEIGHTS,
   clamp01,
   computeSurrogateSignals,
+  normalizeSurrogateWeights,
   scoreSurrogate,
   type SurrogateScorerOptions
 } from './surrogate-scorer';
@@ -135,6 +149,65 @@ export function verifiableVerdictOf(trajectory: ProbeTrajectory): VerifiableVerd
   return 'unknown';
 }
 
+/**
+ * rev6 audit A4-2: the TRUSTED verdict reader used by the production Dream
+ * path.
+ *
+ * `verifiableVerdictOf` above reads the SHAPE of `metadata.verification`. That
+ * is sufficient for the shadow research fixture, but it is exactly the
+ * self-declaration channel the trust boundary forbids in production: a branch
+ * (or a host-injected seam) could attach `{status:'passed'}` and steer Dream.
+ * This reader instead resolves the verdict through the SAME two conditions the
+ * online scorer uses:
+ *
+ *   1. `verificationFromTrajectory` (explicit payload wins; structural fallback
+ *      otherwise), and
+ *   2. `hasTrustedVerificationProvenance`: a caller-supplied producer set must
+ *      contain the verifierId, the evidence hash must be non-empty, and - when
+ *      the deliverable carries one - it must match the deliverable's own
+ *      `contentHash` (the execution-evidence binding).
+ *
+ * Anything short of that reads as `unknown`. The caller supplies the producer
+ * set; this module never invents or widens trust.
+ */
+export function trustedVerifiableVerdictOf(
+  trajectory: ProbeTrajectory,
+  trustedProducers: ReadonlySet<string>
+): VerifiableVerdict {
+  const verification = verificationFromTrajectory(trajectory);
+  const deliverable = trajectory.deliverable;
+  const expectedEvidenceHash =
+    deliverable !== undefined && deliverable.content.length > 0
+      ? deliverable.contentHash
+      : undefined;
+  const trusted = hasTrustedVerificationProvenance(
+    verification,
+    expectedEvidenceHash,
+    trustedProducers
+  );
+  if (!trusted) {
+    return 'unknown';
+  }
+  if (verification.status === 'passed') {
+    return 'passed';
+  }
+  if (verification.status === 'failed') {
+    return 'failed';
+  }
+  return 'unknown';
+}
+
+/**
+ * Options accepted by the evidence policy in addition to the frozen scorer
+ * options. `trustedProducers` is OPTIONAL so the research/shadow callers keep
+ * the historical shape-only behaviour; production MUST pass a set (an empty set
+ * when no host seam exists) to get the trusted reader. That distinction is
+ * deliberate: absence means "legacy research mode", never "trust everything".
+ */
+export interface EvidencePolicyOptions extends SurrogateScorerOptions {
+  readonly trustedProducers?: ReadonlySet<string>;
+}
+
  /**
  * THE ADMISSION RULE (the one decision this module makes).
  *
@@ -159,6 +232,13 @@ export function verifiableVerdictOf(trajectory: ProbeTrajectory): VerifiableVerd
  */
 export interface EvidenceAdmission {
   readonly verdict: VerifiableVerdict;
+  /**
+   * True only when the verdict came from host-trusted provenance (registered
+   * producer + evidence hash bound to the deliverable). The legacy shape reader
+   * always reports false, so a Dream gate can never mistake a self-declared
+   * payload for verified evidence.
+   */
+  readonly trusted: boolean;
   /** True when the composer's `I(H*)` term is counted. */
   readonly admitSelection: boolean;
   /** True when the composer's adoption term is counted. */
@@ -169,17 +249,25 @@ export interface EvidenceAdmission {
 
 export function admissionOf(
   trajectory: ProbeTrajectory,
-  strategy: EvidencePolicyStrategy
+  strategy: EvidencePolicyStrategy,
+  trustedProducers?: ReadonlySet<string>
 ): EvidenceAdmission {
-  const verdict = verifiableVerdictOf(trajectory);
+  const usingTrustedReader = trustedProducers !== undefined;
+  const verdict = usingTrustedReader
+    ? trustedVerifiableVerdictOf(trajectory, trustedProducers)
+    : verifiableVerdictOf(trajectory);
   const corroborated = verdict === 'passed';
+  const trusted = usingTrustedReader && (verdict === 'passed' || verdict === 'failed');
+  const source = usingTrustedReader ? 'host-trusted ' : '';
   const reason = corroborated
-    ? 'the verifiable verdict is `passed`, so the composer terms are corroborated and admissible'
+    ? 'the ' + source + 'verifiable verdict is `passed`, so the composer terms are corroborated and admissible'
     : verdict === 'failed'
-      ? 'the verifiable verdict is `failed`: the composer opinion is REFUTED by evidence, so its terms are zeroed'
+      ? 'the ' + source + 'verifiable verdict is `failed`: the composer opinion is REFUTED by evidence, so its terms are zeroed'
       : 'no verifiable verdict: an uncheckable composer opinion gets no credit, so its terms are zeroed';
+  void strategy;
   return {
     verdict,
+    trusted,
     admitSelection: corroborated,
     admitAdoption: corroborated,
     reason
@@ -211,10 +299,13 @@ export interface PolicyScore {
 export function scoreWithEvidencePolicy(
   request: Parameters<typeof scoreSurrogate>[0],
   strategy: EvidencePolicyStrategy = DEFAULT_EVIDENCE_POLICY_STRATEGY,
-  options: SurrogateScorerOptions = {}
+  options: EvidencePolicyOptions = {}
 ): PolicyScore {
   const baselineScore = scoreSurrogate(request, options).score;
-  const admission = admissionOf(request.trajectory, strategy);
+  // rev6 audit A4-2: production passes a producer SET (possibly empty) to use
+  // the trusted reader; an omitted set keeps the historical shape reader for
+  // research/shadow callers.
+  const admission = admissionOf(request.trajectory, strategy, options.trustedProducers);
 
   let weights: SurrogateScoreWeights;
   if (strategy === 'verified-weight-floor') {
@@ -244,13 +335,22 @@ export function scoreWithEvidencePolicy(
     // absolute size, so both candidates are always measured on the SAME scale.
     // Because the vector no longer sums to 1, the marker below makes that
     // explicit rather than letting a silent renormalization hide it.
-    const base = DEFAULT_SURROGATE_WEIGHTS;
-    weights = {
-      selection: admission.admitSelection ? base.selection : 0,
-      adoption: admission.admitAdoption ? base.adoption : 0,
-      efficiency: base.efficiency,
-      toolErrorPenalty: base.toolErrorPenalty
-    };
+    // rev6 audit A4-2 follow-up: the base vector must be the EFFECTIVE vector
+// `scoreSurrogate` uses, not the compiled default. A host may legally override
+// `dreamRsi.surrogateWeights` (README configuration reference), and before this
+// fix strategy B silently ignored it: `baselineScore` used the request weights
+// while `policyScore` used DEFAULT_SURROGATE_WEIGHTS, so the two were on
+// different scales and a "corroborated" candidate's delta was not 0.
+const effectiveWeights = normalizeSurrogateWeights(
+  request.weights,
+  options.defaultWeights ?? DEFAULT_SURROGATE_WEIGHTS
+).weights;
+weights = {
+  selection: admission.admitSelection ? effectiveWeights.selection : 0,
+  adoption: admission.admitAdoption ? effectiveWeights.adoption : 0,
+  efficiency: effectiveWeights.efficiency,
+  toolErrorPenalty: effectiveWeights.toolErrorPenalty
+};
   }
 
   // Score with the FROZEN weights semantics: the surviving terms keep their
@@ -284,7 +384,7 @@ export function scoreWithEvidencePolicy(
 export function rankWithEvidencePolicy(
   requests: readonly Parameters<typeof scoreSurrogate>[0][],
   strategy: EvidencePolicyStrategy = DEFAULT_EVIDENCE_POLICY_STRATEGY,
-  options: SurrogateScorerOptions = {}
+  options: EvidencePolicyOptions = {}
 ): readonly { readonly nodeId: string; readonly score: number; readonly admission: EvidenceAdmission }[] {
   return requests
     .map((request) => {

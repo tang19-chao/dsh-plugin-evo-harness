@@ -51,7 +51,11 @@ import type {
 } from '../types/contracts';
 import { decide } from './logit-adjuster';
 import { createAutoLogitSource, type AutoLogitSource, type LogprobCapabilities } from './logit-sources';
-import { createStepEvaluator, type JitStepEvaluator } from './step-evaluator';
+import {
+  createStepEvaluator,
+  type JitStepEvaluator,
+  type StepJudgePolicy
+} from './step-evaluator';
 import { backfillFromTreePool, type BackfillResult, type BackfillTreeSource } from './backfill';
 import {
   CURRENT_PROVENANCE_VERSION,
@@ -137,6 +141,13 @@ export interface JitRlFactoryOptions {
    * but never reserved or settled in any ledger.
    */
   readonly metering?: MeteredModelOptions;
+  /**
+   * rev6 audit A4-4 (B3): the LLM step-judge policy. `cost-gated` (default)
+   * preserves the historical gate; `all` judges every call so the orchestrator
+   * can give every executed probe its own auxiliary score. Production passes
+   * `all` (src/index.ts) to remove the Composer-selection bias.
+   */
+  readonly judgePolicy?: StepJudgePolicy;
   /** Surrogate value provider adapted from ISurrogateScorer by the caller. */
   readonly surrogate?: (
     trajectory: Parameters<IStepEvaluator['evaluate']>[0],
@@ -356,6 +367,7 @@ export function createJitRl(options: JitRlFactoryOptions): JitRl {
     // stages instead of bypassing every ledger.
     ...(options.metering === undefined ? {} : { metering: options.metering }),
     ...(options.surrogate === undefined ? {} : { surrogate: options.surrogate }),
+    ...(options.judgePolicy === undefined ? {} : { judgePolicy: options.judgePolicy }),
     clock: now,
     rng
   });

@@ -28,19 +28,31 @@ import {
   type LogLevel
 } from './config';
 import type { UsageLedgerEvent } from './ledger';
+import { resolveLedgerAssemblyOptions } from './ledger/assembly';
 import {
   createCordisSeamManager,
   createDshHookHostAdapter,
   createInMemoryCordisHost,
   detectDshHookHost,
+  diagnoseBranchScopedHookMount,
   SURFACE_HOST_METHOD,
   type CordisHostAdapter,
   type DshHookDetection,
   type DshHookHostAdapter,
+  type DshHookAdapterStats,
   type DshHookSurfaceMountStats,
   type HostDisposer
 } from './cordis-seams';
 import { HARNESS_COMPONENT_KEYS, type HarnessComponentKey } from './types/contracts';
+// rev8 #118/#175 evidence-integrity wiring (audit fix W1): the production
+// assembly constructs the HOST-owned policy from `options.deps.evidenceIntegrity`
+// and hands the SAME object to CordisSeamManager and the agent-loop executor.
+// The digest goes into a diagnostic so an operator can see what was armed
+// without any key text ever being logged.
+import {
+  evidenceIntegrityPolicyDigest,
+  type EvidenceIntegrityPolicy
+} from './verification/evidence-integrity';
 import {
   createMemoryBridge,
   resolveMemoryWritableStatus,
@@ -63,6 +75,7 @@ import {
   createOfflineDreamer,
   createSurrogateScorer,
   generateCandidatePolicies,
+  MIN_VERIFIED_TREES_FOR_DREAM,
   resolveJitPerturbationGrid,
   type DreamReplayReportWithShadow,
   type IOfflineDreamerWithShadow,
@@ -157,6 +170,11 @@ import {
   resolveExecutionProfile,
   type ExecutionProfile
 } from './runtime/execution-profile';
+import {
+  hasTrustedVerifierSeam,
+  resolveWritebackGate,
+  type ResolvedWritebackGate
+} from './runtime/writeback-policy';
 import { matchesReplayDeclarations } from './jitrl/experience-store';
 import type {
   BranchExecutor,
@@ -302,8 +320,15 @@ export interface EvoHarnessPluginOptions {
   readonly listClients?: () => Promise<readonly McpClient[]>;
   /** Host task runner executed inside each isolated probe branch. */
   readonly runBranch?: BranchExecutor;
-  /** Override any collaborator (used by deterministic end-to-end tests). */
-  readonly deps?: Partial<EvoHarnessOrchestratorDeps>;
+  /**
+   * Override any collaborator (used by deterministic end-to-end tests).
+   *
+   * `probeEvaluation` is deliberately OMITTED: it is an offline-evaluation-only
+   * seam, not a public host switch. A host that passes it here is refused by
+   * `createEvoHarnessPlugin`; the in-repo eval harness uses the explicitly named
+   * `createEvoHarnessPluginForOfflineEvaluation` entry instead.
+   */
+  readonly deps?: Partial<Omit<EvoHarnessOrchestratorDeps, 'probeEvaluation'>>;
   /**
    * Already-created durable TreePool / policy / counter storage, from
    * `createPersistenceRuntime()`. Passing it wires all three into the
@@ -396,6 +421,18 @@ export interface EvoHarnessPluginOptions {
     readonly namespace?: string;
   };
 }
+
+/**
+ * The explicit OFFLINE-EVALUATION entry's options. It exists so
+ * `scripts/eval/jitrl-eval-lib.ts` can opt into the historical process scoring
+ * without making `probeEvaluation` a public host option. NOT a production
+ * entrypoint: a host has no reason to select `legacy`, and the public plugin
+ * factory refuses it.
+ */
+export type OfflineEvaluationPluginOptions = Omit<EvoHarnessPluginOptions, 'deps'> & {
+  readonly deps?: Partial<EvoHarnessOrchestratorDeps>;
+};
+
 /**
  * Every key of the public options surface, alphabetically ordered (ADR 0005
  * sections 3.1/3.5).
@@ -1820,6 +1857,12 @@ export function buildJitRlWiring(input: {
       // calls; without this they reach the ledger as provenance 'none' and no
       // reserve/settle ever happens. Absent leaves the previous behaviour intact.
       ...(input.metering === undefined ? {} : { metering: input.metering }),
+      // rev6 audit A4-4 (B3): production judges EVERY executed probe the
+      // orchestrator hands it, not only the Composer's winner. The primary
+      // reward is unchanged (scoreUnderRewardContract + judge-policy
+      // auxiliary-only); this only removes the selection bias in the auxiliary
+      // judge signal.
+      judgePolicy: 'all',
       onDiagnostic: (diagnostic) => {
         input.diagnostics.push('jitrl: ' + diagnostic.message);
       }
@@ -2144,12 +2187,58 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     }),
     now
   });
+  // rev8 evidence-integrity trio (harness2 #67/#72/#118/#175; audit fix W1):
+  // arm the HOST-owned evidence-integrity policy in the PRODUCTION assembly.
+  //
+  // The policy is constructed from `options.deps.evidenceIntegrity` — the
+  // host-owned seam, the same injection discipline as `deps.verification`.
+  // When the host supplies none, a minimal default policy is STILL armed so
+  // the #72 missing-trajectory-sentinel rejection becomes reachable in
+  // production (the collector's finalize scan only runs when a policy object
+  // exists; with an empty policy it scans sentinels only — the #175 path
+  // pre-rejection stays inert until a host names `forbiddenPathSegments`, and
+  // the #118 text scan stays inert until a host supplies per-task answer-key
+  // criteria, which are deliberately NOT a config field: they are per-task
+  // host data and must never be derivable from branch-supplied metadata or
+  // from `result.metadata`).
+  //
+  // The SAME object is forwarded to the multi-step agent probe executor below
+  // (W2), so every TrajectoryCollector the assembly builds scans from one
+  // host-owned source. Nothing here reads a trajectory or its metadata: a
+  // branch cannot declare its own evidence clean.
+  //
+  // SHADOW BOUNDARY (recorded, not implied): the default execution profile is
+  // `mode: 'shadow'` with `applyWinningPatch: false` (src/config.ts), and this
+  // arming touches NO permission, approval or write surface. A hit only (a)
+  // withholds the evidence, (b) persists an audit-only record and (c) excludes
+  // the tree from verified Dream evidence - the same fail-closed direction the
+  // shipped default already had. Without a host-supplied answerKey, the TEXT
+  // scan is inactive BY DESIGN (there are no host-owned criteria to match);
+  // the sentinel scan and any host-declared forbidden path segments are active.
+  const evidenceIntegrity: EvidenceIntegrityPolicy = options.deps?.evidenceIntegrity ?? {};
+  diagnostics.push(
+    'evidence-integrity: seam scans armed from host-owned policy ' +
+      evidenceIntegrityPolicyDigest(evidenceIntegrity) +
+      ' (sentinel scan active; forbiddenPathSegments=' +
+      String(evidenceIntegrity.forbiddenPathSegments?.length ?? 0) +
+      ' segment(s); answerKey=' +
+      (evidenceIntegrity.answerKey === undefined
+        ? 'absent - the answer-key TEXT scan stays inactive until a host supplies per-task criteria'
+        : 'present - text scan active') +
+      ')'
+  );
   const seams = options.deps?.seams ?? createCordisSeamManager({
     host: hostAdapter,
     namespacePrefix: config.memoryBridge.namespacePrefix,
     enabledSurfaces: config.enabledSurfaces,
     now,
-    createBranchId: () => 'br-' + newId()
+    createBranchId: () => 'br-' + newId(),
+    // rev8 W1: the pre-branch #175 scan and the finalize #72/#118 scan run from
+    // THIS policy. Absent here was the audit's "armed module, dead production
+    // path" defect. (A host that injects its OWN `deps.seams` owns that
+    // manager's configuration; the orchestrator still reads whatever marks it
+    // returns — see W3/W4.)
+    evidenceIntegrity
   });
   const policyDefaults = {
     maxWidth: config.dreamRsi.maxWidth,
@@ -2204,10 +2293,17 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     options.agentLoop?.ledgerSettlement === undefined
       ? undefined
       : { ledgerSettlement: options.agentLoop.ledgerSettlement };
+  // A4-4 (rev6 B3): the step judge must see the SAME model the proposer and
+  // composer use. On the documented DSH path there is no `options.model`: the
+  // ctx.llm adapter lands in this holder later, so the kernel needs the
+  // forwarding adapter, not a snapshot of `options.model` (which is undefined
+  // and made every judge call a no-op on the exact assembly the host docs
+  // describe).
+  const model = forwardingModel(holder, () => options.model ?? missingModelAdapter());
   const jitWiring = buildJitRlWiring({
     config,
     policy,
-    options: effectiveOptions,
+    options: { ...effectiveOptions, model },
     scopeRegistry,
     persistence,
     diagnostics,
@@ -2222,7 +2318,6 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
   // once detection settles. The previous ternary forced `model` to undefined
   // whenever deps.proposer was present, so composer/reflector dereferenced an
   // undefined adapter and a supplied options.model was silently discarded.
-  const model = forwardingModel(holder, () => options.model ?? missingModelAdapter());
   const proposer = options.deps?.proposer ?? createDualTrackProposer({
     model,
     now,
@@ -2285,9 +2380,29 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     }) : createOfflineDreamer(dreamBase));
   // Branch executor order: an explicit host runner wins (a test or integrator
   // override), then the multi-step agent probe executor, then the loud-failure
-  // default. The agent executor itself degrades to a single call when it has no
-  // planner or tool runtime, so enabling it never silently changes semantics.
-  const agentExecutor = options.deps?.runBranch === undefined && options.runBranch === undefined && options.agentLoop !== undefined ? createAgentLoopExecutor(options.agentLoop,
+  // default. The agent executor needs a model to produce anything; a host that
+  // supplies ONLY `agentLoop.ledgerSettlement` is asking for metering, not for
+  // an executor, so it must leave the DSH-resolved executor in charge (otherwise
+  // variant "ledger only" built an agent loop with no model and every probe
+  // failed before the ledger could meter anything).
+  // A ledger-only agentLoop does not build an executor, but its CONFIG must
+  // still be validated at mount time (the pre-fix mount failed loudly on an
+  // invalid ledger). Resolve it purely; no manager/settlement is constructed
+  // here, so the "one settlement object" invariant is untouched.
+  if (
+    options.agentLoop !== undefined &&
+    options.agentLoop.model === undefined &&
+    options.agentLoop.ledger !== undefined
+  ) {
+    resolveLedgerAssemblyOptions(options.agentLoop.ledger);
+  }
+  const agentExecutor = options.deps?.runBranch === undefined && options.runBranch === undefined && options.agentLoop !== undefined && options.agentLoop.model !== undefined ? createAgentLoopExecutor({
+    ...options.agentLoop,
+    // rev8 W2 (audit fix): the agent-loop executor's own TrajectoryCollector
+    // scans from the SAME host-owned policy the seam manager received. A
+    // host-supplied `agentLoop.evidenceIntegrity` wins (explicit override).
+    ...(options.agentLoop.evidenceIntegrity === undefined ? { evidenceIntegrity } : {})
+  },
     now) : undefined;
   if (agentExecutor !== undefined) {
     diagnostics.push('multi-step agent probe executor is active: ' + agentExecutor.describe().join('; '));
@@ -2298,6 +2413,18 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
   // executor resolved from the host (P0-1) takes over once detection settles;
   // an injected `deps.runBranch` wins anyway through the deps spread below.
   const resolvedRunBranch = options.deps?.runBranch ?? options.runBranch ?? agentExecutor?.runBranch ?? unconfiguredBranchExecutor(now);
+  // rev6 audit A4-1 (B5): resolve `jitrl.writebackGate` ONCE, from the
+  // EFFECTIVE verification seam (the explicit deps seam is the only producer of
+  // one; no config field can fabricate it). `auto` is the honest default: with
+  // no trusted verifier the experience gate runs, so shadow stops learning
+  // online from unverified signal; with one the historical path stays. The
+  // resolved boolean is written BEFORE `...options.deps`, so a hand-built
+  // assembly that supplies an explicit `deps.writebackGate` still overrides it.
+  const hasTrustedVerifier = hasTrustedVerifierSeam(options.deps?.verification);
+  const writebackResolution: ResolvedWritebackGate = resolveWritebackGate(
+    config.jitrl.writebackGate,
+    hasTrustedVerifier
+  );
   const deps: EvoHarnessOrchestratorDeps = {
     config,
     memory,
@@ -2310,6 +2437,10 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     taxonomy,
     dreamer,
     treePool,
+    // rev6 audit A4-2 (B4/H10): production Dream runs only over >= 12 VERIFIED
+    // trees. A hand-built deps override may lower/disable this (tests) because
+    // `...options.deps` spreads below; the production default must not.
+    dreamMinVerifiedTrees: MIN_VERIFIED_TREES_FOR_DREAM,
     runBranch: forwardingBranch(holder, resolvedRunBranch),
     // Phase 3: hand the kernel to the orchestrator so L2 can select among K
     // proposals and online L1/L2 samples are recorded. A host without JitRL (or
@@ -2326,6 +2457,19 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     ... (persistence === undefined ? {
     } : {
       taskCounter: persistence.policyStore
+    }),
+    // rev8 plan §6.1 item 3 (live-cycle manifest): the cross-cycle manifest
+    // lives in THIS plugin's own resolved persistence data directory
+    // (persistence.dataDir, the single-host directory DREAM-9 already scopes to
+    // one host process), so one run records the realized shape of its cycle for
+    // the NEXT run of the same assembly and never shares another process's
+    // data - the MCP assembly passes an independent EVO_HARNESS_DATA_DIR-rooted
+    // runtime, and a host without persistence keeps the seam unwired (no read,
+    // no write, lifecycle byte-identical). A hand-built deps override below
+    // still wins, exactly like every other `...options.deps` entry.
+    ... (persistence === undefined ? {
+    } : {
+      liveCycleDataDir: persistence.dataDir
     }),
     now,
     newId: () => 'evo-' + newId(),
@@ -2346,6 +2490,9 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
     // orchestrator (mode, layer permissions, shadow-records flag). t12/R1c:
     // this is the SAME object the L1 decorator and the dreamer received above.
     executionProfile: effectiveProfile,
+    // rev6 audit A4-1: the resolved online write-back gate. See the block
+    // above; `...options.deps` below can replace this with an explicit seam.
+    writebackGate: writebackResolution.enabled,
     ... (options.deps ?? {
     })
   };
@@ -2375,18 +2522,40 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
   // injection only - no config field produces it, and the diagnostic states
   // which identity is active so an operator never has to guess whether verdicts
   // are host-authenticated or merely shape-validated.
-  if (deps.verification !== undefined && deps.verification.enabled !== false) {
-    diagnostics.push(
-      'c2a verification: host-owned runner ' +
-        deps.verification.runner.verifierId +
-        '@' +
-        deps.verification.runner.verifierVersion +
-        ' active (testSet=' +
-        deps.verification.runner.testSetId +
-        ', env=' +
-        deps.verification.runner.envId +
-        '); verdicts are registry-authenticated, not shape-only'
-    );
+  //
+  // A4-5 (rev6 audit): a runner whose `trustedProducers` set is EMPTY is the
+  // documented `conservative-degraded` shape. It can authenticate a receipt
+  // internally, but the consumer-side trust condition can never hold, so every
+  // record stays audit-only. Reporting it as "registry-authenticated, not
+  // shape-only" would overstate what a host can learn from; the dedicated line
+  // below names the degradation instead. NO shape-only verdict is ever promoted
+  // to passed anywhere in this path.
+  const verificationSeam = deps.verification;
+  if (verificationSeam !== undefined && verificationSeam.enabled !== false) {
+    const verificationRunner = verificationSeam.runner;
+    const trustedProducerCount = verificationRunner.trustedProducers?.size ?? 0;
+    if (trustedProducerCount === 0) {
+      diagnostics.push(
+        'c2a verification: host-owned runner ' +
+          verificationRunner.verifierId +
+          '@' +
+          verificationRunner.verifierVersion +
+          ' active but conservative-degraded: trustedProducers is EMPTY, so no verdict can be consumer-trusted' +
+          ' (records stay audit-only; shape-only payloads are never promoted to passed)'
+      );
+    } else {
+      diagnostics.push(
+        'c2a verification: host-owned runner ' +
+          verificationRunner.verifierId +
+          '@' +
+          verificationRunner.verifierVersion +
+          ' active (testSet=' +
+          verificationRunner.testSetId +
+          ', env=' +
+          verificationRunner.envId +
+          '); verdicts are registry-authenticated, not shape-only'
+      );
+    }
   } else {
     diagnostics.push(
       'c2a verification: no host runner injected; verdicts stay structural/shape-only (C2-pre conservative default)'
@@ -2399,7 +2568,7 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
         effectiveProfile.mode +
         ', patch=' +
         (deps.applyWinningPatch === true && effectiveProfile.permissions.patch.allowed
-          ? 'evidence-gated'
+          ? 'explicit-opt-in-no-verdict-gate'
           : 'denied') +
         ', publish=' +
         (effectiveProfile.permissions.publish.allowed ? 'allowed' : 'denied') +
@@ -2407,6 +2576,33 @@ export function buildOrchestratorDeps(config: EvoHarnessConfig,
         (effectiveProfile.permissions.memory.allowed ? 'allowed (override)' : 'denied') +
         ' (ADR 0002 R2; shadow records ' +
         (effectiveProfile.shadowRecords ? 'on' : 'stopped') +
+        ')'
+    );
+  }
+  // rev6 audit A4-1 (B5): state the write-back gate resolution and WHY. An
+  // explicit deps seam wins over the config mode (the orchestrator deps spread
+  // runs last), so the diagnostic reports the EFFECTIVE boolean and names the
+  // override instead of pretending the config mode decided it.
+  if (options.deps?.writebackGate !== undefined) {
+    diagnostics.push(
+      'jitrl write-back gate: explicit deps.writebackGate=' +
+        String(options.deps.writebackGate) +
+        ' overrides jitrl.writebackGate=' +
+        config.jitrl.writebackGate +
+        ' (trusted verifier ' +
+        (hasTrustedVerifier ? 'present' : 'absent') +
+        ')'
+    );
+  } else {
+    diagnostics.push(
+      'jitrl write-back gate: jitrl.writebackGate=' +
+        writebackResolution.mode +
+        ' -> ' +
+        (writebackResolution.enabled ? 'on' : 'off') +
+        ' (' +
+        writebackResolution.reason +
+        '; trusted verifier ' +
+        (hasTrustedVerifier ? 'present' : 'absent') +
         ')'
     );
   }
@@ -2578,6 +2774,36 @@ export function createEvoHarnessPlugin(
   options: EvoHarnessPluginOptions = {},
   ctx?: unknown
 ): EvoHarnessPlugin {
+  return createEvoHarnessPluginInternal(options, ctx, false);
+}
+
+/**
+ * OFFLINE EVALUATION ONLY. This is the single supported way to pass the
+ * historical `deps.probeEvaluation: 'legacy'` seam. It is exported for
+ * `scripts/eval/jitrl-eval-lib.ts`; production hosts must use
+ * {@link createEvoHarnessPlugin}, which refuses the key.
+ */
+export function createEvoHarnessPluginForOfflineEvaluation(
+  options: OfflineEvaluationPluginOptions = {},
+  ctx?: unknown
+): EvoHarnessPlugin {
+  return createEvoHarnessPluginInternal(options, ctx, true);
+}
+
+function createEvoHarnessPluginInternal(
+  options: EvoHarnessPluginOptions | OfflineEvaluationPluginOptions = {},
+  ctx: unknown,
+  allowOfflineProbeEvaluation: boolean
+): EvoHarnessPlugin {
+  if (!allowOfflineProbeEvaluation) {
+    const publicDeps = options.deps as Record<string, unknown> | undefined;
+    if (publicDeps !== undefined && publicDeps['probeEvaluation'] !== undefined) {
+      throw new Error(
+        'dsh-plugin-evo-harness: deps.probeEvaluation is an offline-evaluation-only seam and is not a public plugin option; ' +
+          'remove it (production runs the trusted A4-3 evaluation) or use createEvoHarnessPluginForOfflineEvaluation from the eval harness'
+      );
+    }
+  }
   const section = readPluginSection(options, ctx);
   const resolved = parseEvoHarnessConfig(section.config ?? undefined);
   const diagnostics: string[] = [];
@@ -3036,6 +3262,35 @@ export function createEvoHarnessPlugin(
   };
 
   /**
+   * rev6 audit B8 (H12): the SAME two-phase settlement the host already
+   * supplied through `agentLoop.ledgerSettlement` is handed to the DSH-resolved
+   * same-process probe executor when that executor is the one actually running
+   * probes. Nothing is assembled a second time: the value is the host's
+   * coordinator object, so the probe stage, the agent loop and the JitRL stages
+   * all book against one manager/budget.
+   *
+   * Three reachable shapes, each reported truthfully below:
+   *   1. `agentLoop.model` present -> the agent-loop executor runs probes and
+   *      consumes `agentLoop.ledgerSettlement` itself (the resolved same-process
+   *      executor is unused).
+   *   2. `agentLoop.ledgerSettlement` WITHOUT a model -> no agent executor is
+   *      built; the DSH-resolved same-process executor runs probes and receives
+   *      this settlement through `branch.metering`.
+   *   3. an explicit `runBranch`/`deps.runBranch` wins; the settlement reaches
+   *      the JitRL model stages but not that host-owned probe executor.
+   * If no `agentLoop.ledgerSettlement` exists there is no settlement object to
+   * share, so probes stay unmetered - the remaining structural limit.
+   */
+  const hostProbeMetering: MeteredModelOptions | undefined =
+    options.agentLoop?.ledgerSettlement === undefined
+      ? undefined
+      : { ledgerSettlement: options.agentLoop.ledgerSettlement };
+  const resolvedExecutorWillRun =
+    options.runBranch === undefined &&
+    options.deps?.runBranch === undefined &&
+    (options.agentLoop === undefined || options.agentLoop.model === undefined);
+
+  /**
    * Collaborator detection. Resolved once and shared by every consumer; a
    * failure here is a diagnostic, never a mount failure.
    */
@@ -3045,6 +3300,24 @@ export function createEvoHarnessPlugin(
       return undefined;
     }
     try {
+      if (hostProbeMetering !== undefined) {
+        if (options.agentLoop?.model !== undefined) {
+          report(
+            'branch metering: the agent-loop probe executor uses agentLoop.ledgerSettlement ' +
+              '(one settlement object; no second ledger manager is assembled)'
+          );
+        } else if (resolvedExecutorWillRun) {
+          report(
+            'branch metering: the DSH-resolved same-process probe executor shares agentLoop.ledgerSettlement ' +
+              '(one settlement object; no second ledger manager is assembled)'
+          );
+        } else {
+          report(
+            'branch metering: the caller-supplied probe executor is authoritative; agentLoop.ledgerSettlement ' +
+              'reaches the JitRL model stages only, not that executor'
+          );
+        }
+      }
       const resolvedCollaborators = await resolveDshCollaborators(ctx, {
         config: section.config,
         route: modelRoute,
@@ -3052,6 +3325,7 @@ export function createEvoHarnessPlugin(
         ...(options.model === undefined ? {} : { model: options.model }),
         ...(options.runBranch === undefined ? {} : { runBranch: options.runBranch }),
         ...(options.clients === undefined ? {} : { clients: options.clients }),
+        ...(hostProbeMetering === undefined ? {} : { branch: { metering: hostProbeMetering } }),
         onDiagnostic: report
       });
       if (holder.model === undefined && resolvedCollaborators.model !== undefined) {
@@ -3059,9 +3333,14 @@ export function createEvoHarnessPlugin(
       }
       // P0-1: an explicitly injected executor keeps priority over the resolved
       // same-process one. options.runBranch already seeds the holder above, and
-      // an injected agentLoop executor stays authoritative (it carries its own
-      // adapters), so the resolved executor only fills a genuinely empty holder.
-      if (holder.runBranch === undefined && options.agentLoop === undefined) {
+      // an injected agentLoop executor (one with a MODEL) stays authoritative
+      // because it carries its own adapters. A ledger-only agentLoop has no
+      // executor at all (see agentExecutor), so the resolved one must fill the
+      // holder - that is the shape B8 metering depends on.
+      if (
+        holder.runBranch === undefined &&
+        (options.agentLoop === undefined || options.agentLoop.model === undefined)
+      ) {
         holder.runBranch = resolvedCollaborators.runBranch;
       }
       // P1-9 (VCI-1): publish the resolved MCP clients (the tools-backed one
@@ -3142,6 +3421,33 @@ export function createEvoHarnessPlugin(
   };
 
   /**
+   * rev6 audit A5 (B7): report ONCE per process that the live DSH hook
+   * waterfall carries no branch identity. This is measurement-only: it never
+   * touches a mount decision, and it only fires for the real `dsh-hooks`
+   * adapter after at least one dispatch was observed.
+   */
+  let branchMountDiagnosisReported = false;
+  const reportBranchMountDiagnosisOnce = (): void => {
+    if (branchMountDiagnosisReported) {
+      return;
+    }
+    const adapter = hostAdapter as Partial<DshHookHostAdapter>;
+    const stats: DshHookAdapterStats | undefined =
+      typeof adapter.stats === 'function' ? adapter.stats() : undefined;
+    const diagnosis = diagnoseBranchScopedHookMount({
+      hostAdapterSource,
+      ...(stats === undefined ? {} : { stats })
+    });
+    if (diagnosis !== undefined) {
+      // Only a REPORTED diagnosis closes the gate: a run that finished before
+      // the first hook dispatch must not suppress the diagnostic forever.
+      branchMountDiagnosisReported = true;
+      diagnostics.push(diagnosis.diagnostic);
+      diagnostics.push(diagnosis.summary);
+    }
+  };
+
+  /**
    * Unified run execution and teardown helper (L4 governance repair).
    *
    * Shared by plugin.run, plugin.runFromCommand, runFallback, and runCompletedTurn.
@@ -3169,6 +3475,9 @@ export function createEvoHarnessPlugin(
     try {
       await jitReady;
       const runResult = await orchestrator.run(request);
+      // A5: after the run, inspect what the live hook adapter actually saw.
+      // No dispatch => no claim; branch proof => no diagnostic.
+      reportBranchMountDiagnosisOnce();
       // Intentional: log the run's outcome BEFORE the mirror sync, which is
       // subject to the mirror policy.
       logRunSummary(runResult);

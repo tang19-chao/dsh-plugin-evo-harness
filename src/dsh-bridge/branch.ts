@@ -48,6 +48,9 @@ import {
   createMeteredModelAdapter,
   type MeteredModelOptions
 } from './metered-model-adapter';
+// A1 (rev6 audit B1): the DEFAULT prompt builder is patch-aware. This module
+// imports the renderer; the renderer imports types only, so there is no cycle.
+import { appendPatchSections } from './patch-prompt';
 
 /** Where the probe's prompt text comes from. */
 export type BranchPromptSource = (context: IsolatedBranchContext) => readonly ModelMessage[];
@@ -130,6 +133,17 @@ export function defaultBranchMessages(context: IsolatedBranchContext): readonly 
     { role: 'system', content: heading },
     { role: 'user', content: context.task.prompt }
   ];
+}
+
+/**
+ * A1 (rev6 audit B1): the same header + task, with the patch EDITS rendered
+ * between them. An empty patch returns `defaultBranchMessages(context)`
+ * unchanged (same array reference), which is the compatibility contract.
+ */
+export function patchAwareBranchMessages(
+  context: IsolatedBranchContext
+): readonly ModelMessage[] {
+  return appendPatchSections(defaultBranchMessages(context), context);
 }
 
 /** Event-sourced recorder: steps are appended in the order they happen. */
@@ -265,8 +279,13 @@ export function createBranchExecutor(
       return recorder.snapshot();
     }
 
-    const builder = adapters.buildMessages ?? defaultBranchMessages;
-    const baseMessages = builder(context);
+    // A1 (rev6 audit B1): a host-supplied builder stays completely
+    // authoritative (the patch is never appended on top of it); WITHOUT one,
+    // the default builder renders the patch edits the probe is meant to
+    // evaluate. This is the single production wiring point, so reverting it is
+    // exactly what the M5 mutation gate does.
+    const builder = adapters.buildMessages;
+    const baseMessages = builder === undefined ? patchAwareBranchMessages(context) : builder(context);
     const systemPrompt = adapters.systemPrompt?.(context);
     const messages =
       systemPrompt === undefined ? baseMessages : [{ role: 'system' as const, content: systemPrompt }, ...baseMessages];

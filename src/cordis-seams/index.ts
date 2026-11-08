@@ -15,6 +15,7 @@ export * from './eight-surfaces';
 export * from './errors';
 export * from './context-forker';
 export * from './host-adapter';
+export * from './host-mount-diagnostics';
 export * from './patch-utils';
 export * from './seam-manager';
 export * from './tool-face';

@@ -1137,6 +1137,46 @@ export interface SearchGridPlan {
   readonly policyId: string;
 }
 
+/**
+ * rev8 plan §6.1 item 3 (live-cycle manifest wiring): the PREVIOUS lifecycle's
+ * REALIZED execution shape, read from the persisted live-cycle manifest before
+ * plan_grid and handed to the planner as planning context. Only values the
+ * previous cycle actually OBSERVED ride here — a previous planned grid is never
+ * substituted for a realized one — and a field the previous cycle could not
+ * record stays explicitly `null` (never a plausible zero).
+ *
+ * Defined here (contracts) rather than in src/dream-rsi to keep the import
+ * direction clean: the manifest module imports THIS file, not the other way
+ * round. Additive: the built-in active policy uses realized batches, rounds,
+ * effective sequential rounds and probes only to NARROW its next plan; other
+ * policies may ignore the field and plan exactly as before.
+ */
+export interface LiveCyclePlanHistory {
+  /** Identity of the previous lifecycle run. */
+  readonly runId: string;
+  /** Whether the previous cycle completed or failed; `unknown` when unsayable. */
+  readonly status: 'completed' | 'failed' | 'unknown';
+  /** Total probes the previous cycle executed (reference included); null unknown. */
+  readonly probes: number | null;
+  /** Selection rounds the previous cycle executed; null unknown. */
+  readonly rounds: number | null;
+  /** Candidate probes executed per round (index = round - 1); null unknown. */
+  readonly batchSizes: readonly number[] | null;
+  /** Sequential-round cost of the recorded batches; null unknown. */
+  readonly effectiveSequentialRounds: number | null;
+  /**
+   * rev8 P2 (cross-task ownership): the task identity the previous cycle
+   * recorded, when the manifest carried one. The orchestrator's read path
+   * projects ONLY same-task records (the per-data-directory manifest is shared
+   * by every task of a deployment), so a value present here always equals the
+   * current task's id when the history came from that path. A consumer that
+   * receives a DIFFERENT non-empty value must treat the record as another
+   * task's evidence and ignore it entirely; a record without the field is
+   * unattributable legacy data and stays subject to the reader's own gate.
+   */
+  readonly taskId?: string;
+}
+
 /** Input to plan_grid. */
 export interface PlanGridRequest {
   readonly task: ProbeTask;
@@ -1145,6 +1185,14 @@ export interface PlanGridRequest {
   readonly currentDepth: number;
   readonly exploredNodes: number;
   readonly previousFailures?: readonly FailureDiagnosis[];
+  /**
+   * rev8 plan §6.1 item 3: the previous cycle's realized shape (see
+   * {@link LiveCyclePlanHistory}). Present only when the orchestrator's
+   * `liveCycleDataDir` seam is wired AND the previous manifest was readable;
+   * omitted entirely otherwise, so every unwired request is byte-identical to
+   * the pre-rev8 shape.
+   */
+  readonly previousLiveCycle?: LiveCyclePlanHistory | null;
   readonly policy: MetaSearchPolicy;
 }
 
@@ -2019,6 +2067,17 @@ export interface EvoHarnessRunRequest {
   readonly budgetOverride?: RunBudgetOverride;
   readonly dryRun?: boolean;
   readonly metadata?: ContractMetadata;
+  /**
+   * rev8 stage-2 (MCP long tasks): optional cancellation signal. When present,
+   * it is forwarded to EVERY isolated-branch probe of the run
+   * (`ProbeBranchRequest.signal`), so a caller-side disconnect or cancel
+   * propagates to the branch executor exactly like the per-probe timeout does
+   * (seam-manager.ts abort/timeout guards). The orchestrator never aborts this
+   * signal itself; a probe that reports 'aborted' is classified by the
+   * trajectory collector as usual. Additive and optional: every existing
+   * caller compiles unchanged.
+   */
+  readonly signal?: AbortSignal;
 }
 
 /** Terminal outcome of an evolution run. */

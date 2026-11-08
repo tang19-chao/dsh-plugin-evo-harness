@@ -8,45 +8,47 @@
  * exact gap that let a refactor drop the deferred-collaborator forwarding while
  * the whole suite stayed green (each run silently degrading to `no_probe`).
  *
- * This file mounts with a fake ctx.llm ONLY and fails when the run still
- * produces zero probes. The scripted stream answers per prompt family the same
- * way tests/e2e/fixtures.ts createScriptedModel does, but routes on message
- * content because the DSH stream interface carries no purpose field.
+ * REV6 A2 (audit B2): the ORIGINAL fake read `message.content` as a string.
+ * The real adapter sends a DSH content BLOCK ARRAY, so every route missed, the
+ * proposer answered `{lessons:[]}`, and the run ended at `outcome = no_probe`
+ * with `probesRun = 1` (reference only) while this gate still passed. The fake
+ * now decodes blocks through `decodeContent`, and the assertions below pin the
+ * three facts the old gate could not see: a real outcome, more than one probe,
+ * and the patch markers inside candidate prompts (never in the reference).
  */
 import { describe, expect, it } from 'vitest';
 
 import { createEvoHarnessPlugin } from '../../src/index';
-import { createFakeContext, e2eConfig, makeClock, proposalPayload } from './fixtures';
+import { PATCH_PROMPT_PREFIX } from '../../src/dsh-bridge/patch-prompt';
+import {
+  createFakeContext,
+  createPatchAwareHostLlm,
+  e2eConfig,
+  makeClock
+} from './fixtures';
 
-/** Minimal DshGenerateOptions view: the routed messages are all we need. */
-interface FakeStreamOptions {
-  readonly messages: ReadonlyArray<{ readonly role: string; readonly content: string }>;
-}
+/** Markers only the proposer's edits can put into a probe prompt. */
+const MARK_SYS = 'HOST_MARK_SYS_7731';
+const MARK_GUARD = 'Return minified JSON only.';
 
-/** A ctx.llm.stream stand-in that answers propose/compose/reflect/probe prompts. */
-function createHostLlm(): { stream: (options: FakeStreamOptions) => AsyncIterable<unknown> } {
+/** A proposal that edits system_prompt + guardrails, so both surfaces render. */
+function markedProposal(): Record<string, unknown> {
   return {
-    stream: async function* (options: FakeStreamOptions): AsyncIterable<unknown> {
-      const joined = options.messages.map((message) => message.content).join('\n');
-      let reply: string;
-      if (joined.includes('You are the Harness² proposer')) {
-        reply = JSON.stringify(proposalPayload());
-      } else if (/candidate_[A-Z]/.test(joined)) {
-        const aliases = [...new Set(joined.match(/candidate_[A-Z]/g) ?? [])];
-        reply = JSON.stringify({
-          ranking: aliases,
-          assessments: aliases.map((alias, index) => ({
-            alias,
-            rationale: 'ranked ' + String(index + 1) + ' by the host judge'
-          }))
-        });
-      } else if (joined.includes('probe run inside an isolated evolution branch')) {
-        reply = 'host probe deliverable: the failing build passes with the mounted guardrails';
-      } else {
-        reply = JSON.stringify({ lessons: [] });
+    rationale: 'Pin the failing tool in the prompt before the probe retries.',
+    focusSurfaces: ['system_prompt', 'guardrails'],
+    confidence: 0.72,
+    expectedStepsDelta: -1,
+    edits: {
+      system_prompt: {
+        kind: 'system_prompt',
+        mode: 'append',
+        content: 'declare the failing tool before retrying (' + MARK_SYS + ')'
+      },
+      guardrails: {
+        kind: 'guardrails',
+        formatContract: MARK_GUARD,
+        appendRules: ['declare the failing tool before retrying']
       }
-      yield { type: 'text-delta', index: 0, text: reply };
-      yield { type: 'finish', reason: { kind: 'stop' } };
     }
   };
 }
@@ -54,7 +56,8 @@ function createHostLlm(): { stream: (options: FakeStreamOptions) => AsyncIterabl
 describe('plugin mount on a host-resolved context (no options.model / options.runBranch)', () => {
   it('runs probes through the collaborators resolved from ctx.llm', async () => {
     const { ctx } = createFakeContext();
-    const hostCtx = { ...ctx, llm: createHostLlm() };
+    const host = createPatchAwareHostLlm({ proposals: [markedProposal()] });
+    const hostCtx = { ...ctx, llm: host };
     const plugin = createEvoHarnessPlugin({
       config: e2eConfig(),
       now: makeClock()
@@ -71,9 +74,46 @@ describe('plugin mount on a host-resolved context (no options.model / options.ru
       trigger: 'always'
     });
 
-    // The permanent gate: before the forwarding was restored, every probe in
-    // this configuration failed loudly and the run ended with probesRun === 0.
-    expect(result.probesRun).toBeGreaterThan(0);
+    // A2: BEFORE the content-block decode this configuration ended at
+    // `outcome = no_probe` with `probesRun = 1` (reference only) and the old
+    // assertion `probesRun > 0` still passed. All three assertions below are
+    // load-bearing.
+    expect(result.outcome).not.toBe('no_probe');
+    expect(result.probesRun).toBeGreaterThan(1);
     expect(result.diagnostics.join(' ')).not.toContain('no model adapter was injected');
+
+    // A1/A2: every probe prompt observed through the REAL adapter must be
+    // decoded, and candidate probes must carry the patch the proposer emitted.
+    expect(host.probePrompts).toHaveLength(result.probesRun);
+    expect(host.probeDispatches).toHaveLength(result.probesRun);
+    // Identity, not content: prompt text alone cannot tell whether the REFERENCE
+    // was patched or only some candidate was. The reference is the unique
+    // dispatch whose branch id starts with `reference-`.
+    const referenceDispatches = host.probeDispatches.filter(
+      (dispatch) => dispatch.branch?.startsWith('reference-') === true
+    );
+    const candidateDispatches = host.probeDispatches.filter(
+      (dispatch) => dispatch.branch?.startsWith('reference-') !== true
+    );
+    expect(referenceDispatches).toHaveLength(1);
+    expect(candidateDispatches).toHaveLength(result.probesRun - 1);
+    const patched = candidateDispatches.filter((dispatch) =>
+      dispatch.prompt.includes(PATCH_PROMPT_PREFIX)
+    );
+    const unpatched = candidateDispatches.filter(
+      (dispatch) => !dispatch.prompt.includes(PATCH_PROMPT_PREFIX)
+    );
+
+    // EVERY candidate carries the patch; NO reference does.
+    expect(patched).toHaveLength(candidateDispatches.length);
+    expect(patched.every((dispatch) => dispatch.prompt.includes(MARK_SYS))).toBe(true);
+    expect(patched.every((dispatch) => dispatch.prompt.includes(MARK_GUARD))).toBe(true);
+    expect(unpatched).toEqual([]);
+
+    // The reference patch has no edits, so its prompt must be byte-identical to
+    // the default header + task: no patch block and no marker of any kind.
+    expect(referenceDispatches.every((dispatch) => !dispatch.prompt.includes(MARK_SYS))).toBe(true);
+    expect(referenceDispatches.every((dispatch) => !dispatch.prompt.includes(MARK_GUARD))).toBe(true);
+    expect(referenceDispatches.every((dispatch) => !dispatch.prompt.includes(PATCH_PROMPT_PREFIX))).toBe(true);
   });
 });

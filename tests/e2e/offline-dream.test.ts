@@ -14,7 +14,10 @@ import {
 
 describe('offline dream trigger', () => {
   it('runs the zero-execution replay once the cadence is reached', async () => {
-    const { plugin, runner } = buildE2E({ dreamEveryNTasks: 1 });
+    const { plugin, runner } = buildE2E({
+      dreamEveryNTasks: 1,
+      extra: { deps: { dreamMinVerifiedTrees: 0 } }
+    });
     const task = plugin.makeTask({ id: 'task-dream-1', prompt: 'Fix the failing build.' });
 
     const result = await plugin.run({ sessionId: 'sess-dream', task, trigger: 'always' });
@@ -43,7 +46,10 @@ describe('offline dream trigger', () => {
   });
 
   it('respects the configured cadence across runs', async () => {
-    const { plugin } = buildE2E({ dreamEveryNTasks: 2 });
+    const { plugin } = buildE2E({
+      dreamEveryNTasks: 2,
+      extra: { deps: { dreamMinVerifiedTrees: 0 } }
+    });
     const task = plugin.makeTask({ id: 'task-dream-2', prompt: 'Fix the failing build.' });
 
     const first = await plugin.run({ sessionId: 'sess-cadence', task, trigger: 'always' });
@@ -69,6 +75,121 @@ describe('offline dream trigger', () => {
     expect(trees).toHaveLength(2);
     expect(trees.every((tree) => tree.completed)).toBe(true);
     expect(trees.every((tree) => Object.keys(tree.nodes).length >= 2)).toBe(true);
+  });
+
+  it('skips dream under the production floor when no verified tree exists (A4-2 default 12)', async () => {
+    // The production wiring passes dreamMinVerifiedTrees = 12. With no trusted
+    // verifier every tree is unverified, so the cadence fires but the replay
+    // must be SKIPPED with a diagnostic - never run on unverified scores.
+    const { plugin } = buildE2E({ dreamEveryNTasks: 1 });
+    const task = plugin.makeTask({ id: 'task-dream-gate', prompt: 'Fix the failing build.' });
+    const result = await plugin.run({ sessionId: 'sess-dream-gate', task, trigger: 'always' });
+
+    expect(result.metadata?.dreamTriggered).toBe(false);
+    expect(plugin.orchestrator.dreamReports()).toHaveLength(0);
+    expect(result.diagnostics.join(' ')).toContain('offline dream skipped');
+    expect(result.diagnostics.join(' ')).toContain('verified tree(s) < minimum 12');
+    // The task itself still completed normally.
+    expect(result.outcome).toBe('composed');
+  });
+
+  it('hands ONLY verified trees to the dreamer when the floor is positive', async () => {
+    const verifiedId = 'tree-verified-fixture';
+    const verifiedNode = {
+      id: 'node-verified',
+      treeId: verifiedId,
+      parentId: null,
+      depth: 1,
+      branchId: 'b-verified',
+      patchId: 'p-verified',
+      patchOrigin: 'domain',
+      purpose: 'explore',
+      guidance: 'memory',
+      status: 'succeeded',
+      score: 0.9,
+      childIds: [],
+      createdAt: 1,
+      updatedAt: 2,
+      metadata: {
+        dreamEvidence: {
+          verdict: 'passed',
+          trusted: true,
+          dreamScore: 0.9,
+          strategy: 'verified-only-selection',
+          verifierId: 'offline-dream-test-host',
+          evidenceHash: 'sha256:' + 'a'.repeat(64)
+        }
+      }
+    } as const;
+    const verifiedTree = {
+      id: verifiedId,
+      sessionId: 's',
+      taskId: 't-verified',
+      rootId: 'node-verified',
+      nodes: { 'node-verified': verifiedNode },
+      stats: { nodeCount: 1, maxDepth: 1, maxWidth: 1, scoredNodes: 1, completedNodes: 1 },
+      completed: true,
+      createdAt: 1,
+      updatedAt: 2
+    } as unknown as import('../../src/types/contracts').DiscoveryTreeSnapshot;
+
+    const replayed: string[][] = [];
+    const dreamer = {
+      async replay(request: { readonly trees: readonly { readonly id: string }[] }) {
+        replayed.push(request.trees.map((tree) => tree.id));
+        const empty = {
+          policyId: 'pi-0',
+          hypervolume: 0,
+          meanQuality: 0,
+          meanCost: 0,
+          perRho: {},
+          treesEvaluated: 0
+        };
+        return {
+          ranAt: 0,
+          baseline: empty,
+          candidateEvaluations: [],
+          best: empty,
+          improved: false,
+          selectedPolicyId: 'pi-0',
+          replayedTreeIds: request.trees.map((tree) => tree.id),
+          rhoPreferences: [0],
+          publication: { publish: false, reason: 'fixture' },
+          shadow: {
+            suggestedPolicyId: 'pi-0',
+            incumbentPolicyId: 'pi-0',
+            published: false,
+            comparisons: [],
+            selectionTreeIds: request.trees.map((tree) => tree.id),
+            holdoutTreeIds: [],
+            split: { status: 'none', hasSufficientEvidence: false, diagnostics: [] },
+            boundary: 'fixture'
+          },
+          ignoredDimensions: []
+        } as never;
+      }
+    };
+    const treePool = createDiscoveryTreePool();
+    treePool.add(verifiedTree);
+    const { plugin } = buildE2E({
+      dreamEveryNTasks: 1,
+      extra: {
+        deps: {
+          treePool,
+          dreamer,
+          // One verified snapshot is present, so the floor is satisfiable; the
+          // run's own unverified tree must NOT be handed to replay.
+          dreamMinVerifiedTrees: 1
+        }
+      }
+    });
+    const result = await plugin.run({
+      sessionId: 'sess-dream-verified-only',
+      task: plugin.makeTask({ id: 'task-dream-v', prompt: 'Fix the failing build.' }),
+      trigger: 'always'
+    });
+    expect(result.metadata?.dreamTriggered).toBe(true);
+    expect(replayed).toEqual([[verifiedId]]);
   });
 
   it('drives dreaming through the dreamer policy generator instead of shadowing it', async () => {
@@ -103,7 +224,7 @@ describe('offline dream trigger', () => {
         runBranch: createScriptedRunner(now),
         now,
         newId: makeIdFactory('gen-dream'),
-        deps: { dreamer, treePool }
+        deps: { dreamer, treePool, dreamMinVerifiedTrees: 0 }
       },
       {}
     );

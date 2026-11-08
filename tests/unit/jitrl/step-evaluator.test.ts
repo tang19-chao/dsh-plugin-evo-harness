@@ -631,3 +631,57 @@ describe('P6.1-D: the single trajectory-signal yardstick', () => {
     expect(second).toEqual(first);
   });
 });
+// ---------------------------------------------------------------------------
+// rev6 audit A4-4 (B3): symmetric judge policy
+// ---------------------------------------------------------------------------
+
+describe('judgePolicy=all (A4-4)', () => {
+  const oneStep = makeTrajectory({
+    steps: [makeStep(0, 'message', { text: 'single model call' })]
+  });
+  const input: StepEvaluationInput = { trajectory: oneStep, task: TASK };
+
+  it('keeps the historical gate when no policy is supplied (default cost-gated)', async () => {
+    const model = judgeModel('{"steps":[{"stepIndex":0,"score":2}]}');
+    const evaluator = createStepEvaluator({ reward: REWARD, model });
+    const rewards = await evaluator.evaluateSteps(input);
+    expect(model.requests).toHaveLength(0);
+    expect(rewards[0]?.sources.evaluated).toBe(0);
+    expect(rewards[0]?.rationale).toContain('gated out');
+  });
+
+  it('judges a one-step, unselected probe when the policy is all', async () => {
+    const model = judgeModel('{"steps":[{"stepIndex":0,"score":2}]}');
+    const evaluator = createStepEvaluator({ reward: REWARD, model, judgePolicy: 'all' });
+    const rewards = await evaluator.evaluateSteps(input);
+    expect(model.requests).toHaveLength(1);
+    expect(model.requests[0]?.purpose).toBe('evaluate_steps');
+    expect(rewards[0]?.sources.llm).toBe(2);
+    expect(rewards[0]?.sources.evaluated).toBe(1);
+  });
+
+  it('still respects reward.llmEvaluator=false and a missing model in all mode', async () => {
+    const model = judgeModel('{"steps":[{"stepIndex":0,"score":2}]}');
+    const disabled = createStepEvaluator({
+      reward: { ...REWARD, llmEvaluator: false },
+      model,
+      judgePolicy: 'all'
+    });
+    await disabled.evaluateSteps(input);
+    expect(model.requests).toHaveLength(0);
+
+    const noModel = createStepEvaluator({ reward: REWARD, judgePolicy: 'all' });
+    const rewards = await noModel.evaluateSteps(input);
+    expect(rewards[0]?.sources.evaluated).toBe(0);
+    expect(rewards[0]?.rationale).toContain('gated out');
+  });
+
+  it('the same policy applied to two probes yields one judge call each (symmetry)', async () => {
+    const model = judgeModel('{"steps":[{"stepIndex":0,"score":1}]}');
+    const evaluator = createStepEvaluator({ reward: REWARD, model, judgePolicy: 'all' });
+    const second = makeTrajectory({ id: 'traj-2', steps: [makeStep(0, 'message', { text: 'sibling' })] });
+    await evaluator.evaluateSteps(input);
+    await evaluator.evaluateSteps({ trajectory: second, task: TASK });
+    expect(model.requests).toHaveLength(2);
+  });
+});

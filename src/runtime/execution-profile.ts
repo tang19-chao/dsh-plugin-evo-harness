@@ -88,10 +88,10 @@ export const DEFAULT_EXECUTION_MODE: ExecutionMode = 'shadow';
  * Patch permission semantics:
  *   - 'shadow' / 'baseline' / 'off': denied (no permanent mount, no
  *     auto-publish, no real memory write);
- *   - 'guarded-active': allowed ONLY as "evidence-gated" - the conservative
- *     replacement rules (src/jitrl/replacement-policy.ts) still decide every
- *     individual deviation. It is an enabling flag for the gate channel, not a
- *     blanket mount right.
+ *   - 'guarded-active': allowed ONLY by TWO explicit opt-ins - the mode and
+ *     `execution.applyWinningPatch: true`. This profile does NOT inspect a
+ *     verdict; the mount site says no host-trusted verdict gate is applied.
+ *     Replacement rules govern L2 selection, not the final mounted patch.
  *
  * Memory permission semantics (t10/R2): denied in EVERY mode unless the
  * explicit `memoryRealWrites: true` profile override is present (see above).
@@ -113,7 +113,7 @@ export function resolveExecutionProfile(input: ExecutionProfileInput = {}): Exec
       patch: {
         allowed: patchAllowed,
         reason: patchAllowed
-          ? 'guarded-active explicitly enabled; every individual deviation still passes the replacement-evidence gate'
+          ? 'guarded-active explicitly enabled; the permanent mount is an explicit opt-in (mode + applyWinningPatch) and does NOT require a host-trusted verdict'
           : 'patch permission is denied unless guarded-active is explicitly enabled (ADR 0002 R2: fail-closed default)'
       },
       publish: {

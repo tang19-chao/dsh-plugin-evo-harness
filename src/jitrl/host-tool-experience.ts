@@ -113,8 +113,16 @@ export interface HostToolExperienceCollectorOptions {
   /** Diagnostic sink (payload free). */
   readonly onDiagnostic?: (message: string) => void;
   /**
-   * Runtime gate (`/evo jit off`): when it returns false no record is produced,
-   * so switching JitRL off also stops evidence collection.
+   * L3 PROCESS-TRACK EXEMPTION (rev6 audit A4-1 scope, documented rather than
+   * silently widened): these are the host's OWN hook observations, not probe
+   * outcomes. `jitrl.writebackGate` classifies executed PROBE records; it does
+   * not veto this separate process track. `jitrl.hostAdvisor.enabled` is the
+   * explicit opt-in (default false), and a host that enables it accepts that
+   * host-tool process signals are learned from even without a trusted verifier.
+   * See README "write-back gate" and the rev7 runbook for the boundary.
+   *
+   * Runtime gate (`/evo jit off`): when this returns false no record is
+   * produced, so switching JitRL off also stops evidence collection.
    */
   readonly isEnabled?: () => boolean;
   /** Injected ScopeRegistry for trusted scope resolution and invariant branch protection. */

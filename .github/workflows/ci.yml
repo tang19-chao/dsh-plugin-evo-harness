@@ -470,7 +470,7 @@ jobs:
   mutation-gate:
     name: Mutation gate (ADR 0005 D5)
     runs-on: ubuntu-latest
-    # Four baseline runs plus four mutant runs, each in a fresh copy; the
+    # Five baseline runs plus five mutant runs, each in a fresh copy; the
     # generous bound is a hang detector, not a budget.
     timeout-minutes: 30
     steps:
@@ -498,7 +498,7 @@ jobs:
 
       # The documented gate and the CI gate are the same command string; the
       # job fails when any pinned mutant survives.
-      - name: Run the four targeted mutation gates
+      - name: Run the five targeted mutation gates
         run: pnpm run check:mutation
 
   # ---------------------------------------------------------------------------

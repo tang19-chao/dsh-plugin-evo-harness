@@ -628,16 +628,17 @@ describe('rev6 R1-2 wiring: the gate is OFF by default and changes nothing', () 
     expect(gate?.judged).toBe(0);
   });
 
-  it('the OFF path leaves records learnable exactly as before', async () => {
+  it('the OFF path adds no gate refusal marks (records are audited by A4-3, not by the gate)', async () => {
     const harness = makeHarness({ writebackGate: false });
     await runOnce(harness);
     const records = onlineRecords(harness.store);
-    // The succeeded candidate was learnable in the historical run; the gate must
-    // not have demoted it.
-    const learnable = records.filter((record) => record.learningEligible === true);
-    expect(learnable.length).toBeGreaterThan(0);
-    // ...and no refusal mark exists on any record when the gate is off.
+    // The HISTORICAL gate behaviour is unchanged: with the gate explicitly off
+    // no write-back verdict is produced, so no refusal mark exists. The records
+    // are nevertheless audit-only because A4-3 classifies the unverified text
+    // probes as not-evaluable - the two vetoes are separate facts, which is
+    // exactly what this pair of assertions distinguishes.
     expect(records.every((record) => record.rewardSources?.['writebackRefusal'] === undefined)).toBe(true);
+    expect(records.every((record) => record.learningEligible === false)).toBe(true);
   });
 });
 
@@ -671,7 +672,12 @@ describe('rev6 R1-2 wiring: the gate is ON and refuses evidence-free write-back'
     // THE HEADLINE NUMBER: the historical `gateFired: 0` was the defect; here
     // every executed write-back fires the gate.
     expect(gate?.gateFired).toBe(gate?.judged);
-    expect(gate?.refusalCounts['rejected-no-verdict']).toBe(gate?.judged);
+    // The FIRST veto is A4-3 (the scorer already marked this unverified text
+    // probe not-evaluable), so the gate's own first check - "never raise a
+    // record the scorer refused" - is the one that fires. The no-verdict reason
+    // belongs to a record the scorer left eligible; A4-3 means this fixture no
+    // longer produces one.
+    expect(gate?.refusalCounts['rejected-record-ineligible']).toBe(gate?.judged);
     // The refusal code travels WITH the record, not only in a log line.
     expect(
       records.every((record) => typeof record.rewardSources?.['writebackRefusal'] === 'number')
