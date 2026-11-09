@@ -11,6 +11,7 @@
  *   - zero side channels: no network, no model, no memory/patch/publish imports.
  */
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { artifactDigestOf, artifactOf } from '../../../src/verification/artifact-digest';
 import {
@@ -19,7 +20,11 @@ import {
 } from '../../../src/verification/host-runner';
 import type { ProbeTrajectory } from '../../../src/types/contracts';
 
-const REPO_ROOT = new URL('../../../', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+// `URL.pathname` keeps percent-encoding, so from a checkout under a path with a space or a
+// non-ASCII character the static scan below opens a literal '%20'-style name and fails with
+// ENOENT. fileURLToPath decodes it; the separator swap keeps the `REPO_ROOT + rel` joins
+// portable.
+const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url)).replace(/\\/g, '/');
 
 function trajectory(overrides: Partial<ProbeTrajectory> = {}): ProbeTrajectory {
   return {
