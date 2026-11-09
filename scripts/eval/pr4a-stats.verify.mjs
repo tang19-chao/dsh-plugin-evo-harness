@@ -37,12 +37,38 @@
  *   node scripts/eval/pr4a-stats.verify.mjs --check-doc docs/reports/p2-preregistration-v3.md
  */
 
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import {
+// The statistics layer below is a TypeScript module. Node strips types by default only from
+// 22.18, while `engines.node` starts at 20.19, so a plain `node scripts/eval/pr4a-stats.verify.mjs`
+// used to die inside the module loader with ERR_UNKNOWN_FILE_EXTENSION on 20.x and 22.0-22.17.
+// Re-exec once with the flag where it exists, and name the requirement where it does not,
+// instead of letting a documented gate fail with a loader error. Only when this file IS the
+// entrypoint: the suite imports it, and vitest does its own TypeScript transform.
+const isEntrypoint =
+  process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isEntrypoint && !process.features?.typescript) {
+  const [major, minor] = process.versions.node.split('.').map(Number);
+  if (major < 22 || (major === 22 && minor < 6)) {
+    console.error(
+      `pr4a-stats.verify imports a TypeScript module, which needs Node >=22.6; ` +
+        `this is ${process.versions.node}.`
+    );
+    process.exit(2);
+  }
+  const forwarded = spawnSync(
+    process.execPath,
+    ['--experimental-strip-types', fileURLToPath(import.meta.url), ...process.argv.slice(2)],
+    {stdio: 'inherit'}
+  );
+  process.exit(forwarded.status ?? 1);
+}
+
+const {
   benjaminiHochberg,
   closedFormMinDetectableD,
   exactDiscordantInterval,
@@ -56,7 +82,7 @@ import {
   summarisePaired,
   verdictTuple,
   widthBudget
-} from './pr4a-stats.ts';
+} = await import('./pr4a-stats.ts');
 
 import {
   V3_TASKS,
